@@ -46,7 +46,14 @@ Rules:
    - exemplar_paragraph_index: the paragraph_index you used as the exemplar for that role.
      If styleId is a CSI_*__ARCH style you created in create_styles, exemplar_paragraph_index MUST equal that style’s derive_from_paragraph_index.
    If a role does not exist in this document, omit it (do NOT fabricate).
-7) Output must be valid JSON only.
+7) You MUST classify EVERY content paragraph in the document. Do not provide "representative samples" —
+   the apply_pStyle array must contain an entry for every paragraph that has a CSI role.
+   Skip ONLY these paragraphs:
+   - Empty/blank paragraphs (no visible text)
+   - Paragraphs with contains_sectPr=true
+   - "END OF SECTION" paragraphs
+   - Editor/specifier notes in brackets (e.g. "[SPECIFIER NOTE: ...]")
+8) Output must be valid JSON only.
 
 Output schema:
 {

@@ -35,8 +35,9 @@ def validate_registry(path: Path) -> None:
     if not isinstance(roles, dict):
         raise ValueError("registry.roles must be an object")
 
+    # SectionID is optional per the JSON schema — not all spec sections
+    # have a separate section-number paragraph (some combine ID + title).
     required_roles = {
-        "SectionID",
         "SectionTitle",
         "PART",
         "ARTICLE",

@@ -9,6 +9,10 @@ Using the slim bundle, normalize CSI semantics by ensuring consistent paragraph 
 
 You MUST also output a "roles" mapping (role → {styleId, exemplar_paragraph_index}) as described in the master prompt.
 
+IMPORTANT: Classify ALL paragraphs in the document, not just representative samples.
+The apply_pStyle array must be comprehensive — every content paragraph needs an entry.
+Skip only empty paragraphs, sectPr paragraphs, "END OF SECTION", and editor notes in brackets.
+
 Constraints:
 - Preserve visual formatting (render-perfect).
 - Do not change headers/footers or sectPr.

@@ -50,7 +50,7 @@ The output document looks identical but now has proper paragraph styles you can 
 
 Instead of brittle pattern-matching rules:
 1. Extract minimal "slim bundle" (text + numbering hints, no formatting)
-2. Feed to Claude with structured prompt
+2. Classify via Anthropic API (automated) or manual LLM interaction
 3. LLM classifies CSI structure and selects exemplar paragraphs
 4. Script derives formatting locally from exemplars
 5. Applies styles with surgical XML insertion
@@ -59,7 +59,7 @@ Instead of brittle pattern-matching rules:
 
 ## Installation
 ```bash
-pip install anthropic  # Required for LLM API calls
+pip install -r requirements.txt
 ```
 
 Set your Anthropic API key:
@@ -67,9 +67,44 @@ Set your Anthropic API key:
 export ANTHROPIC_API_KEY='your-key-here'
 ```
 
+For PyInstaller packaging, use the separate build requirements:
+```bash
+pip install -r requirements-build.txt
+```
+
 ## Usage
 
-### Basic workflow
+### Automated workflow (recommended)
+```bash
+# One command does everything: extract, classify, apply, emit registries
+python docx_decomposer.py ARCH_TEMPLATE.docx --classify
+```
+
+This will:
+- Extract the DOCX
+- Build a slim bundle for LLM analysis
+- Call the Anthropic API to classify all paragraphs
+- Save `instructions.json` in the extract directory (for auditability)
+- Apply styles and emit both registries
+- Print a coverage metric (% of paragraphs classified)
+
+Optional flags for `--classify`:
+- `--api-key <key>` — Override the `ANTHROPIC_API_KEY` env var
+- `--model <id>` — Model ID (default: `claude-sonnet-4-20250514`)
+
+### GUI
+```bash
+python gui.py
+```
+
+The GUI provides a visual interface for the same automated pipeline:
+- Select a `.docx` file
+- Enter your API key (pre-populated from env var if set)
+- Click "Run Phase 1"
+- View real-time progress and coverage metric
+- Open the output folder or view the registry when done
+
+### Manual workflow (advanced/debugging)
 ```bash
 # Step 1: Extract slim bundle and prepare for LLM
 python docx_decomposer.py ARCH_TEMPLATE.docx --normalize-slim
@@ -84,24 +119,25 @@ python docx_decomposer.py ARCH_TEMPLATE.docx --normalize-slim
 python docx_decomposer.py ARCH_TEMPLATE.docx --apply-instructions instructions.json
 ```
 
-After Step 3, you'll have:
+After completion, you'll have:
 - `ARCH_TEMPLATE_extracted/arch_style_registry.json` - CSI role mappings
 - `ARCH_TEMPLATE_extracted/arch_template_registry.json` - Complete environment
 - Modified `ARCH_TEMPLATE_extracted/` folder with styles applied
 
 ### Available commands
 
-**`--normalize-slim`**  
-Extracts the DOCX and generates `slim_bundle.json` for LLM analysis.
+**`--classify`**
+Full automated pipeline: extract, classify via LLM, apply styles, emit registries.
 
-**`--apply-instructions <instructions.json>`**  
-Main command. Applies LLM-generated style instructions and produces both registries:
-- Creates/applies CSI paragraph styles
-- Extracts complete formatting environment
-- Verifies zero visual drift
-- Produces `arch_style_registry.json` and `arch_template_registry.json`
+**`--normalize-slim`**
+Extracts the DOCX and generates `slim_bundle.json` for manual LLM analysis.
+
+**`--apply-instructions <instructions.json>`**
+Applies LLM-generated style instructions and produces both registries.
 
 **Optional flags:**
+- `--api-key <key>` - Anthropic API key (default: `ANTHROPIC_API_KEY` env var)
+- `--model <id>` - Model ID for LLM classification
 - `--extract-dir <dir>` - Custom extraction directory
 - `--use-extract-dir <dir>` - Use existing extracted folder
 - `--registry-out <path>` - Copy arch_style_registry.json to specific location
@@ -140,6 +176,9 @@ Maps CSI roles to Word styleIds:
 
 ### arch_template_registry.json
 Complete formatting environment with raw XML blocks (see `schemas/arch_template_registry.json` for full structure).
+
+### Coverage metric
+After classification, the pipeline reports what percentage of content paragraphs were classified. Paragraphs that are empty, contain section breaks, say "END OF SECTION", or are editor notes in brackets are excluded from the count. Coverage below 90% triggers a warning.
 
 ### Paragraph styles in DOCX
 - `CSI_SectionID__ARCH` (optional)
@@ -191,7 +230,7 @@ python phase1_smoke_test.py ARCH_TEMPLATE.docx instructions.json
 The smoke test validates:
 - Both registries are created
 - arch_style_registry.json matches schema
-- All required CSI roles are present
+- All required CSI roles are present (SectionID is optional)
 - No stability invariants violated
 
 ## Schemas
@@ -208,26 +247,30 @@ Formal JSON schemas are provided in `schemas/`:
 
 ## Troubleshooting
 
-**"Paragraph drift detected"**  
+**"Paragraph drift detected"**
 The script changed something it shouldn't have. This is a bug, not expected behavior.
 
-**"derive_from_paragraph_index out of range"**  
+**"derive_from_paragraph_index out of range"**
 LLM referenced a paragraph that doesn't exist. Try re-running or check your custom prompt.
 
-**"LLM formatting fields are forbidden"**  
+**"LLM formatting fields are forbidden"**
 LLM tried to specify formatting directly instead of referencing an exemplar. This violates the contract.
 
-**"roles['PART'] exemplar_paragraph_index must equal derive_from_paragraph_index"**  
+**"roles['PART'] exemplar_paragraph_index must equal derive_from_paragraph_index"**
 The LLM's role mapping doesn't match its create_styles entries. The exemplar paragraph used for a role must be the same one used to derive that role's style.
 
+**"No API key provided"**
+Set the `ANTHROPIC_API_KEY` environment variable or pass `--api-key` on the command line.
 
-## 📄 License
+**Coverage below 90%**
+The LLM may not have classified all content paragraphs. Try re-running or use the manual workflow to inspect the slim bundle and instructions.
+
 
 ## Copyright Notice
 
-**Copyright © 2025 Abraham Borg. All Rights Reserved.**
+**Copyright 2025 Abraham Borg. All Rights Reserved.**
 
-This software and associated documentation files (the "Software") are the proprietary property of Abraham Borg. 
+This software and associated documentation files (the "Software") are the proprietary property of Abraham Borg.
 
 **Unauthorized copying, modification, distribution, or use of this Software, via any medium, is strictly prohibited without express written permission from the copyright holder.**
 
