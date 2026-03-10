@@ -795,7 +795,7 @@ def main() -> None:
             extract_dir = Path(args.extract_dir)
         else:
             # Use input docx stem for extract dir name
-            extract_dir = Path(f"{docx_path.stem}_extracted")
+            extract_dir = Path("output") / f"{docx_path.stem}_extracted"
 
         # IMPORTANT: for --apply-instructions or --classify, reuse existing extracted dir if present
         if args.apply_instructions or args.classify:
