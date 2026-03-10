@@ -185,7 +185,7 @@ class App:
 
         # Model row
         tk.Label(input_frame, text="Model:").grid(row=2, column=0, sticky="w", **pad)
-        self.model_var = tk.StringVar(value="claude-sonnet-4-20250514")
+        self.model_var = tk.StringVar(value="claude-opus-4-6")
         tk.Entry(input_frame, textvariable=self.model_var, width=50).grid(row=2, column=1, sticky="ew", **pad)
 
         input_frame.columnconfigure(1, weight=1)
