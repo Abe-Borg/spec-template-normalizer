@@ -44,18 +44,18 @@ def _call_api(
     last_error: Optional[Exception] = None
     for attempt in range(3):  # initial + 2 retries
         try:
-            response = client.messages.create(
+            with client.messages.stream(
                 model=model,
                 max_tokens=max_tokens,
                 temperature=0,
                 system=system,
                 messages=[{"role": "user", "content": user_message}],
-            )
-            return response.content[0].text
+            ) as stream:
+                return stream.get_final_text()
         except (anthropic.APIError, anthropic.APIConnectionError, anthropic.RateLimitError) as e:
             last_error = e
             if attempt < 2:
-                time.sleep(2 ** (attempt + 1))  # 2s, 4s
+                time.sleep(2 ** (attempt + 1))
     raise last_error  # type: ignore[misc]
 
 
