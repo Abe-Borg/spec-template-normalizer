@@ -144,19 +144,17 @@ class PipelineThread(threading.Thread):
             if output_dir_path != extract_dir:
                 import shutil
                 output_dir_path.mkdir(parents=True, exist_ok=True)
-                if reg_path and reg_path.exists():
-                    shutil.copy2(reg_path, output_dir_path / reg_path.name)
-                    self._log(f"Copied {reg_path.name} to {output_dir_path}")
-                if env_path and env_path.exists():
-                    shutil.copy2(env_path, output_dir_path / env_path.name)
-                    self._log(f"Copied {env_path.name} to {output_dir_path}")
+                shutil.copy2(reg_path, output_dir_path / reg_path.name)
+                self._log(f"Copied {reg_path.name} to {output_dir_path}")
+                shutil.copy2(env_path, output_dir_path / env_path.name)
+                self._log(f"Copied {env_path.name} to {output_dir_path}")
 
             self.result_queue.put({
                 "success": True,
                 "extract_dir": str(extract_dir),
                 "output_dir": str(output_dir_path),
-                "registry_path": str(output_dir_path / reg_path.name) if reg_path else None,
-                "env_path": str(output_dir_path / env_path.name) if env_path else None,
+                "registry_path": str(output_dir_path / reg_path.name),
+                "env_path": str(output_dir_path / env_path.name),
                 "coverage": coverage_msg,
             })
 

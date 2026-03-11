@@ -154,7 +154,7 @@ Has a full CLI entry point (`python arch_env_extractor.py`) in addition to being
 
 ### `phase1_smoke_test.py` — Validation
 
-Calls `extract_docx()`, `build_slim_bundle()`, `apply_instructions()`, and `emit_arch_style_registry()` directly, then validates `arch_style_registry.json` against the schema and checks all required CSI roles are present. `SectionID` is optional.
+Calls `extract_docx()`, `build_slim_bundle()`, `apply_instructions()`, `build_style_registry_dict()`, and `extract_arch_template_registry()` directly. Validates both `arch_style_registry.json` and `arch_template_registry.json` via `validate_phase1_contracts()`, which checks required CSI roles, template registry structure, XML fragment well-formedness, and cross-registry consistency (style IDs referenced by the style registry must exist in the template registry). `SectionID` is optional. The test fails if either registry is missing, malformed, or contains truncated XML fragments.
 
 ## Commands
 

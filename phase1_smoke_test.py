@@ -3,7 +3,8 @@
 Phase 1 smoke test:
 - extracts DOCX and builds slim bundle
 - applies instructions
-- validates arch_style_registry.json schema
+- validates both arch_style_registry.json and arch_template_registry.json
+- validates cross-registry consistency (style IDs exist in template registry)
 - validates no header/footer and sectPr drift (indirectly via apply-instructions invariants)
 
 Usage:
@@ -20,9 +21,10 @@ from docx_decomposer import (
     extract_docx,
     build_slim_bundle,
     apply_instructions,
-    emit_arch_style_registry,
+    build_style_registry_dict,
 )
-from phase1_validator import validate_style_registry
+from arch_env_extractor import extract_arch_template_registry
+from phase1_validator import validate_phase1_contracts
 
 
 def run() -> None:
@@ -50,16 +52,30 @@ def run() -> None:
     # Load instructions and apply
     instructions = json.loads(instr.read_text(encoding="utf-8"))
     apply_instructions(extract_dir, instructions)
-    emit_arch_style_registry(extract_dir, docx.name, instructions)
 
-    reg = extract_dir / "arch_style_registry.json"
+    # Build both registries in memory (mirrors gui.py pipeline)
+    style_registry = build_style_registry_dict(extract_dir, docx.name, instructions)
+    template_registry = extract_arch_template_registry(extract_dir, docx)
 
-    if not reg.exists():
-        raise FileNotFoundError(f"Expected registry at: {reg}")
+    # Validate both registries + cross-registry consistency
+    validate_phase1_contracts(style_registry, template_registry)
 
-    data = json.loads(reg.read_text(encoding="utf-8"))
-    validate_style_registry(data)
-    print("✅ Phase 1 smoke test: PASS")
+    # Write both to disk
+    reg_path = extract_dir / "arch_style_registry.json"
+    reg_path.write_text(json.dumps(style_registry, indent=2), encoding="utf-8")
+
+    env_path = extract_dir / "arch_template_registry.json"
+    env_path.write_text(json.dumps(template_registry, indent=2), encoding="utf-8")
+
+    # Verify round-trip from disk
+    for path in (reg_path, env_path):
+        if not path.exists():
+            raise FileNotFoundError(f"Expected artifact at: {path}")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not data:
+            raise ValueError(f"Artifact is empty or not a JSON object: {path}")
+
+    print("Phase 1 smoke test: PASS (both registries validated)")
 
 
 if __name__ == "__main__":
