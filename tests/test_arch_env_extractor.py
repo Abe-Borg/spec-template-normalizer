@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from arch_env_extractor import (
-    _extract_block,
+    _extract_first_block,
     _extract_all_blocks,
     extract_doc_defaults,
     extract_style_defs,
@@ -53,24 +53,24 @@ def assert_parses_as_xml(xml_fragment: str, msg: str = "") -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Unit tests — _extract_block
+# Unit tests — _extract_first_block
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class TestExtractBlock:
-    """Unit tests for _extract_block()."""
+    """Unit tests for _extract_first_block()."""
 
     def test_self_closing_tag(self):
         """Self-closing tags (with />) must be extracted correctly."""
         xml = '<w:styles><w:docGrid w:linePitch="360"/></w:styles>'
-        result = _extract_block(xml, "docGrid")
+        result = _extract_first_block(xml, "docGrid")
         assert result == '<w:docGrid w:linePitch="360"/>'
         assert_parses_as_xml(result)
 
     def test_paired_tag_extraction(self):
         """Paired tags must be extracted in full, not truncated to the opener."""
         xml = '<w:styles><w:pPr><w:jc w:val="center"/></w:pPr></w:styles>'
-        result = _extract_block(xml, "pPr")
+        result = _extract_first_block(xml, "pPr")
         assert result is not None
         # Must contain the closing tag — not just "<w:pPr>"
         assert "</w:pPr>" in result
@@ -87,7 +87,7 @@ class TestExtractBlock:
             '</w:style>'
             '</w:styles>'
         )
-        result = _extract_block(xml, "style")
+        result = _extract_first_block(xml, "style")
         assert result is not None
         assert "</w:style>" in result
         assert '<w:name w:val="heading 1"/>' in result
@@ -97,14 +97,14 @@ class TestExtractBlock:
     def test_empty_paired_tag(self):
         """An empty paired tag like <w:pPr></w:pPr> must not be confused with self-closing."""
         xml = '<w:styles><w:pPr></w:pPr></w:styles>'
-        result = _extract_block(xml, "pPr")
+        result = _extract_first_block(xml, "pPr")
         assert result is not None
         assert "</w:pPr>" in result
 
     def test_no_match_returns_none(self):
         """Non-existent tag returns None."""
         xml = '<w:styles><w:pPr><w:jc w:val="center"/></w:pPr></w:styles>'
-        result = _extract_block(xml, "rPr")
+        result = _extract_first_block(xml, "rPr")
         assert result is None
 
     def test_non_default_namespace_prefix(self):
@@ -116,7 +116,7 @@ class TestExtractBlock:
             '</a:themeElements>'
             '</a:theme>'
         )
-        result = _extract_block(xml, "themeElements", ns_prefix="a")
+        result = _extract_first_block(xml, "themeElements", ns_prefix="a")
         assert result is not None
         assert "</a:themeElements>" in result
         assert '<a:fontScheme name="Office"/>' in result

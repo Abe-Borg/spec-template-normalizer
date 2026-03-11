@@ -77,21 +77,98 @@ def _read_xml_part_bytes(extract_dir: Path, internal_path: str) -> Optional[byte
     return None
 
 
-def _extract_block(xml_text: str, tag: str, ns_prefix: str = "w") -> Optional[str]:
+def _extract_block(xml_text: str, tag: str, ns_prefix: str = "w",
+                    _start: int = 0) -> Optional[Tuple[str, int]]:
     """
-    Extract the first occurrence of <ns:tag>...</ns:tag> from XML text.
-    Uses regex to avoid ElementTree reformatting.
+    Extract the first occurrence of <ns:tag>...</ns:tag> from *xml_text*
+    starting at *_start*.  Returns ``(block_text, end_position)`` so that
+    :func:`_extract_all_blocks` can call repeatedly, or ``None`` when no
+    match is found.
+
+    Uses a forward token-scanner with depth tracking instead of a single
+    regex so that paired elements (e.g. ``<w:compat>…</w:compat>``) are
+    never truncated to just the opening tag.
     """
-    # Handle both w: and a: namespaces
-    pattern = rf"(<{ns_prefix}:{tag}\b[^>]*/?>|<{ns_prefix}:{tag}\b[\s\S]*?</{ns_prefix}:{tag}>)"
-    m = re.search(pattern, xml_text)
-    return m.group(1) if m else None
+    qname = f"{ns_prefix}:{tag}"
+    open_token = f"<{qname}"
+    close_token = f"</{qname}"
+
+    # -- locate the opening tag -------------------------------------------
+    pos = xml_text.find(open_token, _start)
+    if pos == -1:
+        return None
+
+    # The character after the tag name must be whitespace, '/', or '>'
+    # to avoid matching a longer tag name (e.g. <w:stylePaneSortMethod>
+    # when searching for <w:style>).
+    after = pos + len(open_token)
+    if after < len(xml_text) and xml_text[after] not in (" ", "\t", "\n",
+                                                          "\r", ">", "/"):
+        # Not a true match — skip past and retry
+        return _extract_block(xml_text, tag, ns_prefix, _start=after)
+
+    # -- find end of the opening tag ('>' character) ----------------------
+    gt = xml_text.find(">", after)
+    if gt == -1:
+        return None  # malformed XML
+
+    # -- self-closing? ----------------------------------------------------
+    if xml_text[gt - 1] == "/":
+        block = xml_text[pos:gt + 1]
+        return (block, gt + 1)
+
+    # -- paired tag: scan forward tracking depth --------------------------
+    depth = 1
+    cursor = gt + 1
+    while depth > 0:
+        next_open = xml_text.find(open_token, cursor)
+        next_close = xml_text.find(close_token, cursor)
+
+        if next_close == -1:
+            return None  # no matching closer — malformed
+
+        # If there is a nested opener *before* the next closer, handle it
+        # only when the opener is a true tag (word-boundary check).
+        if next_open != -1 and next_open < next_close:
+            after_open = next_open + len(open_token)
+            if after_open < len(xml_text) and xml_text[after_open] in (
+                    " ", "\t", "\n", "\r", ">", "/"):
+                # genuine nested opener
+                depth += 1
+            cursor = after_open
+            continue
+
+        # Process the closer
+        end = xml_text.find(">", next_close + len(close_token))
+        if end == -1:
+            return None  # malformed
+        depth -= 1
+        cursor = end + 1
+
+    block = xml_text[pos:cursor]
+    return (block, cursor)
 
 
-def _extract_all_blocks(xml_text: str, tag: str, ns_prefix: str = "w") -> List[str]:
-    """Extract all occurrences of a tag."""
-    pattern = rf"(<{ns_prefix}:{tag}\b[^>]*/?>|<{ns_prefix}:{tag}\b[\s\S]*?</{ns_prefix}:{tag}>)"
-    return re.findall(pattern, xml_text)
+def _extract_first_block(xml_text: str, tag: str,
+                         ns_prefix: str = "w") -> Optional[str]:
+    """Public convenience: return only the block text (or ``None``)."""
+    result = _extract_block(xml_text, tag, ns_prefix)
+    return result[0] if result else None
+
+
+def _extract_all_blocks(xml_text: str, tag: str,
+                        ns_prefix: str = "w") -> List[str]:
+    """Extract all occurrences of a namespaced tag as raw XML strings."""
+    blocks: List[str] = []
+    start = 0
+    while True:
+        result = _extract_block(xml_text, tag, ns_prefix, _start=start)
+        if result is None:
+            break
+        block_text, end_pos = result
+        blocks.append(block_text)
+        start = end_pos
+    return blocks
 
 
 def _strip_rsids(xml_text: str) -> str:
@@ -142,21 +219,21 @@ def extract_doc_defaults(styles_xml: str) -> Dict[str, Any]:
         "default_paragraph_props": {"pPr": None},
     }
     
-    doc_defaults = _extract_block(styles_xml, "docDefaults")
+    doc_defaults = _extract_first_block(styles_xml, "docDefaults")
     if not doc_defaults:
         return result
     
     # Extract rPrDefault/rPr
-    rpr_default = _extract_block(doc_defaults, "rPrDefault")
+    rpr_default = _extract_first_block(doc_defaults, "rPrDefault")
     if rpr_default:
-        rpr = _extract_block(rpr_default, "rPr")
+        rpr = _extract_first_block(rpr_default, "rPr")
         if rpr:
             result["default_run_props"]["rPr"] = _canonicalize(rpr)
     
     # Extract pPrDefault/pPr
-    ppr_default = _extract_block(doc_defaults, "pPrDefault")
+    ppr_default = _extract_first_block(doc_defaults, "pPrDefault")
     if ppr_default:
-        ppr = _extract_block(ppr_default, "pPr")
+        ppr = _extract_first_block(ppr_default, "pPr")
         if ppr:
             result["default_paragraph_props"]["pPr"] = _canonicalize(ppr)
     
@@ -208,11 +285,11 @@ def extract_style_defs(styles_xml: str) -> List[Dict[str, Any]]:
         locked = "<w:locked" in block
         
         # Extract raw pPr and rPr blocks
-        pPr = _extract_block(block, "pPr")
-        rPr = _extract_block(block, "rPr")
-        tblPr = _extract_block(block, "tblPr")
-        trPr = _extract_block(block, "trPr")
-        tcPr = _extract_block(block, "tcPr")
+        pPr = _extract_first_block(block, "pPr")
+        rPr = _extract_first_block(block, "rPr")
+        tblPr = _extract_first_block(block, "tblPr")
+        trPr = _extract_first_block(block, "trPr")
+        tcPr = _extract_first_block(block, "tcPr")
         
         style_defs.append({
             "style_id": style_id,
@@ -243,7 +320,7 @@ def extract_style_defs(styles_xml: str) -> List[Dict[str, Any]]:
 
 def extract_latent_styles(styles_xml: str) -> Dict[str, Any]:
     """Extract the latentStyles block (defines hidden/default style behaviors)."""
-    latent = _extract_block(styles_xml, "latentStyles")
+    latent = _extract_first_block(styles_xml, "latentStyles")
     return {
         "latentStyles_xml": _canonicalize(latent) if latent else None
     }
@@ -308,7 +385,7 @@ def extract_settings(extract_dir: Path) -> Dict[str, Any]:
     result["settings_xml"] = _canonicalize(settings_xml)
     
     # Extract compat block specifically
-    compat = _extract_block(settings_xml, "compat")
+    compat = _extract_first_block(settings_xml, "compat")
     if compat:
         result["compat"]["compat_xml"] = _canonicalize(compat)
         
@@ -399,7 +476,7 @@ def _parse_sectpr(sect_xml: str, rels_xml: Optional[str], section_index: int) ->
         }
     
     # Document grid
-    doc_grid = _extract_block(sect_xml, "docGrid")
+    doc_grid = _extract_first_block(sect_xml, "docGrid")
     if doc_grid:
         info["doc_grid"] = _canonicalize(doc_grid)
     
