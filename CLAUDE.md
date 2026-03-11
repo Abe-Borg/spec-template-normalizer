@@ -15,7 +15,7 @@ Phase 2 (separate codebase) uses these artifacts to apply architect formatting t
 
 ```
 .
-├── docx_decomposer.py          # Main orchestrator — extraction, slim bundle, style application, CLI
+├── docx_decomposer.py          # Library module — extraction, slim bundle, style application
 ├── llm_classifier.py           # LLM automation — calls Anthropic API, chunking, coverage check
 ├── gui.py                      # Tkinter GUI wrapper (thin — no business logic)
 ├── arch_env_extractor.py       # Environment capture — produces arch_template_registry.json
@@ -38,56 +38,34 @@ Phase 2 (separate codebase) uses these artifacts to apply architect formatting t
 
 - **Language:** Python 3.8+
 - **External API:** Anthropic (Claude) — for semantic CSI structure classification
-- **Key stdlib modules:** `zipfile`, `re`, `json`, `xml.etree.ElementTree`, `hashlib`, `argparse`, `pathlib`, `tkinter`
+- **Key stdlib modules:** `zipfile`, `re`, `json`, `xml.etree.ElementTree`, `hashlib`, `pathlib`, `tkinter`
 - **Runtime dependency:** `anthropic` (for API calls)
 
 ## Architecture and Data Flow
 
-### Automated path (`--classify` flag — recommended)
+### GUI Pipeline (gui.py)
 
 ```
 DOCX (.docx file)
   │
-  └─ [--classify] ──► extract ZIP
-                        │
-                        ├── build_slim_bundle() ──► slim_bundle.json
-                        │                                │
-                        │                   classify_document() (Anthropic API)
-                        │                                │
-                        │                                ▼
-                        │                       instructions.json (saved for audit)
-                        │                                │
-                        ├── validate_instructions()      │
-                        ├── apply_instructions()  ◄──────┘
-                        │     ├── derive styles from exemplar paragraphs
-                        │     ├── insert <w:pStyle> tags only
-                        │     └── verify_stability() (hash checks)
-                        │
-                        ├──► arch_style_registry.json
-                        ├──► arch_template_registry.json
-                        └──► coverage metric (% paragraphs classified)
-```
-
-### Manual path (fallback/debugging)
-
-```
-DOCX (.docx file)
-  │
-  ├─ [--normalize-slim] ──► extract ZIP ──► build_slim_bundle() ──► slim_bundle.json
-  │                                                                       │
-  │                                              (manual: feed to Claude LLM)
-  │                                                                       │
-  │                                                                       ▼
-  │                                                              instructions.json
-  │                                                                       │
-  └─ [--apply-instructions] ──► validate_instructions()                   │
-                                    │                                     │
-                                    ├── derive styles from exemplar paragraphs
-                                    ├── insert <w:pStyle> tags only
-                                    ├── verify_stability() (hash checks)
-                                    │
-                                    ├──► arch_style_registry.json
-                                    └──► arch_template_registry.json
+  └─ [Run Phase 1] ──► extract ZIP
+                          │
+                          ├── build_slim_bundle() ──► slim_bundle.json
+                          │                                │
+                          │                   classify_document() (Anthropic API)
+                          │                                │
+                          │                                ▼
+                          │                       instructions.json (saved for audit)
+                          │                                │
+                          ├── validate_instructions()      │
+                          ├── apply_instructions()  ◄──────┘
+                          │     ├── derive styles from exemplar paragraphs
+                          │     ├── insert <w:pStyle> tags only
+                          │     └── verify_stability() (hash checks)
+                          │
+                          ├──► arch_style_registry.json  ──► (copied to output folder)
+                          ├──► arch_template_registry.json ──► (copied to output folder)
+                          └──► coverage metric (% paragraphs classified)
 ```
 
 ## Critical Design Invariants
@@ -108,7 +86,7 @@ DOCX (.docx file)
 
 ## Key Source Files
 
-### `docx_decomposer.py` — Main Orchestrator
+### `docx_decomposer.py` — Library Module
 
 | Function | Purpose |
 |---|---|
@@ -126,7 +104,7 @@ DOCX (.docx file)
 
 ### `llm_classifier.py` — LLM Automation
 
-Pure module (no CLI) — called by `docx_decomposer.py` and `gui.py`.
+Pure module (no CLI) — called by `gui.py`.
 
 | Function | Purpose |
 |---|---|
@@ -136,13 +114,13 @@ Pure module (no CLI) — called by `docx_decomposer.py` and `gui.py`.
 
 **Design constraints:** Under 200 lines. No CLI of its own. Retry logic (up to 2 retries) for transient API failures. Chunking activates automatically when token estimate > 80K.
 
-### `gui.py` — Tkinter GUI
+### `gui.py` — Tkinter GUI (Primary Entry Point)
 
 Thin wrapper over the pipeline functions — no business logic.
 
 | Class | Purpose |
 |---|---|
-| `App` | Main window: file picker, API key field, Run button, log area, status |
+| `App` | Main window: template picker, API key field, output folder picker, Run button, log area, status |
 | `PipelineThread` | Background thread that runs the full pipeline |
 | `LogRedirector` | Thread-safe stdout redirector for log display |
 
@@ -162,56 +140,26 @@ Thin wrapper over the pipeline functions — no business logic.
 
 ### `phase1_smoke_test.py` — Validation
 
-Runs both `--normalize-slim` and `--apply-instructions` in sequence, then validates `arch_style_registry.json` against the schema and checks all required CSI roles are present. `SectionID` is optional.
+Calls `extract_docx()`, `build_slim_bundle()`, `apply_instructions()`, and `emit_arch_style_registry()` directly, then validates `arch_style_registry.json` against the schema and checks all required CSI roles are present. `SectionID` is optional.
 
 ## Commands
 
-### Automated Workflow (recommended)
-```bash
-# One command does everything: extract → classify → apply → emit registries
-python docx_decomposer.py TEMPLATE.docx --classify
-```
-
-### GUI
+### GUI (primary entry point)
 ```bash
 python gui.py
 ```
 
-### Manual Workflow (fallback/debugging)
-```bash
-# Step 1: Extract and prepare slim bundle for LLM
-python docx_decomposer.py TEMPLATE.docx --normalize-slim
-
-# Step 2: (Manual) Send master_prompt.txt + run_instruction_prompt.txt + slim_bundle.json to Claude
-#         Save LLM JSON output as instructions.json
-
-# Step 3: Apply instructions and generate both registries
-python docx_decomposer.py TEMPLATE.docx --apply-instructions instructions.json
-```
-
-### Standalone Environment Extraction
-```bash
-python arch_env_extractor.py TEMPLATE.docx
-python arch_env_extractor.py --extract-dir TEMPLATE_extracted
-```
+The GUI provides:
+- **Template** picker — select the architect .docx specification
+- **API Key** field — Anthropic API key (pre-populated from `ANTHROPIC_API_KEY` env var)
+- **Output Folder** picker — where `arch_style_registry.json` and `arch_template_registry.json` are written (defaults to same directory as the input .docx)
+- **Run Phase 1** button — runs the full pipeline
+- Post-completion buttons to open the output folder or view the style registry
 
 ### Smoke Test
 ```bash
 python phase1_smoke_test.py TEMPLATE.docx instructions.json
 ```
-
-### CLI Flags (`docx_decomposer.py`)
-- `--classify` — Full automated pipeline (extract → LLM classify → apply → emit registries)
-- `--normalize-slim` — Generate `slim_bundle.json` for manual LLM analysis
-- `--apply-instructions <json>` — Apply LLM instructions, produce both registries
-- `--api-key <key>` — Anthropic API key (default: `ANTHROPIC_API_KEY` env var)
-- `--model <id>` — Model ID for classification (default: `claude-sonnet-4-20250514`)
-- `--extract-dir <dir>` — Custom extraction directory
-- `--use-extract-dir <dir>` — Reuse existing extracted folder
-- `--registry-out <path>` — Copy `arch_style_registry.json` to a specific location
-- `--skip-env-extract` — Skip `arch_template_registry.json` generation
-- `--master-prompt <file>` — Custom master prompt (default: `master_prompt.txt`)
-- `--run-instruction <file>` — Custom run instruction (default: `run_instruction_prompt.txt`)
 
 ## CSI Role Hierarchy and Allowed Style IDs
 
@@ -270,7 +218,7 @@ After classification, the pipeline reports what percentage of non-empty, non-sec
 - Descriptive error messages with context (paragraph index, style ID, etc.)
 
 ### Testing
-- No formal test framework (unittest/pytest) — uses `phase1_smoke_test.py` with subprocess calls
+- No formal test framework (unittest/pytest) — uses `phase1_smoke_test.py` with direct function calls
 - Stability verification is built into the apply pipeline itself
 - Test creates timestamped extraction directories to avoid collisions
 
@@ -288,9 +236,11 @@ After classification, the pipeline reports what percentage of non-empty, non-sec
 
 6. **The `.docx` files and `*_extracted/` directories in the repo are test data** — they are architect specification templates used for development and testing.
 
-7. **`llm_classifier.py` must remain a pure module** — no CLI of its own. It is called by `docx_decomposer.py` (via `--classify`) and by `gui.py`.
+7. **`llm_classifier.py` must remain a pure module** — no CLI of its own. It is called by `gui.py`.
 
-8. **`gui.py` must remain a thin wrapper** — no pipeline logic. It imports and calls the same functions as the CLI.
+8. **`gui.py` must remain a thin wrapper** — no pipeline logic. It imports and calls library functions from `docx_decomposer.py`.
+
+9. **`docx_decomposer.py` is a library module only** — no CLI entry point. All user interaction goes through `gui.py`.
 
 ## Environment Setup
 

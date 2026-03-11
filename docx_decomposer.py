@@ -1,10 +1,14 @@
-#!/usr/bin/env python3
 """
 PHASE 1 — Architect Template Normalization (Lean)
 
+Library module providing pipeline functions for the Phase 1 DOCX CSI Normalizer.
+Called by gui.py — no CLI entry point.
+
 Purpose
 - Run ONLY on an architect's DOCX template (e.g. MySpec.docx).
-- Produce ONE formal contract artifact for Phase 2: arch_style_registry.json
+- Produce formal contract artifacts for Phase 2:
+  - arch_style_registry.json
+  - arch_template_registry.json
 
 Hard invariants (enforced):
 - Pixel-identical output (we DO NOT emit a reconstructed docx in Phase 1)
@@ -15,27 +19,14 @@ Hard invariants (enforced):
 - When applying, only insert/replace <w:pStyle> in document.xml
 - Styles are derived locally from exemplar paragraphs (LLM never specifies pPr/rPr)
 
-Outputs
-- <extract_dir>/slim_bundle.json
-- <extract_dir>/prompts_slim/master_prompt.txt and run_instruction.txt
-- <extract_dir>/arch_style_registry.json
-- (Optionally) copy registry to CWD with --registry-out
-
-Typical workflow
-1) python phase1_arch_normalize.py MySpec.docx --normalize-slim
-2) Paste prompts + slim_bundle.json into LLM, save JSON output as instructions.json
-3) python phase1_arch_normalize.py MySpec.docx --apply-instructions instructions.json
-
 Note:
-- This script intentionally does NOT generate an "analysis markdown" report and does NOT reconstruct a docx.
+- This module intentionally does NOT generate an "analysis markdown" report and does NOT reconstruct a docx.
 """
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
-import os
 import re
 import shutil
 import zipfile
@@ -755,209 +746,3 @@ def emit_arch_style_registry(extract_dir: Path, source_docx_name: str, instructi
         out_path = extract_dir / "arch_style_registry.json"
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return out_path
-
-
-# -----------------------------
-# CLI
-# -----------------------------
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Phase 1 — Architect Template Normalization (Lean)")
-    ap.add_argument("docx_path", help="Path to architect template .docx (e.g. ARCH_TEMPLATE.docx)")
-    ap.add_argument("--extract-dir", default=None, help="Optional extraction directory (default: <stem>_extracted)")
-    ap.add_argument("--use-extract-dir", default=None, help="Use an existing extracted folder (skip extract/delete)")
-
-    ap.add_argument("--normalize-slim", action="store_true", help="Write slim_bundle.json + prompts_slim/")
-    ap.add_argument("--apply-instructions", default=None, help="Path to LLM instruction JSON (apply styles + emit registries)")
-    ap.add_argument("--classify", action="store_true", help="Full automated pipeline: extract → classify → apply → emit registries")
-    ap.add_argument("--api-key", default=None, help="Anthropic API key (default: ANTHROPIC_API_KEY env var)")
-    ap.add_argument("--model", default="claude-sonnet-4-20250514", help="Model ID for LLM classification")
-
-    ap.add_argument("--master-prompt", default="master_prompt.txt", help="Master prompt file to copy into prompts_slim/")
-    ap.add_argument("--run-instruction", default="run_instruction.txt", help="Run instruction file to copy into prompts_slim/")
-
-    ap.add_argument("--registry-out", default=None, help="Optional output path for arch_style_registry.json (copy)")
-    ap.add_argument("--skip-env-extract", action="store_true", help="Skip arch_template_registry.json extraction")
-
-    args = ap.parse_args()
-
-    docx_path = Path(args.docx_path)
-    if not docx_path.exists():
-        raise FileNotFoundError(f"Input docx not found: {docx_path}")
-
-    if args.use_extract_dir:
-        extract_dir = Path(args.use_extract_dir)
-        if not extract_dir.exists():
-            raise FileNotFoundError(f"Extract dir not found: {extract_dir}")
-
-    else:
-        if args.extract_dir:
-            extract_dir = Path(args.extract_dir)
-        else:
-            # Use input docx stem for extract dir name
-            extract_dir = Path("output") / f"{docx_path.stem}_extracted"
-
-        # IMPORTANT: for --apply-instructions or --classify, reuse existing extracted dir if present
-        if args.apply_instructions or args.classify:
-            if not extract_dir.exists():
-                extract_docx(docx_path, extract_dir)
-        else:
-            # for --normalize-slim, start from a fresh extraction
-            extract_docx(docx_path, extract_dir)
-
-    if args.classify:
-        from llm_classifier import classify_document, compute_coverage
-
-        api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            raise ValueError(
-                "No API key provided. Set ANTHROPIC_API_KEY env var or use --api-key."
-            )
-
-        # 1) Build slim bundle
-        print("Building slim bundle...")
-        bundle = build_slim_bundle(extract_dir)
-        bundle_path = extract_dir / "slim_bundle.json"
-        bundle_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
-        print(f"Slim bundle written: {bundle_path}")
-
-        # 2) Read prompts
-        master_prompt_path = Path(args.master_prompt)
-        if not master_prompt_path.exists():
-            raise FileNotFoundError(f"Master prompt not found: {master_prompt_path}")
-        master_prompt = master_prompt_path.read_text(encoding="utf-8")
-
-        run_instr_path = Path(args.run_instruction)
-        if not run_instr_path.exists():
-            raise FileNotFoundError(f"Run instruction not found: {run_instr_path}")
-        run_instruction = run_instr_path.read_text(encoding="utf-8")
-
-        # 3) Classify via LLM
-        print(f"Classifying paragraphs via {args.model}...")
-        instructions = classify_document(
-            slim_bundle=bundle,
-            master_prompt=master_prompt,
-            run_instruction=run_instruction,
-            api_key=api_key,
-            model=args.model,
-        )
-
-        # 4) Save instructions for auditability
-        instr_path = extract_dir / "instructions.json"
-        instr_path.write_text(json.dumps(instructions, indent=2), encoding="utf-8")
-        print(f"Instructions saved: {instr_path}")
-
-        # 5) Coverage check
-        coverage, styled, classifiable = compute_coverage(bundle, instructions)
-        print(f"Coverage: {coverage:.1%} ({styled}/{classifiable} classifiable paragraphs)")
-        if coverage < 0.90:
-            print("WARNING: Coverage below 90% — some content paragraphs may be unstyled.")
-
-        # 6) Apply instructions
-        print("Applying instructions...")
-        apply_instructions(extract_dir, instructions)
-
-        # 7) Emit registries
-        reg_path = emit_arch_style_registry(extract_dir, docx_path.name, instructions)
-        if args.registry_out:
-            outp = Path(args.registry_out)
-            outp.write_text(reg_path.read_text(encoding="utf-8"), encoding="utf-8")
-            print(f"arch_style_registry.json written: {reg_path} (copied to {outp})")
-        else:
-            print(f"arch_style_registry.json written: {reg_path}")
-
-        if not args.skip_env_extract:
-            try:
-                from arch_env_extractor import extract_arch_template_registry
-
-                print("\nExtracting environment (arch_template_registry.json)...")
-                env_registry = extract_arch_template_registry(extract_dir, docx_path)
-                env_path = extract_dir / "arch_template_registry.json"
-                env_path.write_text(json.dumps(env_registry, indent=2), encoding="utf-8")
-                print(f"arch_template_registry.json written: {env_path}")
-
-                inv = env_registry.get("package_inventory", {})
-                n_styles = len(env_registry.get("styles", {}).get("style_defs", []))
-                print(f"\nEnvironment captured:")
-                print(f"  - {n_styles} style definitions")
-                print(f"  - Theme: {'✓' if inv.get('has_theme') else '✗'}")
-                print(f"  - Numbering: {'✓' if inv.get('has_numbering') else '✗'}")
-                print(f"  - Headers/Footers: {'✓' if inv.get('has_header_parts') or inv.get('has_footer_parts') else '✗'}")
-            except ImportError:
-                print("\nWARNING: arch_env_extractor.py not found in same directory.")
-                print("Run separately: python arch_env_extractor.py", docx_path)
-            except Exception as e:
-                print(f"\nWARNING: Environment extraction failed: {e}")
-                print("Run separately: python arch_env_extractor.py", docx_path)
-
-        print("\n✓ Phase 1 complete (automated). Both registries ready for Phase 2.")
-        return
-
-    if args.normalize_slim:
-        bundle = build_slim_bundle(extract_dir)
-        (extract_dir / "slim_bundle.json").write_text(json.dumps(bundle, indent=2), encoding="utf-8")
-
-        print(f"Slim bundle written: {extract_dir / 'slim_bundle.json'}")
-        print("\nNEXT STEP:")
-        print("- Use the prompt files in repo root:")
-        print(f"  - {Path(args.master_prompt).resolve()}")
-        print(f"  - {Path(args.run_instruction).resolve()}")
-        print("- Paste those + slim_bundle.json into your LLM")
-        print("- Save LLM output as instructions.json")
-        print("- Then run: --apply-instructions instructions.json")
-        return
-
-    if args.apply_instructions:
-        instr_path = Path(args.apply_instructions)
-        if not instr_path.exists():
-            raise FileNotFoundError(f"instructions JSON not found: {instr_path}")
-        instructions = json.loads(instr_path.read_text(encoding="utf-8"))
-
-        apply_instructions(extract_dir, instructions)
-        
-        # Emit arch_style_registry.json
-        reg_path = emit_arch_style_registry(extract_dir, docx_path.name, instructions)
-
-        if args.registry_out:
-            outp = Path(args.registry_out)
-            outp.write_text(reg_path.read_text(encoding="utf-8"), encoding="utf-8")
-            print(f"arch_style_registry.json written: {reg_path} (copied to {outp})")
-        else:
-            print(f"arch_style_registry.json written: {reg_path}")
-
-        # NEW: Also emit arch_template_registry.json (environment capture)
-        if not args.skip_env_extract:
-            try:
-                from arch_env_extractor import extract_arch_template_registry
-                
-                print("\nExtracting environment (arch_template_registry.json)...")
-                env_registry = extract_arch_template_registry(extract_dir, docx_path)
-                env_path = extract_dir / "arch_template_registry.json"
-                env_path.write_text(json.dumps(env_registry, indent=2), encoding="utf-8")
-                print(f"arch_template_registry.json written: {env_path}")
-                
-                # Summary
-                inv = env_registry.get("package_inventory", {})
-                n_styles = len(env_registry.get("styles", {}).get("style_defs", []))
-                print(f"\nEnvironment captured:")
-                print(f"  - {n_styles} style definitions")
-                print(f"  - Theme: {'✓' if inv.get('has_theme') else '✗'}")
-                print(f"  - Numbering: {'✓' if inv.get('has_numbering') else '✗'}")
-                print(f"  - Headers/Footers: {'✓' if inv.get('has_header_parts') or inv.get('has_footer_parts') else '✗'}")
-                
-            except ImportError:
-                print("\nWARNING: arch_env_extractor.py not found in same directory.")
-                print("Run separately: python arch_env_extractor.py", docx_path)
-            except Exception as e:
-                print(f"\nWARNING: Environment extraction failed: {e}")
-                print("Run separately: python arch_env_extractor.py", docx_path)
-
-        # DO NOT reconstruct a docx in Phase 1 (by design).
-        print("\n✓ Phase 1 complete. Both registries ready for Phase 2.")
-        return
-
-    ap.print_help()
-
-
-if __name__ == "__main__":
-    main()

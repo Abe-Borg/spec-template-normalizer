@@ -2,7 +2,7 @@
 Tkinter GUI wrapper for the Phase 1 DOCX CSI Normalizer pipeline.
 
 This is a thin wrapper — no business logic. It imports and calls the same
-functions that the CLI uses.
+library functions as the smoke test.
 """
 from __future__ import annotations
 
@@ -41,14 +41,14 @@ class PipelineThread(threading.Thread):
         self,
         docx_path: str,
         api_key: str,
-        model: str,
+        output_dir: Optional[str],
         log_queue: queue.Queue,
         result_queue: queue.Queue,
     ) -> None:
         super().__init__(daemon=True)
         self.docx_path = docx_path
         self.api_key = api_key
-        self.model = model
+        self.output_dir = output_dir
         self.log_queue = log_queue
         self.result_queue = result_queue
 
@@ -87,13 +87,12 @@ class PipelineThread(threading.Thread):
             run_instruction = (script_dir / "run_instruction_prompt.txt").read_text(encoding="utf-8")
 
             # 4) Classify
-            self._log(f"Classifying via {self.model}...")
+            self._log("Classifying via LLM...")
             instructions = classify_document(
                 slim_bundle=bundle,
                 master_prompt=master_prompt,
                 run_instruction=run_instruction,
                 api_key=self.api_key,
-                model=self.model,
             )
 
             # Save instructions
@@ -135,11 +134,24 @@ class PipelineThread(threading.Thread):
             except Exception as e:
                 self._log(f"WARNING: Environment extraction failed: {e}")
 
+            # 9) Copy deliverables to output_dir if specified
+            output_dir_path = Path(self.output_dir) if self.output_dir else extract_dir
+            if output_dir_path != extract_dir:
+                import shutil
+                output_dir_path.mkdir(parents=True, exist_ok=True)
+                if reg_path and reg_path.exists():
+                    shutil.copy2(reg_path, output_dir_path / reg_path.name)
+                    self._log(f"Copied {reg_path.name} to {output_dir_path}")
+                if env_path and env_path.exists():
+                    shutil.copy2(env_path, output_dir_path / env_path.name)
+                    self._log(f"Copied {env_path.name} to {output_dir_path}")
+
             self.result_queue.put({
                 "success": True,
                 "extract_dir": str(extract_dir),
-                "registry_path": str(reg_path),
-                "env_path": str(env_path) if env_path else None,
+                "output_dir": str(output_dir_path),
+                "registry_path": str(output_dir_path / reg_path.name) if reg_path else None,
+                "env_path": str(output_dir_path / env_path.name) if env_path else None,
                 "coverage": coverage_msg,
             })
 
@@ -183,10 +195,11 @@ class App:
         self.key_toggle = tk.Button(input_frame, text="Show", command=self._toggle_key)
         self.key_toggle.grid(row=1, column=2, **pad)
 
-        # Model row
-        tk.Label(input_frame, text="Model:").grid(row=2, column=0, sticky="w", **pad)
-        self.model_var = tk.StringVar(value="claude-opus-4-6")
-        tk.Entry(input_frame, textvariable=self.model_var, width=50).grid(row=2, column=1, sticky="ew", **pad)
+        # Output folder row
+        tk.Label(input_frame, text="Output Folder:").grid(row=2, column=0, sticky="w", **pad)
+        self.output_dir_var = tk.StringVar()
+        tk.Entry(input_frame, textvariable=self.output_dir_var, width=50).grid(row=2, column=1, sticky="ew", **pad)
+        tk.Button(input_frame, text="Browse", command=self._browse_output).grid(row=2, column=2, **pad)
 
         input_frame.columnconfigure(1, weight=1)
 
@@ -230,6 +243,13 @@ class App:
         path = filedialog.askopenfilename(filetypes=[("Word Documents", "*.docx")])
         if path:
             self.path_var.set(path)
+            # Auto-populate output folder to same directory as the selected .docx
+            self.output_dir_var.set(str(Path(path).parent))
+
+    def _browse_output(self) -> None:
+        folder = filedialog.askdirectory()
+        if folder:
+            self.output_dir_var.set(folder)
 
     def _toggle_key(self) -> None:
         self._key_visible = not self._key_visible
@@ -264,7 +284,7 @@ class App:
         thread = PipelineThread(
             docx_path=docx_path,
             api_key=api_key,
-            model=self.model_var.get().strip(),
+            output_dir=self.output_dir_var.get().strip() or None,
             log_queue=self.log_queue,
             result_queue=self.result_queue,
         )
@@ -308,7 +328,7 @@ class App:
     def _open_folder(self) -> None:
         if not self._result:
             return
-        folder = self._result.get("extract_dir", "")
+        folder = self._result.get("output_dir") or self._result.get("extract_dir", "")
         if not folder:
             return
         _open_path(folder)
