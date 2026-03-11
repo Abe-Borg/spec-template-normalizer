@@ -18,7 +18,7 @@ Phase 2 (separate codebase) uses these artifacts to apply architect formatting t
 ├── docx_decomposer.py          # Library module — extraction, slim bundle, style application
 ├── llm_classifier.py           # LLM automation — calls Anthropic API, chunking, coverage check
 ├── gui.py                      # Tkinter GUI wrapper (thin — no business logic)
-├── arch_env_extractor.py       # Environment capture — produces arch_template_registry.json
+├── arch_env_extractor.py       # Environment capture — produces arch_template_registry.json (has CLI)
 ├── phase1_smoke_test.py        # Validation test suite
 ├── master_prompt.txt           # System prompt for LLM CSI classification
 ├── run_instruction_prompt.txt  # Task prompt for LLM
@@ -90,15 +90,21 @@ DOCX (.docx file)
 
 | Function | Purpose |
 |---|---|
-| `extract_docx()` | Unzips .docx into workspace directory |
+| `extract_docx()` | Unzips .docx into workspace directory (with OneDrive lock retry) |
 | `build_slim_bundle()` | Creates minimal JSON (text + numbering hints) for LLM input |
+| `build_style_catalog()` | Builds style name/type catalog from `styles.xml` |
+| `build_numbering_catalog()` | Builds numbering definition catalog from `numbering.xml` |
 | `iter_paragraph_xml_blocks()` | Regex iterator over `<w:p>` blocks — preserves indices |
 | `paragraph_text_from_block()` | Extracts visible text from paragraph XML |
+| `paragraph_contains_sectpr()` | Checks if paragraph contains `<w:sectPr>` |
+| `paragraph_pstyle_from_block()` | Extracts existing `<w:pStyle>` value from paragraph |
+| `paragraph_numpr_from_block()` | Extracts numbering properties (numId, ilvl) |
 | `validate_instructions()` | Strict validation of LLM output before application |
 | `apply_instructions()` | Main apply logic: create styles, insert pStyle, verify stability |
 | `apply_pstyle_to_paragraph_block()` | Surgically inserts `<w:pStyle>` into a single paragraph |
 | `derive_style_def_from_paragraph()` | Extracts pPr/rPr from exemplar paragraph to build style definition |
 | `build_style_xml_block()` | Generates `<w:style>` XML for insertion into `styles.xml` |
+| `insert_styles_into_styles_xml()` | Inserts style blocks into `styles.xml` |
 | `emit_arch_style_registry()` | Writes the final `arch_style_registry.json` contract |
 | `snapshot_stability()` / `verify_stability()` | Hash-based invariant enforcement |
 
@@ -108,11 +114,11 @@ Pure module (no CLI) — called by `gui.py`.
 
 | Function | Purpose |
 |---|---|
-| `classify_document()` | Main entry: calls Anthropic API with slim bundle, returns instructions dict |
+| `classify_document()` | Main entry: calls Anthropic API with slim bundle, returns instructions dict. Default model: `claude-opus-4-6` |
 | `compute_coverage()` | Computes % of classifiable paragraphs that received a style |
 | `estimate_tokens()` | Rough token count for chunking decisions |
 
-**Design constraints:** Under 200 lines. No CLI of its own. Retry logic (up to 2 retries) for transient API failures. Chunking activates automatically when token estimate > 80K.
+**Design constraints:** No CLI of its own. Retry logic (up to 2 retries) for transient API failures. Chunking activates automatically when token estimate > 80K or paragraphs > 300.
 
 ### `gui.py` — Tkinter GUI (Primary Entry Point)
 
@@ -124,19 +130,27 @@ Thin wrapper over the pipeline functions — no business logic.
 | `PipelineThread` | Background thread that runs the full pipeline |
 | `LogRedirector` | Thread-safe stdout redirector for log display |
 
-### `arch_env_extractor.py` — Environment Capture
+### `arch_env_extractor.py` — Environment Capture (has CLI)
+
+Has a full CLI entry point (`python arch_env_extractor.py`) in addition to being importable as a library.
 
 | Function | Purpose |
 |---|---|
 | `extract_arch_template_registry()` | Main orchestrator — builds complete registry |
 | `extract_doc_defaults()` | Extracts `<w:docDefaults>` (baseline rPr/pPr) |
 | `extract_style_defs()` | All style definitions with raw XML blocks |
+| `extract_latent_styles()` | Extracts latent style exception settings |
+| `extract_table_styles()` | Extracts table-specific style definitions |
+| `extract_styles_section()` | Composite: doc_defaults + style_defs + latent + table styles |
 | `extract_theme()` | Theme fonts and colors from `theme1.xml` |
 | `extract_settings()` | Compatibility flags from `settings.xml` |
 | `extract_page_layout()` | Section properties, margins, columns |
 | `extract_headers_footers()` | Complete header/footer XML |
 | `extract_numbering()` | Numbering definitions from `numbering.xml` |
 | `extract_fonts()` | Font table declarations |
+| `extract_relationships()` | Document relationship entries |
+| `extract_package_inventory()` | Inventories which OOXML parts are present |
+| `extract_docx_to_dir()` | Extracts .docx ZIP to a directory |
 
 ### `phase1_smoke_test.py` — Validation
 
@@ -155,6 +169,18 @@ The GUI provides:
 - **Output Folder** picker — where `arch_style_registry.json` and `arch_template_registry.json` are written (defaults to same directory as the input .docx)
 - **Run Phase 1** button — runs the full pipeline
 - Post-completion buttons to open the output folder or view the style registry
+
+### Standalone Environment Extraction
+```bash
+# From a .docx file
+python arch_env_extractor.py TEMPLATE.docx
+
+# From an already-extracted folder
+python arch_env_extractor.py --extract-dir TEMPLATE_extracted
+
+# Custom output path
+python arch_env_extractor.py TEMPLATE.docx --output /path/to/output.json
+```
 
 ### Smoke Test
 ```bash
@@ -236,7 +262,7 @@ After classification, the pipeline reports what percentage of non-empty, non-sec
 
 6. **The `.docx` files and `*_extracted/` directories in the repo are test data** — they are architect specification templates used for development and testing.
 
-7. **`llm_classifier.py` must remain a pure module** — no CLI of its own. It is called by `gui.py`.
+7. **`llm_classifier.py` must remain a pure module** — no CLI of its own. It is imported only by `gui.py`.
 
 8. **`gui.py` must remain a thin wrapper** — no pipeline logic. It imports and calls library functions from `docx_decomposer.py`.
 
@@ -253,4 +279,4 @@ Runtime: Python 3.8+ on Windows or Linux.
 
 ## License
 
-Copyright 2025 Andrew Gossman. All Rights Reserved. Proprietary software — no license to use, copy, modify, or distribute without written permission.
+Copyright 2025 Abraham Borg. All Rights Reserved. Proprietary software — no license to use, copy, modify, or distribute without written permission.

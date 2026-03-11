@@ -50,7 +50,7 @@ The output document looks identical but now has proper paragraph styles you can 
 
 Instead of brittle pattern-matching rules:
 1. Extract minimal "slim bundle" (text + numbering hints, no formatting)
-2. Classify via Anthropic API (automated) or manual LLM interaction
+2. Classify via Anthropic API (automated through GUI)
 3. LLM classifies CSI structure and selects exemplar paragraphs
 4. Script derives formatting locally from exemplars
 5. Applies styles with surgical XML insertion
@@ -74,84 +74,36 @@ pip install -r requirements-build.txt
 
 ## Usage
 
-### Automated workflow (recommended)
-```bash
-# One command does everything: extract, classify, apply, emit registries
-python docx_decomposer.py ARCH_TEMPLATE.docx --classify
-```
-
-This will:
-- Extract the DOCX
-- Build a slim bundle for LLM analysis
-- Call the Anthropic API to classify all paragraphs
-- Save `instructions.json` in the extract directory (for auditability)
-- Apply styles and emit both registries
-- Print a coverage metric (% of paragraphs classified)
-
-Optional flags for `--classify`:
-- `--api-key <key>` — Override the `ANTHROPIC_API_KEY` env var
-- `--model <id>` — Model ID (default: `claude-sonnet-4-20250514`)
-
-### GUI
+### GUI (recommended)
 ```bash
 python gui.py
 ```
 
-The GUI provides a visual interface for the same automated pipeline:
+The GUI is the primary entry point and runs the full automated pipeline:
 - Select a `.docx` file
-- Enter your API key (pre-populated from env var if set)
+- Enter your API key (pre-populated from `ANTHROPIC_API_KEY` env var if set)
+- Optionally choose an output folder (defaults to same directory as the input .docx)
 - Click "Run Phase 1"
 - View real-time progress and coverage metric
 - Open the output folder or view the registry when done
 
-### Manual workflow (advanced/debugging)
-```bash
-# Step 1: Extract slim bundle and prepare for LLM
-python docx_decomposer.py ARCH_TEMPLATE.docx --normalize-slim
-
-# Step 2: Feed to LLM (manual step)
-# - Use master_prompt.txt as system instructions
-# - Use run_instruction_prompt.txt as task prompt
-# - Attach slim_bundle.json from extracted folder
-# - Save LLM output as instructions.json
-
-# Step 3: Apply LLM instructions (creates both registries)
-python docx_decomposer.py ARCH_TEMPLATE.docx --apply-instructions instructions.json
-```
+The pipeline performs: extract → build slim bundle → classify via Anthropic API (default model: `claude-opus-4-6`) → apply styles → emit both registries.
 
 After completion, you'll have:
 - `ARCH_TEMPLATE_extracted/arch_style_registry.json` - CSI role mappings
 - `ARCH_TEMPLATE_extracted/arch_template_registry.json` - Complete environment
 - Modified `ARCH_TEMPLATE_extracted/` folder with styles applied
 
-### Available commands
-
-**`--classify`**
-Full automated pipeline: extract, classify via LLM, apply styles, emit registries.
-
-**`--normalize-slim`**
-Extracts the DOCX and generates `slim_bundle.json` for manual LLM analysis.
-
-**`--apply-instructions <instructions.json>`**
-Applies LLM-generated style instructions and produces both registries.
-
-**Optional flags:**
-- `--api-key <key>` - Anthropic API key (default: `ANTHROPIC_API_KEY` env var)
-- `--model <id>` - Model ID for LLM classification
-- `--extract-dir <dir>` - Custom extraction directory
-- `--use-extract-dir <dir>` - Use existing extracted folder
-- `--registry-out <path>` - Copy arch_style_registry.json to specific location
-- `--skip-env-extract` - Skip arch_template_registry.json generation
-- `--master-prompt <file>` - Custom master prompt (default: master_prompt.txt)
-- `--run-instruction <file>` - Custom run instruction (default: run_instruction_prompt.txt)
-
 ### Standalone environment extraction
 ```bash
-# Extract environment registry from existing DOCX
+# Extract environment registry from a .docx file
 python arch_env_extractor.py ARCH_TEMPLATE.docx
 
-# Or from already-extracted folder
+# From already-extracted folder
 python arch_env_extractor.py --extract-dir ARCH_TEMPLATE_extracted
+
+# Custom output path
+python arch_env_extractor.py ARCH_TEMPLATE.docx --output /path/to/output.json
 ```
 
 ## What gets created
@@ -242,7 +194,7 @@ Formal JSON schemas are provided in `schemas/`:
 ## Requirements
 
 - Python 3.8+
-- Anthropic API key (Claude Sonnet 4 recommended)
+- Anthropic API key (default model: `claude-opus-4-6`)
 - Windows or Linux (tested on both)
 
 ## Troubleshooting
@@ -260,10 +212,10 @@ LLM tried to specify formatting directly instead of referencing an exemplar. Thi
 The LLM's role mapping doesn't match its create_styles entries. The exemplar paragraph used for a role must be the same one used to derive that role's style.
 
 **"No API key provided"**
-Set the `ANTHROPIC_API_KEY` environment variable or pass `--api-key` on the command line.
+Set the `ANTHROPIC_API_KEY` environment variable or enter the key in the GUI's API Key field.
 
 **Coverage below 90%**
-The LLM may not have classified all content paragraphs. Try re-running or use the manual workflow to inspect the slim bundle and instructions.
+The LLM may not have classified all content paragraphs. Try re-running the pipeline via the GUI.
 
 
 ## Copyright Notice

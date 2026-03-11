@@ -4,8 +4,7 @@ LLM classifier module for automated CSI paragraph classification.
 Calls the Anthropic API with the master prompt + slim bundle to produce
 classification instructions (same schema as instructions.json).
 
-Design constraint: pure module with no CLI — called by docx_decomposer.py
-and gui.py.
+Design constraint: pure module with no CLI — imported by gui.py.
 """
 from __future__ import annotations
 
