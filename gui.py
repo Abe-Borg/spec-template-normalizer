@@ -61,7 +61,7 @@ class PipelineThread(threading.Thread):
                 extract_docx,
                 build_slim_bundle,
                 apply_instructions,
-                emit_arch_style_registry,
+                build_style_registry_dict,
             )
             from llm_classifier import classify_document, compute_coverage
 
@@ -117,24 +117,29 @@ class PipelineThread(threading.Thread):
             finally:
                 sys.stdout = old_stdout
 
-            # 7) Emit style registry
-            reg_path = emit_arch_style_registry(extract_dir, docx_path.name, instructions)
+            # 7) Build registries in memory
+            self._log("Building style registry...")
+            style_registry = build_style_registry_dict(extract_dir, docx_path.name, instructions)
+
+            self._log("Extracting environment...")
+            from arch_env_extractor import extract_arch_template_registry
+            template_registry = extract_arch_template_registry(extract_dir, docx_path)
+
+            # 8) Validate both registries before writing
+            from phase1_validator import validate_phase1_contracts
+            self._log("Validating Phase 1 contracts...")
+            validate_phase1_contracts(style_registry, template_registry)
+
+            # 9) Write registries (only reached if validation passes)
+            reg_path = extract_dir / "arch_style_registry.json"
+            reg_path.write_text(json.dumps(style_registry, indent=2), encoding="utf-8")
             self._log(f"Style registry: {reg_path.name}")
 
-            # 8) Emit environment registry
-            env_path: Optional[Path] = None
-            try:
-                from arch_env_extractor import extract_arch_template_registry
+            env_path = extract_dir / "arch_template_registry.json"
+            env_path.write_text(json.dumps(template_registry, indent=2), encoding="utf-8")
+            self._log(f"Environment registry: {env_path.name}")
 
-                self._log("Extracting environment...")
-                env_registry = extract_arch_template_registry(extract_dir, docx_path)
-                env_path = extract_dir / "arch_template_registry.json"
-                env_path.write_text(json.dumps(env_registry, indent=2), encoding="utf-8")
-                self._log(f"Environment registry: {env_path.name}")
-            except Exception as e:
-                self._log(f"WARNING: Environment extraction failed: {e}")
-
-            # 9) Copy deliverables to output_dir if specified
+            # 10) Copy deliverables to output_dir if specified
             output_dir_path = Path(self.output_dir) if self.output_dir else extract_dir
             if output_dir_path != extract_dir:
                 import shutil

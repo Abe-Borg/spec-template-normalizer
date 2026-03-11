@@ -717,7 +717,8 @@ def _build_style_name_map(styles_xml_path: Path) -> Dict[str, str]:
     return out
 
 
-def emit_arch_style_registry(extract_dir: Path, source_docx_name: str, instructions: Dict[str, Any], out_path: Optional[Path] = None) -> Path:
+def build_style_registry_dict(extract_dir: Path, source_docx_name: str, instructions: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the arch_style_registry payload dict without writing to disk."""
     roles = instructions.get("roles") or {}
     styles_path = extract_dir / "word" / "styles.xml"
     name_map = _build_style_name_map(styles_path)
@@ -735,14 +736,17 @@ def emit_arch_style_registry(extract_dir: Path, source_docx_name: str, instructi
             entry["style_name"] = style_name
         out_roles[role] = entry
 
-    payload = {
+    return {
         "version": 1,
         "source_docx": source_docx_name,
         "roles": out_roles,
     }
 
+
+def emit_arch_style_registry(extract_dir: Path, source_docx_name: str, instructions: Dict[str, Any], out_path: Optional[Path] = None) -> Path:
+    payload = build_style_registry_dict(extract_dir, source_docx_name, instructions)
+
     if out_path is None:
-        # FIXED: was arch_role_style_registry.json, now arch_style_registry.json
         out_path = extract_dir / "arch_style_registry.json"
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return out_path

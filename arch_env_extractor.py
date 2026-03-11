@@ -773,7 +773,12 @@ def main():
     # Extract registry
     print(f"Extracting environment from: {extract_dir}")
     registry = extract_arch_template_registry(extract_dir, source_docx)
-    
+
+    # Validate before writing
+    from phase1_validator import validate_template_registry
+    print("Validating template registry...")
+    validate_template_registry(registry)
+
     # Determine output path
     if args.output:
         out_path = Path(args.output)
