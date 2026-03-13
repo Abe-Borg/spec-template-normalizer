@@ -35,7 +35,7 @@ def _call_api(
     system: str,
     user_message: str,
     model: str,
-    max_tokens: int = 65536,
+    max_tokens: int = 128000,
 ) -> str:
     """Single API call with retry logic. Returns raw response text."""
     import anthropic
@@ -46,7 +46,9 @@ def _call_api(
             with client.messages.stream(
                 model=model,
                 max_tokens=max_tokens,
-                temperature=0,
+                temperature=1,
+                thinking={"type": "adaptive"},
+                output_config={"effort":"max"},
                 system=system,
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
