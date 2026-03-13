@@ -217,18 +217,40 @@ def paragraph_ppr_hints_from_block(p_xml: str) -> Dict[str, Any]:
     return hints
 
 
+def _read_on_off_tag(xml: str, tag: str) -> Optional[bool]:
+    """Read WordprocessingML on/off property semantics for a given tag.
+
+    Returns:
+      - None if the tag is absent
+      - True/False when present, honoring explicit w:val values
+    """
+    m = re.search(rf"<w:{tag}\b([^>]*)/?>[\s\S]*?(?:</w:{tag}>)?", xml)
+    if not m:
+        return None
+
+    attrs = m.group(1) or ""
+    val_match = re.search(r'w:val="([^"]+)"', attrs)
+    if not val_match:
+        return True
+
+    norm = val_match.group(1).strip().lower()
+    if norm in {"false", "0", "off", "none"}:
+        return False
+    return True
+
+
 def paragraph_rpr_hints_from_block(p_xml: str) -> Dict[str, Any]:
     """Extract lightweight run-property signals for classification."""
     rpr_inner = extract_paragraph_rpr_inner(p_xml)
     if not rpr_inner:
         return {}
 
-    hints: Dict[str, Any] = {
-        "bold": bool(re.search(r"<w:b(?:\s|/|>)", rpr_inner)),
-        "italic": bool(re.search(r"<w:i(?:\s|/|>)", rpr_inner)),
-        "caps": bool(re.search(r"<w:caps(?:\s|/|>)", rpr_inner)),
-        "underline": bool(re.search(r"<w:u\b", rpr_inner)),
-    }
+    hints: Dict[str, Any] = {}
+
+    for key, tag in [("bold", "b"), ("italic", "i"), ("caps", "caps"), ("underline", "u")]:
+        val = _read_on_off_tag(rpr_inner, tag)
+        if val is not None:
+            hints[key] = val
 
     sz = re.search(r"<w:sz\b[^>]*w:val=\"([^\"]+)\"", rpr_inner)
     if sz:
