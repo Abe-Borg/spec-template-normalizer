@@ -207,7 +207,7 @@ def paragraph_ppr_hints_from_block(p_xml: str) -> Dict[str, Any]:
         hints["ind"] = ind
 
     spacing = {}
-    for k in ["before", "after", "line"]:
+    for k in ["before", "after", "line", "lineRule"]:
         m3 = re.search(rf"<w:spacing\b[^>]*w:{k}=\"([^\"]+)\"", p_xml)
         if m3:
             spacing[k] = m3.group(1)
@@ -215,6 +215,34 @@ def paragraph_ppr_hints_from_block(p_xml: str) -> Dict[str, Any]:
         hints["spacing"] = spacing
 
     return hints
+
+
+def paragraph_rpr_hints_from_block(p_xml: str) -> Dict[str, Any]:
+    """Extract lightweight run-property signals for classification."""
+    rpr_inner = extract_paragraph_rpr_inner(p_xml)
+    if not rpr_inner:
+        return {}
+
+    hints: Dict[str, Any] = {
+        "bold": bool(re.search(r"<w:b(?:\s|/|>)", rpr_inner)),
+        "italic": bool(re.search(r"<w:i(?:\s|/|>)", rpr_inner)),
+        "caps": bool(re.search(r"<w:caps(?:\s|/|>)", rpr_inner)),
+        "underline": bool(re.search(r"<w:u\b", rpr_inner)),
+    }
+
+    sz = re.search(r"<w:sz\b[^>]*w:val=\"([^\"]+)\"", rpr_inner)
+    if sz:
+        hints["sz"] = sz.group(1)
+
+    font = re.search(r"<w:rFonts\b[^>]*w:ascii=\"([^\"]+)\"", rpr_inner)
+    if font:
+        hints["font"] = font.group(1)
+
+    return hints
+
+
+def paragraph_is_in_table(start: int, table_spans: List[Tuple[int, int]]) -> bool:
+    return any(t_start <= start < t_end for t_start, t_end in table_spans)
 
 
 def build_style_catalog(styles_xml_path: Path, used_style_ids: Set[str]) -> Dict[str, Any]:
@@ -313,12 +341,16 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
     used_style_ids: Set[str] = set()
     used_num_ids: Set[str] = set()
 
+    table_spans = [(m.start(), m.end()) for m in re.finditer(r"<w:tbl\b[\s\S]*?</w:tbl>", doc_text)]
+
     for idx, (_s, _e, p_xml) in enumerate(iter_paragraph_xml_blocks(doc_text)):
         txt = paragraph_text_from_block(p_xml)
         pStyle = paragraph_pstyle_from_block(p_xml)
         numpr = paragraph_numpr_from_block(p_xml)
         hints = paragraph_ppr_hints_from_block(p_xml)
+        rpr_hints = paragraph_rpr_hints_from_block(p_xml)
         contains_sect = paragraph_contains_sectpr(p_xml)
+        in_table = paragraph_is_in_table(_s, table_spans)
 
         if pStyle:
             used_style_ids.add(pStyle)
@@ -334,7 +366,9 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
             "pStyle": pStyle,
             "numPr": numpr if (numpr.get("numId") or numpr.get("ilvl")) else None,
             "pPr_hints": hints if hints else None,
+            "rPr_hints": rpr_hints if rpr_hints else None,
             "contains_sectPr": contains_sect,
+            "in_table": in_table,
         })
 
     style_catalog: Dict[str, Any] = {}
@@ -423,7 +457,11 @@ def extract_paragraph_rpr_inner(p_xml: str) -> str:
 
     for rm in re.finditer(r"<w:r\b[^>]*>(.*?)</w:r>", p_xml, flags=re.S):
         run_inner = rm.group(1)
-        if "<w:t" not in run_inner:
+        text_nodes = re.findall(r"<w:t\b[^>]*>([\s\S]*?)</w:t>", run_inner)
+        if not text_nodes:
+            continue
+        run_text = html.unescape("".join(text_nodes))
+        if not run_text.strip():
             continue
         m = re.search(r"<w:rPr\b[^>]*>(.*?)</w:rPr>", run_inner, flags=re.S)
         if not m:
@@ -562,7 +600,7 @@ def apply_pstyle_to_paragraph_block(p_xml: str, styleId: str) -> str:
     )
 
 
-def validate_instructions(instructions: Dict[str, Any]) -> None:
+def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Dict[str, Any]] = None) -> None:
     allowed_keys = {"create_styles", "apply_pStyle", "roles", "notes"}
     extra = set(instructions.keys()) - allowed_keys
     if extra:
@@ -571,7 +609,6 @@ def validate_instructions(instructions: Dict[str, Any]) -> None:
     allowed_new_style_ids: Set[str] = {
         "CSI_SectionTitle__ARCH",
         "CSI_SectionID__ARCH",
-        "CSI_SectionName__ARCH",
         "CSI_Part__ARCH",
         "CSI_Article__ARCH",
         "CSI_Paragraph__ARCH",
@@ -580,6 +617,7 @@ def validate_instructions(instructions: Dict[str, Any]) -> None:
     }
 
     created_style_src_idx: Dict[str, int] = {}
+    created_style_ids_seen: Set[str] = set()
     for sd in instructions.get("create_styles", []) or []:
         if not isinstance(sd, dict):
             raise ValueError("create_styles entries must be objects")
@@ -590,6 +628,9 @@ def validate_instructions(instructions: Dict[str, Any]) -> None:
             raise ValueError(f"Style {sid}: create_styles styleId must be namespaced CSI_*__ARCH")
         if sid not in allowed_new_style_ids:
             raise ValueError(f"Style {sid}: styleId is not allowed")
+        if sid in created_style_ids_seen:
+            raise ValueError(f"Duplicate create_styles styleId: {sid}")
+        created_style_ids_seen.add(sid)
         if any(k in sd for k in ("pPr", "rPr", "pPr_inner", "rPr_inner")):
             raise ValueError(f"Style {sid}: LLM formatting fields are forbidden. Use derive_from_paragraph_index only.")
         allowed_style_fields = {"styleId", "name", "type", "derive_from_paragraph_index", "basedOn", "role"}
@@ -645,9 +686,69 @@ def validate_instructions(instructions: Dict[str, Any]) -> None:
                 f"({created_style_src_idx[sid]}) for created styleId '{sid}'"
             )
 
+    if slim_bundle is None:
+        return
+
+    paragraphs = slim_bundle.get("paragraphs", [])
+    paragraph_count = len(paragraphs)
+    allowed_existing_style_ids = set(slim_bundle.get("style_catalog", {}).keys())
+    all_allowed_style_ids = allowed_existing_style_ids | allowed_new_style_ids
+
+    for ap in instructions.get("apply_pStyle", []) or []:
+        idx = ap["paragraph_index"]
+        sid = ap["styleId"]
+        if idx >= paragraph_count:
+            raise ValueError(f"apply_pStyle paragraph_index out of range: {idx} >= {paragraph_count}")
+        if sid not in all_allowed_style_ids:
+            raise ValueError(f"apply_pStyle[{idx}] uses disallowed styleId '{sid}'")
+
+    for role, spec in roles.items():
+        sid = spec["styleId"]
+        ex = int(spec["exemplar_paragraph_index"])
+        if sid not in all_allowed_style_ids:
+            raise ValueError(f"roles['{role}'] uses disallowed styleId '{sid}'")
+        if ex >= paragraph_count:
+            raise ValueError(f"roles['{role}'].exemplar_paragraph_index out of range: {ex} >= {paragraph_count}")
+        para = paragraphs[ex]
+        text = (para.get("text") or "").strip()
+        if not text:
+            raise ValueError(f"roles['{role}'] exemplar paragraph {ex} is blank")
+        if para.get("contains_sectPr"):
+            raise ValueError(f"roles['{role}'] exemplar paragraph {ex} contains sectPr")
+        if para.get("in_table"):
+            raise ValueError(f"roles['{role}'] exemplar paragraph {ex} is inside a table")
+        if text.upper() == "END OF SECTION":
+            raise ValueError(f"roles['{role}'] exemplar paragraph {ex} cannot be END OF SECTION")
+        if text.startswith("[") and text.endswith("]"):
+            raise ValueError(f"roles['{role}'] exemplar paragraph {ex} cannot be an editor note")
+
+    required_apply_indices: List[int] = []
+    for p in paragraphs:
+        text = (p.get("text") or "").strip()
+        if not text or p.get("contains_sectPr") or p.get("in_table"):
+            continue
+        if text.upper() == "END OF SECTION":
+            continue
+        if text.startswith("[") and text.endswith("]"):
+            continue
+        required_apply_indices.append(int(p["paragraph_index"]))
+
+    apply_indices = [int(ap["paragraph_index"]) for ap in instructions.get("apply_pStyle", []) or []]
+    apply_set = set(apply_indices)
+    required_set = set(required_apply_indices)
+    missing = sorted(required_set - apply_set)
+    unexpected = sorted(apply_set - required_set)
+    if missing or unexpected:
+        raise ValueError(
+            "apply_pStyle coverage mismatch; "
+            f"missing={missing[:20]}{'...' if len(missing) > 20 else ''}, "
+            f"unexpected={unexpected[:20]}{'...' if len(unexpected) > 20 else ''}"
+        )
+
 
 def apply_instructions(extract_dir: Path, instructions: Dict[str, Any]) -> None:
-    validate_instructions(instructions)
+    slim_bundle = build_slim_bundle(extract_dir)
+    validate_instructions(instructions, slim_bundle=slim_bundle)
 
     snap = snapshot_stability(extract_dir)
 
@@ -768,6 +869,9 @@ def build_style_registry_dict(extract_dir: Path, source_docx_name: str, instruct
     roles = instructions.get("roles") or {}
     styles_path = extract_dir / "word" / "styles.xml"
     name_map = _build_style_name_map(styles_path)
+    bundle = build_slim_bundle(extract_dir)
+    paragraphs = bundle.get("paragraphs", [])
+    created_style_ids = {sd.get("styleId") for sd in (instructions.get("create_styles") or []) if isinstance(sd, dict)}
 
     out_roles: Dict[str, Any] = {}
     for role, spec in roles.items():
@@ -780,6 +884,19 @@ def build_style_registry_dict(extract_dir: Path, source_docx_name: str, instruct
         style_name = name_map.get(style_id)
         if style_name:
             entry["style_name"] = style_name
+
+        if 0 <= exemplar_idx < len(paragraphs):
+            exemplar = paragraphs[exemplar_idx]
+            resolved: Dict[str, Any] = {}
+            if exemplar.get("pPr_hints"):
+                resolved["pPr_hints"] = exemplar["pPr_hints"]
+            if exemplar.get("rPr_hints"):
+                resolved["rPr_hints"] = exemplar["rPr_hints"]
+            if resolved:
+                entry["resolved_formatting"] = resolved
+            if style_id in created_style_ids and exemplar.get("pStyle"):
+                entry["warning"] = "Derived style exemplar has existing pStyle; inheritance chain may affect formatting"
+
         out_roles[role] = entry
 
     return {

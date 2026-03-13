@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phase 1 LLM instructions",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["create_styles", "apply_pStyle", "roles"],
+  "properties": {
+    "create_styles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["styleId", "type", "derive_from_paragraph_index"],
+        "properties": {
+          "styleId": {
+            "type": "string",
+            "enum": [
+              "CSI_SectionTitle__ARCH",
+              "CSI_SectionID__ARCH",
+              "CSI_Part__ARCH",
+              "CSI_Article__ARCH",
+              "CSI_Paragraph__ARCH",
+              "CSI_Subparagraph__ARCH",
+              "CSI_Subsubparagraph__ARCH"
+            ]
+          },
+          "name": {"type": "string"},
+          "type": {"const": "paragraph"},
+          "derive_from_paragraph_index": {"type": "integer", "minimum": 0},
+          "basedOn": {"type": ["string", "null"]},
+          "role": {"type": "string"}
+        }
+      }
+    },
+    "apply_pStyle": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["paragraph_index", "styleId"],
+        "properties": {
+          "paragraph_index": {"type": "integer", "minimum": 0},
+          "styleId": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "SectionID": {"$ref": "#/$defs/roleSpec"},
+        "SectionTitle": {"$ref": "#/$defs/roleSpec"},
+        "PART": {"$ref": "#/$defs/roleSpec"},
+        "ARTICLE": {"$ref": "#/$defs/roleSpec"},
+        "PARAGRAPH": {"$ref": "#/$defs/roleSpec"},
+        "SUBPARAGRAPH": {"$ref": "#/$defs/roleSpec"},
+        "SUBSUBPARAGRAPH": {"$ref": "#/$defs/roleSpec"}
+      }
+    },
+    "notes": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "roleSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["styleId", "exemplar_paragraph_index"],
+      "properties": {
+        "styleId": {"type": "string", "minLength": 1},
+        "exemplar_paragraph_index": {"type": "integer", "minimum": 0},
+        "style_name": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

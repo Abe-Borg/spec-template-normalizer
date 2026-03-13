@@ -304,6 +304,7 @@ def extract_style_defs(styles_xml: str) -> List[Dict[str, Any]]:
             "unhide_when_used": unhide_when_used,
             "locked": locked,
             "rsid": None,  # Stripped
+            "raw_style_xml": _canonicalize(block),
             "pPr": _canonicalize(pPr) if pPr else None,
             "rPr": _canonicalize(rPr) if rPr else None,
             "tblPr": _canonicalize(tblPr) if tblPr else None,

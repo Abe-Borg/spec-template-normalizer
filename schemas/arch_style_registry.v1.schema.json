@@ -9,14 +9,7 @@
     "source_docx": { "type": "string", "minLength": 1 },
     "roles": {
       "type": "object",
-      "required": [
-        "SectionTitle",
-        "PART",
-        "ARTICLE",
-        "PARAGRAPH",
-        "SUBPARAGRAPH"
-      ],
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "SectionID": { "$ref": "#/$defs/roleSpec" },
         "SectionTitle": { "$ref": "#/$defs/roleSpec" },
@@ -36,7 +29,9 @@
       "properties": {
         "style_id": { "type": "string", "minLength": 1 },
         "exemplar_paragraph_index": { "type": "integer", "minimum": 0 },
-        "style_name": { "type": ["string", "null"] }
+        "style_name": { "type": ["string", "null"] },
+        "resolved_formatting": { "type": "object", "additionalProperties": true },
+        "warning": { "type": "string" }
       }
     }
   }

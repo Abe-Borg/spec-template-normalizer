@@ -284,11 +284,10 @@ class TestValidateStyleRegistry:
         with pytest.raises(ValueError, match="source_docx must be a non-empty string"):
             validate_style_registry(reg)
 
-    def test_missing_required_role(self):
+    def test_missing_role_allowed(self):
         reg = _minimal_style_registry()
         del reg["roles"]["PART"]
-        with pytest.raises(ValueError, match="roles missing.*PART"):
-            validate_style_registry(reg)
+        validate_style_registry(reg)
 
     def test_empty_style_id_in_role(self):
         reg = _minimal_style_registry()

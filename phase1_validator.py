@@ -46,18 +46,16 @@ _REQUIRED_TOP_LEVEL_KEYS = {
     "fonts",
 }
 
-# Roles that every spec document must have.
-# SectionID and SUBSUBPARAGRAPH are optional — not every document has them.
-_REQUIRED_ROLES = {
+# All supported roles for the architect style contract.
+_ALLOWED_ROLES = {
+    "SectionID",
     "SectionTitle",
     "PART",
     "ARTICLE",
     "PARAGRAPH",
     "SUBPARAGRAPH",
+    "SUBSUBPARAGRAPH",
 }
-
-# All roles that are recognized (required + optional).
-_ALLOWED_ROLES = _REQUIRED_ROLES | {"SectionID", "SUBSUBPARAGRAPH"}
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +153,7 @@ def validate_template_registry(registry: Dict[str, Any]) -> None:
     # each style_defs[*] XML properties
     for i, sdef in enumerate(style_defs):
         ctx = f"styles.style_defs[{i}] (style_id={sdef.get('style_id', '?')})"
-        for prop in ("pPr", "rPr", "tblPr", "trPr", "tcPr"):
+        for prop in ("raw_style_xml", "pPr", "rPr", "tblPr", "trPr", "tcPr"):
             _validate_xml_field(sdef, prop, ctx)
 
     # settings.compat
@@ -222,10 +220,6 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
     if not isinstance(roles, dict):
         raise ValueError("style registry roles must be an object")
 
-    missing = _REQUIRED_ROLES - set(roles.keys())
-    if missing:
-        raise ValueError(f"style registry roles missing: {sorted(missing)}")
-
     for role, spec in roles.items():
         if role not in _ALLOWED_ROLES:
             raise ValueError(f"style registry contains unknown role '{role}'")
@@ -239,6 +233,9 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
             raise ValueError(
                 f"roles['{role}'].exemplar_paragraph_index must be a non-negative int"
             )
+        resolved = spec.get("resolved_formatting")
+        if resolved is not None and not isinstance(resolved, dict):
+            raise ValueError(f"roles['{role}'].resolved_formatting must be an object when present")
 
 
 # ---------------------------------------------------------------------------

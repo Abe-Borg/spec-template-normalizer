@@ -20,6 +20,17 @@ from pathlib import Path
 from typing import Optional
 
 
+
+
+def _load_prompt_file(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing required prompt file: {path}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise RuntimeError(f"Failed reading prompt file {path}: {exc}") from exc
+
+
 class LogRedirector:
     """Redirects writes to a thread-safe queue for GUI consumption."""
 
@@ -83,8 +94,8 @@ class PipelineThread(threading.Thread):
 
             # 3) Read prompts
             script_dir = Path(__file__).resolve().parent
-            master_prompt = (script_dir / "master_prompt.txt").read_text(encoding="utf-8")
-            run_instruction = (script_dir / "run_instruction_prompt.txt").read_text(encoding="utf-8")
+            master_prompt = _load_prompt_file(script_dir / "master_prompt.txt")
+            run_instruction = _load_prompt_file(script_dir / "run_instruction_prompt.txt")
 
             # 4) Classify
             self._log("Classifying via LLM...")
@@ -104,8 +115,8 @@ class PipelineThread(threading.Thread):
             coverage, styled, classifiable = compute_coverage(bundle, instructions)
             coverage_msg = f"Coverage: {coverage:.1%} ({styled}/{classifiable})"
             self._log(coverage_msg)
-            if coverage < 0.90:
-                self._log("WARNING: Coverage below 90%")
+            if coverage < 1.0:
+                raise ValueError(f"Coverage must be 100% for classifiable paragraphs; got {coverage_msg}")
 
             # 6) Apply
             self._log("Applying instructions...")

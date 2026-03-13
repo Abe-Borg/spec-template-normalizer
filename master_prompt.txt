@@ -9,49 +9,43 @@ You are not allowed to describe or prescribe formatting.
 Instead, when a new style is needed, you must reference an exemplar paragraph using derive_from_paragraph_index.
 Any attempt to specify alignment, indentation, spacing, fonts, or numbering is forbidden.
 
-Goal: render-perfect output while normalizing CSI semantics using paragraph styles (w:pStyle).
+Goal: classify architect template CSI semantics using paragraph styles (w:pStyle) and produce a complete downstream contract.
 
 Rules:
 1) Do not propose changes to headers/footers or section properties (sectPr). Those must remain unchanged.
 2) Prefer reusing existing template styles if they match the current appearance.
 3) If a CSI role exists but paragraphs lack a style, propose creating a template-namespaced style that matches the current appearance
    (via derive_from_paragraph_index only). Allowed CSI_*__ARCH styleIds:
-   - CSI_SectionTitle__ARCH        (single-paragraph section header, if applicable)
-   - CSI_SectionID__ARCH           (section number line, e.g. "SECTION 23 31 13")
-   - CSI_SectionName__ARCH         (section name line, e.g. "METAL DUCTS")
+   - CSI_SectionTitle__ARCH
+   - CSI_SectionID__ARCH
    - CSI_Part__ARCH
    - CSI_Article__ARCH
    - CSI_Paragraph__ARCH
    - CSI_Subparagraph__ARCH
    - CSI_Subsubparagraph__ARCH
 4) If you create a new CSI_*__ARCH style, choose a derive_from_paragraph_index that is a “clean” exemplar of that role
-   (not END OF SECTION, not blank, not a section break, not a weird edge-case).
-5) Determine hierarchy using text patterns AND numbering/indent hints:
-   - PART headings: "PART 1", "PART 2", "PART 3"
-   - Articles: "1.01", "1.02"… (often under PART)
-   - Paragraphs: "A." "B." …
-   - Subparagraphs: "1." "2." … under A./B.
-   - Sub-subparagraphs: "a." "b." … under 1./2. and typically indented
-6) You MUST output a deterministic role→style mapping under the top-level key "roles".
-   This is a contract file we will write downstream (arch_style_registry.json). Role keys must be EXACTLY:
+   (not END OF SECTION, not blank, not a section break, not in-table, not a weird edge-case).
+5) Determine hierarchy using text patterns AND numbering/indent hints.
+6) You MUST output a deterministic role→style mapping under top-level key "roles".
+   Allowed role keys are EXACTLY:
    - SectionID (optional; only if section number line exists as its own paragraph)
-   - SectionTitle (the section NAME line; e.g. "METAL DUCTS")
+   - SectionTitle
    - PART
    - ARTICLE
    - PARAGRAPH
    - SUBPARAGRAPH
-   - SUBSUBPARAGRAPH
-   For each role you include, you must provide:
-   - styleId: the EXACT Word w:styleId string to use (either existing or created)
-   - exemplar_paragraph_index: the paragraph_index you used as the exemplar for that role.
-     If styleId is a CSI_*__ARCH style you created in create_styles, exemplar_paragraph_index MUST equal that style’s derive_from_paragraph_index.
-   If a role does not exist in this document, omit it (do NOT fabricate).
-7) You MUST classify EVERY content paragraph in the document. Do not provide "representative samples" —
-   the apply_pStyle array must contain an entry for every paragraph that has a CSI role.
-   Skip ONLY these paragraphs:
-   - Empty/blank paragraphs (no visible text)
+   - SUBSUBPARAGRAPH (optional)
+   For each included role:
+   - styleId: exact Word w:styleId string
+   - exemplar_paragraph_index: paragraph_index used as exemplar
+   If styleId is a created CSI_*__ARCH style, exemplar_paragraph_index MUST equal derive_from_paragraph_index.
+   Include roles only when present in this architect document.
+7) You MUST classify EVERY non-skipped, non-table content paragraph in apply_pStyle.
+   Skip ONLY:
+   - Empty/blank paragraphs
    - Paragraphs with contains_sectPr=true
-   - "END OF SECTION" paragraphs
+   - Paragraphs with in_table=true
+   - "END OF SECTION"
    - Editor/specifier notes in brackets (e.g. "[SPECIFIER NOTE: ...]")
 8) Output must be valid JSON only.
 
@@ -70,14 +64,8 @@ Output schema:
     { "paragraph_index": 12, "styleId": "CSI_Part__ARCH" }
   ],
   "roles": {
-    "SectionTitle": { "styleId": "CSI_SectionName__ARCH", "exemplar_paragraph_index": 1 },
-    "PART":        { "styleId": "SectionTitle",           "exemplar_paragraph_index": 12 }
+    "SectionTitle": { "styleId": "CSI_SectionTitle__ARCH", "exemplar_paragraph_index": 1 },
+    "PART": { "styleId": "CSI_Part__ARCH", "exemplar_paragraph_index": 12 }
   },
   "notes": ["..."]
 }
-
-Notes:
-- Use paragraph_index from the provided bundle.
-- Do not include paragraphs that are marked contains_sectPr=true.
-- For create_styles: derive_from_paragraph_index must reference a real paragraph_index from the bundle.
-- Never emit pPr/rPr in JSON.

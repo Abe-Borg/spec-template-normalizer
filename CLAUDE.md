@@ -213,7 +213,7 @@ The pipeline recognizes these CSI structural roles (from schema):
 | Role | Style ID | Required? |
 |---|---|---|
 | `SectionID` | `CSI_SectionID__ARCH` | Optional |
-| `SectionTitle` | `CSI_SectionTitle__ARCH` or `CSI_SectionName__ARCH` | Required |
+| `SectionTitle` | `CSI_SectionTitle__ARCH` or `CSI_SectionTitle__ARCH` | Required |
 | `PART` | `CSI_Part__ARCH` | Required |
 | `ARTICLE` | `CSI_Article__ARCH` | Required |
 | `PARAGRAPH` | `CSI_Paragraph__ARCH` | Required |
@@ -241,7 +241,7 @@ Validated against `schemas/arch_style_registry.v1.schema.json`.
 Complete formatting environment with sections: `meta`, `package_inventory`, `doc_defaults`, `styles`, `theme`, `settings`, `page_layout`, `headers_footers`, `numbering`, `fonts`, `custom_xml`, `capture_policy`.
 
 ### Coverage Metric
-After classification, the pipeline reports what percentage of non-empty, non-sectPr, non-editor-note paragraphs received a style. Coverage below 90% triggers a warning.
+After classification, the pipeline reports what percentage of non-empty, non-sectPr, non-editor-note paragraphs received a style. Coverage must be 100% for classifiable paragraphs; otherwise Phase 1 fails validation.
 
 ## Development Conventions
 

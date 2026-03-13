@@ -127,10 +127,10 @@ Maps CSI roles to Word styleIds:
 ```
 
 ### arch_template_registry.json
-Complete formatting environment with raw XML blocks (see `schemas/arch_template_registry.json` for full structure).
+Complete formatting environment with raw XML blocks (see `schemas/arch_template_registry.example.json` for full structure).
 
 ### Coverage metric
-After classification, the pipeline reports what percentage of content paragraphs were classified. Paragraphs that are empty, contain section breaks, say "END OF SECTION", or are editor notes in brackets are excluded from the count. Coverage below 90% triggers a warning.
+After classification, the pipeline reports what percentage of content paragraphs were classified. Paragraphs that are empty, contain section breaks, say "END OF SECTION", or are editor notes in brackets are excluded from the count. Coverage must be 100% for classifiable paragraphs; otherwise Phase 1 fails validation.
 
 ### Paragraph styles in DOCX
 - `CSI_SectionID__ARCH` (optional)
@@ -199,7 +199,7 @@ The smoke test runs the full pipeline end-to-end and delegates contract validati
 
 Formal JSON schemas are provided in `schemas/`:
 - `arch_style_registry.v1.schema.json` - Style registry contract
-- `arch_template_registry.json` - Environment registry example/schema
+- `schemas/arch_template_registry.example.json` - Environment registry example file (not runtime output)
 
 ## Requirements
 
@@ -224,7 +224,7 @@ The LLM's role mapping doesn't match its create_styles entries. The exemplar par
 **"No API key provided"**
 Set the `ANTHROPIC_API_KEY` environment variable or enter the key in the GUI's API Key field.
 
-**Coverage below 90%**
+**Coverage below 100%**
 The LLM may not have classified all content paragraphs. Try re-running the pipeline via the GUI.
 
 

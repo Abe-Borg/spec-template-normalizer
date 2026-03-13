@@ -102,19 +102,9 @@ def classify_document(
     bundle_json = json.dumps(slim_bundle, indent=2)
     user_message = f"{run_instruction}\n\nSlim bundle:\n{bundle_json}"
 
-    # Check if chunking is needed
-    total_text = master_prompt + user_message
-    token_est = estimate_tokens(total_text)
-
-    n_paragraphs = len(slim_bundle.get("paragraphs", []))
-    if token_est > 80_000 or n_paragraphs > 300:
-        return _classify_chunked(
-            slim_bundle, master_prompt, run_instruction, client, model
-        )
-
     raw = _call_api(client, master_prompt, user_message, model)
     instructions = _parse_response(raw)
-    validate_instructions(instructions)
+    validate_instructions(instructions, slim_bundle=slim_bundle)
     return instructions
 
 
@@ -155,7 +145,7 @@ def _classify_chunked(
 
     raw = _call_api(client, master_prompt, user_msg, model)
     merged = _parse_response(raw)
-    validate_instructions(merged)
+    validate_instructions(merged, slim_bundle=slim_bundle)
 
     if len(chunks) <= 1:
         return merged
@@ -198,7 +188,7 @@ def _classify_chunked(
         key=lambda x: x["paragraph_index"],
     )
 
-    validate_instructions(merged)
+    validate_instructions(merged, slim_bundle=slim_bundle)
     return merged
 
 
@@ -218,6 +208,8 @@ def compute_coverage(slim_bundle: dict, instructions: dict) -> tuple:
         if not text:
             continue
         if p.get("contains_sectPr", False):
+            continue
+        if p.get("in_table", False):
             continue
         if text.upper() == "END OF SECTION":
             continue
