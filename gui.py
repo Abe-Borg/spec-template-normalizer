@@ -14,9 +14,28 @@ import sys
 import threading
 import traceback
 import tkinter as tk
+import customtkinter as ctk
 from tkinter import filedialog, scrolledtext
 from pathlib import Path
 from typing import Optional
+
+
+COLORS = {
+    "bg_dark": "#0D0D0D",
+    "bg_card": "#1A1A1A",
+    "bg_input": "#252525",
+    "border": "#333333",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#B0B0B0",
+    "text_muted": "#707070",
+    "accent": "#3B82F6",
+    "accent_hover": "#2563EB",
+    "accent_glow": "#60A5FA",
+    "success": "#22C55E",
+    "success_glow": "#4ADE80",
+    "warning": "#F59E0B",
+    "error": "#EF4444",
+}
 
 
 
@@ -173,315 +192,408 @@ class PipelineThread(threading.Thread):
             self.result_queue.put({"success": False})
 
 
-class App:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        root.title("DOCX CSI Normalizer — Phase 1")
-        root.minsize(600, 500)
-        root.configure(bg="#0D0D0D")
-
-        self.colors = {
-            "bg_dark": "#0D0D0D",
-            "bg_card": "#1A1A1A",
-            "bg_input": "#252525",
-            "border": "#333333",
-            "text_primary": "#FFFFFF",
-            "text_secondary": "#B0B0B0",
-            "text_muted": "#707070",
-            "accent": "#3B82F6",
-            "accent_hover": "#2563EB",
-            "success": "#22C55E",
-            "error": "#EF4444",
-        }
-        self.fonts = {
-            "title": ("Segoe UI", 24, "bold"),
-            "subtitle": ("Segoe UI", 12),
-            "section": ("Segoe UI", 10, "bold"),
-            "label": ("Segoe UI", 11),
-            "button": ("Segoe UI", 11, "bold"),
-            "mono": ("Consolas", 11),
-        }
+class App(ctk.CTk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("DOCX CSI Normalizer — Phase 1")
+        self.geometry("900x750")
+        self.minsize(750, 600)
+        self.configure(fg_color=COLORS["bg_dark"])
 
         self.log_queue: queue.Queue = queue.Queue()
         self.result_queue: queue.Queue = queue.Queue()
         self._result: Optional[dict] = None
-        self._help_windows: list[tk.Toplevel] = []
+        self._help_windows: list[ctk.CTkToplevel] = []
+
+        self._inputs_expanded = True
+        self._log_expanded = True
 
         self._build_ui()
         self._poll_queues()
 
     def _build_ui(self) -> None:
-        pad = {"padx": 16, "pady": 10}
+        container = ctk.CTkFrame(self, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=24, pady=24)
 
         # --- Header ---
-        header = tk.Frame(self.root, bg=self.colors["bg_dark"])
-        header.pack(fill="x", padx=20, pady=(18, 8))
-        tk.Label(
-            header,
+        header = ctk.CTkFrame(container, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 10))
+
+        title_row = ctk.CTkFrame(header, fg_color="transparent")
+        title_row.pack(fill="x")
+
+        ctk.CTkLabel(
+            title_row,
             text="DOCX CSI NORMALIZER",
-            bg=self.colors["bg_dark"],
-            fg=self.colors["text_primary"],
-            font=self.fonts["title"],
-            anchor="w",
-        ).pack(fill="x")
-        tk.Label(
-            header,
-            text="Phase 1 Pipeline • Dark Professional UI",
-            bg=self.colors["bg_dark"],
-            fg=self.colors["text_secondary"],
-            font=self.fonts["subtitle"],
-            anchor="w",
-        ).pack(fill="x", pady=(2, 0))
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
+        ).pack(side="left")
 
-        help_btn_frame = tk.Frame(header, bg=self.colors["bg_dark"])
-        help_btn_frame.pack(anchor="e", pady=(8, 0))
+        help_btn_frame = ctk.CTkFrame(title_row, fg_color="transparent")
+        help_btn_frame.pack(side="right")
 
-        tk.Button(
+        ctk.CTkButton(
             help_btn_frame,
             text="How It Works",
             command=lambda: self._show_info_popup("How It Works", HOW_IT_WORKS_TEXT),
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_secondary"],
-            activebackground=self.colors["accent_hover"],
-            activeforeground=self.colors["text_primary"],
-            relief="flat",
-            font=("Segoe UI", 9),
-            padx=10,
-            pady=4,
+            width=100,
+            height=32,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            fg_color=COLORS["bg_input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["text_secondary"],
         ).pack(side="right", padx=(8, 0))
 
-        tk.Button(
+        ctk.CTkButton(
             help_btn_frame,
             text="How to Use",
             command=lambda: self._show_info_popup("How to Use", HOW_TO_USE_TEXT),
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_secondary"],
-            activebackground=self.colors["accent_hover"],
-            activeforeground=self.colors["text_primary"],
-            relief="flat",
-            font=("Segoe UI", 9),
-            padx=10,
-            pady=4,
+            width=100,
+            height=32,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            fg_color=COLORS["bg_input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["text_secondary"],
         ).pack(side="right")
 
-        # --- Input card ---
-        input_frame = tk.Frame(
-            self.root,
-            bg=self.colors["bg_card"],
-            highlightthickness=1,
-            highlightbackground=self.colors["border"],
-        )
-        input_frame.pack(fill="x", padx=20, pady=(4, 10))
+        ctk.CTkLabel(
+            header,
+            text="Phase 1 Pipeline — Architect Template Analysis",
+            text_color=COLORS["text_secondary"],
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+        ).pack(fill="x", pady=(6, 0), anchor="w")
 
-        tk.Label(
-            input_frame,
+        # --- Inputs card ---
+        inputs_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=8)
+        inputs_card.pack(fill="x", pady=(0, 12))
+
+        inputs_header = ctk.CTkFrame(inputs_card, fg_color="transparent", cursor="hand2")
+        inputs_header.pack(fill="x", padx=16, pady=12)
+        inputs_header.bind("<Button-1>", self._toggle_inputs)
+
+        self._inputs_arrow = ctk.CTkLabel(
+            inputs_header,
+            text="▼",
+            font=ctk.CTkFont(family="Consolas", size=12),
+            text_color=COLORS["text_muted"],
+            width=20,
+        )
+        self._inputs_arrow.pack(side="left")
+        self._inputs_arrow.bind("<Button-1>", self._toggle_inputs)
+
+        inputs_lbl = ctk.CTkLabel(
+            inputs_header,
             text="INPUTS",
-            bg=self.colors["bg_card"],
-            fg=self.colors["text_muted"],
-            font=self.fonts["section"],
-        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(10, 4))
-
-        # Template row
-        tk.Label(
-            input_frame,
-            text="Template",
-            bg=self.colors["bg_card"],
-            fg=self.colors["text_secondary"],
-            font=self.fonts["label"],
-        ).grid(row=1, column=0, sticky="w", **pad)
-        self.path_var = tk.StringVar()
-        tk.Entry(
-            input_frame,
-            textvariable=self.path_var,
-            width=50,
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_primary"],
-            insertbackground=self.colors["text_primary"],
-            relief="flat",
-            font=self.fonts["mono"],
-        ).grid(row=1, column=1, sticky="ew", **pad)
-        tk.Button(
-            input_frame,
-            text="Browse",
-            command=self._browse,
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_secondary"],
-            activebackground=self.colors["accent_hover"],
-            activeforeground=self.colors["text_primary"],
-            relief="flat",
-            font=self.fonts["label"],
-        ).grid(row=1, column=2, **pad)
-
-        # API key row
-        tk.Label(
-            input_frame,
-            text="API Key",
-            bg=self.colors["bg_card"],
-            fg=self.colors["text_secondary"],
-            font=self.fonts["label"],
-        ).grid(row=2, column=0, sticky="w", **pad)
-        self.key_var = tk.StringVar(value=os.environ.get("ANTHROPIC_API_KEY", ""))
-        self.key_entry = tk.Entry(
-            input_frame,
-            textvariable=self.key_var,
-            width=50,
-            show="*",
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_primary"],
-            insertbackground=self.colors["text_primary"],
-            relief="flat",
-            font=self.fonts["mono"],
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            text_color=COLORS["text_muted"],
         )
-        self.key_entry.grid(row=2, column=1, sticky="ew", **pad)
+        inputs_lbl.pack(side="left", padx=(4, 0))
+        inputs_lbl.bind("<Button-1>", self._toggle_inputs)
+
+        self._inputs_content = ctk.CTkFrame(inputs_card, fg_color="transparent")
+        self._inputs_content.pack(fill="x", padx=16, pady=(0, 16))
+
+        # Row 0: Template
+        ctk.CTkLabel(
+            self._inputs_content,
+            text="Template",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLORS["text_secondary"],
+            width=100,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", pady=8)
+
+        template_frame = ctk.CTkFrame(self._inputs_content, fg_color="transparent")
+        template_frame.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=8)
+        template_frame.columnconfigure(0, weight=1)
+
+        self.path_var = tk.StringVar()
+        self.path_entry = ctk.CTkEntry(
+            template_frame,
+            textvariable=self.path_var,
+            placeholder_text="Select architect template .docx",
+            font=ctk.CTkFont(family="Consolas", size=12),
+            fg_color=COLORS["bg_input"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            height=36,
+        )
+        self.path_entry.grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkButton(
+            template_frame,
+            text="Browse",
+            width=70,
+            command=self._browse,
+            height=36,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            fg_color=COLORS["bg_input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["text_secondary"],
+        ).grid(row=0, column=1, padx=(8, 0))
+
+        # Row 1: API Key
+        ctk.CTkLabel(
+            self._inputs_content,
+            text="API Key",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLORS["text_secondary"],
+            width=100,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=8)
+
+        key_frame = ctk.CTkFrame(self._inputs_content, fg_color="transparent")
+        key_frame.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=8)
+        key_frame.columnconfigure(0, weight=1)
+
+        self.key_var = tk.StringVar(value=os.environ.get("ANTHROPIC_API_KEY", ""))
+        self.key_entry = ctk.CTkEntry(
+            key_frame,
+            textvariable=self.key_var,
+            show="•",
+            placeholder_text="sk-ant-...",
+            font=ctk.CTkFont(family="Consolas", size=12),
+            fg_color=COLORS["bg_input"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            height=36,
+        )
+        self.key_entry.grid(row=0, column=0, sticky="ew")
         self._key_visible = False
-        self.key_toggle = tk.Button(
-            input_frame,
+
+        self.key_toggle = ctk.CTkButton(
+            key_frame,
             text="Show",
             command=self._toggle_key,
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_secondary"],
-            activebackground=self.colors["accent_hover"],
-            activeforeground=self.colors["text_primary"],
-            relief="flat",
-            font=self.fonts["label"],
+            width=70,
+            height=36,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            fg_color=COLORS["bg_input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["text_secondary"],
         )
-        self.key_toggle.grid(row=2, column=2, **pad)
+        self.key_toggle.grid(row=0, column=1, padx=(8, 0))
 
-        # Output folder row
-        tk.Label(
-            input_frame,
+        # Row 2: Output Folder
+        ctk.CTkLabel(
+            self._inputs_content,
             text="Output Folder",
-            bg=self.colors["bg_card"],
-            fg=self.colors["text_secondary"],
-            font=self.fonts["label"],
-        ).grid(row=3, column=0, sticky="w", **pad)
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLORS["text_secondary"],
+            width=100,
+            anchor="w",
+        ).grid(row=2, column=0, sticky="w", pady=8)
+
+        output_frame = ctk.CTkFrame(self._inputs_content, fg_color="transparent")
+        output_frame.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=8)
+        output_frame.columnconfigure(0, weight=1)
+
         self.output_dir_var = tk.StringVar()
-        tk.Entry(
-            input_frame,
+        self.output_entry = ctk.CTkEntry(
+            output_frame,
             textvariable=self.output_dir_var,
-            width=50,
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_primary"],
-            insertbackground=self.colors["text_primary"],
-            relief="flat",
-            font=self.fonts["mono"],
-        ).grid(row=3, column=1, sticky="ew", **pad)
-        tk.Button(
-            input_frame,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            fg_color=COLORS["bg_input"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            height=36,
+        )
+        self.output_entry.grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkButton(
+            output_frame,
             text="Browse",
             command=self._browse_output,
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_secondary"],
-            activebackground=self.colors["accent_hover"],
-            activeforeground=self.colors["text_primary"],
-            relief="flat",
-            font=self.fonts["label"],
-        ).grid(row=3, column=2, **pad)
+            width=70,
+            height=36,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            fg_color=COLORS["bg_input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["text_secondary"],
+        ).grid(row=0, column=1, padx=(8, 0))
 
-        input_frame.columnconfigure(1, weight=1)
+        self._inputs_content.columnconfigure(1, weight=1)
 
         # --- Run button ---
-        self.run_btn = tk.Button(
-            self.root,
+        self.run_btn = ctk.CTkButton(
+            container,
             text="Run Phase 1",
             command=self._run,
-            font=self.fonts["button"],
-            height=2,
-            bg=self.colors["accent"],
-            fg=self.colors["text_primary"],
-            activebackground=self.colors["accent_hover"],
-            activeforeground=self.colors["text_primary"],
-            relief="flat",
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            height=44,
+            corner_radius=8,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
         )
-        self.run_btn.pack(fill="x", padx=20, pady=(2, 12))
+        self.run_btn.pack(fill="x", pady=(0, 0))
+
+        self.progress_bar = ctk.CTkProgressBar(
+            container,
+            height=4,
+            corner_radius=2,
+            fg_color=COLORS["bg_input"],
+            progress_color=COLORS["accent"],
+            indeterminate_speed=0.5,
+        )
 
         # --- Log card ---
-        log_frame = tk.Frame(
-            self.root,
-            bg=self.colors["bg_card"],
-            highlightthickness=1,
-            highlightbackground=self.colors["border"],
-        )
-        log_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        log_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=8)
+        log_card.pack(fill="both", expand=True, pady=(12, 0))
 
-        tk.Label(
-            log_frame,
+        log_header = ctk.CTkFrame(log_card, fg_color="transparent", cursor="hand2")
+        log_header.pack(fill="x", padx=16, pady=12)
+        log_header.bind("<Button-1>", self._toggle_log)
+
+        self._log_arrow = ctk.CTkLabel(
+            log_header,
+            text="▼",
+            font=ctk.CTkFont(family="Consolas", size=12),
+            text_color=COLORS["text_muted"],
+            width=20,
+        )
+        self._log_arrow.pack(side="left")
+        self._log_arrow.bind("<Button-1>", self._toggle_log)
+
+        log_lbl = ctk.CTkLabel(
+            log_header,
             text="ACTIVITY LOG",
-            bg=self.colors["bg_card"],
-            fg=self.colors["text_muted"],
-            font=self.fonts["section"],
-        ).pack(anchor="w", padx=14, pady=(10, 6))
-
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            height=15,
-            state="disabled",
-            wrap="word",
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_secondary"],
-            insertbackground=self.colors["text_primary"],
-            relief="flat",
-            font=self.fonts["mono"],
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            text_color=COLORS["text_muted"],
         )
-        self.log_text.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        log_lbl.pack(side="left", padx=(4, 0))
+        log_lbl.bind("<Button-1>", self._toggle_log)
+
+        ctk.CTkButton(
+            log_header,
+            text="Clear",
+            width=50,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            hover_color=COLORS["bg_input"],
+            text_color=COLORS["text_muted"],
+            command=self._clear_log,
+        ).pack(side="right")
+
+        self._log_content = ctk.CTkFrame(log_card, fg_color="transparent")
+        self._log_content.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        self.log_text = ctk.CTkTextbox(
+            self._log_content,
+            fg_color=COLORS["bg_input"],
+            corner_radius=4,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            text_color=COLORS["text_secondary"],
+            wrap="word",
+            state="disabled",
+            activate_scrollbars=True,
+        )
+        self.log_text.pack(fill="both", expand=True)
 
         # --- Status bar ---
-        status_frame = tk.Frame(self.root, bg=self.colors["bg_dark"])
-        status_frame.pack(fill="x", padx=20, pady=(0, 4))
+        status_frame = ctk.CTkFrame(container, fg_color="transparent")
+        status_frame.pack(fill="x", pady=(8, 0))
 
         self.status_var = tk.StringVar(value="Ready")
-        self.status_label = tk.Label(
+        self.status_label = ctk.CTkLabel(
             status_frame,
             textvariable=self.status_var,
             anchor="w",
-            bg=self.colors["bg_dark"],
-            fg=self.colors["text_secondary"],
-            font=self.fonts["label"],
+            text_color=COLORS["text_secondary"],
+            font=ctk.CTkFont(family="Segoe UI", size=11),
         )
         self.status_label.pack(side="left")
 
-    def _show_info_popup(self, title: str, body: str) -> None:
-        popup = tk.Toplevel(self.root)
-        popup.title(title)
-        popup.geometry("760x600")
-        popup.configure(bg=self.colors["bg_dark"])
+    def _toggle_inputs(self, event=None) -> None:
+        if self._inputs_expanded:
+            self._inputs_content.pack_forget()
+            self._inputs_arrow.configure(text="▶")
+            self._inputs_expanded = False
+        else:
+            self._inputs_content.pack(fill="x", padx=16, pady=(0, 16))
+            self._inputs_arrow.configure(text="▼")
+            self._inputs_expanded = True
 
-        frame = tk.Frame(
-            popup,
-            bg=self.colors["bg_card"],
-            highlightthickness=1,
-            highlightbackground=self.colors["border"],
-        )
+    def _toggle_log(self, event=None) -> None:
+        if self._log_expanded:
+            self._log_content.pack_forget()
+            self._log_arrow.configure(text="▶")
+            self._log_expanded = False
+        else:
+            self._log_content.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+            self._log_arrow.configure(text="▼")
+            self._log_expanded = True
+
+    def _clear_log(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+    def _show_info_popup(self, title: str, body: str) -> None:
+        popup = ctk.CTkToplevel(self)
+        popup.title(title)
+        popup.geometry("760x650")
+        popup.minsize(640, 480)
+        popup.configure(fg_color=COLORS["bg_dark"])
+        popup.transient(self)
+        popup.grab_set()
+        popup.lift()
+        popup.focus_force()
+
+        frame = ctk.CTkFrame(popup, fg_color=COLORS["bg_card"], corner_radius=8)
         frame.pack(fill="both", expand=True, padx=16, pady=16)
 
-        tk.Label(
+        ctk.CTkLabel(
             frame,
             text=title,
-            bg=self.colors["bg_card"],
-            fg=self.colors["text_primary"],
-            font=("Segoe UI", 18, "bold"),
-            anchor="w",
-        ).pack(fill="x", padx=14, pady=(14, 8))
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+        ).pack(fill="x", padx=14, pady=(14, 8), anchor="w")
+
+        text_frame = ctk.CTkFrame(frame, fg_color=COLORS["bg_input"], corner_radius=4)
+        text_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
         text_widget = scrolledtext.ScrolledText(
-            frame,
+            text_frame,
             wrap="word",
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_secondary"],
-            insertbackground=self.colors["text_primary"],
-            relief="flat",
             font=("Segoe UI", 10),
+            bg=COLORS["bg_input"],
+            fg=COLORS["text_secondary"],
+            insertbackground=COLORS["text_primary"],
+            relief="flat",
+            highlightthickness=0,
             padx=12,
             pady=10,
         )
-        text_widget.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        text_widget.pack(fill="both", expand=True)
         self._insert_markdown(text_widget, body)
-        text_widget.config(state="disabled")
+        text_widget.configure(state="disabled")
+
+        ctk.CTkButton(
+            frame,
+            text="Close",
+            width=100,
+            height=32,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            command=popup.destroy,
+        ).pack(pady=(0, 16))
 
         self._help_windows.append(popup)
         popup.protocol("WM_DELETE_WINDOW", lambda p=popup: self._close_help_popup(p))
 
-    def _close_help_popup(self, popup: tk.Toplevel) -> None:
+    def _close_help_popup(self, popup: ctk.CTkToplevel) -> None:
         if popup in self._help_windows:
             self._help_windows.remove(popup)
         popup.destroy()
@@ -557,7 +669,6 @@ class App:
         path = filedialog.askopenfilename(filetypes=[("Word Documents", "*.docx")])
         if path:
             self.path_var.set(path)
-            # Auto-populate output folder to same directory as the selected .docx
             self.output_dir_var.set(str(Path(path).parent))
 
     def _browse_output(self) -> None:
@@ -567,8 +678,39 @@ class App:
 
     def _toggle_key(self) -> None:
         self._key_visible = not self._key_visible
-        self.key_entry.config(show="" if self._key_visible else "*")
-        self.key_toggle.config(text="Hide" if self._key_visible else "Show")
+        self.key_entry.configure(show="" if self._key_visible else "•")
+        self.key_toggle.configure(text="Hide" if self._key_visible else "Show")
+
+    def _set_run_processing(self) -> None:
+        self.run_btn.configure(
+            text="Processing...",
+            state="disabled",
+            text_color_disabled="#FFFFFF",
+        )
+
+    def _set_run_complete(self) -> None:
+        self.run_btn.configure(
+            text="✓ Complete",
+            fg_color=COLORS["success"],
+            state="disabled",
+        )
+        self.after(2500, self._reset_run_button)
+
+    def _set_run_failed(self) -> None:
+        self.run_btn.configure(
+            text="✗ Failed",
+            fg_color=COLORS["error"],
+            state="disabled",
+        )
+        self.after(2500, self._reset_run_button)
+
+    def _reset_run_button(self) -> None:
+        self.run_btn.configure(
+            text="Run Phase 1",
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            state="normal",
+        )
 
     def _run(self) -> None:
         docx_path = self.path_var.get().strip()
@@ -576,26 +718,29 @@ class App:
 
         if not docx_path:
             self.status_var.set("Error: No template selected")
-            self.status_label.config(fg=self.colors["error"])
+            self.status_label.configure(text_color=COLORS["error"])
             return
         if not Path(docx_path).exists():
             self.status_var.set("Error: File not found")
-            self.status_label.config(fg=self.colors["error"])
+            self.status_label.configure(text_color=COLORS["error"])
             return
         if not api_key:
             self.status_var.set("Error: No API key")
-            self.status_label.config(fg=self.colors["error"])
+            self.status_label.configure(text_color=COLORS["error"])
             return
 
-        # Clear log
-        self.log_text.config(state="normal")
+        self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
-        self.log_text.config(state="disabled")
+        self.log_text.configure(state="disabled")
 
-        self.run_btn.config(state="disabled")
+        self._set_run_processing()
         self.status_var.set("Running...")
-        self.status_label.config(fg=self.colors["text_secondary"])
+        self.status_label.configure(text_color=COLORS["text_secondary"])
         self._result = None
+
+        self.progress_bar.pack(fill="x", pady=(8, 0), after=self.run_btn)
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start()
 
         thread = PipelineThread(
             docx_path=docx_path,
@@ -607,37 +752,40 @@ class App:
         thread.start()
 
     def _poll_queues(self) -> None:
-        # Drain log queue
         while True:
             try:
                 msg = self.log_queue.get_nowait()
-                self.log_text.config(state="normal")
+                self.log_text.configure(state="normal")
                 self.log_text.insert("end", msg + "\n")
                 self.log_text.see("end")
-                self.log_text.config(state="disabled")
+                self.log_text.configure(state="disabled")
             except queue.Empty:
                 break
 
-        # Check result queue
         try:
             result = self.result_queue.get_nowait()
             self._result = result
-            self.run_btn.config(state="normal")
+            self.progress_bar.stop()
+            self.progress_bar.pack_forget()
             if result["success"]:
+                self._set_run_complete()
                 self.status_var.set("Success — " + result.get("coverage", ""))
-                self.status_label.config(fg=self.colors["success"])
+                self.status_label.configure(text_color=COLORS["success"])
 
-                self.log_text.config(state="normal")
+                self.log_text.configure(state="normal")
                 self.log_text.insert("end", "\nPhase 1 complete. Both registries ready for Phase 2.\n")
                 self.log_text.see("end")
-                self.log_text.config(state="disabled")
+                self.log_text.configure(state="disabled")
             else:
+                self._set_run_failed()
                 self.status_var.set("Failed — see log for details")
-                self.status_label.config(fg=self.colors["error"])
+                self.status_label.configure(text_color=COLORS["error"])
         except queue.Empty:
             pass
 
-        self.root.after(100, self._poll_queues)
+        self.after(100, self._poll_queues)
+
+
 HOW_TO_USE_TEXT = """
 # What You Need Before Starting
 
@@ -740,9 +888,9 @@ This tool is **Phase 1** of a two-step process.
 
 
 def main() -> None:
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    App().mainloop()
 
 
 if __name__ == "__main__":
