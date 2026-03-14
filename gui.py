@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import queue
-import subprocess
 import sys
 import threading
 import traceback
@@ -206,6 +204,7 @@ class App:
         self.log_queue: queue.Queue = queue.Queue()
         self.result_queue: queue.Queue = queue.Queue()
         self._result: Optional[dict] = None
+        self._help_windows: list[tk.Toplevel] = []
 
         self._build_ui()
         self._poll_queues()
@@ -232,6 +231,37 @@ class App:
             font=self.fonts["subtitle"],
             anchor="w",
         ).pack(fill="x", pady=(2, 0))
+
+        help_btn_frame = tk.Frame(header, bg=self.colors["bg_dark"])
+        help_btn_frame.pack(anchor="e", pady=(8, 0))
+
+        tk.Button(
+            help_btn_frame,
+            text="How It Works",
+            command=lambda: self._show_info_popup("How It Works", HOW_IT_WORKS_TEXT),
+            bg=self.colors["bg_input"],
+            fg=self.colors["text_secondary"],
+            activebackground=self.colors["accent_hover"],
+            activeforeground=self.colors["text_primary"],
+            relief="flat",
+            font=("Segoe UI", 9),
+            padx=10,
+            pady=4,
+        ).pack(side="right", padx=(8, 0))
+
+        tk.Button(
+            help_btn_frame,
+            text="How to Use",
+            command=lambda: self._show_info_popup("How to Use", HOW_TO_USE_TEXT),
+            bg=self.colors["bg_input"],
+            fg=self.colors["text_secondary"],
+            activebackground=self.colors["accent_hover"],
+            activeforeground=self.colors["text_primary"],
+            relief="flat",
+            font=("Segoe UI", 9),
+            padx=10,
+            pady=4,
+        ).pack(side="right")
 
         # --- Input card ---
         input_frame = tk.Frame(
@@ -409,39 +439,51 @@ class App:
         )
         self.status_label.pack(side="left")
 
-        # --- Action row ---
-        btn_frame = tk.Frame(self.root, bg=self.colors["bg_dark"])
-        btn_frame.pack(fill="x", padx=20, pady=(0, 14))
+    def _show_info_popup(self, title: str, body: str) -> None:
+        popup = tk.Toplevel(self.root)
+        popup.title(title)
+        popup.geometry("760x600")
+        popup.configure(bg=self.colors["bg_dark"])
 
-        self.open_folder_btn = tk.Button(
-            btn_frame,
-            text="Open Output Folder",
-            command=self._open_folder,
-            state="disabled",
+        frame = tk.Frame(
+            popup,
+            bg=self.colors["bg_card"],
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+        )
+        frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+        tk.Label(
+            frame,
+            text=title,
+            bg=self.colors["bg_card"],
+            fg=self.colors["text_primary"],
+            font=("Segoe UI", 18, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(14, 8))
+
+        text_widget = scrolledtext.ScrolledText(
+            frame,
+            wrap="word",
             bg=self.colors["bg_input"],
             fg=self.colors["text_secondary"],
-            activebackground=self.colors["accent_hover"],
-            activeforeground=self.colors["text_primary"],
-            disabledforeground=self.colors["text_muted"],
+            insertbackground=self.colors["text_primary"],
             relief="flat",
-            font=self.fonts["label"],
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=10,
         )
-        self.open_folder_btn.pack(side="left", padx=(0, 10), pady=4)
+        text_widget.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        text_widget.insert("1.0", body.strip())
+        text_widget.config(state="disabled")
 
-        self.view_reg_btn = tk.Button(
-            btn_frame,
-            text="View Style Registry",
-            command=self._view_registry,
-            state="disabled",
-            bg=self.colors["bg_input"],
-            fg=self.colors["text_secondary"],
-            activebackground=self.colors["accent_hover"],
-            activeforeground=self.colors["text_primary"],
-            disabledforeground=self.colors["text_muted"],
-            relief="flat",
-            font=self.fonts["label"],
-        )
-        self.view_reg_btn.pack(side="left", padx=(0, 10), pady=4)
+        self._help_windows.append(popup)
+        popup.protocol("WM_DELETE_WINDOW", lambda p=popup: self._close_help_popup(p))
+
+    def _close_help_popup(self, popup: tk.Toplevel) -> None:
+        if popup in self._help_windows:
+            self._help_windows.remove(popup)
+        popup.destroy()
 
     def _browse(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Word Documents", "*.docx")])
@@ -483,8 +525,6 @@ class App:
         self.log_text.config(state="disabled")
 
         self.run_btn.config(state="disabled")
-        self.open_folder_btn.config(state="disabled")
-        self.view_reg_btn.config(state="disabled")
         self.status_var.set("Running...")
         self.status_label.config(fg=self.colors["text_secondary"])
         self._result = None
@@ -518,8 +558,6 @@ class App:
             if result["success"]:
                 self.status_var.set("Success — " + result.get("coverage", ""))
                 self.status_label.config(fg=self.colors["success"])
-                self.open_folder_btn.config(state="normal")
-                self.view_reg_btn.config(state="normal")
 
                 self.log_text.config(state="normal")
                 self.log_text.insert("end", "\nPhase 1 complete. Both registries ready for Phase 2.\n")
@@ -532,33 +570,96 @@ class App:
             pass
 
         self.root.after(100, self._poll_queues)
+HOW_TO_USE_TEXT = """
+What You Need Before Starting
 
-    def _open_folder(self) -> None:
-        if not self._result:
-            return
-        folder = self._result.get("output_dir") or self._result.get("extract_dir", "")
-        if not folder:
-            return
-        _open_path(folder)
+- An architect's Word specification template (.docx)
+- An Anthropic API key (get one at console.anthropic.com)
 
-    def _view_registry(self) -> None:
-        if not self._result:
-            return
-        reg = self._result.get("registry_path", "")
-        if not reg:
-            return
-        _open_path(reg)
+Steps
+
+1. Select the template
+Click Browse next to Template and select the architect's .docx spec file.
+
+2. Enter your API key
+Paste your Anthropic API key into the API Key field. Click Show to verify it if needed.
+The key is pre-filled automatically if the ANTHROPIC_API_KEY environment variable is set on your machine.
+
+3. Set an output folder (optional)
+By default, output files are saved to the same folder as the .docx you selected. Click Browse next to Output Folder to choose a different location.
+
+4. Run
+Click Run Phase 1. The activity log will show live progress. Processing typically takes 1–3 minutes depending on document length.
+
+5. Review results
+When complete, the status bar shows the coverage result.
+
+Output Files
+
+- arch_style_registry.json: Maps CSI structural roles (PART, Article, Paragraph, etc.) to Word paragraph styles.
+- arch_template_registry.json: A complete snapshot of the architect's formatting environment.
+
+Both files are required inputs for the Phase 2 formatting tool.
+
+If Something Goes Wrong
+
+- "Coverage must be 100%" — The AI didn't classify every paragraph. Click Run Phase 1 again; this usually resolves on retry.
+- "File not found" — Make sure the .docx file isn't open in Word when you run.
+- "No API key" — Check that your key is pasted correctly and hasn't expired.
+- Any other error — The full error message is in the activity log. The document is never modified in place; re-running is always safe.
+"""
 
 
-def _open_path(path: str) -> None:
-    """Open a file or folder with the OS default handler."""
-    system = platform.system()
-    if system == "Windows":
-        os.startfile(path)  # type: ignore[attr-defined]
-    elif system == "Darwin":
-        subprocess.Popen(["open", path])
-    else:
-        subprocess.Popen(["xdg-open", path])
+HOW_IT_WORKS_TEXT = """
+The Problem This Solves
+
+Every architecture firm formats their specification templates differently. When a mechanical, electrical, or plumbing consultant needs to reformat their specs to match the architect's style — fonts, indentation, numbering appearance, heading weights — it's tedious manual work that has to be repeated for every project and every architect.
+
+This tool automates the first step: reading and understanding an architect's Word template so that the formatting can be applied to other documents automatically.
+
+The Two-Phase Pipeline
+
+This tool is Phase 1 of a two-step process.
+
+- Phase 1 (this tool): Analyzes the architect's template and produces two output files that describe its structure and formatting.
+- Phase 2 (separate tool): Uses those output files to apply the architect's formatting to MEP consultant specs.
+
+What Phase 1 Actually Does
+
+1. Unpack the Document
+A .docx file is actually a ZIP archive containing XML files. The tool unpacks it into a working folder so it can be read and modified safely. Your original file is never touched.
+
+2. Read the Structure
+The tool reads every paragraph in the document and records its text, indentation, numbering, and any existing paragraph style. It strips out everything that isn't needed for classification and produces a compact summary (the slim bundle), which is what gets sent to the AI.
+
+3. AI Classification
+The slim bundle is sent to Claude (Anthropic's AI) with detailed instructions. Claude identifies the CSI structural role of each paragraph (Section Title, PART, Article, Paragraph, Subparagraph).
+
+4. Derive Formatting Locally
+For each CSI role, the tool identifies a representative exemplar paragraph from the template and extracts exact formatting from it to create a new style.
+
+5. Apply Styles (Surgically)
+The tool writes new paragraph styles and tags each paragraph with its assigned style. Only the style tag is added. Text, spacing, numbering, and layout remain unchanged.
+
+6. Capture the Formatting Environment
+The tool snapshots additional document settings including font defaults, theme colors, compatibility flags, page layout, headers/footers, and numbering definitions.
+
+7. Validate and Write Output
+Before writing anything, the tool verifies required roles, full classification coverage, and byte-for-byte integrity for protected document components. If any check fails, the run aborts.
+
+The Two Output Files
+
+- arch_style_registry.json: Maps each CSI role to the Word style that represents it.
+- arch_template_registry.json: Captures the template's broader formatting environment for downstream rendering consistency.
+
+What This Tool Does Not Do
+
+- It does not change how the architect's template looks.
+- It does not generate new content.
+- It does not modify headers, footers, or page layout.
+- It does not produce a new .docx file.
+- It does not touch numbering definitions.
+"""
 
 
 def main() -> None:
