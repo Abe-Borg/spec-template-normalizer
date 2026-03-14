@@ -7,6 +7,7 @@ library functions as the smoke test.
 from __future__ import annotations
 
 import json
+import re
 import os
 import queue
 import sys
@@ -474,7 +475,7 @@ class App:
             pady=10,
         )
         text_widget.pack(fill="both", expand=True, padx=14, pady=(0, 14))
-        text_widget.insert("1.0", body.strip())
+        self._insert_markdown(text_widget, body)
         text_widget.config(state="disabled")
 
         self._help_windows.append(popup)
@@ -484,6 +485,73 @@ class App:
         if popup in self._help_windows:
             self._help_windows.remove(popup)
         popup.destroy()
+
+    def _insert_markdown(self, text_widget: scrolledtext.ScrolledText, markdown_text: str) -> None:
+        """Render a small markdown subset into a Tk text widget."""
+        text_widget.tag_configure("h1", font=("Segoe UI", 15, "bold"), spacing1=8, spacing3=6)
+        text_widget.tag_configure("h2", font=("Segoe UI", 13, "bold"), spacing1=6, spacing3=4)
+        text_widget.tag_configure("h3", font=("Segoe UI", 11, "bold"), spacing1=4, spacing3=2)
+        text_widget.tag_configure("bold", font=("Segoe UI", 10, "bold"))
+        text_widget.tag_configure("code", font=("Consolas", 10), background="#2D2D2D")
+
+        for raw_line in markdown_text.strip().splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+
+            if not stripped:
+                text_widget.insert("end", "\n")
+                continue
+
+            heading_level = 0
+            if stripped.startswith("### "):
+                heading_level = 3
+                stripped = stripped[4:]
+            elif stripped.startswith("## "):
+                heading_level = 2
+                stripped = stripped[3:]
+            elif stripped.startswith("# "):
+                heading_level = 1
+                stripped = stripped[2:]
+
+            if heading_level:
+                text_widget.insert("end", stripped + "\n", (f"h{heading_level}",))
+                continue
+
+            bullet_match = re.match(r"^[-*]\s+(.*)$", stripped)
+            numbered_match = re.match(r"^(\d+)\.\s+(.*)$", stripped)
+            if bullet_match:
+                text_widget.insert("end", "• ")
+                self._insert_inline_markdown(text_widget, bullet_match.group(1))
+                text_widget.insert("end", "\n")
+                continue
+            if numbered_match:
+                text_widget.insert("end", f"{numbered_match.group(1)}. ")
+                self._insert_inline_markdown(text_widget, numbered_match.group(2))
+                text_widget.insert("end", "\n")
+                continue
+
+            self._insert_inline_markdown(text_widget, stripped)
+            text_widget.insert("end", "\n")
+
+    def _insert_inline_markdown(self, text_widget: scrolledtext.ScrolledText, text: str) -> None:
+        token_pattern = re.compile(r"(`[^`]+`|\*\*[^*]+\*\*)")
+        pos = 0
+        for match in token_pattern.finditer(text):
+            if match.start() > pos:
+                text_widget.insert("end", text[pos:match.start()])
+
+            token = match.group(0)
+            if token.startswith("**") and token.endswith("**"):
+                text_widget.insert("end", token[2:-2], ("bold",))
+            elif token.startswith("`") and token.endswith("`"):
+                text_widget.insert("end", token[1:-1], ("code",))
+            else:
+                text_widget.insert("end", token)
+
+            pos = match.end()
+
+        if pos < len(text):
+            text_widget.insert("end", text[pos:])
 
     def _browse(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Word Documents", "*.docx")])
@@ -571,93 +639,102 @@ class App:
 
         self.root.after(100, self._poll_queues)
 HOW_TO_USE_TEXT = """
-What You Need Before Starting
+# What You Need Before Starting
 
-- An architect's Word specification template (.docx)
+- An architect's Word specification template (`.docx`)
 - An Anthropic API key (get one at console.anthropic.com)
 
-Steps
+# Steps
 
-1. Select the template
-Click Browse next to Template and select the architect's .docx spec file.
+1. **Select the template**
+   Click **Browse** next to Template and select the architect's `.docx` spec file.
 
-2. Enter your API key
-Paste your Anthropic API key into the API Key field. Click Show to verify it if needed.
-The key is pre-filled automatically if the ANTHROPIC_API_KEY environment variable is set on your machine.
+2. **Enter your API key**
+   Paste your Anthropic API key into the API Key field. Click **Show** to verify it if needed.
+   The key is pre-filled automatically if the `ANTHROPIC_API_KEY` environment variable is set on your machine.
 
-3. Set an output folder (optional)
-By default, output files are saved to the same folder as the .docx you selected. Click Browse next to Output Folder to choose a different location.
+3. **Set an output folder (optional)**
+   By default, output files are saved to the same folder as the `.docx` you selected.
+   Click **Browse** next to Output Folder to choose a different location.
 
-4. Run
-Click Run Phase 1. The activity log will show live progress. Processing typically takes 1–3 minutes depending on document length.
+4. **Run**
+   Click **Run Phase 1**. The activity log will show live progress.
+   Processing typically takes 1–3 minutes depending on document length.
 
-5. Review results
-When complete, the status bar shows the coverage result.
+5. **Review results**
+   When complete, the status bar shows the coverage result.
 
-Output Files
+# Output Files
 
-- arch_style_registry.json: Maps CSI structural roles (PART, Article, Paragraph, etc.) to Word paragraph styles.
-- arch_template_registry.json: A complete snapshot of the architect's formatting environment.
+- `arch_style_registry.json`: Maps CSI structural roles (PART, Article, Paragraph, etc.) to Word paragraph styles.
+- `arch_template_registry.json`: A complete snapshot of the architect's formatting environment.
 
 Both files are required inputs for the Phase 2 formatting tool.
 
-If Something Goes Wrong
+# If Something Goes Wrong
 
-- "Coverage must be 100%" — The AI didn't classify every paragraph. Click Run Phase 1 again; this usually resolves on retry.
-- "File not found" — Make sure the .docx file isn't open in Word when you run.
-- "No API key" — Check that your key is pasted correctly and hasn't expired.
+- **"Coverage must be 100%"** — The AI didn't classify every paragraph. Click **Run Phase 1** again; this usually resolves on retry.
+- **"File not found"** — Make sure the `.docx` file isn't open in Word when you run.
+- **"No API key"** — Check that your key is pasted correctly and hasn't expired.
 - Any other error — The full error message is in the activity log. The document is never modified in place; re-running is always safe.
 """
 
 
 HOW_IT_WORKS_TEXT = """
-The Problem This Solves
+# The Problem This Solves
 
-Every architecture firm formats their specification templates differently. When a mechanical, electrical, or plumbing consultant needs to reformat their specs to match the architect's style — fonts, indentation, numbering appearance, heading weights — it's tedious manual work that has to be repeated for every project and every architect.
+Every architecture firm formats their specification templates differently.
+When a mechanical, electrical, or plumbing consultant needs to reformat their specs to match the architect's style — fonts, indentation, numbering appearance, heading weights — it's tedious manual work that has to be repeated for every project and every architect.
 
 This tool automates the first step: reading and understanding an architect's Word template so that the formatting can be applied to other documents automatically.
 
-The Two-Phase Pipeline
+# The Two-Phase Pipeline
 
-This tool is Phase 1 of a two-step process.
+This tool is **Phase 1** of a two-step process.
 
-- Phase 1 (this tool): Analyzes the architect's template and produces two output files that describe its structure and formatting.
-- Phase 2 (separate tool): Uses those output files to apply the architect's formatting to MEP consultant specs.
+- **Phase 1 (this tool):** Analyzes the architect's template and produces two output files that describe its structure and formatting.
+- **Phase 2 (separate tool):** Uses those output files to apply the architect's formatting to MEP consultant specs.
 
-What Phase 1 Actually Does
+# What Phase 1 Actually Does
 
-1. Unpack the Document
-A .docx file is actually a ZIP archive containing XML files. The tool unpacks it into a working folder so it can be read and modified safely. Your original file is never touched.
+1. **Unpack the Document**
+   A `.docx` file is actually a ZIP archive containing XML files.
+   The tool unpacks it into a working folder so it can be read and modified safely.
+   Your original file is never touched.
 
-2. Read the Structure
-The tool reads every paragraph in the document and records its text, indentation, numbering, and any existing paragraph style. It strips out everything that isn't needed for classification and produces a compact summary (the slim bundle), which is what gets sent to the AI.
+2. **Read the Structure**
+   The tool reads every paragraph in the document and records its text, indentation, numbering, and any existing paragraph style.
+   It strips out everything that isn't needed for classification and produces a compact summary (the slim bundle), which is what gets sent to the AI.
 
-3. AI Classification
-The slim bundle is sent to Claude (Anthropic's AI) with detailed instructions. Claude identifies the CSI structural role of each paragraph (Section Title, PART, Article, Paragraph, Subparagraph).
+3. **AI Classification**
+   The slim bundle is sent to Claude (Anthropic's AI) with detailed instructions.
+   Claude identifies the CSI structural role of each paragraph (Section Title, PART, Article, Paragraph, Subparagraph).
 
-4. Derive Formatting Locally
-For each CSI role, the tool identifies a representative exemplar paragraph from the template and extracts exact formatting from it to create a new style.
+4. **Derive Formatting Locally**
+   For each CSI role, the tool identifies a representative exemplar paragraph from the template and extracts exact formatting from it to create a new style.
 
-5. Apply Styles (Surgically)
-The tool writes new paragraph styles and tags each paragraph with its assigned style. Only the style tag is added. Text, spacing, numbering, and layout remain unchanged.
+5. **Apply Styles (Surgically)**
+   The tool writes new paragraph styles and tags each paragraph with its assigned style.
+   Only the style tag is added. Text, spacing, numbering, and layout remain unchanged.
 
-6. Capture the Formatting Environment
-The tool snapshots additional document settings including font defaults, theme colors, compatibility flags, page layout, headers/footers, and numbering definitions.
+6. **Capture the Formatting Environment**
+   The tool snapshots additional document settings including font defaults, theme colors, compatibility flags, page layout, headers/footers, and numbering definitions.
 
-7. Validate and Write Output
-Before writing anything, the tool verifies required roles, full classification coverage, and byte-for-byte integrity for protected document components. If any check fails, the run aborts.
+7. **Validate and Write Output**
+   Before writing anything, the tool verifies required roles, full classification coverage, and byte-for-byte integrity for protected document components.
+   If any check fails, the run aborts.
 
-The Two Output Files
+# The Two Output Files
 
-- arch_style_registry.json: Maps each CSI role to the Word style that represents it.
-- arch_template_registry.json: Captures the template's broader formatting environment for downstream rendering consistency.
+- `arch_style_registry.json`: Maps each CSI role to the Word style that represents it.
+- `arch_template_registry.json`: Captures the template's broader formatting environment for downstream rendering consistency.
 
-What This Tool Does Not Do
+# What This Tool Does Not Do
 
 - It does not change how the architect's template looks.
 - It does not generate new content.
 - It does not modify headers, footers, or page layout.
-- It does not produce a new .docx file.
+- It does not produce a new `.docx` file.
 - It does not touch numbering definitions.
 """
 
