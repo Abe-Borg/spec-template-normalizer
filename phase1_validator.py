@@ -190,6 +190,52 @@ def validate_template_registry(registry: Dict[str, Any]) -> None:
     if isinstance(theme, dict):
         _validate_xml_field(theme, "theme1_xml", "theme")
 
+    # headers/footers + relationship/media payloads
+    hf = registry["headers_footers"]
+    if isinstance(hf, dict):
+        for section_name in ("headers", "footers"):
+            items = hf.get(section_name)
+            if not isinstance(items, list):
+                continue
+            for i, entry in enumerate(items):
+                if not isinstance(entry, dict):
+                    raise ValueError(f"headers_footers.{section_name}[{i}] must be an object")
+
+                _validate_xml_field(entry, "xml", f"headers_footers.{section_name}[{i}]")
+
+                rels_xml = entry.get("rels_xml")
+                if rels_xml is not None and not isinstance(rels_xml, str):
+                    raise ValueError(
+                        f"headers_footers.{section_name}[{i}].rels_xml must be a string or null"
+                    )
+
+                media = entry.get("media")
+                if media is None:
+                    continue
+                if not isinstance(media, list):
+                    raise ValueError(f"headers_footers.{section_name}[{i}].media must be a list")
+                for j, media_entry in enumerate(media):
+                    if not isinstance(media_entry, dict):
+                        raise ValueError(
+                            f"headers_footers.{section_name}[{i}].media[{j}] must be an object"
+                        )
+                    for field in ("rel_id", "target", "content_type", "data_base64"):
+                        val = media_entry.get(field)
+                        if not isinstance(val, str):
+                            raise ValueError(
+                                f"headers_footers.{section_name}[{i}].media[{j}].{field} must be a string"
+                            )
+
+        header_footer_media = hf.get("header_footer_media")
+        if header_footer_media is not None:
+            if not isinstance(header_footer_media, list):
+                raise ValueError("headers_footers.header_footer_media must be a list when present")
+            for i, item in enumerate(header_footer_media):
+                if not isinstance(item, str):
+                    raise ValueError(
+                        f"headers_footers.header_footer_media[{i}] must be a string"
+                    )
+
     # fonts
     fonts = registry["fonts"]
     if isinstance(fonts, dict):

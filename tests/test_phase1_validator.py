@@ -120,7 +120,7 @@ def _minimal_template_registry():
             },
             "section_chain": [],
         },
-        "headers_footers": {"headers": [], "footers": []},
+        "headers_footers": {"headers": [], "footers": [], "header_footer_media": []},
         "numbering": {"numbering_xml": None, "abstract_nums": [], "nums": []},
         "fonts": {"font_table_xml": None},
         "custom_xml": {"relationships": [], "other_parts_passthrough": []},
@@ -261,6 +261,50 @@ class TestValidateTemplateRegistry:
             '<a:themeElements/></a:theme>'
         )
         validate_template_registry(reg)
+
+    def test_header_footer_media_schema_validation(self):
+        reg = _minimal_template_registry()
+        reg["headers_footers"]["headers"] = [
+            {
+                "part_name": "word/header1.xml",
+                "rel_id": "rId10",
+                "xml": '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+                "rels_xml": '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+                "media": [
+                    {
+                        "rel_id": "rId1",
+                        "target": "media/image1.png",
+                        "content_type": "image/png",
+                        "data_base64": "QUJD",
+                    }
+                ],
+            }
+        ]
+        reg["headers_footers"]["header_footer_media"] = ["media/image1.png"]
+
+        validate_template_registry(reg)
+
+    def test_header_footer_media_requires_string_fields(self):
+        reg = _minimal_template_registry()
+        reg["headers_footers"]["headers"] = [
+            {
+                "part_name": "word/header1.xml",
+                "rel_id": "rId10",
+                "xml": '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+                "rels_xml": None,
+                "media": [
+                    {
+                        "rel_id": "rId1",
+                        "target": "media/image1.png",
+                        "content_type": "image/png",
+                        "data_base64": 123,
+                    }
+                ],
+            }
+        ]
+
+        with pytest.raises(ValueError, match="data_base64 must be a string"):
+            validate_template_registry(reg)
 
 
 # ---------------------------------------------------------------------------

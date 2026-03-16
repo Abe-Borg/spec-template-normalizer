@@ -19,6 +19,7 @@ Coverage:
 
 from __future__ import annotations
 
+import base64
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -34,6 +35,7 @@ from arch_env_extractor import (
     extract_numbering,
     extract_theme,
     extract_fonts,
+    extract_headers_footers,
 )
 
 
@@ -677,3 +679,44 @@ class TestExtractFonts:
 
         result = extract_fonts(tmp_path)
         assert result["font_table_xml"] is None
+
+
+class TestExtractHeadersFooters:
+    def test_extracts_media_and_rels_xml(self, tmp_path):
+        word_dir = tmp_path / "word"
+        rels_dir = word_dir / "_rels"
+        media_dir = word_dir / "media"
+        rels_dir.mkdir(parents=True)
+        media_dir.mkdir(parents=True)
+
+        (word_dir / "header1.xml").write_text(
+            '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+            encoding="utf-8",
+        )
+        (rels_dir / "document.xml.rels").write_text(
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId10" Target="header1.xml" />'
+            '</Relationships>',
+            encoding="utf-8",
+        )
+        (rels_dir / "header1.xml.rels").write_text(
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+            'Target="media/image1.png" />'
+            '</Relationships>',
+            encoding="utf-8",
+        )
+        (media_dir / "image1.png").write_bytes(b"PNGDATA")
+
+        extracted = extract_headers_footers(tmp_path)
+
+        header = extracted["headers"][0]
+        assert header["part_name"] == "word/header1.xml"
+        assert header["rel_id"] == "rId10"
+        assert isinstance(header["rels_xml"], str)
+        assert len(header["media"]) == 1
+        assert header["media"][0]["target"] == "media/image1.png"
+        assert header["media"][0]["content_type"] == "image/png"
+        assert base64.b64decode(header["media"][0]["data_base64"]) == b"PNGDATA"
+        assert extracted["header_footer_media"] == ["media/image1.png"]
