@@ -130,7 +130,7 @@ Maps CSI roles to Word styleIds:
 Complete formatting environment with raw XML blocks (see `schemas/arch_template_registry.example.json` for full structure).
 
 ### Coverage metric
-After classification, the pipeline reports what percentage of content paragraphs were classified. Paragraphs that are empty, contain section breaks, say "END OF SECTION", or are editor notes in brackets are excluded from the count. Coverage must be 100% for classifiable paragraphs; otherwise Phase 1 fails validation.
+After classification, the pipeline reports what percentage of content paragraphs were classified. Paragraphs that are empty, contain section breaks, are inside tables, say "END OF SECTION", or are editor notes in brackets are excluded from the count. Coverage must be 100% for classifiable paragraphs; otherwise Phase 1 fails validation.
 
 ### Paragraph styles in DOCX
 - `CSI_SectionID__ARCH` (optional)
@@ -171,7 +171,7 @@ These are intentional safeguards. The architect's template is sacred.
 - Hard fails if relationships change (hash verification)
 - Hard fails if paragraph properties drift beyond `<w:pStyle>` insertion
 - LLM forbidden from specifying formatting (only structure classification)
-- Comprehensive validation of LLM output before application
+- Shape + semantic validation of LLM output before application (strong structural signals for SECTION/PART/ARTICLE/PARAGRAPH levels must be coherent)
 
 ## Testing
 
@@ -180,7 +180,7 @@ These are intentional safeguards. The architect's template is sacred.
 python -m pytest tests/
 ```
 
-Regression tests cover XML extraction (`test_arch_env_extractor.py`), template registry validation (`test_arch_template_registry_validation.py`), and contract validation (`test_phase1_validator.py`).
+Regression tests cover XML extraction (`test_arch_env_extractor.py`), template registry validation (`test_arch_template_registry_validation.py`), contract validation (`test_phase1_validator.py`), and hardening rules (`test_phase1_hardening.py`).
 
 ### Smoke test
 ```bash

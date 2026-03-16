@@ -37,6 +37,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import html
 
 import xml.etree.ElementTree as ET  # only used for styles.xml name lookup + optional catalogs
+from paragraph_rules import (
+    compute_skip_reason,
+    detect_role_signal,
+    infer_expected_roles,
+    is_classifiable_paragraph,
+)
 
 
 # -----------------------------
@@ -126,8 +132,10 @@ def verify_stability(extract_dir: Path, snap: StabilitySnapshot) -> None:
 # DOCX extraction (workspace only)
 # -----------------------------
 
-def extract_docx(docx_path: Path, extract_dir: Path) -> None:
+def extract_docx(docx_path: Path, extract_dir: Path, *, overwrite: bool = False) -> None:
     if extract_dir.exists():
+        if not overwrite:
+            raise FileExistsError(f"Extraction target already exists: {extract_dir}")
         # OneDrive-safe deletion: retry with delay if locked
         import time
         max_retries = 3
@@ -135,7 +143,7 @@ def extract_docx(docx_path: Path, extract_dir: Path) -> None:
             try:
                 shutil.rmtree(extract_dir)
                 break
-            except PermissionError as e:
+            except PermissionError:
                 if attempt < max_retries - 1:
                     print(f"Folder locked (OneDrive?), retrying in 2s... ({attempt + 1}/{max_retries})")
                     time.sleep(2)
@@ -366,7 +374,7 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
     table_spans = [(m.start(), m.end()) for m in re.finditer(r"<w:tbl\b[\s\S]*?</w:tbl>", doc_text)]
 
     for idx, (_s, _e, p_xml) in enumerate(iter_paragraph_xml_blocks(doc_text)):
-        txt = paragraph_text_from_block(p_xml)
+        raw_text = paragraph_text_from_block(p_xml)
         pStyle = paragraph_pstyle_from_block(p_xml)
         numpr = paragraph_numpr_from_block(p_xml)
         hints = paragraph_ppr_hints_from_block(p_xml)
@@ -379,18 +387,22 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
         if numpr.get("numId"):
             used_num_ids.add(numpr["numId"])
 
-        if len(txt) > 200:
-            txt = txt[:200] + "…"
+        display_text = raw_text
+        if len(raw_text) > 200:
+            display_text = raw_text[:200] + "…"
+        skip_reason = compute_skip_reason(raw_text, contains_sect, in_table)
 
         paragraphs.append({
             "paragraph_index": idx,
-            "text": txt,
+            "text": display_text,
             "pStyle": pStyle,
             "numPr": numpr if (numpr.get("numId") or numpr.get("ilvl")) else None,
             "pPr_hints": hints if hints else None,
             "rPr_hints": rpr_hints if rpr_hints else None,
             "contains_sectPr": contains_sect,
             "in_table": in_table,
+            "skip_reason": skip_reason,
+            "text_was_truncated": len(raw_text) > 200,
         })
 
     style_catalog: Dict[str, Any] = {}
@@ -735,25 +747,21 @@ def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Di
         text = (para.get("text") or "").strip()
         if not text:
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} is blank")
-        if para.get("contains_sectPr"):
+        skip_reason = para.get("skip_reason")
+        if skip_reason is None:
+            skip_reason = compute_skip_reason(text, bool(para.get("contains_sectPr")), bool(para.get("in_table")))
+        if skip_reason == "sectPr":
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} contains sectPr")
-        if para.get("in_table"):
+        if skip_reason == "in_table":
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} is inside a table")
-        if text.upper() == "END OF SECTION":
+        if skip_reason == "end_of_section":
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} cannot be END OF SECTION")
-        if text.startswith("[") and text.endswith("]"):
+        if skip_reason == "editor_note":
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} cannot be an editor note")
+        if skip_reason:
+            raise ValueError(f"roles['{role}'] exemplar paragraph {ex} is non-classifiable (skip_reason={skip_reason})")
 
-    required_apply_indices: List[int] = []
-    for p in paragraphs:
-        text = (p.get("text") or "").strip()
-        if not text or p.get("contains_sectPr") or p.get("in_table"):
-            continue
-        if text.upper() == "END OF SECTION":
-            continue
-        if text.startswith("[") and text.endswith("]"):
-            continue
-        required_apply_indices.append(int(p["paragraph_index"]))
+    required_apply_indices = [int(p["paragraph_index"]) for p in paragraphs if is_classifiable_paragraph(p)]
 
     apply_indices = [int(ap["paragraph_index"]) for ap in instructions.get("apply_pStyle", []) or []]
     apply_set = set(apply_indices)
@@ -766,6 +774,54 @@ def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Di
             f"missing={missing[:20]}{'...' if len(missing) > 20 else ''}, "
             f"unexpected={unexpected[:20]}{'...' if len(unexpected) > 20 else ''}"
         )
+
+    validate_semantic_structure(instructions, slim_bundle)
+
+
+def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[str, Any]) -> None:
+    paragraphs = slim_bundle.get("paragraphs", [])
+    roles = instructions.get("roles", {}) or {}
+    apply_map = {item["paragraph_index"]: item["styleId"] for item in instructions.get("apply_pStyle", []) or []}
+    role_style = {role: spec.get("styleId") for role, spec in roles.items() if isinstance(spec, dict)}
+    expected_roles, strong_hits = infer_expected_roles(paragraphs)
+
+    missing_roles = sorted(role for role in expected_roles if role not in roles)
+    if missing_roles:
+        raise ValueError(f"Semantic validation failed: missing expected roles {missing_roles}")
+
+    classifiable = [p for p in paragraphs if is_classifiable_paragraph(p)]
+    has_alpha = any(re.match(r"^[A-Z]\.\s+", (p.get("text") or "").strip()) for p in classifiable)
+    has_numeric = any(re.match(r"^\d+\.\s+", (p.get("text") or "").strip()) for p in classifiable)
+
+    for role, spec in roles.items():
+        exemplar_idx = int(spec["exemplar_paragraph_index"])
+        para = paragraphs[exemplar_idx]
+        signal = detect_role_signal(
+            (para.get("text") or "").strip(),
+            numeric_is_strong=has_alpha,
+            lower_is_strong=has_numeric,
+        )
+        if signal is not None and signal != role:
+            raise ValueError(
+                f"Semantic validation failed: roles['{role}'] exemplar paragraph {exemplar_idx} looks like {signal}"
+            )
+
+    for role, indices in strong_hits.items():
+        expected_style = role_style.get(role)
+        if not expected_style:
+            continue
+        mismatches = [idx for idx in indices if apply_map.get(idx) != expected_style]
+        if mismatches:
+            samples = ", ".join(str(i) for i in mismatches[:5])
+            raise ValueError(
+                f"Semantic validation failed: role {role} expects styleId {expected_style}; mismatched paragraph indices [{samples}]"
+            )
+
+    for upper, lower in (("PART", "ARTICLE"), ("ARTICLE", "PARAGRAPH"), ("PARAGRAPH", "SUBPARAGRAPH")):
+        if upper in expected_roles and lower in expected_roles and role_style.get(upper) == role_style.get(lower):
+            raise ValueError(
+                f"Semantic validation failed: roles {upper} and {lower} collapsed to styleId {role_style.get(upper)}"
+            )
 
 
 def apply_instructions(extract_dir: Path, instructions: Dict[str, Any]) -> None:
@@ -948,6 +1004,7 @@ def _determine_numbering_provenance(
 
     txt = (exemplar.get("text") or "") if isinstance(exemplar, dict) else ""
     marker_patterns = [
+        r"^\s*\d+\.\d{2,}\s+",
         r"^\s*[A-Z]\.\s+",
         r"^\s*\d+\.\s+",
         r"^\s*[a-z]\.\s+",
@@ -994,12 +1051,17 @@ def _extract_numbering_pattern(
     return pattern if pattern else None
 
 
-def build_style_registry_dict(extract_dir: Path, source_docx_name: str, instructions: Dict[str, Any]) -> Dict[str, Any]:
+def build_style_registry_dict(
+    extract_dir: Path,
+    source_docx_name: str,
+    instructions: Dict[str, Any],
+    pre_apply_bundle: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Build the arch_style_registry payload dict without writing to disk."""
     roles = instructions.get("roles") or {}
     styles_path = extract_dir / "word" / "styles.xml"
     name_map = _build_style_name_map(styles_path)
-    bundle = build_slim_bundle(extract_dir)
+    bundle = pre_apply_bundle if pre_apply_bundle is not None else build_slim_bundle(extract_dir)
     paragraphs = bundle.get("paragraphs", [])
     created_style_ids = {sd.get("styleId") for sd in (instructions.get("create_styles") or []) if isinstance(sd, dict)}
     styles_by_id = _build_styles_by_id(styles_path)
@@ -1036,7 +1098,10 @@ def build_style_registry_dict(extract_dir: Path, source_docx_name: str, instruct
             if resolved:
                 entry["resolved_formatting"] = resolved
             if style_id in created_style_ids and exemplar.get("pStyle"):
-                entry["warning"] = "Derived style exemplar has existing pStyle; inheritance chain may affect formatting"
+                source_pstyle = exemplar.get("pStyle")
+                entry["warning"] = (
+                    f"Derived style exemplar had pre-existing source pStyle '{source_pstyle}'; verify inheritance"
+                )
 
         entry["numbering_provenance"] = _determine_numbering_provenance(
             style_id, exemplar_idx, paragraphs, styles_path

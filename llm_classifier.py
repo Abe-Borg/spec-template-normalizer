@@ -13,6 +13,11 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from paragraph_rules import is_classifiable_paragraph
+
+
+MAX_SINGLE_PASS_PARAGRAPHS = 500
+
 
 def estimate_tokens(text: str) -> int:
     """Rough token estimate (1 token ≈ 4 chars)."""
@@ -177,6 +182,12 @@ def classify_document(
         ValueError: If the LLM response is not valid JSON or fails validation
                     after all patch attempts are exhausted.
     """
+    paragraphs = slim_bundle.get("paragraphs", [])
+    if len(paragraphs) > MAX_SINGLE_PASS_PARAGRAPHS:
+        raise ValueError(
+            "Document too large for current single-pass classification; chunked mode requires redesign"
+        )
+
     import anthropic
     from docx_decomposer import validate_instructions
 
@@ -321,24 +332,8 @@ def compute_coverage(slim_bundle: dict, instructions: dict) -> tuple:
         (coverage_fraction, styled_count, classifiable_count)
     """
     paragraphs = slim_bundle.get("paragraphs", [])
-    classifiable = 0
-    classifiable_indices = set()
-
-    for p in paragraphs:
-        text = (p.get("text") or "").strip()
-        if not text:
-            continue
-        if p.get("contains_sectPr", False):
-            continue
-        if p.get("in_table", False):
-            continue
-        if text.upper() == "END OF SECTION":
-            continue
-        # Editor/specifier notes in brackets
-        if text.startswith("[") and text.endswith("]"):
-            continue
-        classifiable += 1
-        classifiable_indices.add(p["paragraph_index"])
+    classifiable_indices = {p["paragraph_index"] for p in paragraphs if is_classifiable_paragraph(p)}
+    classifiable = len(classifiable_indices)
 
     styled_indices = {item["paragraph_index"] for item in instructions.get("apply_pStyle", [])}
     styled_count = len(styled_indices & classifiable_indices)
