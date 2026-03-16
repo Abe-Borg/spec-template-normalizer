@@ -376,6 +376,23 @@ class TestValidateStyleRegistry:
         # No style_name on any role — should pass
         validate_style_registry(reg)
 
+    def test_numbering_provenance_valid(self):
+        reg = _minimal_style_registry()
+        reg["roles"]["PART"]["numbering_provenance"] = "style_numpr"
+        validate_style_registry(reg)
+
+    def test_numbering_provenance_invalid(self):
+        reg = _minimal_style_registry()
+        reg["roles"]["PART"]["numbering_provenance"] = "bad_value"
+        with pytest.raises(ValueError, match="numbering_provenance must be one of"):
+            validate_style_registry(reg)
+
+    def test_numbering_pattern_must_be_object(self):
+        reg = _minimal_style_registry()
+        reg["roles"]["PART"]["numbering_pattern"] = "not-an-object"
+        with pytest.raises(ValueError, match="numbering_pattern must be an object"):
+            validate_style_registry(reg)
+
 
 # ---------------------------------------------------------------------------
 # Cross-registry validation tests
