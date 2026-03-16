@@ -26,6 +26,7 @@ The output JSON follows the arch_template_registry schema (v1.0.0).
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import re
@@ -505,10 +506,70 @@ def _parse_sectpr(sect_xml: str, rels_xml: Optional[str], section_index: int) ->
 
 def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
     """Extract all header and footer parts."""
+
+    def _content_type_from_suffix(path_like: str) -> str:
+        suffix = Path(path_like).suffix.lower()
+        if suffix == ".png":
+            return "image/png"
+        if suffix in {".jpg", ".jpeg"}:
+            return "image/jpeg"
+        if suffix == ".gif":
+            return "image/gif"
+        if suffix == ".emf":
+            return "image/x-emf"
+        if suffix == ".wmf":
+            return "image/x-wmf"
+        return "application/octet-stream"
+
+    def _extract_media_from_rels(part_name: str, rels_xml: Optional[str]) -> List[Dict[str, str]]:
+        if not rels_xml:
+            return []
+
+        media_items: List[Dict[str, str]] = []
+        rels_dir = Path(part_name).parent
+
+        try:
+            root = ET.fromstring(rels_xml)
+        except ET.ParseError:
+            return media_items
+
+        for rel in root.findall(f"{{{REL_NS}}}Relationship"):
+            rel_id = rel.get("Id")
+            target = rel.get("Target")
+            if not rel_id or not target:
+                continue
+
+            normalized_target = target.replace("\\", "/")
+            target_name = Path(normalized_target).name.lower()
+            if "/media/" not in f"/{normalized_target.lower()}" and not target_name.startswith("image"):
+                continue
+
+            resolved_rel_path = (rels_dir / normalized_target).as_posix()
+            media_rel_idx = resolved_rel_path.lower().find("media/")
+            if media_rel_idx == -1:
+                continue
+            media_rel_target = resolved_rel_path[media_rel_idx:]
+
+            media_path = extract_dir / resolved_rel_path
+            if not media_path.exists() or not media_path.is_file():
+                continue
+
+            media_items.append(
+                {
+                    "rel_id": rel_id,
+                    "target": media_rel_target,
+                    "content_type": _content_type_from_suffix(media_rel_target),
+                    "data_base64": base64.b64encode(media_path.read_bytes()).decode("ascii"),
+                }
+            )
+
+        return media_items
+
     result = {
         "headers": [],
         "footers": []
     }
+    header_footer_media = set()
     
     word_dir = extract_dir / "word"
     
@@ -523,6 +584,10 @@ def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
     for hdr_path in sorted(word_dir.glob("header*.xml")):
         part_name = f"word/{hdr_path.name}"
         xml_content = hdr_path.read_text(encoding="utf-8")
+        rels_content = _read_xml_part(extract_dir, f"word/_rels/{hdr_path.name}.rels")
+        media_entries = _extract_media_from_rels(part_name, rels_content)
+        for media_entry in media_entries:
+            header_footer_media.add(media_entry["target"])
         
         # Find the rId for this part
         rel_id = None
@@ -534,13 +599,19 @@ def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
         result["headers"].append({
             "part_name": part_name,
             "rel_id": rel_id,
-            "xml": _canonicalize(xml_content)
+            "xml": _canonicalize(xml_content),
+            "rels_xml": _canonicalize(rels_content, strip_rsid=False) if rels_content else None,
+            "media": media_entries,
         })
     
     # Collect footers
     for ftr_path in sorted(word_dir.glob("footer*.xml")):
         part_name = f"word/{ftr_path.name}"
         xml_content = ftr_path.read_text(encoding="utf-8")
+        rels_content = _read_xml_part(extract_dir, f"word/_rels/{ftr_path.name}.rels")
+        media_entries = _extract_media_from_rels(part_name, rels_content)
+        for media_entry in media_entries:
+            header_footer_media.add(media_entry["target"])
         
         rel_id = None
         for rid, target in rid_to_target.items():
@@ -551,8 +622,12 @@ def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
         result["footers"].append({
             "part_name": part_name,
             "rel_id": rel_id,
-            "xml": _canonicalize(xml_content)
+            "xml": _canonicalize(xml_content),
+            "rels_xml": _canonicalize(rels_content, strip_rsid=False) if rels_content else None,
+            "media": media_entries,
         })
+
+    result["header_footer_media"] = sorted(header_footer_media)
     
     return result
 
