@@ -886,6 +886,114 @@ def _build_style_name_map(styles_xml_path: Path) -> Dict[str, str]:
     return out
 
 
+def _build_styles_by_id(styles_xml_path: Path) -> Dict[str, ET.Element]:
+    if not styles_xml_path.exists():
+        return {}
+    tree = ET.parse(styles_xml_path)
+    root = tree.getroot()
+    styles_by_id: Dict[str, ET.Element] = {}
+    for st in root.findall(f".//{_q('style')}"):
+        sid = _get_attr(st, "styleId")
+        if sid:
+            styles_by_id[sid] = st
+    return styles_by_id
+
+
+def _find_style_chain_numpr(style_id: str, styles_by_id: Dict[str, ET.Element]) -> Optional[Dict[str, str]]:
+    """Resolve style + basedOn chain looking for w:numPr and return numId/ilvl when found."""
+    visited: Set[str] = set()
+    current = style_id
+    while current and current not in visited:
+        visited.add(current)
+        st = styles_by_id.get(current)
+        if st is None:
+            break
+
+        ppr = st.find(_q("pPr"))
+        if ppr is not None:
+            numpr = ppr.find(_q("numPr"))
+            if numpr is not None:
+                num_id_el = numpr.find(_q("numId"))
+                ilvl_el = numpr.find(_q("ilvl"))
+                out: Dict[str, str] = {}
+                num_id = _get_attr(num_id_el, "val") if num_id_el is not None else None
+                ilvl = _get_attr(ilvl_el, "val") if ilvl_el is not None else None
+                if num_id:
+                    out["numId"] = num_id
+                if ilvl:
+                    out["ilvl"] = ilvl
+                return out
+
+        based = st.find(_q("basedOn"))
+        current = _get_attr(based, "val") if based is not None else None
+
+    return None
+
+
+def _determine_numbering_provenance(
+    style_id: str,
+    exemplar_idx: int,
+    paragraphs: List[Dict],
+    styles_xml_path: Path,
+) -> str:
+    """Determine whether numbering is from style numPr, literal text, or absent."""
+    styles_by_id = _build_styles_by_id(styles_xml_path)
+    if _find_style_chain_numpr(style_id, styles_by_id) is not None:
+        return "style_numpr"
+
+    exemplar = paragraphs[exemplar_idx] if 0 <= exemplar_idx < len(paragraphs) else {}
+    numpr = exemplar.get("numPr") if isinstance(exemplar, dict) else None
+    if isinstance(numpr, dict) and numpr.get("numId"):
+        return "style_numpr"
+
+    txt = (exemplar.get("text") or "") if isinstance(exemplar, dict) else ""
+    marker_patterns = [
+        r"^\s*[A-Z]\.\s+",
+        r"^\s*\d+\.\s+",
+        r"^\s*[a-z]\.\s+",
+    ]
+    if any(re.match(pat, txt) for pat in marker_patterns):
+        return "text_literal"
+    return "none"
+
+
+def _extract_numbering_pattern(
+    style_id: str,
+    styles_xml_path: Path,
+    numbering_catalog: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    """Extract style-linked numbering pattern details (numId/ilvl/numFmt/lvlText)."""
+    styles_by_id = _build_styles_by_id(styles_xml_path)
+    numpr = _find_style_chain_numpr(style_id, styles_by_id)
+    if numpr is None:
+        return None
+
+    pattern: Dict[str, str] = {}
+    num_id = numpr.get("numId")
+    ilvl = numpr.get("ilvl")
+    if num_id:
+        pattern["numId"] = num_id
+    if ilvl:
+        pattern["ilvl"] = ilvl
+
+    nums = numbering_catalog.get("nums", {}) if isinstance(numbering_catalog, dict) else {}
+    abstracts = numbering_catalog.get("abstracts", {}) if isinstance(numbering_catalog, dict) else {}
+
+    abstract_num_id = nums.get(num_id, {}).get("abstractNumId") if num_id else None
+    if abstract_num_id:
+        levels = abstracts.get(abstract_num_id, {}).get("levels", [])
+        level = next((lvl for lvl in levels if lvl.get("ilvl") == ilvl), None)
+        if level is None and levels:
+            level = levels[0]
+        if isinstance(level, dict):
+            if level.get("numFmt"):
+                pattern["numFmt"] = level["numFmt"]
+            if level.get("lvlText"):
+                pattern["lvlText"] = level["lvlText"]
+
+    return pattern if pattern else None
+
+
 def build_style_registry_dict(extract_dir: Path, source_docx_name: str, instructions: Dict[str, Any]) -> Dict[str, Any]:
     """Build the arch_style_registry payload dict without writing to disk."""
     roles = instructions.get("roles") or {}
@@ -894,6 +1002,17 @@ def build_style_registry_dict(extract_dir: Path, source_docx_name: str, instruct
     bundle = build_slim_bundle(extract_dir)
     paragraphs = bundle.get("paragraphs", [])
     created_style_ids = {sd.get("styleId") for sd in (instructions.get("create_styles") or []) if isinstance(sd, dict)}
+    styles_by_id = _build_styles_by_id(styles_path)
+
+    used_num_ids: Set[str] = set()
+    for spec in roles.values():
+        style_id = spec.get("styleId")
+        if not style_id:
+            continue
+        numpr = _find_style_chain_numpr(style_id, styles_by_id)
+        if numpr and numpr.get("numId"):
+            used_num_ids.add(numpr["numId"])
+    numbering_catalog = build_numbering_catalog(extract_dir / "word" / "numbering.xml", used_num_ids)
 
     out_roles: Dict[str, Any] = {}
     for role, spec in roles.items():
@@ -918,6 +1037,14 @@ def build_style_registry_dict(extract_dir: Path, source_docx_name: str, instruct
                 entry["resolved_formatting"] = resolved
             if style_id in created_style_ids and exemplar.get("pStyle"):
                 entry["warning"] = "Derived style exemplar has existing pStyle; inheritance chain may affect formatting"
+
+        entry["numbering_provenance"] = _determine_numbering_provenance(
+            style_id, exemplar_idx, paragraphs, styles_path
+        )
+        if entry["numbering_provenance"] == "style_numpr":
+            pattern = _extract_numbering_pattern(style_id, styles_path, numbering_catalog)
+            if pattern:
+                entry["numbering_pattern"] = pattern
 
         out_roles[role] = entry
 

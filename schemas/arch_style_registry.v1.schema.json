@@ -31,7 +31,21 @@
         "exemplar_paragraph_index": { "type": "integer", "minimum": 0 },
         "style_name": { "type": ["string", "null"] },
         "resolved_formatting": { "type": "object", "additionalProperties": true },
-        "warning": { "type": "string" }
+        "warning": { "type": "string" },
+        "numbering_provenance": {
+          "type": "string",
+          "enum": ["style_numpr", "text_literal", "none"]
+        },
+        "numbering_pattern": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "numId": { "type": "string" },
+            "ilvl": { "type": "string" },
+            "numFmt": { "type": "string" },
+            "lvlText": { "type": "string" }
+          }
+        }
       }
     }
   }

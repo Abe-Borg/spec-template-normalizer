@@ -10,6 +10,7 @@ from docx_decomposer import (
     paragraph_ppr_hints_from_block,
     paragraph_rpr_hints_from_block,
     validate_instructions,
+    build_style_registry_dict,
 )
 from gui import _load_prompt_file
 from llm_classifier import _parse_response
@@ -155,3 +156,54 @@ def test_ppr_hints_include_line_rule():
     )
     hints = paragraph_ppr_hints_from_block(para_xml)
     assert hints["spacing"]["lineRule"] == "auto"
+
+
+def test_style_registry_includes_numbering_provenance_metadata(tmp_path: Path):
+    extract_dir = tmp_path / "x"
+    (extract_dir / "word" / "theme").mkdir(parents=True)
+    (extract_dir / "word" / "_rels").mkdir(parents=True)
+
+    (extract_dir / "word" / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>'
+        '<w:style w:type="paragraph" w:styleId="CSI_Part__ARCH"><w:name w:val="Part"/>'
+        '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="CSI_Paragraph__ARCH"><w:name w:val="Paragraph"/></w:style>'
+        '<w:style w:type="paragraph" w:styleId="CSI_SectionTitle__ARCH"><w:name w:val="Section Title"/></w:style>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    (extract_dir / "word" / "numbering.xml").write_text(
+        '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:abstractNum w:abstractNumId="10"><w:lvl w:ilvl="0">'
+        '<w:numFmt w:val="upperLetter"/><w:lvlText w:val="%1."/>'
+        '</w:lvl></w:abstractNum>'
+        '<w:num w:numId="7"><w:abstractNumId w:val="10"/></w:num>'
+        '</w:numbering>',
+        encoding="utf-8",
+    )
+    (extract_dir / "word" / "document.xml").write_text(
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+        '<w:p><w:r><w:t>PART 1 - GENERAL</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>A. Scope</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>PROJECT TITLE</w:t></w:r></w:p>'
+        '<w:p><w:sectPr/></w:p>'
+        '</w:body></w:document>',
+        encoding="utf-8",
+    )
+
+    instructions = {
+        "roles": {
+            "PART": {"styleId": "CSI_Part__ARCH", "exemplar_paragraph_index": 0},
+            "PARAGRAPH": {"styleId": "CSI_Paragraph__ARCH", "exemplar_paragraph_index": 1},
+            "SectionTitle": {"styleId": "CSI_SectionTitle__ARCH", "exemplar_paragraph_index": 2},
+        }
+    }
+
+    reg = build_style_registry_dict(extract_dir, "test.docx", instructions)
+
+    assert reg["roles"]["PART"]["numbering_provenance"] == "style_numpr"
+    assert reg["roles"]["PART"]["numbering_pattern"]["numFmt"] == "upperLetter"
+    assert reg["roles"]["PART"]["numbering_pattern"]["lvlText"] == "%1."
+    assert reg["roles"]["PARAGRAPH"]["numbering_provenance"] == "text_literal"
+    assert reg["roles"]["SectionTitle"]["numbering_provenance"] == "none"

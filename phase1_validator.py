@@ -283,6 +283,19 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
         if resolved is not None and not isinstance(resolved, dict):
             raise ValueError(f"roles['{role}'].resolved_formatting must be an object when present")
 
+        provenance = spec.get("numbering_provenance")
+        if provenance is not None:
+            if provenance not in ("style_numpr", "text_literal", "none"):
+                raise ValueError(
+                    f"roles['{role}'].numbering_provenance must be one of: "
+                    "style_numpr, text_literal, none"
+                )
+
+        numbering_pattern = spec.get("numbering_pattern")
+        if numbering_pattern is not None:
+            if not isinstance(numbering_pattern, dict):
+                raise ValueError(f"roles['{role}'].numbering_pattern must be an object when present")
+
 
 # ---------------------------------------------------------------------------
 # Cross-registry consistency
