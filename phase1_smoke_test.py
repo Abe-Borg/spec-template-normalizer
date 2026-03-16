@@ -54,7 +54,12 @@ def run() -> None:
     apply_instructions(extract_dir, instructions)
 
     # Build both registries in memory (mirrors gui.py pipeline)
-    style_registry = build_style_registry_dict(extract_dir, docx.name, instructions)
+    style_registry = build_style_registry_dict(
+        extract_dir,
+        docx.name,
+        instructions,
+        pre_apply_bundle=bundle,
+    )
     template_registry = extract_arch_template_registry(extract_dir, docx)
 
     # Validate both registries + cross-registry consistency

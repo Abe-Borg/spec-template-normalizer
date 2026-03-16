@@ -18,6 +18,7 @@ import customtkinter as ctk
 from tkinter import filedialog, scrolledtext
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 
 
 COLORS = {
@@ -84,6 +85,14 @@ class PipelineThread(threading.Thread):
     def _log(self, msg: str) -> None:
         self.log_queue.put(msg)
 
+    def _choose_extract_dir(self, docx_path: Path) -> Path:
+        base_dir = Path(self.output_dir) if self.output_dir else docx_path.parent
+        candidate = base_dir / f"{docx_path.stem}_extracted"
+        if not candidate.exists():
+            return candidate
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return base_dir / f"{docx_path.stem}_extracted__{stamp}"
+
     def run(self) -> None:
         try:
             from docx_decomposer import (
@@ -95,7 +104,7 @@ class PipelineThread(threading.Thread):
             from llm_classifier import classify_document, compute_coverage
 
             docx_path = Path(self.docx_path)
-            extract_dir = Path(f"{docx_path.stem}_extracted")
+            extract_dir = self._choose_extract_dir(docx_path)
 
             # 1) Extract
             self._log(f"Extracting {docx_path.name}...")
@@ -148,7 +157,12 @@ class PipelineThread(threading.Thread):
 
             # 7) Build registries in memory
             self._log("Building style registry...")
-            style_registry = build_style_registry_dict(extract_dir, docx_path.name, instructions)
+            style_registry = build_style_registry_dict(
+                extract_dir,
+                docx_path.name,
+                instructions,
+                pre_apply_bundle=bundle,
+            )
 
             self._log("Extracting environment...")
             from arch_env_extractor import extract_arch_template_registry
