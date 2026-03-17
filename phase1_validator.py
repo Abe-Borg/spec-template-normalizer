@@ -255,8 +255,8 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
     if not isinstance(registry, dict):
         raise ValueError("Style registry must be a JSON object")
 
-    if registry.get("version") != 1:
-        raise ValueError("style registry version must be 1")
+    if registry.get("version") not in (1, 2):
+        raise ValueError("style registry version must be 1 or 2")
 
     src = registry.get("source_docx")
     if not isinstance(src, str) or not src:
@@ -285,10 +285,11 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
 
         provenance = spec.get("numbering_provenance")
         if provenance is not None:
-            if provenance not in ("style_numpr", "text_literal", "none"):
+            allowed = ("style_numpr", "direct_numpr", "text_literal", "none")
+            if provenance not in allowed:
                 raise ValueError(
                     f"roles['{role}'].numbering_provenance must be one of: "
-                    "style_numpr, text_literal, none"
+                    "style_numpr, direct_numpr, text_literal, none"
                 )
 
         numbering_pattern = spec.get("numbering_pattern")

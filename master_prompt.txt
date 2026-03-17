@@ -14,6 +14,7 @@ Goal: classify architect template CSI semantics using paragraph styles (w:pStyle
 Rules:
 1) Do not propose changes to headers/footers or section properties (sectPr). Those must remain unchanged.
 2) Prefer reusing existing template styles if they match the current appearance.
+   Existing paragraph styles may be reusable even if they are currently unused in document paragraphs.
 3) If a CSI role exists but paragraphs lack a style, propose creating a template-namespaced style that matches the current appearance
    (via derive_from_paragraph_index only). Allowed CSI_*__ARCH styleIds:
    - CSI_SectionTitle__ARCH
@@ -25,7 +26,7 @@ Rules:
    - CSI_Subsubparagraph__ARCH
 4) If you create a new CSI_*__ARCH style, choose a derive_from_paragraph_index that is a “clean” exemplar of that role
    (not END OF SECTION, not blank, not a section break, not in-table, not a weird edge-case).
-5) Determine hierarchy using text patterns AND numbering/indent hints.
+5) Determine hierarchy using text patterns AND numbering/indent hints, including Word numbering metadata (numPr), not just visible numbering text.
 6) You MUST output a deterministic role→style mapping under top-level key "roles".
    Allowed role keys are EXACTLY:
    - SectionID (optional; only if section number line exists as its own paragraph)
@@ -40,6 +41,8 @@ Rules:
    - exemplar_paragraph_index: paragraph_index used as exemplar
    If styleId is a created CSI_*__ARCH style, exemplar_paragraph_index MUST equal derive_from_paragraph_index.
    Include roles only when present in this architect document.
+   Roles must be meaningful and should cover detected structural numbering families when numbering metadata exists.
+   Shared styles across roles are allowed when hierarchy remains structurally distinguishable.
 7) You MUST classify EVERY non-skipped, non-table content paragraph in apply_pStyle.
    Skip ONLY:
    - Empty/blank paragraphs

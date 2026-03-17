@@ -185,7 +185,9 @@ def classify_document(
     paragraphs = slim_bundle.get("paragraphs", [])
     if len(paragraphs) > MAX_SINGLE_PASS_PARAGRAPHS:
         raise ValueError(
-            "Document too large for current single-pass classification; chunked mode requires redesign"
+            f"Unsupported document size: {len(paragraphs)} paragraphs exceeds "
+            f"single-pass limit ({MAX_SINGLE_PASS_PARAGRAPHS}). Chunked classification is intentionally disabled "
+            "pending two-pass redesign."
         )
 
     import anthropic
@@ -249,79 +251,9 @@ def _classify_chunked(
     chunk_size: int = 200,
     overlap: int = 20,
 ) -> dict:
-    """
-    Chunked classification for large documents.
-
-    First chunk returns full instructions (create_styles + roles + apply_pStyle).
-    Subsequent chunks receive the already-determined styles/roles as context
-    and return only apply_pStyle for their paragraph range.
-    """
-    from docx_decomposer import validate_instructions
-
-    paragraphs = slim_bundle.get("paragraphs", [])
-    total = len(paragraphs)
-
-    # Build chunk boundaries
-    chunks: List[tuple] = []  # (start, end) indices into paragraphs list
-    start = 0
-    while start < total:
-        end = min(start + chunk_size, total)
-        chunks.append((start, end))
-        start = end - overlap if end < total else end
-
-    # First chunk: full classification
-    first_bundle = dict(slim_bundle)
-    first_bundle["paragraphs"] = paragraphs[chunks[0][0]:chunks[0][1]]
-    bundle_json = json.dumps(first_bundle, indent=2)
-    user_msg = f"{run_instruction}\n\nSlim bundle:\n{bundle_json}"
-
-    raw = _call_api(client, master_prompt, user_msg, model)
-    merged = _parse_response(raw)
-    validate_instructions(merged, slim_bundle=slim_bundle)
-
-    if len(chunks) <= 1:
-        return merged
-
-    # Subsequent chunks: only apply_pStyle
-    context_info = json.dumps({
-        "create_styles": merged.get("create_styles", []),
-        "roles": merged.get("roles", {}),
-    }, indent=2)
-
-    for chunk_start, chunk_end in chunks[1:]:
-        chunk_bundle = dict(slim_bundle)
-        chunk_bundle["paragraphs"] = paragraphs[chunk_start:chunk_end]
-        chunk_json = json.dumps(chunk_bundle, indent=2)
-
-        chunk_prompt = (
-            f"{run_instruction}\n\n"
-            f"The following styles and roles have already been determined:\n{context_info}\n\n"
-            f"You MUST use these exact styles. Return ONLY the apply_pStyle array for the "
-            f"paragraphs in this chunk (paragraph indices {chunk_start} to {chunk_end - 1}).\n"
-            f"Output format: {{\"apply_pStyle\": [...]}}\n\n"
-            f"Slim bundle chunk:\n{chunk_json}"
-        )
-
-        raw = _call_api(client, master_prompt, chunk_prompt, model)
-        chunk_result = _parse_response(raw)
-        chunk_apply = chunk_result.get("apply_pStyle", [])
-
-        # Merge: deduplicate by paragraph_index (later chunk wins for overlaps)
-        existing_indices = {item["paragraph_index"] for item in merged.get("apply_pStyle", [])}
-        for item in chunk_apply:
-            idx = item["paragraph_index"]
-            if idx not in existing_indices:
-                merged.setdefault("apply_pStyle", []).append(item)
-                existing_indices.add(idx)
-
-    # Sort apply_pStyle by paragraph_index
-    merged["apply_pStyle"] = sorted(
-        merged.get("apply_pStyle", []),
-        key=lambda x: x["paragraph_index"],
+    raise NotImplementedError(
+        "Chunked classification is intentionally disabled pending two-pass redesign."
     )
-
-    validate_instructions(merged, slim_bundle=slim_bundle)
-    return merged
 
 
 def compute_coverage(slim_bundle: dict, instructions: dict) -> tuple:

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "arch_style_registry.json (v2)",
+  "type": "object",
+  "required": ["version", "source_docx", "roles"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 2 },
+    "source_docx": { "type": "string", "minLength": 1 },
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "SectionID": { "$ref": "#/$defs/roleSpec" },
+        "SectionTitle": { "$ref": "#/$defs/roleSpec" },
+        "PART": { "$ref": "#/$defs/roleSpec" },
+        "ARTICLE": { "$ref": "#/$defs/roleSpec" },
+        "PARAGRAPH": { "$ref": "#/$defs/roleSpec" },
+        "SUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" },
+        "SUBSUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" }
+      }
+    }
+  },
+  "$defs": {
+    "roleSpec": {
+      "type": "object",
+      "required": ["style_id", "exemplar_paragraph_index"],
+      "additionalProperties": false,
+      "properties": {
+        "style_id": { "type": "string", "minLength": 1 },
+        "exemplar_paragraph_index": { "type": "integer", "minimum": 0 },
+        "style_name": { "type": ["string", "null"] },
+        "resolved_formatting": { "type": "object", "additionalProperties": true },
+        "warning": { "type": "string" },
+        "numbering_provenance": {
+          "type": "string",
+          "enum": ["style_numpr", "direct_numpr", "text_literal", "none"]
+        },
+        "numbering_pattern": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "numId": { "type": "string" },
+            "ilvl": { "type": "string" },
+            "numFmt": { "type": "string" },
+            "lvlText": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

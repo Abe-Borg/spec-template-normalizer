@@ -75,6 +75,25 @@ class StabilitySnapshot:
     doc_rels_hash: str
 
 
+@dataclass(frozen=True)
+class ParagraphContext:
+    in_table: bool
+    contains_sectPr: bool
+
+
+@dataclass(frozen=True)
+class StructureSignal:
+    paragraph_index: int
+    text_role: Optional[str]
+    numbering_source: str
+    num_id: Optional[str]
+    abstract_num_id: Optional[str]
+    ilvl: Optional[str]
+    num_fmt: Optional[str]
+    lvl_text: Optional[str]
+    family_key: Optional[Tuple[Optional[str], Optional[str]]]
+
+
 def snapshot_headers_footers(extract_dir: Path) -> Dict[str, str]:
     wf = extract_dir / "word"
     hashes: Dict[str, str] = {}
@@ -275,8 +294,30 @@ def paragraph_is_in_table(start: int, table_spans: List[Tuple[int, int]]) -> boo
     return any(t_start <= start < t_end for t_start, t_end in table_spans)
 
 
+def _localname(tag: str) -> str:
+    return tag.rsplit('}', 1)[-1]
+
+
+def collect_paragraph_contexts(document_xml_path: Path) -> List[ParagraphContext]:
+    tree = ET.parse(document_xml_path)
+    root = tree.getroot()
+    out: List[ParagraphContext] = []
+
+    def walk(node: ET.Element, in_table: bool = False) -> None:
+        local = _localname(node.tag)
+        next_in_table = in_table or (local == "tbl")
+        if local == "p":
+            has_sect = node.find(f".//{_q('sectPr')}") is not None
+            out.append(ParagraphContext(in_table=next_in_table, contains_sectPr=has_sect))
+        for child in list(node):
+            walk(child, in_table=next_in_table)
+
+    walk(root)
+    return out
+
+
 def build_style_catalog(styles_xml_path: Path, used_style_ids: Set[str]) -> Dict[str, Any]:
-    # Compact info for used styles + basedOn chain (safe to keep; not required, but useful)
+    # Compact info for all paragraph styles (used + unused).
     tree = ET.parse(styles_xml_path)
     root = tree.getroot()
 
@@ -286,33 +327,22 @@ def build_style_catalog(styles_xml_path: Path, used_style_ids: Set[str]) -> Dict
         if sid:
             styles_by_id[sid] = st
 
-    to_include = set(used_style_ids)
-    changed = True
-    while changed:
-        changed = False
-        for sid in list(to_include):
-            st = styles_by_id.get(sid)
-            if st is None:
-                continue
-            based = st.find(_q("basedOn"))
-            if based is not None:
-                base_id = _get_attr(based, "val")
-                if base_id and base_id not in to_include:
-                    to_include.add(base_id)
-                    changed = True
-
     catalog: Dict[str, Any] = {}
-    for sid in sorted(to_include):
+    for sid in sorted(styles_by_id.keys()):
         st = styles_by_id.get(sid)
         if st is None:
+            continue
+        if _get_attr(st, "type") != "paragraph":
             continue
         name_el = st.find(_q("name"))
         based_el = st.find(_q("basedOn"))
         catalog[sid] = {
             "styleId": sid,
-            "type": _get_attr(st, "type"),
+            "type": "paragraph",
             "name": _get_attr(name_el, "val") if name_el is not None else None,
             "basedOn": _get_attr(based_el, "val") if based_el is not None else None,
+            "in_use": sid in used_style_ids,
+            "resolved_numPr": _find_style_chain_numpr(sid, styles_by_id),
         }
     return catalog
 
@@ -371,16 +401,22 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
     used_style_ids: Set[str] = set()
     used_num_ids: Set[str] = set()
 
-    table_spans = [(m.start(), m.end()) for m in re.finditer(r"<w:tbl\b[\s\S]*?</w:tbl>", doc_text)]
+    contexts = collect_paragraph_contexts(doc_path)
+    blocks = list(iter_paragraph_xml_blocks(doc_text))
+    if len(contexts) != len(blocks):
+        raise ValueError(
+            f"Paragraph extraction mismatch: xml_contexts={len(contexts)} blocks={len(blocks)}"
+        )
 
-    for idx, (_s, _e, p_xml) in enumerate(iter_paragraph_xml_blocks(doc_text)):
+    for idx, (_s, _e, p_xml) in enumerate(blocks):
+        ctx = contexts[idx]
         raw_text = paragraph_text_from_block(p_xml)
         pStyle = paragraph_pstyle_from_block(p_xml)
         numpr = paragraph_numpr_from_block(p_xml)
         hints = paragraph_ppr_hints_from_block(p_xml)
         rpr_hints = paragraph_rpr_hints_from_block(p_xml)
-        contains_sect = paragraph_contains_sectpr(p_xml)
-        in_table = paragraph_is_in_table(_s, table_spans)
+        contains_sect = ctx.contains_sectPr
+        in_table = ctx.in_table
 
         if pStyle:
             used_style_ids.add(pStyle)
@@ -728,6 +764,13 @@ def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Di
     allowed_existing_style_ids = set(slim_bundle.get("style_catalog", {}).keys())
     all_allowed_style_ids = allowed_existing_style_ids | allowed_new_style_ids
 
+    for sd in instructions.get("create_styles", []) or []:
+        sid = sd["styleId"]
+        if sid in allowed_new_style_ids and sid in allowed_existing_style_ids:
+            raise ValueError(
+                f"Reserved ARCH style collision: '{sid}' already exists in styles.xml; refuse silent reuse"
+            )
+
     for ap in instructions.get("apply_pStyle", []) or []:
         idx = ap["paragraph_index"]
         sid = ap["styleId"]
@@ -785,22 +828,86 @@ def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[
     role_style = {role: spec.get("styleId") for role, spec in roles.items() if isinstance(spec, dict)}
     expected_roles, strong_hits = infer_expected_roles(paragraphs)
 
-    missing_roles = sorted(role for role in expected_roles if role not in roles)
-    if missing_roles:
-        raise ValueError(f"Semantic validation failed: missing expected roles {missing_roles}")
+    nums = slim_bundle.get("numbering_catalog", {}).get("nums", {})
+    abstracts = slim_bundle.get("numbering_catalog", {}).get("abstracts", {})
+    style_catalog = slim_bundle.get("style_catalog", {})
 
     classifiable = [p for p in paragraphs if is_classifiable_paragraph(p)]
     has_alpha = any(re.match(r"^[A-Z]\.\s+", (p.get("text") or "").strip()) for p in classifiable)
     has_numeric = any(re.match(r"^\d+\.\s+", (p.get("text") or "").strip()) for p in classifiable)
 
+    signals: Dict[int, StructureSignal] = {}
+    numbered_families: Set[Tuple[Optional[str], Optional[str]]] = set()
+    for p in classifiable:
+        idx = int(p["paragraph_index"])
+        text = (p.get("text") or "").strip()
+        text_role = detect_role_signal(text, numeric_is_strong=has_alpha, lower_is_strong=has_numeric)
+
+        num_id: Optional[str] = None
+        ilvl: Optional[str] = None
+        source = "none"
+        direct = p.get("numPr") if isinstance(p.get("numPr"), dict) else None
+        style_numpr = style_catalog.get(p.get("pStyle"), {}).get("resolved_numPr") if p.get("pStyle") else None
+
+        if isinstance(direct, dict) and (direct.get("numId") or direct.get("ilvl")):
+            source = "direct_numpr"
+            num_id, ilvl = direct.get("numId"), direct.get("ilvl")
+        elif isinstance(style_numpr, dict) and (style_numpr.get("numId") or style_numpr.get("ilvl")):
+            source = "style_numpr"
+            num_id, ilvl = style_numpr.get("numId"), style_numpr.get("ilvl")
+        elif text_role in {"ARTICLE", "PARAGRAPH", "SUBPARAGRAPH", "SUBSUBPARAGRAPH"}:
+            source = "text_literal"
+
+        abstract_num_id = nums.get(num_id, {}).get("abstractNumId") if num_id else None
+        num_fmt = None
+        lvl_text = None
+        if abstract_num_id and abstract_num_id in abstracts:
+            levels = abstracts[abstract_num_id].get("levels", [])
+            level = next((lv for lv in levels if lv.get("ilvl") == ilvl), None)
+            if level is None and levels:
+                level = levels[0]
+            if isinstance(level, dict):
+                num_fmt = level.get("numFmt")
+                lvl_text = level.get("lvlText")
+
+        family_key = None
+        if source in {"style_numpr", "direct_numpr"} and (num_id or ilvl):
+            family_key = (abstract_num_id if abstract_num_id else num_id, ilvl)
+            numbered_families.add(family_key)
+
+        signals[idx] = StructureSignal(
+            paragraph_index=idx,
+            text_role=text_role,
+            numbering_source=source,
+            num_id=num_id,
+            abstract_num_id=abstract_num_id,
+            ilvl=ilvl,
+            num_fmt=num_fmt,
+            lvl_text=lvl_text,
+            family_key=family_key,
+        )
+
+    missing_roles = sorted(role for role in expected_roles if role not in roles)
+    if missing_roles:
+        raise ValueError(f"Semantic validation failed: missing expected roles {missing_roles}")
+
+    if numbered_families and not roles:
+        raise ValueError("Semantic validation failed: numbered structure detected but roles is empty")
+
+    covered_families: Set[Tuple[Optional[str], Optional[str]]] = set()
+    for spec in roles.values():
+        if not isinstance(spec, dict):
+            continue
+        s = signals.get(int(spec["exemplar_paragraph_index"]))
+        if s and s.family_key is not None:
+            covered_families.add(s.family_key)
+    missing_families = sorted(numbered_families - covered_families)
+    if missing_families:
+        raise ValueError(f"Semantic validation failed: missing numbered families {missing_families}")
+
     for role, spec in roles.items():
         exemplar_idx = int(spec["exemplar_paragraph_index"])
-        para = paragraphs[exemplar_idx]
-        signal = detect_role_signal(
-            (para.get("text") or "").strip(),
-            numeric_is_strong=has_alpha,
-            lower_is_strong=has_numeric,
-        )
+        signal = signals.get(exemplar_idx).text_role if signals.get(exemplar_idx) else None
         if signal is not None and signal != role:
             raise ValueError(
                 f"Semantic validation failed: roles['{role}'] exemplar paragraph {exemplar_idx} looks like {signal}"
@@ -817,11 +924,7 @@ def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[
                 f"Semantic validation failed: role {role} expects styleId {expected_style}; mismatched paragraph indices [{samples}]"
             )
 
-    for upper, lower in (("PART", "ARTICLE"), ("ARTICLE", "PARAGRAPH"), ("PARAGRAPH", "SUBPARAGRAPH")):
-        if upper in expected_roles and lower in expected_roles and role_style.get(upper) == role_style.get(lower):
-            raise ValueError(
-                f"Semantic validation failed: roles {upper} and {lower} collapsed to styleId {role_style.get(upper)}"
-            )
+
 
 
 def apply_instructions(extract_dir: Path, instructions: Dict[str, Any]) -> None:
@@ -992,14 +1095,14 @@ def _determine_numbering_provenance(
     paragraphs: List[Dict],
     styles_xml_path: Path,
 ) -> str:
-    """Determine whether numbering is from style numPr, literal text, or absent."""
-    styles_by_id = _build_styles_by_id(styles_xml_path)
-    if _find_style_chain_numpr(style_id, styles_by_id) is not None:
-        return "style_numpr"
-
+    """Determine whether numbering is from style, direct paragraph, literal text, or absent."""
     exemplar = paragraphs[exemplar_idx] if 0 <= exemplar_idx < len(paragraphs) else {}
     numpr = exemplar.get("numPr") if isinstance(exemplar, dict) else None
     if isinstance(numpr, dict) and numpr.get("numId"):
+        return "direct_numpr"
+
+    styles_by_id = _build_styles_by_id(styles_xml_path)
+    if _find_style_chain_numpr(style_id, styles_by_id) is not None:
         return "style_numpr"
 
     txt = (exemplar.get("text") or "") if isinstance(exemplar, dict) else ""
@@ -1014,14 +1117,10 @@ def _determine_numbering_provenance(
     return "none"
 
 
-def _extract_numbering_pattern(
-    style_id: str,
-    styles_xml_path: Path,
+def _extract_numbering_pattern_from_numpr(
+    numpr: Optional[Dict[str, str]],
     numbering_catalog: Dict[str, Any],
 ) -> Optional[Dict[str, str]]:
-    """Extract style-linked numbering pattern details (numId/ilvl/numFmt/lvlText)."""
-    styles_by_id = _build_styles_by_id(styles_xml_path)
-    numpr = _find_style_chain_numpr(style_id, styles_by_id)
     if numpr is None:
         return None
 
@@ -1051,6 +1150,17 @@ def _extract_numbering_pattern(
     return pattern if pattern else None
 
 
+def _extract_numbering_pattern(
+    style_id: str,
+    styles_xml_path: Path,
+    numbering_catalog: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    styles_by_id = _build_styles_by_id(styles_xml_path)
+    return _extract_numbering_pattern_from_numpr(
+        _find_style_chain_numpr(style_id, styles_by_id), numbering_catalog
+    )
+
+
 def build_style_registry_dict(
     extract_dir: Path,
     source_docx_name: str,
@@ -1074,6 +1184,11 @@ def build_style_registry_dict(
         numpr = _find_style_chain_numpr(style_id, styles_by_id)
         if numpr and numpr.get("numId"):
             used_num_ids.add(numpr["numId"])
+        exemplar_idx = int(spec.get("exemplar_paragraph_index", -1))
+        if 0 <= exemplar_idx < len(paragraphs):
+            direct_numpr = paragraphs[exemplar_idx].get("numPr")
+            if isinstance(direct_numpr, dict) and direct_numpr.get("numId"):
+                used_num_ids.add(direct_numpr["numId"])
     numbering_catalog = build_numbering_catalog(extract_dir / "word" / "numbering.xml", used_num_ids)
 
     out_roles: Dict[str, Any] = {}
@@ -1106,15 +1221,18 @@ def build_style_registry_dict(
         entry["numbering_provenance"] = _determine_numbering_provenance(
             style_id, exemplar_idx, paragraphs, styles_path
         )
+        pattern = None
         if entry["numbering_provenance"] == "style_numpr":
             pattern = _extract_numbering_pattern(style_id, styles_path, numbering_catalog)
-            if pattern:
-                entry["numbering_pattern"] = pattern
+        elif entry["numbering_provenance"] == "direct_numpr" and 0 <= exemplar_idx < len(paragraphs):
+            pattern = _extract_numbering_pattern_from_numpr(paragraphs[exemplar_idx].get("numPr"), numbering_catalog)
+        if pattern:
+            entry["numbering_pattern"] = pattern
 
         out_roles[role] = entry
 
     return {
-        "version": 1,
+        "version": 2,
         "source_docx": source_docx_name,
         "roles": out_roles,
     }
