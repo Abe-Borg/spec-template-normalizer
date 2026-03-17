@@ -28,7 +28,7 @@ def _bundle_for_semantics() -> dict:
     }
 
 
-def test_semantic_validator_rejects_single_style_collapse():
+def test_semantic_validator_allows_single_style_collapse_when_other_rules_hold():
     bundle = _bundle_for_semantics()
     instructions = {
         "apply_pStyle": [
@@ -44,8 +44,7 @@ def test_semantic_validator_rejects_single_style_collapse():
             "SUBSUBPARAGRAPH": {"styleId": "CSI_Paragraph__ARCH", "exemplar_paragraph_index": 6},
         },
     }
-    with pytest.raises(ValueError, match="Semantic validation failed"):
-        validate_instructions(instructions, slim_bundle=bundle)
+    validate_instructions(instructions, slim_bundle=bundle)
 
 
 def test_long_bracketed_note_remains_skippable_after_truncation(tmp_path: Path):
@@ -139,5 +138,5 @@ def test_extract_docx_raises_if_target_exists_without_overwrite(tmp_path: Path):
 
 def test_large_doc_raises_clear_not_supported_error():
     bundle = {"paragraphs": [{"paragraph_index": i, "text": "x", "skip_reason": None} for i in range(501)]}
-    with pytest.raises(ValueError, match="chunked mode requires redesign"):
+    with pytest.raises(ValueError, match="Unsupported document size"):
         classify_document(bundle, "x", "y", api_key="k")

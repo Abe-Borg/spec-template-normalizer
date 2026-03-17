@@ -318,8 +318,8 @@ class TestValidateStyleRegistry:
 
     def test_wrong_version(self):
         reg = _minimal_style_registry()
-        reg["version"] = 2
-        with pytest.raises(ValueError, match="version must be 1"):
+        reg["version"] = 99
+        with pytest.raises(ValueError, match="version must be 1 or 2"):
             validate_style_registry(reg)
 
     def test_empty_source_docx(self):
@@ -456,7 +456,7 @@ class TestValidatePhase1Contracts:
     def test_style_failure_after_template_passes(self):
         style_reg = _minimal_style_registry()
         style_reg["version"] = 99
-        with pytest.raises(ValueError, match="version must be 1"):
+        with pytest.raises(ValueError, match="version must be 1 or 2"):
             validate_phase1_contracts(style_reg, _minimal_template_registry())
 
     def test_cross_failure_after_both_pass(self):

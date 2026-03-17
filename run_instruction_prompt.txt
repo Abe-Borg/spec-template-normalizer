@@ -9,11 +9,13 @@ Using the slim bundle, normalize CSI semantics by ensuring consistent paragraph 
 
 You MUST also output a "roles" mapping (role → {styleId, exemplar_paragraph_index}) as described in the master prompt.
 
-IMPORTANT: Classify all non-skipped, non-table content paragraphs.
+IMPORTANT: Classify all classifiable paragraphs (all non-skipped, non-table content paragraphs).
 The apply_pStyle array must include every classifiable paragraph.
 Skip only empty paragraphs, sectPr paragraphs, in-table paragraphs, "END OF SECTION", and editor notes in brackets.
 
 Constraints:
 - Do not change headers/footers or sectPr.
+- Reuse existing paragraph styles from the style catalog when possible, even if those styles are currently unused.
+- When numbering metadata exists, use it as structural evidence.
 - If you create styles, do NOT describe formatting. Use derive_from_paragraph_index only.
 - Return JSON instructions only (no prose, no XML, no markdown).
