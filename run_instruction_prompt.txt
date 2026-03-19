@@ -11,7 +11,7 @@ You MUST also output a "roles" mapping (role → {styleId, exemplar_paragraph_in
 
 IMPORTANT: Classify all classifiable paragraphs (all non-skipped, non-table content paragraphs).
 The apply_pStyle array must include every classifiable paragraph.
-Skip only empty paragraphs, sectPr paragraphs, in-table paragraphs, "END OF SECTION", and editor notes in brackets.
+Skip only empty paragraphs, sectPr paragraphs, in-table paragraphs, "END OF SECTION", editor notes in brackets, copyright/distribution notices, and unbracketed specifier editing instructions.
 
 Constraints:
 - Do not change headers/footers or sectPr.

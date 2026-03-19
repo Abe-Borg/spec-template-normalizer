@@ -10,10 +10,65 @@ RE_ALPHA_PARA = re.compile(r"^[A-Z]\.\s+")
 RE_NUMERIC_SUB = re.compile(r"^\d+\.\s+")
 RE_LOWER_SUBSUB = re.compile(r"^[a-z]\.\s+")
 
+RE_COPYRIGHT_NOTICE = re.compile(r"^Copyright\s+\d{4}\s+by\s+", re.IGNORECASE)
+RE_DISTRIBUTION_NOTICE = re.compile(r"^Exclusively published and distributed by\s+", re.IGNORECASE)
+
+RE_SPECIFIER_RETAIN = re.compile(r"^Retain\s+(first|both|one|option|Sections?|definitions?|paragraph|sub)\b", re.IGNORECASE)
+RE_SPECIFIER_REVISE = re.compile(r"^Revise\s+(this|reference|first|sub)\b", re.IGNORECASE)
+RE_SPECIFIER_VERIFY_SECTION = re.compile(r"^Verify that Section\b", re.IGNORECASE)
+RE_SPECIFIER_EDITING_INSTRUCTION = re.compile(r"^See Editing Instruction\b", re.IGNORECASE)
+RE_SPECIFIER_SPECIFY_PARTS = re.compile(r"^Specify parts in\s+(first|sub)\b", re.IGNORECASE)
+RE_SPECIFIER_PARAGRAPH_DEFINED = re.compile(r"^Paragraph below is defined in Section\b", re.IGNORECASE)
+RE_SPECIFIER_OPTION = re.compile(r"^Option:\s*", re.IGNORECASE)
+RE_SPECIFIER_HIGH_COMPRESSIVE = re.compile(r"^High-compressive-strength inserts may permit\b", re.IGNORECASE)
+
 
 def is_editor_note(raw_text: str) -> bool:
     txt = (raw_text or "").strip()
     return bool(txt) and txt.startswith("[") and txt.endswith("]")
+
+
+def is_copyright_notice(raw_text: str) -> bool:
+    txt = (raw_text or "").strip()
+    if not txt:
+        return False
+    return bool(RE_COPYRIGHT_NOTICE.match(txt) or RE_DISTRIBUTION_NOTICE.match(txt))
+
+
+def is_specifier_note(raw_text: str) -> bool:
+    txt = (raw_text or "").strip()
+    if not txt:
+        return False
+
+    if (
+        RE_SPECIFIER_RETAIN.match(txt)
+        or RE_SPECIFIER_REVISE.match(txt)
+        or RE_SPECIFIER_VERIFY_SECTION.match(txt)
+        or RE_SPECIFIER_EDITING_INSTRUCTION.match(txt)
+        or RE_SPECIFIER_SPECIFY_PARTS.match(txt)
+        or RE_SPECIFIER_PARAGRAPH_DEFINED.match(txt)
+    ):
+        return True
+
+    low = txt.lower()
+    has_para_ref = any(token in low for token in ["paragraph below", "paragraphs below", "subparagraph below", "subparagraphs below"])
+    has_edit_verb = any(token in low for token in ["retain", "revise", "delete", "insert"])
+    if has_para_ref and has_edit_verb:
+        return True
+
+    if "requires calculating and detailing at each use" in low:
+        return True
+
+    if RE_SPECIFIER_OPTION.match(txt) and "may be used" in low:
+        return True
+
+    if "catalogs indicate" in low:
+        return True
+
+    if RE_SPECIFIER_HIGH_COMPRESSIVE.match(txt):
+        return True
+
+    return False
 
 
 def compute_skip_reason(raw_text: str, contains_sectpr: bool, in_table: bool) -> Optional[str]:
@@ -28,6 +83,10 @@ def compute_skip_reason(raw_text: str, contains_sectpr: bool, in_table: bool) ->
         return "end_of_section"
     if is_editor_note(text):
         return "editor_note"
+    if is_copyright_notice(text):
+        return "copyright_notice"
+    if is_specifier_note(text):
+        return "specifier_note"
     return None
 
 

@@ -50,6 +50,8 @@ Rules:
    - Paragraphs with in_table=true
    - "END OF SECTION"
    - Editor/specifier notes in brackets (e.g. "[SPECIFIER NOTE: ...]")
+   - Copyright/distribution notices (e.g. "Copyright 2011 by The American Institute of Architects")
+   - Unbracketed specifier editing instructions from the template publisher (e.g. "Retain first paragraph below...", "Revise this Section...", "See Editing Instruction No. 1...")
 8) Output must be valid JSON only.
 
 Output schema:
