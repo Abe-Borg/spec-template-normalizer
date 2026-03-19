@@ -94,18 +94,6 @@ After completion, you'll have:
 - `ARCH_TEMPLATE_extracted/arch_template_registry.json` - Complete environment
 - Modified `ARCH_TEMPLATE_extracted/` folder with styles applied
 
-### Standalone environment extraction
-```bash
-# Extract environment registry from a .docx file
-python arch_env_extractor.py ARCH_TEMPLATE.docx
-
-# From already-extracted folder
-python arch_env_extractor.py --extract-dir ARCH_TEMPLATE_extracted
-
-# Custom output path
-python arch_env_extractor.py ARCH_TEMPLATE.docx --output /path/to/output.json
-```
-
 ## What gets created
 
 ### arch_style_registry.json
@@ -182,10 +170,12 @@ python -m pytest tests/
 
 Regression tests cover XML extraction (`test_arch_env_extractor.py`), template registry validation (`test_arch_template_registry_validation.py`), contract validation (`test_phase1_validator.py`), and hardening rules (`test_phase1_hardening.py`).
 
-### Smoke test
+### Smoke test (developer tool)
 ```bash
 python phase1_smoke_test.py ARCH_TEMPLATE.docx instructions.json
 ```
+
+End-to-end validation using a real .docx and instructions.json. Not user-facing.
 
 The smoke test runs the full pipeline end-to-end and delegates contract validation to `phase1_validator`. It checks:
 - Both registries are created
@@ -205,7 +195,7 @@ Formal JSON schemas are provided in `schemas/`:
 
 - Python 3.8+
 - Anthropic API key (default model: `claude-opus-4-6`)
-- Windows or Linux (tested on both)
+- Windows (primary platform)
 
 ## Troubleshooting
 

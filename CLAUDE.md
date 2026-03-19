@@ -18,7 +18,7 @@ Phase 2 (separate codebase) uses these artifacts to apply architect formatting t
 ├── docx_decomposer.py          # Library module — extraction, slim bundle, style application
 ├── llm_classifier.py           # LLM automation — calls Anthropic API, chunking, coverage check
 ├── gui.py                      # Tkinter GUI wrapper (thin — no business logic)
-├── arch_env_extractor.py       # Environment capture — produces arch_template_registry.json (has CLI)
+├── arch_env_extractor.py       # Environment capture — produces arch_template_registry.json (library)
 ├── phase1_validator.py         # Contract validation — validates both registries before writing
 ├── phase1_smoke_test.py        # Validation test suite
 ├── master_prompt.txt           # System prompt for LLM CSI classification
@@ -133,9 +133,7 @@ Thin wrapper over the pipeline functions — no business logic.
 | `PipelineThread` | Background thread that runs the full pipeline |
 | `LogRedirector` | Thread-safe stdout redirector for log display |
 
-### `arch_env_extractor.py` — Environment Capture (has CLI)
-
-Has a full CLI entry point (`python arch_env_extractor.py`) in addition to being importable as a library.
+### `arch_env_extractor.py` — Environment Capture (library module)
 
 | Function | Purpose |
 |---|---|
@@ -153,7 +151,6 @@ Has a full CLI entry point (`python arch_env_extractor.py`) in addition to being
 | `extract_fonts()` | Font table declarations |
 | `extract_relationships()` | Document relationship entries |
 | `extract_package_inventory()` | Inventories which OOXML parts are present |
-| `extract_docx_to_dir()` | Extracts .docx ZIP to a directory |
 
 ### `phase1_validator.py` — Contract Validation
 
@@ -184,24 +181,14 @@ The GUI provides:
 - **Run Phase 1** button — runs the full pipeline
 - Post-completion buttons to open the output folder or view the style registry
 
-### Standalone Environment Extraction
-```bash
-# From a .docx file
-python arch_env_extractor.py TEMPLATE.docx
-
-# From an already-extracted folder
-python arch_env_extractor.py --extract-dir TEMPLATE_extracted
-
-# Custom output path
-python arch_env_extractor.py TEMPLATE.docx --output /path/to/output.json
-```
-
 ### Unit Tests
 ```bash
 python -m pytest tests/
 ```
 
-### Smoke Test
+## Testing
+
+### Smoke Test (developer tool)
 ```bash
 python phase1_smoke_test.py TEMPLATE.docx instructions.json
 ```

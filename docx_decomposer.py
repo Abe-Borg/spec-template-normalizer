@@ -290,10 +290,6 @@ def paragraph_rpr_hints_from_block(p_xml: str) -> Dict[str, Any]:
     return hints
 
 
-def paragraph_is_in_table(start: int, table_spans: List[Tuple[int, int]]) -> bool:
-    return any(t_start <= start < t_end for t_start, t_end in table_spans)
-
-
 def _localname(tag: str) -> str:
     return tag.rsplit('}', 1)[-1]
 

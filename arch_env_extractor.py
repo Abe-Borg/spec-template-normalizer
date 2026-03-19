@@ -15,22 +15,17 @@ This captures everything Word uses to render a document BEYOND style definitions
 - Headers/footers
 - Font table
 
-Usage:
-    python arch_env_extractor.py ARCH_TEMPLATE.docx
-    python arch_env_extractor.py ARCH_TEMPLATE.docx --output arch_template_registry.json
-    python arch_env_extractor.py --extract-dir MySpec_extracted
+This module is imported as a library by gui.py and phase1_smoke_test.py.
+It has no CLI entry point.
 
 The output JSON follows the arch_template_registry schema (v1.0.0).
 """
 
 from __future__ import annotations
 
-import argparse
 import base64
 import hashlib
-import json
 import re
-import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -773,121 +768,3 @@ def extract_arch_template_registry(
     
     return registry
 
-
-def extract_docx_to_dir(docx_path: Path, extract_dir: Path) -> None:
-    """Extract a .docx file to a directory."""
-    import shutil
-    
-    if extract_dir.exists():
-        shutil.rmtree(extract_dir)
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    
-    with zipfile.ZipFile(docx_path, "r") as zf:
-        zf.extractall(extract_dir)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Extract arch_template_registry.json from an architect Word template"
-    )
-    parser.add_argument(
-        "input",
-        nargs="?",
-        help="Path to .docx file OR extracted folder"
-    )
-    parser.add_argument(
-        "--extract-dir",
-        help="Use existing extracted folder (skip extraction)"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        default=None,
-        help="Output path for arch_template_registry.json (default: <extract_dir>/arch_template_registry.json)"
-    )
-    parser.add_argument(
-        "--pretty",
-        action="store_true",
-        default=True,
-        help="Pretty-print JSON output (default: True)"
-    )
-    
-    args = parser.parse_args()
-    
-    # Determine extraction directory
-    source_docx = None
-    
-    if args.extract_dir:
-        extract_dir = Path(args.extract_dir)
-        if not extract_dir.exists():
-            raise FileNotFoundError(f"Extract directory not found: {extract_dir}")
-    elif args.input:
-        input_path = Path(args.input)
-        if input_path.is_file() and input_path.suffix.lower() == ".docx":
-            source_docx = input_path
-            extract_dir = Path(f"{input_path.stem}_extracted")
-            print(f"Extracting {input_path} to {extract_dir}...")
-            extract_docx_to_dir(input_path, extract_dir)
-        elif input_path.is_dir():
-            extract_dir = input_path
-        else:
-            raise ValueError(f"Input must be a .docx file or extracted folder: {input_path}")
-    else:
-        parser.print_help()
-        return
-    
-    # Validate extraction directory
-    if not (extract_dir / "word" / "styles.xml").exists():
-        raise FileNotFoundError(
-            f"Invalid extraction directory: {extract_dir}\n"
-            "Expected word/styles.xml to exist."
-        )
-    
-    # Extract registry
-    print(f"Extracting environment from: {extract_dir}")
-    registry = extract_arch_template_registry(extract_dir, source_docx)
-
-    # Validate before writing
-    from phase1_validator import validate_template_registry
-    print("Validating template registry...")
-    validate_template_registry(registry)
-
-    # Determine output path
-    if args.output:
-        out_path = Path(args.output)
-    else:
-        out_path = extract_dir / "arch_template_registry.json"
-    
-    # Write output
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    indent = 2 if args.pretty else None
-    out_path.write_text(json.dumps(registry, indent=indent), encoding="utf-8")
-    
-    print(f"arch_template_registry.json written: {out_path}")
-    
-    # Summary
-    inv = registry["package_inventory"]
-    print("\nPackage inventory:")
-    for k, v in inv.items():
-        status = "✓" if v else "✗"
-        print(f"  {status} {k}")
-    
-    n_styles = len(registry["styles"]["style_defs"])
-    n_abstract = len(registry["numbering"]["abstract_nums"])
-    n_nums = len(registry["numbering"]["nums"])
-    n_headers = len(registry["headers_footers"]["headers"])
-    n_footers = len(registry["headers_footers"]["footers"])
-    
-    print(f"\nCaptured:")
-    print(f"  {n_styles} style definitions")
-    print(f"  {n_abstract} abstract numbering definitions")
-    print(f"  {n_nums} numbering instances")
-    print(f"  {n_headers} header parts")
-    print(f"  {n_footers} footer parts")
-
-
-if __name__ == "__main__":
-    main()
