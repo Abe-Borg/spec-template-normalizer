@@ -21,7 +21,7 @@ RE_SPECIFIER_SPECIFY_PARTS = re.compile(r"^Specify parts in\s+(first|sub)\b", re
 RE_SPECIFIER_PARAGRAPH_DEFINED = re.compile(r"^Paragraph below is defined in Section\b", re.IGNORECASE)
 RE_SPECIFIER_OPTION = re.compile(r"^Option:\s*", re.IGNORECASE)
 RE_SPECIFIER_HIGH_COMPRESSIVE = re.compile(r"^High-compressive-strength inserts may permit\b", re.IGNORECASE)
-
+RE_SPECIFIER_VERIFY_SUITABILITY = re.compile(r"^Verify suitability of\b", re.IGNORECASE)
 
 def is_editor_note(raw_text: str) -> bool:
     txt = (raw_text or "").strip()
@@ -47,6 +47,7 @@ def is_specifier_note(raw_text: str) -> bool:
         or RE_SPECIFIER_EDITING_INSTRUCTION.match(txt)
         or RE_SPECIFIER_SPECIFY_PARTS.match(txt)
         or RE_SPECIFIER_PARAGRAPH_DEFINED.match(txt)
+        or RE_SPECIFIER_VERIFY_SUITABILITY.match(txt)
     ):
         return True
 
