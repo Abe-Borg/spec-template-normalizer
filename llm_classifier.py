@@ -242,20 +242,6 @@ def classify_document(
     return instructions
 
 
-def _classify_chunked(
-    slim_bundle: dict,
-    master_prompt: str,
-    run_instruction: str,
-    client: Any,
-    model: str,
-    chunk_size: int = 200,
-    overlap: int = 20,
-) -> dict:
-    raise NotImplementedError(
-        "Chunked classification is intentionally disabled pending two-pass redesign."
-    )
-
-
 def compute_coverage(slim_bundle: dict, instructions: dict) -> tuple:
     """
     Compute what percentage of classifiable paragraphs received a style.
