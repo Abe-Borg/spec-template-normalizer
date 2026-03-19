@@ -174,8 +174,9 @@ Regression tests cover XML extraction (`test_arch_env_extractor.py`), template r
 ```bash
 python phase1_smoke_test.py ARCH_TEMPLATE.docx instructions.json
 ```
+End-to-end pipeline validation using a real .docx and instructions.json. Not user-facing — this is a developer QA tool.
 
-End-to-end validation using a real .docx and instructions.json. Not user-facing.
+
 
 The smoke test runs the full pipeline end-to-end and delegates contract validation to `phase1_validator`. It checks:
 - Both registries are created
