@@ -135,6 +135,8 @@ Thin wrapper over the pipeline functions — no business logic.
 
 ### `arch_env_extractor.py` — Environment Capture (library module)
 
+Imported as a library by gui.py and phase1_smoke_test.py. No CLI entry point.
+
 | Function | Purpose |
 |---|---|
 | `extract_arch_template_registry()` | Main orchestrator — builds complete registry |
@@ -186,12 +188,11 @@ The GUI provides:
 python -m pytest tests/
 ```
 
-## Testing
-
 ### Smoke Test (developer tool)
 ```bash
 python phase1_smoke_test.py TEMPLATE.docx instructions.json
 ```
+
 
 ## CSI Role Hierarchy and Allowed Style IDs
 
