@@ -10,6 +10,7 @@ import json
 import re
 import os
 import queue
+import shutil
 import sys
 import threading
 import traceback
@@ -37,6 +38,8 @@ COLORS = {
     "warning": "#F59E0B",
     "error": "#EF4444",
 }
+
+CLEANUP_ON_FAILURE = True
 
 
 
@@ -94,6 +97,7 @@ class PipelineThread(threading.Thread):
         return base_dir / f"{docx_path.stem}_extracted__{stamp}"
 
     def run(self) -> None:
+        extract_dir: Optional[Path] = None
         try:
             from docx_decomposer import (
                 extract_docx,
@@ -113,8 +117,6 @@ class PipelineThread(threading.Thread):
             # 2) Build slim bundle
             self._log("Building slim bundle...")
             bundle = build_slim_bundle(extract_dir)
-            bundle_path = extract_dir / "slim_bundle.json"
-            bundle_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
 
             n_paras = len(bundle.get("paragraphs", []))
             self._log(f"Slim bundle: {n_paras} paragraphs")
@@ -132,11 +134,6 @@ class PipelineThread(threading.Thread):
                 run_instruction=run_instruction,
                 api_key=self.api_key,
             )
-
-            # Save instructions
-            instr_path = extract_dir / "instructions.json"
-            instr_path.write_text(json.dumps(instructions, indent=2), encoding="utf-8")
-            self._log(f"Instructions saved: {instr_path.name}")
 
             # 5) Coverage
             coverage, styled, classifiable = compute_coverage(bundle, instructions)
@@ -185,12 +182,18 @@ class PipelineThread(threading.Thread):
             # 10) Copy deliverables to output_dir if specified
             output_dir_path = Path(self.output_dir) if self.output_dir else extract_dir
             if output_dir_path != extract_dir:
-                import shutil
                 output_dir_path.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(reg_path, output_dir_path / reg_path.name)
                 self._log(f"Copied {reg_path.name} to {output_dir_path}")
                 shutil.copy2(env_path, output_dir_path / env_path.name)
                 self._log(f"Copied {env_path.name} to {output_dir_path}")
+
+            if extract_dir.resolve() != output_dir_path.resolve():
+                try:
+                    shutil.rmtree(extract_dir)
+                    self._log(f"Cleaned up working directory: {extract_dir.name}")
+                except Exception as cleanup_err:
+                    self._log(f"Warning: could not clean up {extract_dir.name}: {cleanup_err}")
 
             self.result_queue.put({
                 "success": True,
@@ -203,6 +206,14 @@ class PipelineThread(threading.Thread):
 
         except Exception:
             self._log(f"ERROR:\n{traceback.format_exc()}")
+            if CLEANUP_ON_FAILURE and extract_dir and extract_dir.exists():
+                try:
+                    output_dir_path = Path(self.output_dir) if self.output_dir else extract_dir
+                    if extract_dir.resolve() != output_dir_path.resolve():
+                        shutil.rmtree(extract_dir)
+                        self._log(f"Cleaned up working directory after failure: {extract_dir.name}")
+                except Exception:
+                    pass
             self.result_queue.put({"success": False})
 
 
