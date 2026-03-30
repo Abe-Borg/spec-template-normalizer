@@ -10,6 +10,7 @@ Public API:
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Set
 
@@ -18,20 +19,37 @@ from typing import Any, Dict, List, Set
 # OOXML namespace declarations for wrapping XML fragments
 # ---------------------------------------------------------------------------
 
-_NS_DECLS = (
-    'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
-    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
-    'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
-    'xmlns:o="urn:schemas-microsoft-com:office:office" '
-    'xmlns:v="urn:schemas-microsoft-com:vml" '
-    'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" '
-    'xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" '
-    'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
-    'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '
-    'xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" '
-    'xmlns:w16se="http://schemas.microsoft.com/office/word/2015/wordml/symex"'
-)
+_KNOWN_NS = {
+    "w":      "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "a":      "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "r":      "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "mc":     "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    "o":      "urn:schemas-microsoft-com:office:office",
+    "v":      "urn:schemas-microsoft-com:vml",
+    "m":      "http://schemas.openxmlformats.org/officeDocument/2006/math",
+    "wpc":    "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas",
+    "wp":     "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    "w14":    "http://schemas.microsoft.com/office/word/2010/wordml",
+    "w15":    "http://schemas.microsoft.com/office/word/2012/wordml",
+    "w16se":  "http://schemas.microsoft.com/office/word/2015/wordml/symex",
+    "w16cid": "http://schemas.microsoft.com/office/word/2016/wordml/cid",
+    "w16":    "http://schemas.microsoft.com/office/word/2018/wordml",
+    "w16cex": "http://schemas.microsoft.com/office/word/2018/wordml/cex",
+    "w16sdtdh": "http://schemas.microsoft.com/office/word/2020/wordml/sdtdatahash",
+    "wp14":   "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing",
+    "wps":    "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+    "wne":    "http://schemas.microsoft.com/office/word/2006/wordml",
+    "cx":     "http://schemas.microsoft.com/office/drawing/2014/chartex",
+    "cx1":    "http://schemas.microsoft.com/office/drawing/2015/9/8/chartex",
+    "sl":     "http://schemas.openxmlformats.org/schemaLibrary/2006/main",
+}
+
+# Pre-built declaration string from the known set
+_NS_DECLS = " ".join(f'xmlns:{k}="{v}"' for k, v in _KNOWN_NS.items())
+
+# Regex to find all namespace prefixes used in an XML fragment
+# Matches element names like <prefix:local and attribute names like prefix:attr="
+_PREFIX_RE = re.compile(r'(?:</?|[\s])([A-Za-z][A-Za-z0-9_]*):[A-Za-z]')
 
 _REQUIRED_TOP_LEVEL_KEYS = {
     "meta",
@@ -62,6 +80,30 @@ _ALLOWED_ROLES = {
 # XML fragment parser
 # ---------------------------------------------------------------------------
 
+def _build_ns_decls(xml_str: str) -> str:
+    """Build namespace declarations that cover every prefix used in *xml_str*.
+
+    Starts with the known OOXML set.  For any prefix found in the fragment
+    that is NOT in the known set, a synthetic placeholder URI is generated
+    so that :func:`ET.fromstring` never fails with 'unbound prefix'.
+
+    This is safe because we are only checking well-formedness, not resolving
+    namespace semantics.
+    """
+    used_prefixes = set(_PREFIX_RE.findall(xml_str))
+    # 'xml' is always implicitly declared
+    used_prefixes.discard("xml")
+
+    unknown = used_prefixes - set(_KNOWN_NS.keys())
+    if not unknown:
+        return _NS_DECLS
+
+    extra = " ".join(
+        f'xmlns:{p}="urn:unknown-ooxml-ns:{p}"' for p in sorted(unknown)
+    )
+    return f"{_NS_DECLS} {extra}"
+
+
 def _parse_xml_fragment(xml_str: str, context: str) -> None:
     """Parse an XML fragment by wrapping it in a namespace-aware synthetic root.
 
@@ -76,8 +118,10 @@ def _parse_xml_fragment(xml_str: str, context: str) -> None:
         idx = stripped.index("?>")
         stripped = stripped[idx + 2:].strip()
 
+    ns_decls = _build_ns_decls(stripped)
+
     try:
-        ET.fromstring(f"<root {_NS_DECLS}>{stripped}</root>")
+        ET.fromstring(f"<root {ns_decls}>{stripped}</root>")
     except ET.ParseError as exc:
         raise ValueError(
             f"Malformed XML fragment at {context}: {exc}"
