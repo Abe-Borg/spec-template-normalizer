@@ -91,8 +91,9 @@ def _build_ns_decls(xml_str: str) -> str:
     namespace semantics.
     """
     used_prefixes = set(_PREFIX_RE.findall(xml_str))
-    # 'xml' is always implicitly declared
+    # 'xml' and 'xmlns' are reserved prefixes that must never be (re)declared
     used_prefixes.discard("xml")
+    used_prefixes.discard("xmlns")
 
     unknown = used_prefixes - set(_KNOWN_NS.keys())
     if not unknown:
