@@ -127,6 +127,38 @@ def test_style_registry_warning_uses_pre_apply_bundle(tmp_path: Path):
     assert "warning" not in reg["roles"]["PARAGRAPH"]
 
 
+def test_style_registry_emits_source_tokens_for_section_roles(tmp_path: Path):
+    extract_dir = tmp_path / "x"
+    (extract_dir / "word").mkdir(parents=True)
+    (extract_dir / "word" / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="CSI_SectionID__ARCH"><w:name w:val="Section ID"/></w:style>'
+        '<w:style w:type="paragraph" w:styleId="CSI_SectionTitle__ARCH"><w:name w:val="Section Title"/></w:style>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    (extract_dir / "word" / "document.xml").write_text(
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+        '<w:p><w:r><w:t> SECTION 23 31 13 </w:t></w:r></w:p>'
+        '<w:p><w:r><w:t> METAL DUCTS </w:t></w:r></w:p>'
+        '<w:p><w:sectPr/></w:p>'
+        '</w:body></w:document>',
+        encoding="utf-8",
+    )
+
+    instructions = {
+        "roles": {
+            "SectionID": {"styleId": "CSI_SectionID__ARCH", "exemplar_paragraph_index": 0},
+            "SectionTitle": {"styleId": "CSI_SectionTitle__ARCH", "exemplar_paragraph_index": 1},
+        }
+    }
+    reg = build_style_registry_dict(extract_dir, "x.docx", instructions)
+    assert reg["source_tokens"] == {
+        "SectionID": "SECTION 23 31 13",
+        "SectionTitle": "METAL DUCTS",
+    }
+
+
 def test_extract_docx_raises_if_target_exists_without_overwrite(tmp_path: Path):
     docx_path = tmp_path / "a.docx"
     docx_path.write_bytes(b"PK\x05\x06" + b"\x00" * 18)

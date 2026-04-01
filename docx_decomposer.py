@@ -1227,9 +1227,21 @@ def build_style_registry_dict(
 
         out_roles[role] = entry
 
+    source_tokens: Dict[str, str] = {}
+    for role_name in ("SectionID", "SectionTitle"):
+        role_spec = roles.get(role_name)
+        if not isinstance(role_spec, dict):
+            continue
+        exemplar_idx = int(role_spec.get("exemplar_paragraph_index", -1))
+        if 0 <= exemplar_idx < len(paragraphs):
+            text = str(paragraphs[exemplar_idx].get("text", "")).strip()
+            if text:
+                source_tokens[role_name] = text
+
     return {
         "version": 2,
         "source_docx": source_docx_name,
+        "source_tokens": source_tokens,
         "roles": out_roles,
     }
 

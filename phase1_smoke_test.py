@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 import json
+import shutil
 import sys
 from pathlib import Path
 import time
@@ -72,13 +73,26 @@ def run() -> None:
     env_path = extract_dir / "arch_template_registry.json"
     env_path.write_text(json.dumps(template_registry, indent=2), encoding="utf-8")
 
+    raw_styles_src = extract_dir / "word" / "styles.xml"
+    raw_settings_src = extract_dir / "word" / "settings.xml"
+    raw_styles_dst = extract_dir / "arch_styles_raw.xml"
+    raw_settings_dst = extract_dir / "arch_settings_raw.xml"
+
+    if raw_styles_src.exists():
+        shutil.copy2(raw_styles_src, raw_styles_dst)
+        print(f"Preserved raw styles.xml as {raw_styles_dst.name}")
+    if raw_settings_src.exists():
+        shutil.copy2(raw_settings_src, raw_settings_dst)
+        print(f"Preserved raw settings.xml as {raw_settings_dst.name}")
+
     # Verify round-trip from disk
-    for path in (reg_path, env_path):
+    for path in (reg_path, env_path, raw_styles_dst, raw_settings_dst):
         if not path.exists():
             raise FileNotFoundError(f"Expected artifact at: {path}")
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not data:
-            raise ValueError(f"Artifact is empty or not a JSON object: {path}")
+        if path.suffix == ".json":
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not data:
+                raise ValueError(f"Artifact is empty or not a JSON object: {path}")
 
     print("Phase 1 smoke test: PASS (both registries validated)")
 

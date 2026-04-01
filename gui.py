@@ -188,6 +188,19 @@ class PipelineThread(threading.Thread):
                 shutil.copy2(env_path, output_dir_path / env_path.name)
                 self._log(f"Copied {env_path.name} to {output_dir_path}")
 
+            raw_styles_src = extract_dir / "word" / "styles.xml"
+            raw_settings_src = extract_dir / "word" / "settings.xml"
+            raw_styles_dst = output_dir_path / "arch_styles_raw.xml"
+            raw_settings_dst = output_dir_path / "arch_settings_raw.xml"
+
+            if raw_styles_src.exists():
+                shutil.copy2(raw_styles_src, raw_styles_dst)
+                self._log(f"Preserved raw styles.xml as {raw_styles_dst.name}")
+
+            if raw_settings_src.exists():
+                shutil.copy2(raw_settings_src, raw_settings_dst)
+                self._log(f"Preserved raw settings.xml as {raw_settings_dst.name}")
+
             if extract_dir.resolve() != output_dir_path.resolve():
                 try:
                     shutil.rmtree(extract_dir)

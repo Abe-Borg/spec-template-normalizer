@@ -4,13 +4,13 @@ A tool that adds CSI structural tagging to Word specification documents without 
 
 ## Project Status
 
-**Phase 1 Complete** - This project handles architect template normalization and environment capture. It produces formal contract artifacts (`arch_style_registry.json` and `arch_template_registry.json`) for use in downstream specification automation pipelines.
+**Phase 1 Complete** - This project handles architect template normalization and environment capture. It produces formal contract artifacts for use in downstream specification automation pipelines.
 
 Phase 2 (applying architect formatting to MEP specs) is implemented separately.
 
 ## What it does
 
-Takes an architect's Word spec template and produces two formal artifacts:
+Takes an architect's Word spec template and produces four formal artifacts:
 
 ### 1. Structure Normalization (`arch_style_registry.json`)
 - Identifies CSI structural elements (PART, Article, Paragraph, etc.) using LLM classification
@@ -30,7 +30,7 @@ Takes an architect's Word spec template and produces two formal artifacts:
   - Numbering definitions
   - Font table
 
-The output document looks identical but now has proper paragraph styles you can work with programmatically. The two JSON registries provide everything needed to recreate the architect's formatting environment in other documents.
+The output document looks identical but now has proper paragraph styles you can work with programmatically. The registries plus raw XML companions provide everything needed to recreate the architect's formatting environment in other documents with exact fidelity.
 
 ## Architecture
 
@@ -90,8 +90,10 @@ The GUI is the primary entry point and runs the full automated pipeline:
 The pipeline performs: extract → build slim bundle → classify via Anthropic API (default model: `claude-opus-4-6`) → apply styles → emit both registries.
 
 After completion, you'll have:
-- `ARCH_TEMPLATE_extracted/arch_style_registry.json` - CSI role mappings
+- `ARCH_TEMPLATE_extracted/arch_style_registry.json` - CSI role mappings + source section tokens
 - `ARCH_TEMPLATE_extracted/arch_template_registry.json` - Complete environment
+- `ARCH_TEMPLATE_extracted/arch_styles_raw.xml` - Byte-exact `word/styles.xml` from the source DOCX
+- `ARCH_TEMPLATE_extracted/arch_settings_raw.xml` - Byte-exact `word/settings.xml` from the source DOCX
 - Modified `ARCH_TEMPLATE_extracted/` folder with styles applied
 
 ## What gets created
@@ -100,8 +102,12 @@ After completion, you'll have:
 Maps CSI roles to Word styleIds:
 ```json
 {
-  "version": 1,
+  "version": 2,
   "source_docx": "ARCH_TEMPLATE.docx",
+  "source_tokens": {
+    "SectionID": "SECTION 23 31 13",
+    "SectionTitle": "METAL DUCTS"
+  },
   "roles": {
     "PART": {
       "style_id": "CSI_Part__ARCH",
@@ -116,6 +122,14 @@ Maps CSI roles to Word styleIds:
 
 ### arch_template_registry.json
 Complete formatting environment with raw XML blocks (see `schemas/arch_template_registry.example.json` for full structure).
+
+### arch_styles_raw.xml
+Byte-exact copy of the architect template's `word/styles.xml`. Phase 2 can import this directly for exact style fidelity.
+
+### arch_settings_raw.xml
+Byte-exact copy of the architect template's `word/settings.xml`. Phase 2 can import this directly for exact settings transfer.
+
+Keep all four files together in the same output directory.
 
 ### Coverage metric
 After classification, the pipeline reports what percentage of content paragraphs were classified. Paragraphs that are empty, contain section breaks, are inside tables, say "END OF SECTION", or are editor notes in brackets are excluded from the count. Coverage must be 100% for classifiable paragraphs; otherwise Phase 1 fails validation.
@@ -180,6 +194,7 @@ End-to-end pipeline validation using a real .docx and instructions.json. Not use
 
 The smoke test runs the full pipeline end-to-end and delegates contract validation to `phase1_validator`. It checks:
 - Both registries are created
+- Raw `styles.xml` and `settings.xml` companions are preserved
 - arch_style_registry.json matches schema
 - All required CSI roles are present (SectionID is optional)
 - XML fragments are well-formed
@@ -190,6 +205,7 @@ The smoke test runs the full pipeline end-to-end and delegates contract validati
 
 Formal JSON schemas are provided in `schemas/`:
 - `arch_style_registry.v1.schema.json` - Style registry contract
+- `arch_style_registry.v2.schema.json` - Current style registry contract
 - `schemas/arch_template_registry.example.json` - Environment registry example file (not runtime output)
 
 ## Requirements
