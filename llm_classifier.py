@@ -13,7 +13,13 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from paragraph_rules import is_classifiable_paragraph
+from paragraph_rules import (
+    is_classifiable_paragraph,
+    detect_role_signal,
+    infer_expected_roles,
+    RE_ALPHA_PARA,
+    RE_NUMERIC_SUB,
+)
 
 
 MAX_SINGLE_PASS_PARAGRAPHS = 500
@@ -102,6 +108,206 @@ def _extract_missing_indices(error: ValueError) -> Optional[List[int]]:
         return None
 
 
+def _repair_strong_signal_mismatches(
+    instructions: dict,
+    slim_bundle: dict,
+) -> int:
+    """Auto-correct apply_pStyle entries where strong text signals contradict
+    the assigned styleId.
+
+    When a paragraph's text unambiguously matches a CSI role pattern
+    (e.g. ``SECTION 23 05 00`` → SectionID) but the LLM assigned a
+    different styleId than what it declared in the ``roles`` mapping,
+    this function overwrites the apply_pStyle entry with the correct
+    styleId.
+
+    This avoids an unnecessary retry/patch API call for errors that are
+    deterministically fixable from regex evidence alone.
+
+    Returns:
+        Number of corrections applied.
+    """
+    roles = instructions.get("roles")
+    if not roles or not isinstance(roles, dict):
+        return 0
+
+    # Build role → styleId mapping
+    role_style: Dict[str, str] = {}
+    for role, spec in roles.items():
+        if isinstance(spec, dict) and spec.get("styleId"):
+            role_style[role] = spec["styleId"]
+
+    if not role_style:
+        return 0
+
+    # Build paragraph_index → apply_pStyle entry mapping (by reference)
+    apply_list = instructions.get("apply_pStyle", [])
+    apply_map: Dict[int, dict] = {item["paragraph_index"]: item for item in apply_list}
+
+    paragraphs = slim_bundle.get("paragraphs", [])
+    classifiable = [p for p in paragraphs if is_classifiable_paragraph(p)]
+
+    # Determine whether numeric/lower patterns are strong signals
+    has_alpha = any(
+        RE_ALPHA_PARA.match((p.get("text") or "").strip()) for p in classifiable
+    )
+    has_numeric = any(
+        RE_NUMERIC_SUB.match((p.get("text") or "").strip()) for p in classifiable
+    )
+
+    corrections = 0
+    for p in classifiable:
+        idx = p["paragraph_index"]
+        text = (p.get("text") or "").strip()
+
+        signal = detect_role_signal(
+            text, numeric_is_strong=has_alpha, lower_is_strong=has_numeric
+        )
+        if signal is None:
+            continue
+
+        expected_style = role_style.get(signal)
+        if not expected_style:
+            continue
+
+        entry = apply_map.get(idx)
+        if entry is not None and entry["styleId"] != expected_style:
+            entry["styleId"] = expected_style
+            corrections += 1
+
+    return corrections
+
+
+def _repair_missing_roles(
+    instructions: dict,
+    slim_bundle: dict,
+) -> int:
+    """Auto-add missing roles when strong text signals prove they exist in
+    the document but the LLM omitted them from ``roles``.
+
+    For each missing role detected by :func:`infer_expected_roles`:
+
+    1. Select the first strong-hit paragraph as the exemplar.
+    2. Determine the styleId — if all strong-hit paragraphs already share
+       one assigned style, reuse it; otherwise create a ``CSI_*__ARCH``
+       style derived from the exemplar.
+    3. Insert the role into ``roles``, the style into ``create_styles``
+       (if new), and ensure all strong-hit paragraphs carry the correct
+       styleId in ``apply_pStyle``.
+
+    Returns:
+        Number of roles added.
+    """
+    paragraphs = slim_bundle.get("paragraphs", [])
+    expected_roles, strong_hits = infer_expected_roles(paragraphs)
+
+    roles = instructions.get("roles")
+    if not isinstance(roles, dict):
+        instructions["roles"] = roles = {}
+
+    missing = sorted(expected_roles - set(roles.keys()))
+    if not missing:
+        return 0
+
+    # Mapping: role name → canonical CSI_*__ARCH styleId
+    ROLE_TO_ARCH_STYLE = {
+        "SectionID": "CSI_SectionID__ARCH",
+        "SectionTitle": "CSI_SectionTitle__ARCH",
+        "PART": "CSI_Part__ARCH",
+        "ARTICLE": "CSI_Article__ARCH",
+        "PARAGRAPH": "CSI_Paragraph__ARCH",
+        "SUBPARAGRAPH": "CSI_Subparagraph__ARCH",
+        "SUBSUBPARAGRAPH": "CSI_Subsubparagraph__ARCH",
+    }
+
+    ROLE_TO_STYLE_NAME = {
+        "SectionID": "CSI SectionID (Architect Template)",
+        "SectionTitle": "CSI SectionTitle (Architect Template)",
+        "PART": "CSI Part (Architect Template)",
+        "ARTICLE": "CSI Article (Architect Template)",
+        "PARAGRAPH": "CSI Paragraph (Architect Template)",
+        "SUBPARAGRAPH": "CSI Subparagraph (Architect Template)",
+        "SUBSUBPARAGRAPH": "CSI Subsubparagraph (Architect Template)",
+    }
+
+    # Build working indices
+    apply_list = instructions.get("apply_pStyle", [])
+    apply_map: Dict[int, dict] = {
+        item["paragraph_index"]: item for item in apply_list
+    }
+    existing_style_ids = set(slim_bundle.get("style_catalog", {}).keys())
+    created_style_ids = {
+        sd["styleId"]
+        for sd in instructions.get("create_styles", [])
+        if isinstance(sd, dict)
+    }
+
+    added = 0
+    for role in missing:
+        hits = strong_hits.get(role, [])
+        if not hits:
+            # SectionTitle has no regex hits — skip for now (position-based,
+            # requires more context than a simple auto-repair can provide).
+            continue
+
+        exemplar_idx = hits[0]
+
+        # Check if these paragraphs already share a single assigned style
+        assigned_styles: Set[str] = set()
+        for idx in hits:
+            entry = apply_map.get(idx)
+            if entry:
+                assigned_styles.add(entry["styleId"])
+
+        if len(assigned_styles) == 1:
+            # All strong-hit paragraphs already have the same style — reuse it
+            style_id = assigned_styles.pop()
+        else:
+            # Need a CSI_*__ARCH style
+            style_id = ROLE_TO_ARCH_STYLE.get(role)
+            if not style_id:
+                continue
+
+            # Create the style definition if it doesn't already exist
+            if style_id not in existing_style_ids and style_id not in created_style_ids:
+                create_list = instructions.setdefault("create_styles", [])
+                create_list.append({
+                    "styleId": style_id,
+                    "name": ROLE_TO_STYLE_NAME.get(role, style_id),
+                    "type": "paragraph",
+                    "derive_from_paragraph_index": exemplar_idx,
+                    "basedOn": "Normal",
+                })
+                created_style_ids.add(style_id)
+
+        # Register the role
+        roles[role] = {
+            "styleId": style_id,
+            "exemplar_paragraph_index": exemplar_idx,
+        }
+
+        # Ensure every strong-hit paragraph is assigned this style
+        for idx in hits:
+            entry = apply_map.get(idx)
+            if entry is None:
+                new_entry = {"paragraph_index": idx, "styleId": style_id}
+                instructions.setdefault("apply_pStyle", []).append(new_entry)
+                apply_map[idx] = new_entry
+            elif entry["styleId"] != style_id:
+                entry["styleId"] = style_id
+
+        added += 1
+
+    # Keep apply_pStyle sorted after mutations
+    if added:
+        instructions["apply_pStyle"] = sorted(
+            instructions.get("apply_pStyle", []),
+            key=lambda x: x["paragraph_index"],
+        )
+
+    return added
+
+
 def _build_patch_prompt(
     slim_bundle: dict,
     instructions: dict,
@@ -167,6 +373,10 @@ def classify_document(
     (coverage mismatch), automatically makes a targeted follow-up call
     to classify just the missing indices before failing.
 
+    Strong-signal mismatches (where regex-detectable text patterns like
+    "SECTION 23 05 00" or "PART 1 - GENERAL" contradict the LLM's style
+    assignment) are auto-repaired locally without an additional API call.
+
     Args:
         slim_bundle: The slim bundle dict from build_slim_bundle().
         master_prompt: Content of master_prompt.txt (system prompt).
@@ -200,6 +410,21 @@ def classify_document(
 
     raw = _call_api(client, master_prompt, user_message, model)
     instructions = _parse_response(raw)
+
+    # Auto-repair missing roles before other repairs.
+    # When the LLM omits a role that strong text signals prove exists
+    # (e.g. SECTION XX XX XX paragraphs exist but roles has no SectionID),
+    # add the role, create the style if needed, and assign strong-hit paragraphs.
+    added_roles = _repair_missing_roles(instructions, slim_bundle)
+    if added_roles:
+        print(f"Auto-added {added_roles} missing role(s) from strong text signals")
+
+    # Auto-repair strong-signal mismatches before validation.
+    # These are paragraphs whose text unambiguously identifies their CSI role
+    # (via regex) but were assigned the wrong styleId by the LLM.
+    repairs = _repair_strong_signal_mismatches(instructions, slim_bundle)
+    if repairs:
+        print(f"Auto-repaired {repairs} strong-signal style mismatch(es)")
 
     # Attempt validation; if coverage mismatch, try targeted patching
     for patch_attempt in range(max_patch_attempts + 1):
@@ -236,6 +461,11 @@ def classify_document(
                 instructions.get("apply_pStyle", []),
                 key=lambda x: x["paragraph_index"],
             )
+
+            # Re-run strong-signal repair after patching (new entries may need it)
+            repairs = _repair_strong_signal_mismatches(instructions, slim_bundle)
+            if repairs:
+                print(f"Auto-repaired {repairs} strong-signal style mismatch(es) after patch")
 
     # Final validation (should not reach here, but safety net)
     validate_instructions(instructions, slim_bundle=slim_bundle)
