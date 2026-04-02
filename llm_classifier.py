@@ -373,7 +373,13 @@ def _repair_role_exemplar_mismatches(
             continue
 
         correct_idx = _find_correct_exemplar(role)
-        if correct_idx is None or correct_idx == exemplar_idx:
+        if correct_idx is None:
+            # No valid exemplar exists for this role in the document.
+            del roles[role]
+            corrections += 1
+            print(f"Removed phantom role '{role}' (no valid exemplar exists)")
+            continue
+        if correct_idx == exemplar_idx:
             continue
 
         spec["exemplar_paragraph_index"] = correct_idx
