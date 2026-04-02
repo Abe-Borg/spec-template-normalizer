@@ -8,6 +8,7 @@ Design constraint: pure module with no CLI — imported by gui.py.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import re
 import time
@@ -308,6 +309,140 @@ def _repair_missing_roles(
     return added
 
 
+def _repair_role_exemplar_mismatches(
+    instructions: dict,
+    slim_bundle: dict,
+) -> int:
+    """Repair role exemplars whose paragraph text strongly signals a different role."""
+    roles = instructions.get("roles")
+    if not isinstance(roles, dict):
+        return 0
+
+    paragraphs = slim_bundle.get("paragraphs", [])
+    classifiable = [p for p in paragraphs if is_classifiable_paragraph(p)]
+    by_index: Dict[int, dict] = {p["paragraph_index"]: p for p in classifiable}
+    if not by_index:
+        return 0
+
+    _, strong_hits = infer_expected_roles(paragraphs)
+
+    has_alpha = any(
+        RE_ALPHA_PARA.match((p.get("text") or "").strip()) for p in classifiable
+    )
+    has_numeric = any(
+        RE_NUMERIC_SUB.match((p.get("text") or "").strip()) for p in classifiable
+    )
+
+    def _find_correct_exemplar(role: str) -> Optional[int]:
+        if role == "SectionTitle":
+            for section_id_idx in sorted(strong_hits.get("SectionID", [])):
+                candidate_idx = section_id_idx + 1
+                para = by_index.get(candidate_idx)
+                if not para:
+                    continue
+                text = (para.get("text") or "").strip()
+                signal = detect_role_signal(
+                    text, numeric_is_strong=has_alpha, lower_is_strong=has_numeric
+                )
+                if signal is None:
+                    return candidate_idx
+            return None
+
+        hits = strong_hits.get(role, [])
+        return hits[0] if hits else None
+
+    corrections = 0
+    for role, spec in list(roles.items()):
+        if not isinstance(spec, dict):
+            continue
+
+        exemplar_idx = spec.get("exemplar_paragraph_index")
+        if not isinstance(exemplar_idx, int):
+            continue
+
+        para = by_index.get(exemplar_idx)
+        if not para:
+            continue
+
+        text = (para.get("text") or "").strip()
+        signal = detect_role_signal(
+            text, numeric_is_strong=has_alpha, lower_is_strong=has_numeric
+        )
+
+        if signal is None or signal == role:
+            continue
+
+        correct_idx = _find_correct_exemplar(role)
+        if correct_idx is None or correct_idx == exemplar_idx:
+            continue
+
+        spec["exemplar_paragraph_index"] = correct_idx
+        style_id = spec.get("styleId")
+        for sd in instructions.get("create_styles", []):
+            if not isinstance(sd, dict):
+                continue
+            if sd.get("styleId") == style_id and sd.get("derive_from_paragraph_index") == exemplar_idx:
+                sd["derive_from_paragraph_index"] = correct_idx
+
+        corrections += 1
+
+    return corrections
+
+
+def _repair_coverage_gaps(
+    instructions: dict,
+    slim_bundle: dict,
+) -> int:
+    """Fill remaining unclassified classifiable paragraphs by nearest-neighbor style."""
+    paragraphs = slim_bundle.get("paragraphs", [])
+    classifiable_indices = {
+        p["paragraph_index"] for p in paragraphs if is_classifiable_paragraph(p)
+    }
+    apply_list = instructions.setdefault("apply_pStyle", [])
+    apply_map: Dict[int, str] = {
+        item["paragraph_index"]: item["styleId"] for item in apply_list if isinstance(item, dict)
+    }
+
+    missing = sorted(classifiable_indices - set(apply_map.keys()))
+    if not missing:
+        return 0
+
+    classified_indices = sorted(apply_map.keys())
+    repairs = 0
+
+    for idx in missing:
+        insert_at = bisect.bisect_left(classified_indices, idx)
+
+        prev_style: Optional[str] = None
+        if insert_at > 0:
+            prev_style = apply_map.get(classified_indices[insert_at - 1])
+
+        next_style: Optional[str] = None
+        if insert_at < len(classified_indices):
+            next_style = apply_map.get(classified_indices[insert_at])
+
+        if prev_style and next_style:
+            chosen = prev_style if prev_style == next_style else prev_style
+        else:
+            chosen = prev_style or next_style
+
+        if not chosen:
+            continue
+
+        apply_list.append({"paragraph_index": idx, "styleId": chosen})
+        apply_map[idx] = chosen
+        bisect.insort(classified_indices, idx)
+        repairs += 1
+
+    if repairs:
+        instructions["apply_pStyle"] = sorted(
+            apply_list,
+            key=lambda x: x["paragraph_index"],
+        )
+
+    return repairs
+
+
 def _build_patch_prompt(
     slim_bundle: dict,
     instructions: dict,
@@ -364,18 +499,21 @@ def classify_document(
     run_instruction: str,
     api_key: str,
     model: str = "claude-opus-4-6",
-    max_patch_attempts: int = 2,
+    max_patch_attempts: int = 3,
 ) -> dict:
     """
     Classify all paragraphs in a slim bundle using the Anthropic API.
 
     If the initial classification misses a small number of paragraphs
-    (coverage mismatch), automatically makes a targeted follow-up call
-    to classify just the missing indices before failing.
+    (coverage mismatch), automatically makes targeted follow-up calls
+    to classify just the missing indices. If coverage still fails after
+    all patch attempts, applies a nearest-neighbor fallback repair.
 
-    Strong-signal mismatches (where regex-detectable text patterns like
+    Deterministic repairs are applied locally before validation:
+    missing roles, role-exemplar mismatches, and strong-signal style
+    mismatches (where regex-detectable text patterns like
     "SECTION 23 05 00" or "PART 1 - GENERAL" contradict the LLM's style
-    assignment) are auto-repaired locally without an additional API call.
+    assignment).
 
     Args:
         slim_bundle: The slim bundle dict from build_slim_bundle().
@@ -383,7 +521,7 @@ def classify_document(
         run_instruction: Content of run_instruction_prompt.txt (task prompt).
         api_key: Anthropic API key.
         model: Model ID to use.
-        max_patch_attempts: Max number of targeted patch calls (default 2).
+        max_patch_attempts: Max number of targeted patch calls (default 3).
 
     Returns:
         Parsed instructions dict (same schema as instructions.json).
@@ -419,6 +557,10 @@ def classify_document(
     if added_roles:
         print(f"Auto-added {added_roles} missing role(s) from strong text signals")
 
+    exemplar_repairs = _repair_role_exemplar_mismatches(instructions, slim_bundle)
+    if exemplar_repairs:
+        print(f"Auto-repaired {exemplar_repairs} role exemplar mismatch(es)")
+
     # Auto-repair strong-signal mismatches before validation.
     # These are paragraphs whose text unambiguously identifies their CSI role
     # (via regex) but were assigned the wrong styleId by the LLM.
@@ -433,8 +575,15 @@ def classify_document(
             return instructions  # Clean pass
         except ValueError as exc:
             missing = _extract_missing_indices(exc)
-            if missing is None or patch_attempt >= max_patch_attempts:
-                raise  # Not a coverage error, or out of patch attempts
+            if missing is None:
+                raise  # Not a coverage error
+
+            if patch_attempt >= max_patch_attempts:
+                gap_fills = _repair_coverage_gaps(instructions, slim_bundle)
+                if gap_fills:
+                    print(f"Gap-filled {gap_fills} paragraph(s) via nearest-neighbor")
+                    break
+                raise  # Out of patch attempts and no deterministic gap fill was possible
 
             print(
                 f"Coverage patch attempt {patch_attempt + 1}/{max_patch_attempts}: "

@@ -126,14 +126,19 @@ class PipelineThread(threading.Thread):
             master_prompt = _load_prompt_file(script_dir / "master_prompt.txt")
             run_instruction = _load_prompt_file(script_dir / "run_instruction_prompt.txt")
 
-            # 4) Classify
+            # 4) Classify (redirect stdout so classifier repair logs appear in GUI)
             self._log("Classifying via LLM...")
-            instructions = classify_document(
-                slim_bundle=bundle,
-                master_prompt=master_prompt,
-                run_instruction=run_instruction,
-                api_key=self.api_key,
-            )
+            old_stdout = sys.stdout
+            sys.stdout = LogRedirector(self.log_queue)
+            try:
+                instructions = classify_document(
+                    slim_bundle=bundle,
+                    master_prompt=master_prompt,
+                    run_instruction=run_instruction,
+                    api_key=self.api_key,
+                )
+            finally:
+                sys.stdout = old_stdout
 
             # 5) Coverage
             coverage, styled, classifiable = compute_coverage(bundle, instructions)

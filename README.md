@@ -150,10 +150,16 @@ Each style captures exact formatting from exemplar paragraphs.
 1. **Extract**: Unzips DOCX, records hashes of headers/footers/section properties
 2. **Slim bundle**: Creates minimal JSON (text + numbering hints) for LLM
 3. **LLM classify**: Claude analyzes structure and returns JSON with role assignments + exemplar selections
-4. **Derive locally**: Script extracts formatting from chosen exemplar paragraphs
-5. **Apply surgically**: Inserts `<w:pStyle>` tags into paragraphs by index
-6. **Capture environment**: Extracts complete formatting environment into arch_template_registry.json
-7. **Verify**: Fails if anything changed except `<w:pStyle>` additions
+4. **Deterministic repair chain** (local, no formatting generation):
+   - Add missing roles inferred from strong regex signals
+   - Fix role exemplar mismatches when exemplar text contradicts the declared role
+   - Fix strong-signal style mismatches in `apply_pStyle`
+   - Validate with targeted coverage patch calls (up to 3 API retries)
+   - If coverage still fails, fill remaining gaps with nearest-neighbor style fallback
+5. **Derive locally**: Script extracts formatting from chosen exemplar paragraphs
+6. **Apply surgically**: Inserts `<w:pStyle>` tags into paragraphs by index
+7. **Capture environment**: Extracts complete formatting environment into arch_template_registry.json
+8. **Verify**: Fails if anything changed except `<w:pStyle>` additions
 
 ## What it doesn't do
 
@@ -232,7 +238,17 @@ The LLM's role mapping doesn't match its create_styles entries. The exemplar par
 Set the `ANTHROPIC_API_KEY` environment variable or enter the key in the GUI's API Key field.
 
 **Coverage below 100%**
-The LLM may not have classified all content paragraphs. Try re-running the pipeline via the GUI.
+The classifier now runs a staged recovery flow: targeted patch retries (up to 3) and then nearest-neighbor fallback for any remaining classifiable gaps. If coverage still fails, inspect the logged paragraph indices and retry with a refined prompt.
+
+### Classification recovery behavior
+
+| Failure mode | Automatic recovery |
+|------|---------------------|
+| Missing expected role (e.g., SectionID omitted) | Add role + style mapping from strong text signals |
+| Role exemplar contradicts its declared role | Move exemplar to a role-consistent paragraph and sync create-style derivation index |
+| Strong regex signal paragraph assigned wrong style | Override paragraph `styleId` to the role's declared style |
+| Coverage mismatch after initial pass | Targeted patch API calls (up to 3) |
+| Coverage mismatch after all patch calls | Nearest-neighbor paragraph style fill for remaining classifiable indices |
 
 
 ## Copyright Notice
