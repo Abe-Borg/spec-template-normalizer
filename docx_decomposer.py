@@ -183,8 +183,8 @@ def extract_docx(docx_path: Path, extract_dir: Path, *, overwrite: bool = False)
 # -----------------------------
 
 def iter_paragraph_xml_blocks(document_xml_text: str):
-    # Non-greedy paragraph blocks. Avoid full XML parse to preserve indices + raw text.
-    for m in re.finditer(r"(<w:p\b[\s\S]*?</w:p>)", document_xml_text):
+    # Match both paired <w:p>...</w:p> and self-closing <w:p ... />
+    for m in re.finditer(r"(<w:p\b(?:[^>]*/>|[\s\S]*?</w:p>))", document_xml_text):
         yield m.start(), m.end(), m.group(1)
 
 
