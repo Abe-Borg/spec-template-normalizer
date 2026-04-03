@@ -903,7 +903,15 @@ def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[
             covered_ilvls.add(s.family_key[1])  # ilvl component
 
     required_ilvls = {fk[1] for fk in numbered_families}
-    missing_ilvls = sorted(required_ilvls - covered_ilvls, key=lambda x: (x is None, x))
+
+    # ilvls beyond the deepest covered level are implicitly handled by the
+    # deepest role (e.g. SUBSUBPARAGRAPH absorbs ilvl 5+ when it covers ilvl 4).
+    numeric_covered = sorted(int(v) for v in covered_ilvls if v is not None)
+    max_covered = numeric_covered[-1] if numeric_covered else -1
+    missing_ilvls = sorted(
+        [v for v in (required_ilvls - covered_ilvls) if v is None or int(v) <= max_covered],
+        key=lambda x: (x is None, x),
+    )
     if missing_ilvls:
         raise ValueError(f"Semantic validation failed: missing numbered ilvl coverage {missing_ilvls}")
 
