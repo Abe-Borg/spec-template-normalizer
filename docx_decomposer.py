@@ -890,16 +890,22 @@ def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[
     if numbered_families and not roles:
         raise ValueError("Semantic validation failed: numbered structure detected but roles is empty")
 
-    covered_families: Set[Tuple[Optional[str], Optional[str]]] = set()
+    # Check that every numbered ilvl is covered by at least one role exemplar,
+    # rather than requiring every exact (abstractNumId, ilvl) family to be covered.
+    # Documents routinely use many different numbering definitions (per-section restarts)
+    # that all map to the same CSI hierarchy level.
+    covered_ilvls: Set[Optional[str]] = set()
     for spec in roles.values():
         if not isinstance(spec, dict):
             continue
         s = signals.get(int(spec["exemplar_paragraph_index"]))
         if s and s.family_key is not None:
-            covered_families.add(s.family_key)
-    missing_families = sorted(numbered_families - covered_families)
-    if missing_families:
-        raise ValueError(f"Semantic validation failed: missing numbered families {missing_families}")
+            covered_ilvls.add(s.family_key[1])  # ilvl component
+
+    required_ilvls = {fk[1] for fk in numbered_families}
+    missing_ilvls = sorted(required_ilvls - covered_ilvls, key=lambda x: (x is None, x))
+    if missing_ilvls:
+        raise ValueError(f"Semantic validation failed: missing numbered ilvl coverage {missing_ilvls}")
 
     for role, spec in roles.items():
         exemplar_idx = int(spec["exemplar_paragraph_index"])
