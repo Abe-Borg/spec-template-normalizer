@@ -16,7 +16,8 @@ Phase 2 (separate codebase) uses these artifacts to apply architect formatting t
 ```
 .
 ├── docx_decomposer.py          # Library module — extraction, slim bundle, style application
-├── llm_classifier.py           # LLM automation — calls Anthropic API, chunking, coverage check
+├── llm_classifier.py           # LLM automation — calls Anthropic API, chunking, repair chain
+├── paragraph_rules.py          # CSI role detection, paragraph classification, skip rules
 ├── gui.py                      # Tkinter GUI wrapper (thin — no business logic)
 ├── arch_env_extractor.py       # Environment capture — produces arch_template_registry.json (library)
 ├── phase1_validator.py         # Contract validation — validates both registries before writing
@@ -25,12 +26,23 @@ Phase 2 (separate codebase) uses these artifacts to apply architect formatting t
 ├── run_instruction_prompt.txt  # Task prompt for LLM
 ├── instructions.json           # Example LLM output (style instructions)
 ├── schemas/
-│   ├── arch_style_registry.v1.schema.json   # Formal JSON Schema for style registry
-│   └── arch_template_registry.json          # Example/template for environment registry
+│   ├── arch_style_registry.v1.schema.json      # Formal JSON Schema for style registry (v1)
+│   ├── arch_style_registry.v2.schema.json      # Formal JSON Schema for style registry (v2, current)
+│   ├── phase1_instructions.schema.json         # Formal JSON Schema for LLM instruction output
+│   └── arch_template_registry.example.json     # Example/reference for environment registry
 ├── tests/
-│   ├── test_arch_env_extractor.py           # Regression tests for XML extraction
+│   ├── test_arch_env_extractor.py              # Regression tests for XML extraction
 │   ├── test_arch_template_registry_validation.py  # Template registry validation tests
-│   └── test_phase1_validator.py             # Contract validation tests
+│   ├── test_phase1_validator.py                # Contract validation tests
+│   ├── test_phase1_hardening.py                # Post-classification repair chain tests
+│   ├── test_paragraph_rules.py                 # Paragraph rule detection tests
+│   ├── test_phase1_contracts.py                # End-to-end contract shape tests
+│   ├── test_apply_reserved_styles.py           # Reserved style application tests
+│   ├── test_document_structure.py              # Document structure tests
+│   ├── test_docx_decomposer_rpr_hints.py       # rPr hint extraction tests
+│   ├── test_registry_numbering.py              # Numbering registry tests
+│   ├── test_semantic_validation.py             # Semantic validation tests
+│   └── test_style_catalog.py                   # Style catalog tests
 ├── requirements.txt            # Runtime dependencies (anthropic)
 ├── requirements-build.txt      # PyInstaller build dependencies
 ├── README.md
@@ -120,8 +132,27 @@ Pure module (no CLI) — called by `gui.py`.
 | `classify_document()` | Main entry: calls Anthropic API with slim bundle, returns instructions dict. Default model: `claude-opus-4-6` |
 | `compute_coverage()` | Computes % of classifiable paragraphs that received a style |
 | `estimate_tokens()` | Rough token count for chunking decisions |
+| `_repair_missing_roles()` | Auto-adds roles where strong text signals prove they exist but LLM omitted them |
+| `_repair_role_exemplar_mismatches()` | Moves exemplar to role-consistent paragraph when exemplar text contradicts declared role |
+| `_repair_strong_signal_mismatches()` | Overwrites apply_pStyle entries where regex signals contradict the assigned styleId |
+| `_repair_coverage_gaps()` | Nearest-neighbor fallback fill for paragraphs still unclassified after patch retries |
+| `_build_patch_prompt()` | Builds a targeted prompt for coverage patch API calls |
 
-**Design constraints:** No CLI of its own. Retry logic (up to 2 retries) for transient API failures. Chunking activates automatically when token estimate > 80K or paragraphs > 300.
+**Design constraints:** No CLI of its own. Retry logic (up to 2 retries) for transient API failures. Chunking activates automatically when token estimate > 80K or paragraphs > 300. After initial classification, a deterministic repair chain runs before any API patch retries.
+
+### `paragraph_rules.py` — CSI Role Detection and Skip Rules
+
+Imported by `docx_decomposer.py` and `llm_classifier.py`. Contains all regex patterns and classification logic for CSI structural roles.
+
+| Function | Purpose |
+|---|---|
+| `compute_skip_reason()` | Returns skip label (empty, sectPr, in_table, end_of_section, editor_note, copyright_notice, specifier_note) or None |
+| `is_classifiable_paragraph()` | Returns True if a paragraph should receive a CSI style |
+| `is_editor_note()` | Detects bracketed editor instructions |
+| `is_copyright_notice()` | Detects copyright/distribution boilerplate |
+| `is_specifier_note()` | Detects specifier editing instructions (Retain/Revise/etc.) |
+| `detect_role_signal()` | Returns the unambiguous CSI role for a paragraph's text based on regex patterns |
+| `infer_expected_roles()` | Returns the set of roles expected in a document based on strong text signals |
 
 ### `gui.py` — Tkinter GUI (Primary Entry Point)
 
@@ -215,18 +246,25 @@ All created style IDs must match the pattern `CSI_*__ARCH`.
 ### `arch_style_registry.json`
 ```json
 {
-  "version": 1,
+  "version": 2,
   "source_docx": "TEMPLATE.docx",
+  "source_tokens": {
+    "SectionID": "SECTION 23 05 00",
+    "SectionTitle": "COMMON WORK RESULTS FOR HVAC"
+  },
   "roles": {
     "PART": { "style_id": "CSI_Part__ARCH", "exemplar_paragraph_index": 4, "style_name": "..." },
     ...
   }
 }
 ```
-Validated against `schemas/arch_style_registry.v1.schema.json`.
+Current schema: `schemas/arch_style_registry.v2.schema.json`. `source_tokens` captures the literal text of the exemplar paragraph for each role (SectionID and SectionTitle only), used by Phase 2 for section identification.
 
 ### `arch_template_registry.json`
 Complete formatting environment with sections: `meta`, `package_inventory`, `doc_defaults`, `styles`, `theme`, `settings`, `page_layout`, `headers_footers`, `numbering`, `fonts`, `custom_xml`, `capture_policy`.
+
+### `arch_styles_raw.xml` and `arch_settings_raw.xml`
+Byte-exact copies of the architect template's `word/styles.xml` and `word/settings.xml`. Phase 2 can import these directly for exact style and settings fidelity. Written alongside the registries in the output directory.
 
 ### Coverage Metric
 After classification, the pipeline reports what percentage of non-empty, non-sectPr, non-editor-note paragraphs received a style. Coverage must be 100% for classifiable paragraphs; otherwise Phase 1 fails validation.
