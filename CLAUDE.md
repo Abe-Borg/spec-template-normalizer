@@ -45,6 +45,7 @@ Phase 2 (separate codebase) uses these artifacts to apply architect formatting t
 │   └── test_style_catalog.py                   # Style catalog tests
 ├── requirements.txt            # Runtime dependencies (anthropic)
 ├── requirements-build.txt      # PyInstaller build dependencies
+├── DESIGN_SYSTEM.md            # UI design reference for a companion application (Spec Critic) — NOT for gui.py (which uses Tkinter)
 ├── README.md
 └── .gitignore
 ```
