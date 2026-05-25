@@ -43,8 +43,9 @@ Phase 2 (separate codebase) uses these artifacts to apply architect formatting t
 │   ├── test_registry_numbering.py              # Numbering registry tests
 │   ├── test_semantic_validation.py             # Semantic validation tests
 │   └── test_style_catalog.py                   # Style catalog tests
-├── requirements.txt            # Runtime dependencies (anthropic)
+├── requirements.txt            # Runtime dependencies (anthropic, customtkinter)
 ├── requirements-build.txt      # PyInstaller build dependencies
+├── DESIGN_SYSTEM.md            # GUI design tokens, color palette, typography, component patterns
 ├── README.md
 └── .gitignore
 ```
@@ -54,7 +55,7 @@ Phase 2 (separate codebase) uses these artifacts to apply architect formatting t
 - **Language:** Python 3.8+
 - **External API:** Anthropic (Claude) — for semantic CSI structure classification
 - **Key stdlib modules:** `zipfile`, `re`, `json`, `xml.etree.ElementTree`, `hashlib`, `pathlib`, `tkinter`
-- **Runtime dependency:** `anthropic` (for API calls)
+- **Runtime dependencies:** `anthropic` (for API calls), `customtkinter` (GUI framework — not stdlib tkinter)
 
 ## Architecture and Data Flow
 
