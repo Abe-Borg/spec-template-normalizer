@@ -174,6 +174,19 @@ class TestValidateTemplateRegistry:
         with pytest.raises(ValueError, match="missing required keys"):
             validate_template_registry(reg)
 
+    @pytest.mark.parametrize("missing", ["custom_xml", "capture_policy"])
+    def test_requires_complete_capture_contract(self, missing):
+        reg = _minimal_template_registry()
+        del reg[missing]
+        with pytest.raises(ValueError, match="missing required keys"):
+            validate_template_registry(reg)
+
+    def test_rejects_unsupported_schema_version(self):
+        reg = _minimal_template_registry()
+        reg["meta"]["schema_version"] = "999"
+        with pytest.raises(ValueError, match="Unsupported template registry schema_version"):
+            validate_template_registry(reg)
+
     def test_not_a_dict(self):
         with pytest.raises(ValueError, match="must be a JSON object"):
             validate_template_registry([])
@@ -407,6 +420,27 @@ class TestValidateCrossRegistry:
         """Cross-registry passes when SUBSUBPARAGRAPH is absent from both."""
         style_reg = _style_registry_without_subsubparagraph()
         tmpl_reg = _minimal_template_registry()
+        validate_cross_registry(style_reg, tmpl_reg)
+
+    def test_generated_canonical_role_style_need_not_exist_in_source_registry(self):
+        style_reg = {
+            "version": 2,
+            "source_docx": "test.docx",
+            "source_sha256": "a" * 64,
+            "source_tokens": {},
+            "roles": {
+                "PART": {
+                    "style_id": "CSI_Part__ARCH",
+                    "exemplar_paragraph_index": 1,
+                    "numbering_provenance": "none",
+                }
+            },
+        }
+        tmpl_reg = _minimal_template_registry()
+        tmpl_reg["styles"]["style_defs"] = [
+            item for item in tmpl_reg["styles"]["style_defs"]
+            if item["style_id"] != "CSI_Part__ARCH"
+        ]
         validate_cross_registry(style_reg, tmpl_reg)
 
     def test_missing_style_id_in_template(self):

@@ -29,8 +29,8 @@ import hashlib
 import json
 import re
 import shutil
+import stat
 import zipfile
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -38,11 +38,15 @@ import html
 
 import xml.etree.ElementTree as ET  # only used for styles.xml name lookup + optional catalogs
 from paragraph_rules import (
+    RE_SECTION_WITH_TITLE,
     compute_skip_reason,
+    detect_numbering_role,
     detect_role_signal,
     infer_expected_roles,
     is_classifiable_paragraph,
+    is_role_candidate_paragraph,
 )
+from ooxml_text import prepare_xml_text_for_utf8, read_xml_text
 
 
 # -----------------------------
@@ -50,6 +54,18 @@ from paragraph_rules import (
 # -----------------------------
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+ROLE_TO_ARCH_STYLE: Dict[str, str] = {
+    "SectionID": "CSI_SectionID__ARCH",
+    "SectionTitle": "CSI_SectionTitle__ARCH",
+    "PART": "CSI_Part__ARCH",
+    "ARTICLE": "CSI_Article__ARCH",
+    "PARAGRAPH": "CSI_Paragraph__ARCH",
+    "SUBPARAGRAPH": "CSI_Subparagraph__ARCH",
+    "SUBSUBPARAGRAPH": "CSI_Subsubparagraph__ARCH",
+    "END_OF_SECTION": "CSI_EndOfSection__ARCH",
+}
+ALLOWED_ROLES: Set[str] = set(ROLE_TO_ARCH_STYLE)
 
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
@@ -118,7 +134,7 @@ def extract_sectpr_block(document_xml: str) -> str:
 
 def snapshot_stability(extract_dir: Path) -> StabilitySnapshot:
     doc_path = extract_dir / "word" / "document.xml"
-    doc_text = doc_path.read_text(encoding="utf-8")
+    doc_text = read_xml_text(doc_path)
     sectpr = extract_sectpr_block(doc_text)
     return StabilitySnapshot(
         header_footer_hashes=snapshot_headers_footers(extract_dir),
@@ -137,7 +153,7 @@ def verify_stability(extract_dir: Path, snap: StabilitySnapshot) -> None:
                 changed.append(k)
         raise ValueError(f"Header/footer stability check FAILED. Changed: {changed}")
 
-    doc_text = (extract_dir / "word" / "document.xml").read_text(encoding="utf-8")
+    doc_text = read_xml_text(extract_dir / "word" / "document.xml")
     current_sectpr = extract_sectpr_block(doc_text)
     if sha256_text(current_sectpr) != snap.sectpr_hash:
         raise ValueError("Section properties (w:sectPr) stability check FAILED.")
@@ -150,6 +166,36 @@ def verify_stability(extract_dir: Path, snap: StabilitySnapshot) -> None:
 # -----------------------------
 # DOCX extraction (workspace only)
 # -----------------------------
+
+MAX_PACKAGE_ENTRIES = 10_000
+MAX_PACKAGE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_PACKAGE_PART_BYTES = 128 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 1_000
+
+
+def _safe_package_member_path(extract_dir: Path, member_name: str) -> Path:
+    if not member_name or "\x00" in member_name or "\\" in member_name:
+        raise ValueError(f"Unsafe DOCX package member name: {member_name!r}")
+    if member_name.startswith(("/", "//")) or re.match(r"^[A-Za-z]:", member_name):
+        raise ValueError(f"Unsafe absolute DOCX package member: {member_name!r}")
+    parts = member_name.rstrip("/").split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Unsafe DOCX package member traversal: {member_name!r}")
+    reserved_windows_names = {"CON", "PRN", "AUX", "NUL"} | {
+        f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
+    }
+    for part in parts:
+        stem = part.split(".", 1)[0].upper()
+        if ":" in part or part.endswith((" ", ".")) or stem in reserved_windows_names:
+            raise ValueError(f"Unsafe Windows DOCX package member: {member_name!r}")
+    destination = (extract_dir / Path(*parts)).resolve()
+    root = extract_dir.resolve()
+    try:
+        destination.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"DOCX package member escapes extraction root: {member_name!r}") from exc
+    return destination
+
 
 def extract_docx(docx_path: Path, extract_dir: Path, *, overwrite: bool = False) -> None:
     if extract_dir.exists():
@@ -174,8 +220,64 @@ def extract_docx(docx_path: Path, extract_dir: Path, *, overwrite: bool = False)
                     extract_dir.rename(backup)
     
     extract_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(docx_path, "r") as zin:
-        zin.extractall(extract_dir)
+    try:
+        with zipfile.ZipFile(docx_path, "r") as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_PACKAGE_ENTRIES:
+                raise ValueError(
+                    f"DOCX package has {len(entries)} entries; limit is {MAX_PACKAGE_ENTRIES}"
+                )
+            total_size = sum(entry.file_size for entry in entries)
+            if total_size > MAX_PACKAGE_UNCOMPRESSED_BYTES:
+                raise ValueError(
+                    f"DOCX package expands to {total_size} bytes; limit is {MAX_PACKAGE_UNCOMPRESSED_BYTES}"
+                )
+
+            seen_names: Set[str] = set()
+            for entry in entries:
+                # ZipInfo.filename may normalize backslashes; orig_filename is
+                # the only trustworthy value for rejecting a crafted archive.
+                raw_member_name = entry.orig_filename
+                _safe_package_member_path(extract_dir, raw_member_name)
+                normalized_name = entry.filename.casefold()
+                if normalized_name in seen_names:
+                    raise ValueError(f"DOCX package contains duplicate member: {entry.filename!r}")
+                seen_names.add(normalized_name)
+                destination = _safe_package_member_path(extract_dir, entry.filename)
+                unix_mode = (entry.external_attr >> 16) & 0xFFFF
+                if stat.S_ISLNK(unix_mode):
+                    raise ValueError(f"DOCX package contains a symbolic link: {entry.filename!r}")
+                if entry.file_size > MAX_PACKAGE_PART_BYTES:
+                    raise ValueError(
+                        f"DOCX package member {entry.filename!r} is {entry.file_size} bytes; "
+                        f"per-part limit is {MAX_PACKAGE_PART_BYTES}"
+                    )
+                if entry.file_size and entry.compress_size == 0:
+                    raise ValueError(f"DOCX package member has invalid compressed size: {entry.filename!r}")
+                if entry.compress_size and entry.file_size / entry.compress_size > MAX_COMPRESSION_RATIO:
+                    raise ValueError(f"DOCX package member has suspicious compression ratio: {entry.filename!r}")
+
+                if entry.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(entry, "r") as source, destination.open("xb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+
+        required_parts = [
+            extract_dir / "[Content_Types].xml",
+            extract_dir / "_rels" / ".rels",
+            extract_dir / "word" / "document.xml",
+            extract_dir / "word" / "styles.xml",
+        ]
+        missing_parts = [str(path.relative_to(extract_dir)) for path in required_parts if not path.is_file()]
+        if missing_parts:
+            raise ValueError(f"DOCX package is missing required parts: {missing_parts}")
+    except Exception:
+        # Never leave a partially extracted tree that a later run could mistake
+        # for a valid template.
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise
 
 
 # -----------------------------
@@ -189,10 +291,20 @@ def iter_paragraph_xml_blocks(document_xml_text: str):
 
 
 def paragraph_text_from_block(p_xml: str) -> str:
-    texts = re.findall(r"<w:t\b[^>]*>([\s\S]*?)</w:t>", p_xml)
-    if not texts:
+    # Deleted/moved-from text and field instructions are not visible paragraph
+    # content and must not influence semantic classification.
+    visible = re.sub(r"<w:(?:del|moveFrom)\b[^>]*>[\s\S]*?</w:(?:del|moveFrom)>", "", p_xml)
+    visible = re.sub(r"<w:instrText\b[^>]*>[\s\S]*?</w:instrText>", "", visible)
+    # Tabs and explicit line breaks separate words in Word even though they do
+    # not live inside w:t nodes.  The old extractor concatenated either side.
+    separator_token = "\ue000"
+    visible = re.sub(r"<w:(?:tab|br|cr)\b[^>]*/>", separator_token, visible)
+    visible = re.sub(r"<w:noBreakHyphen\b[^>]*/>", "-", visible)
+    visible = re.sub(r"<w:softHyphen\b[^>]*/>", "", visible)
+    pieces = re.findall(rf"<w:t\b[^>]*>([\s\S]*?)</w:t>|({separator_token})", visible)
+    if not pieces:
         return ""
-    joined = html.unescape("".join(texts))
+    joined = html.unescape("".join(text if text else " " for text, _separator in pieces))
     joined = re.sub(r"\s+", " ", joined).strip()
     return joined
 
@@ -337,6 +449,7 @@ def build_style_catalog(styles_xml_path: Path, used_style_ids: Set[str]) -> Dict
             "type": "paragraph",
             "name": _get_attr(name_el, "val") if name_el is not None else None,
             "basedOn": _get_attr(based_el, "val") if based_el is not None else None,
+            "default": str(_get_attr(st, "default") or "").lower() in {"1", "true", "on"},
             "in_use": sid in used_style_ids,
             "resolved_numPr": _find_style_chain_numpr(sid, styles_by_id),
         }
@@ -352,6 +465,7 @@ def build_numbering_catalog(numbering_xml_path: Path, used_num_ids: Set[str]) ->
     root = tree.getroot()
 
     num_map: Dict[str, str] = {}
+    num_overrides: Dict[str, List[Dict[str, Any]]] = {}
     for num in root.findall(f".//{_q('num')}"):
         numId = _get_attr(num, "numId")
         abs_el = num.find(_q("abstractNumId"))
@@ -359,6 +473,24 @@ def build_numbering_catalog(numbering_xml_path: Path, used_num_ids: Set[str]) ->
             absId = _get_attr(abs_el, "val")
             if absId:
                 num_map[numId] = absId
+        if numId:
+            overrides: List[Dict[str, Any]] = []
+            for override in num.findall(_q("lvlOverride")):
+                item: Dict[str, Any] = {"ilvl": _get_attr(override, "ilvl")}
+                start = override.find(_q("startOverride"))
+                if start is not None and _get_attr(start, "val") is not None:
+                    item["startOverride"] = _get_attr(start, "val")
+                override_lvl = override.find(_q("lvl"))
+                if override_lvl is not None:
+                    num_fmt = override_lvl.find(_q("numFmt"))
+                    lvl_text = override_lvl.find(_q("lvlText"))
+                    if num_fmt is not None and _get_attr(num_fmt, "val") is not None:
+                        item["numFmt"] = _get_attr(num_fmt, "val")
+                    if lvl_text is not None and _get_attr(lvl_text, "val") is not None:
+                        item["lvlText"] = _get_attr(lvl_text, "val")
+                overrides.append(item)
+            if overrides:
+                num_overrides[numId] = overrides
 
     abs_needed = {num_map[n] for n in used_num_ids if n in num_map}
 
@@ -382,7 +514,10 @@ def build_numbering_catalog(numbering_xml_path: Path, used_num_ids: Set[str]) ->
 
     nums: Dict[str, Any] = {}
     for numId in sorted(used_num_ids):
-        nums[numId] = {"numId": numId, "abstractNumId": num_map.get(numId)}
+        item: Dict[str, Any] = {"numId": numId, "abstractNumId": num_map.get(numId)}
+        if numId in num_overrides:
+            item["levelOverrides"] = num_overrides[numId]
+        nums[numId] = item
 
     return {"nums": nums, "abstracts": abstracts}
 
@@ -391,7 +526,7 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
     snap = snapshot_stability(extract_dir)
 
     doc_path = extract_dir / "word" / "document.xml"
-    doc_text = doc_path.read_text(encoding="utf-8")
+    doc_text = read_xml_text(doc_path)
 
     paragraphs = []
     used_style_ids: Set[str] = set()
@@ -411,6 +546,8 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
         numpr = paragraph_numpr_from_block(p_xml)
         hints = paragraph_ppr_hints_from_block(p_xml)
         rpr_hints = paragraph_rpr_hints_from_block(p_xml)
+        has_direct_ppr = bool(extract_paragraph_ppr_inner(p_xml))
+        has_uniform_direct_rpr = bool(extract_paragraph_rpr_inner(p_xml))
         contains_sect = ctx.contains_sectPr
         in_table = ctx.in_table
 
@@ -431,6 +568,8 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
             "numPr": numpr if (numpr.get("numId") or numpr.get("ilvl")) else None,
             "pPr_hints": hints if hints else None,
             "rPr_hints": rpr_hints if rpr_hints else None,
+            "has_direct_pPr": has_direct_ppr,
+            "has_uniform_direct_rPr": has_uniform_direct_rpr,
             "contains_sectPr": contains_sect,
             "in_table": in_table,
             "skip_reason": skip_reason,
@@ -442,7 +581,24 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
     if styles_path.exists():
         style_catalog = build_style_catalog(styles_path, used_style_ids)
 
+    # Numbering is frequently inherited solely through a paragraph style.  It
+    # still has to be included in the numbering catalog and exposed per
+    # paragraph; otherwise a fully auto-numbered spec appears unnumbered.
+    for paragraph in paragraphs:
+        pstyle = paragraph.get("pStyle")
+        inherited = style_catalog.get(pstyle, {}).get("resolved_numPr") if pstyle else None
+        direct = paragraph.get("numPr")
+        effective: Optional[Dict[str, Any]] = dict(inherited) if isinstance(inherited, dict) else None
+        if isinstance(direct, dict) and (direct.get("numId") or direct.get("ilvl")):
+            effective = effective or {}
+            effective.update({key: value for key, value in direct.items() if value is not None})
+        paragraph["effective_numPr"] = effective if effective else None
+        if isinstance(effective, dict) and effective.get("numId"):
+            used_num_ids.add(effective["numId"])
+
     numbering_catalog = build_numbering_catalog(extract_dir / "word" / "numbering.xml", used_num_ids)
+    for paragraph in paragraphs:
+        paragraph["numbering_role"] = detect_numbering_role(paragraph, numbering_catalog)
 
     return {
         "stability": {
@@ -506,69 +662,313 @@ def extract_paragraph_ppr_inner(p_xml: str) -> str:
         return ""
     inner = m.group(1)
     inner = re.sub(r"<w:pStyle\b[^>]*/>", "", inner)
-    inner = re.sub(r"<w:numPr\b[^>]*>.*?</w:numPr>", "", inner, flags=re.S)
     return inner.strip()
 
 
-def extract_paragraph_rpr_inner(p_xml: str) -> str:
-    """Extract the representative run-level rPr inner XML from a paragraph.
+def _xml_element_signature(element: ET.Element) -> Tuple[Any, ...]:
+    """Return an attribute-order-independent signature for a small XML tree."""
+    return (
+        element.tag,
+        tuple(sorted(element.attrib.items())),
+        (element.text or "").strip(),
+        tuple(_xml_element_signature(child) for child in list(element)),
+    )
 
-    For multi-run paragraphs, selects the most common non-empty rPr
-    (after canonicalization for comparison), breaking ties by first
-    occurrence.  Returns the original (non-canonicalized) rPr to
-    preserve all formatting information.
+
+_XML_QNAME = r"[A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?"
+_XML_PREFIX_RE = re.compile(
+    r"(?:</?\s*|\s)([A-Za-z_][\w.-]*):[A-Za-z_][\w.-]*(?=\s|/?>|=)"
+)
+_XMLNS_ATTRIBUTE_RE = re.compile(
+    r"\sxmlns:(?P<prefix>[A-Za-z_][\w.-]*)\s*=\s*"
+    r"(?P<quote>['\"])(?P<uri>.*?)(?P=quote)",
+    flags=re.S,
+)
+
+
+def _xml_markup_end(xml_text: str, start: int) -> int:
+    """Return the exclusive end of markup beginning at *start*."""
+    if xml_text.startswith("<!--", start):
+        end = xml_text.find("-->", start + 4)
+        return len(xml_text) if end == -1 else end + 3
+    if xml_text.startswith("<![CDATA[", start):
+        end = xml_text.find("]]>", start + 9)
+        return len(xml_text) if end == -1 else end + 3
+    if xml_text.startswith("<?", start):
+        end = xml_text.find("?>", start + 2)
+        return len(xml_text) if end == -1 else end + 2
+
+    quote: Optional[str] = None
+    for index in range(start + 1, len(xml_text)):
+        char = xml_text[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == ">":
+            return index + 1
+    return len(xml_text)
+
+
+def _direct_xml_child_fragments(xml_text: str) -> List[str]:
+    """Return exact top-level element fragments from an XML inner string.
+
+    Run properties may be in Word extension namespaces (for example w14) and
+    may themselves contain nested elements.  A QName-aware lexical walk keeps
+    those fragments byte-for-byte without assuming a particular prefix.
     """
-    originals: List[str] = []
-    canon_keys: List[str] = []
+    fragments: List[str] = []
+    element_stack: List[str] = []
+    fragment_start: Optional[int] = None
+    position = 0
 
-    for rm in re.finditer(r"<w:r\b[^>]*>(.*?)</w:r>", p_xml, flags=re.S):
+    while True:
+        start = xml_text.find("<", position)
+        if start == -1:
+            break
+        end = _xml_markup_end(xml_text, start)
+        if end <= start or end > len(xml_text):
+            return []
+        token = xml_text[start:end]
+        position = end
+
+        if token.startswith(("<!--", "<![CDATA[", "<?", "<!")):
+            continue
+
+        if token.startswith("</"):
+            match = re.match(rf"</\s*({_XML_QNAME})\s*>", token, flags=re.S)
+            if not match or not element_stack or element_stack[-1] != match.group(1):
+                return []
+            element_stack.pop()
+            if not element_stack and fragment_start is not None:
+                fragments.append(xml_text[fragment_start:end].strip())
+                fragment_start = None
+            continue
+
+        match = re.match(rf"<\s*({_XML_QNAME})(?=\s|/?>)", token, flags=re.S)
+        if not match:
+            return []
+        if not element_stack:
+            fragment_start = start
+        if re.search(r"/\s*>$", token):
+            if not element_stack and fragment_start is not None:
+                fragments.append(xml_text[fragment_start:end].strip())
+                fragment_start = None
+        else:
+            element_stack.append(match.group(1))
+
+    return fragments if not element_stack else []
+
+
+def _fragment_namespace_declarations(xml_text: str) -> str:
+    """Declare prefixes synthetically so ElementTree can compare fragments."""
+    prefixes = set(_XML_PREFIX_RE.findall(xml_text)) - {"xml", "xmlns"}
+    declarations = []
+    for prefix in sorted(prefixes):
+        uri = W_NS if prefix == "w" else f"urn:phase1-ooxml-prefix:{prefix}"
+        declarations.append(f'xmlns:{prefix}="{xml_escape(uri)}"')
+    return " ".join(declarations)
+
+
+def _run_property_fragments(rpr_inner: str) -> List[Tuple[Tuple[Any, ...], str]]:
+    """Split direct w:rPr children while preserving their original XML bytes."""
+    fragments: List[Tuple[Tuple[Any, ...], str]] = []
+    for raw in _direct_xml_child_fragments(rpr_inner):
+        try:
+            declarations = _fragment_namespace_declarations(raw)
+            wrapper = ET.fromstring(f"<root {declarations}>{raw}</root>")
+            if not list(wrapper):
+                continue
+            signature = _xml_element_signature(list(wrapper)[0])
+        except ET.ParseError:
+            # Keep a conservative signature rather than throwing away a
+            # property that is demonstrably identical in every visible run.
+            signature = (re.sub(r"\s+", " ", raw).strip(),)
+        fragments.append((signature, raw))
+    return fragments
+
+
+def extract_paragraph_rpr_inner(p_xml: str) -> str:
+    """Return only direct run properties common to all visible text runs.
+
+    Promoting the most common *non-empty* run formatting to a paragraph style
+    made an entire role bold when the exemplar merely began with a bold label.
+    An absent rPr is therefore a real empty set, and mixed formatting yields
+    only the exact properties shared by every visible run.
+    """
+    visible_xml = re.sub(r"<w:(?:del|moveFrom)\b[^>]*>[\s\S]*?</w:(?:del|moveFrom)>", "", p_xml)
+    run_properties: List[List[Tuple[Tuple[Any, ...], str]]] = []
+
+    for rm in re.finditer(r"<w:r\b[^>]*>(.*?)</w:r>", visible_xml, flags=re.S):
         run_inner = rm.group(1)
         text_nodes = re.findall(r"<w:t\b[^>]*>([\s\S]*?)</w:t>", run_inner)
-        if not text_nodes:
+        has_visible_control = bool(re.search(r"<w:(?:tab|br|cr)\b", run_inner))
+        if not text_nodes and not has_visible_control:
             continue
         run_text = html.unescape("".join(text_nodes))
-        if not run_text.strip():
+        if not run_text.strip() and not has_visible_control:
             continue
         m = re.search(r"<w:rPr\b[^>]*>(.*?)</w:rPr>", run_inner, flags=re.S)
         if not m:
+            run_properties.append([])
             continue
         raw = m.group(1).strip()
         if not raw:
+            run_properties.append([])
             continue
-        canon = _strip_proofing_for_cmp(_strip_rsids_for_cmp(raw)).strip()
-        if not canon:
-            continue
-        originals.append(raw)
-        canon_keys.append(canon)
+        cleaned = _strip_proofing_for_cmp(_strip_rsids_for_cmp(raw)).strip()
+        run_properties.append(_run_property_fragments(cleaned))
 
-    if not originals:
+    if not run_properties:
         return ""
 
-    if len(set(canon_keys)) == 1:
-        return originals[0]
-
-    # Multiple distinct forms: pick the most common, tie-break by first occurrence
-    counts = Counter(canon_keys)
-    max_count = counts.most_common(1)[0][1]
-    best_idx = len(originals)  # sentinel
-    for canon_val, cnt in counts.items():
-        if cnt == max_count:
-            first_idx = canon_keys.index(canon_val)
-            if first_idx < best_idx:
-                best_idx = first_idx
-
-    return originals[best_idx]
+    common = {signature for signature, _raw in run_properties[0]}
+    for properties in run_properties[1:]:
+        common &= {signature for signature, _raw in properties}
+    if not common:
+        return ""
+    return "".join(raw for signature, raw in run_properties[0] if signature in common)
 
 
 def derive_style_def_from_paragraph(styleId: str, name: str, p_xml: str, based_on: Optional[str] = None) -> Dict[str, Any]:
+    # A paragraph's current style is part of its effective appearance.  New
+    # portable styles must inherit from it; trusting an LLM-supplied "Normal"
+    # here silently discarded the architect's inherited formatting.
+    source_style = paragraph_pstyle_from_block(p_xml)
     return {
         "styleId": styleId,
         "name": name,
         "type": "paragraph",
-        "basedOn": based_on,
+        "basedOn": source_style or based_on,
         "pPr_inner": extract_paragraph_ppr_inner(p_xml),
         "rPr_inner": extract_paragraph_rpr_inner(p_xml),
     }
+
+
+def _default_paragraph_style_id(styles_xml_text: str) -> Optional[str]:
+    try:
+        root = ET.fromstring(styles_xml_text)
+    except ET.ParseError:
+        return None
+    for style in root.findall(f".//{_q('style')}"):
+        if _get_attr(style, "type") != "paragraph":
+            continue
+        if str(_get_attr(style, "default") or "").lower() in {"1", "true", "on"}:
+            return _get_attr(style, "styleId")
+    return "Normal" if re.search(r'w:styleId="Normal"', styles_xml_text) else None
+
+
+def _root_opening_tag_span(xml_text: str) -> Optional[Tuple[int, int]]:
+    """Locate the document element's opening tag without reserializing XML."""
+    position = 0
+    while True:
+        start = xml_text.find("<", position)
+        if start == -1:
+            return None
+        end = _xml_markup_end(xml_text, start)
+        token = xml_text[start:end]
+        position = end
+        if token.startswith(("<?", "<!--", "<!")):
+            continue
+        if token.startswith("</") or not re.match(rf"<\s*{_XML_QNAME}(?=\s|/?>)", token):
+            return None
+        return start, end
+
+
+def _root_namespace_declarations(xml_text: str) -> Dict[str, str]:
+    span = _root_opening_tag_span(xml_text)
+    if span is None:
+        return {}
+    opening_tag = xml_text[span[0]:span[1]]
+    return {
+        match.group("prefix"): html.unescape(match.group("uri"))
+        for match in _XMLNS_ATTRIBUTE_RE.finditer(opening_tag)
+    }
+
+
+def _propagate_style_fragment_namespaces(
+    styles_xml_text: str,
+    document_xml_text: str,
+    style_blocks: List[str],
+) -> str:
+    """Copy namespaces needed by derived fragments onto the styles root."""
+    if not style_blocks:
+        return styles_xml_text
+
+    used_prefixes = set(_XML_PREFIX_RE.findall("\n".join(style_blocks))) - {"xml", "xmlns"}
+    styles_namespaces = _root_namespace_declarations(styles_xml_text)
+    document_namespaces = _root_namespace_declarations(document_xml_text)
+    additions = {
+        prefix: document_namespaces[prefix]
+        for prefix in used_prefixes - set(styles_namespaces)
+        if prefix in document_namespaces
+    }
+    if not additions:
+        return styles_xml_text
+
+    span = _root_opening_tag_span(styles_xml_text)
+    if span is None:
+        raise ValueError("styles.xml does not contain a valid root opening tag")
+    opening_tag = styles_xml_text[span[0]:span[1]]
+    if re.search(r"/\s*>$", opening_tag):
+        raise ValueError("styles.xml root must not be self-closing")
+    declarations = "".join(
+        f' xmlns:{prefix}="{xml_escape(uri)}"'
+        for prefix, uri in sorted(additions.items())
+    )
+    updated_opening_tag = opening_tag[:-1] + declarations + ">"
+    return styles_xml_text[:span[0]] + updated_opening_tag + styles_xml_text[span[1]:]
+
+
+def build_portable_styles_xml(extract_dir: Path, instructions: Dict[str, Any]) -> str:
+    """Build the portable stylesheet without mutating the extracted package."""
+    slim_bundle = build_slim_bundle(extract_dir)
+    validate_instructions(instructions, slim_bundle=slim_bundle)
+
+    styles_path = extract_dir / "word" / "styles.xml"
+    if not styles_path.exists():
+        raise FileNotFoundError(f"DOCX is missing required part: {styles_path}")
+    styles_text = read_xml_text(styles_path)
+    default_style = _default_paragraph_style_id(styles_text)
+    doc_text = read_xml_text(extract_dir / "word" / "document.xml")
+    paragraph_blocks = [block for _start, _end, block in iter_paragraph_xml_blocks(doc_text)]
+
+    derived_blocks: List[str] = []
+    for style_spec in instructions.get("create_styles", []) or []:
+        source_index = int(style_spec["derive_from_paragraph_index"])
+        if source_index >= len(paragraph_blocks):
+            raise ValueError(
+                f"Style {style_spec['styleId']}: derive_from_paragraph_index out of range: {source_index}"
+            )
+        exemplar = paragraph_blocks[source_index]
+        source_style = paragraph_pstyle_from_block(exemplar)
+        derived = derive_style_def_from_paragraph(
+            style_spec["styleId"],
+            style_spec.get("name") or style_spec["styleId"],
+            exemplar,
+            based_on=source_style or default_style,
+        )
+        derived_blocks.append(build_style_xml_block(derived))
+
+    portable = _propagate_style_fragment_namespaces(
+        insert_styles_into_styles_xml(styles_text, derived_blocks),
+        doc_text,
+        derived_blocks,
+    )
+    portable = prepare_xml_text_for_utf8(portable)
+    try:
+        ET.fromstring(portable)
+    except ET.ParseError as exc:
+        raise ValueError(
+            f"Generated portable styles.xml is not well-formed after namespace propagation: {exc}"
+        ) from exc
+    style_ids = set(re.findall(r'w:styleId="([^"]+)"', portable))
+    for item in instructions.get("apply_pStyle", []) or []:
+        if item["styleId"] not in style_ids:
+            raise ValueError(f"apply_pStyle references unknown styleId: {item['styleId']}")
+    return portable
 
 
 def build_style_xml_block(style_def: Dict[str, Any]) -> str:
@@ -667,20 +1067,24 @@ def apply_pstyle_to_paragraph_block(p_xml: str, styleId: str) -> str:
 
 
 def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Dict[str, Any]] = None) -> None:
-    allowed_keys = {"create_styles", "apply_pStyle", "roles", "notes"}
+    if not isinstance(instructions, dict):
+        raise ValueError("Instructions must be a JSON object")
+    # Keep the runtime and the published JSON schema on one shared structural
+    # contract (including rejecting bool-as-int indices and null arrays).
+    from phase1_validator import validate_instruction_contract
+
+    validate_instruction_contract(instructions)
+    allowed_keys = {"create_styles", "apply_pStyle", "ignored_paragraphs", "roles", "notes"}
     extra = set(instructions.keys()) - allowed_keys
     if extra:
         raise ValueError(f"Invalid instruction keys: {extra}")
 
-    allowed_new_style_ids: Set[str] = {
-        "CSI_SectionTitle__ARCH",
-        "CSI_SectionID__ARCH",
-        "CSI_Part__ARCH",
-        "CSI_Article__ARCH",
-        "CSI_Paragraph__ARCH",
-        "CSI_Subparagraph__ARCH",
-        "CSI_Subsubparagraph__ARCH",
-    }
+    for list_key in ("create_styles", "apply_pStyle", "ignored_paragraphs", "notes"):
+        value = instructions.get(list_key, [])
+        if value is not None and not isinstance(value, list):
+            raise ValueError(f"{list_key} must be an array")
+
+    allowed_new_style_ids: Set[str] = set(ROLE_TO_ARCH_STYLE.values())
 
     created_style_src_idx: Dict[str, int] = {}
     created_style_ids_seen: Set[str] = set()
@@ -727,13 +1131,31 @@ def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Di
             raise ValueError(f"Duplicate paragraph_index in apply_pStyle: {idx}")
         seen_para.add(idx)
 
+    ignored_indices: Set[int] = set()
+    for ignored in instructions.get("ignored_paragraphs", []) or []:
+        if not isinstance(ignored, dict):
+            raise ValueError("ignored_paragraphs entries must be objects")
+        extra_fields = set(ignored) - {"paragraph_index", "reason"}
+        if extra_fields:
+            raise ValueError(f"ignored_paragraphs entry has invalid fields: {extra_fields}")
+        idx = ignored.get("paragraph_index")
+        reason = ignored.get("reason")
+        if not isinstance(idx, int) or idx < 0:
+            raise ValueError(f"Invalid ignored paragraph_index: {idx}")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"ignored_paragraphs[{idx}].reason must be a non-empty string")
+        if idx in ignored_indices:
+            raise ValueError(f"Duplicate paragraph_index in ignored_paragraphs: {idx}")
+        if idx in seen_para:
+            raise ValueError(f"Paragraph {idx} cannot be both styled and ignored")
+        ignored_indices.add(idx)
+
     roles = instructions.get("roles")
     if roles is None or not isinstance(roles, dict):
         raise ValueError("Missing/invalid required key: roles")
 
-    allowed_roles = {"SectionID","SectionTitle","PART","ARTICLE","PARAGRAPH","SUBPARAGRAPH","SUBSUBPARAGRAPH"}
     for role, spec in roles.items():
-        if role not in allowed_roles:
+        if role not in ALLOWED_ROLES:
             raise ValueError(f"Unknown role '{role}'")
         if not isinstance(spec, dict):
             raise ValueError(f"roles['{role}'] must be an object")
@@ -758,7 +1180,16 @@ def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Di
     paragraphs = slim_bundle.get("paragraphs", [])
     paragraph_count = len(paragraphs)
     allowed_existing_style_ids = set(slim_bundle.get("style_catalog", {}).keys())
-    all_allowed_style_ids = allowed_existing_style_ids | allowed_new_style_ids
+    default_style_ids = {
+        style_id
+        for style_id, info in slim_bundle.get("style_catalog", {}).items()
+        if isinstance(info, dict) and info.get("default") is True
+    }
+    if not default_style_ids and "Normal" in allowed_existing_style_ids:
+        default_style_ids.add("Normal")
+    # A reserved name is not a style definition.  It may only be referenced if
+    # it already exists in the source or is actually declared in create_styles.
+    all_allowed_style_ids = allowed_existing_style_ids | created_style_ids_seen
 
     for sd in instructions.get("create_styles", []) or []:
         sid = sd["styleId"]
@@ -766,20 +1197,34 @@ def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Di
             raise ValueError(
                 f"Reserved ARCH style collision: '{sid}' already exists in styles.xml; refuse silent reuse"
             )
-
-    for ap in instructions.get("apply_pStyle", []) or []:
-        idx = ap["paragraph_index"]
-        sid = ap["styleId"]
-        if idx >= paragraph_count:
-            raise ValueError(f"apply_pStyle paragraph_index out of range: {idx} >= {paragraph_count}")
-        if sid not in all_allowed_style_ids:
-            raise ValueError(f"apply_pStyle[{idx}] uses disallowed styleId '{sid}'")
+        source_idx = int(sd["derive_from_paragraph_index"])
+        if source_idx >= paragraph_count:
+            raise ValueError(
+                f"Style {sid}: derive_from_paragraph_index out of range: {source_idx} >= {paragraph_count}"
+            )
+        source_style = paragraphs[source_idx].get("pStyle")
+        requested_base = sd.get("basedOn")
+        if "basedOn" in sd and requested_base != source_style:
+            if source_style:
+                raise ValueError(
+                    f"Style {sid}: basedOn must preserve exemplar source pStyle '{source_style}', got '{requested_base}'"
+                )
+            defaults = [
+                style_id
+                for style_id, info in slim_bundle.get("style_catalog", {}).items()
+                if isinstance(info, dict) and info.get("default") is True
+            ]
+            allowed_fallbacks = set(defaults) | ({"Normal"} if "Normal" in allowed_existing_style_ids else set())
+            if requested_base not in allowed_fallbacks:
+                raise ValueError(
+                    f"Style {sid}: basedOn '{requested_base}' is not the source default paragraph style"
+                )
+        if requested_base and requested_base not in allowed_existing_style_ids:
+            raise ValueError(f"Style {sid}: basedOn references unknown source style '{requested_base}'")
 
     for role, spec in roles.items():
         sid = spec["styleId"]
         ex = int(spec["exemplar_paragraph_index"])
-        if sid not in all_allowed_style_ids:
-            raise ValueError(f"roles['{role}'] uses disallowed styleId '{sid}'")
         if ex >= paragraph_count:
             raise ValueError(f"roles['{role}'].exemplar_paragraph_index out of range: {ex} >= {paragraph_count}")
         para = paragraphs[ex]
@@ -793,61 +1238,171 @@ def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Di
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} contains sectPr")
         if skip_reason == "in_table":
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} is inside a table")
-        if skip_reason == "end_of_section":
-            raise ValueError(f"roles['{role}'] exemplar paragraph {ex} cannot be END OF SECTION")
         if skip_reason == "editor_note":
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} cannot be an editor note")
         if skip_reason:
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} is non-classifiable (skip_reason={skip_reason})")
+        if sid in allowed_existing_style_ids and (
+            para.get("has_direct_pPr")
+            or para.get("has_uniform_direct_rPr")
+            or para.get("pPr_hints")
+            or para.get("rPr_hints")
+            or para.get("numPr")
+        ):
+            raise ValueError(
+                f"roles['{role}'] exemplar paragraph {ex} contains direct formatting; "
+                "derive the canonical CSI_*__ARCH style from the exemplar instead of reusing its pStyle"
+            )
+
+    for ignored_index in ignored_indices:
+        if ignored_index >= paragraph_count:
+            continue
+        paragraph = paragraphs[ignored_index]
+        semantic_exclusion = paragraph.get("skip_reason") in {
+            "editor_note",
+            "specifier_note",
+            "copyright_notice",
+        }
+        if not semantic_exclusion and (
+            paragraph.get("effective_numPr") or paragraph.get("numPr") or paragraph.get("numbering_role")
+        ):
+            raise ValueError(
+                f"ignored_paragraphs[{ignored_index}] is numbered structural content and cannot be ignored"
+            )
+
+    for paragraph in paragraphs:
+        if paragraph.get("skip_reason") not in {
+            "editor_note",
+            "specifier_note",
+            "copyright_notice",
+        }:
+            continue
+        index = int(paragraph["paragraph_index"])
+        if index in seen_para:
+            raise ValueError(
+                f"apply_pStyle[{index}] targets detected non-CSI content ({paragraph['skip_reason']}); "
+                "use ignored_paragraphs"
+            )
 
     required_apply_indices = [int(p["paragraph_index"]) for p in paragraphs if is_classifiable_paragraph(p)]
 
     apply_indices = [int(ap["paragraph_index"]) for ap in instructions.get("apply_pStyle", []) or []]
     apply_set = set(apply_indices)
     required_set = set(required_apply_indices)
-    missing = sorted(required_set - apply_set)
-    unexpected = sorted(apply_set - required_set)
+    covered_set = apply_set | ignored_indices
+    missing = sorted(required_set - covered_set)
+    unexpected = sorted(covered_set - required_set)
     if missing or unexpected:
         raise ValueError(
-            "apply_pStyle coverage mismatch; "
-            f"missing={missing[:20]}{'...' if len(missing) > 20 else ''}, "
-            f"unexpected={unexpected[:20]}{'...' if len(unexpected) > 20 else ''}"
+            "classification coverage mismatch; "
+            f"missing={missing}, unexpected={unexpected}"
         )
 
     validate_semantic_structure(instructions, slim_bundle)
 
+    declared_role_style_ids = {
+        spec["styleId"] for spec in roles.values() if isinstance(spec, dict)
+    }
+    undeclared_apply_styles = sorted(
+        {
+            item["styleId"]
+            for item in instructions.get("apply_pStyle", []) or []
+            if item["styleId"] not in declared_role_style_ids
+        }
+    )
+    if undeclared_apply_styles:
+        raise ValueError(
+            "apply_pStyle may use only styleIds declared in roles; "
+            f"undeclared={undeclared_apply_styles}"
+        )
+    unused_created_styles = sorted(created_style_ids_seen - declared_role_style_ids)
+    if unused_created_styles:
+        raise ValueError(f"create_styles contains styles unused by roles: {unused_created_styles}")
+
+    # Validate style identity only after structural and coverage diagnostics so
+    # callers receive the most actionable document error first.
+    for ap in instructions.get("apply_pStyle", []) or []:
+        idx = ap["paragraph_index"]
+        sid = ap["styleId"]
+        if idx >= paragraph_count:
+            raise ValueError(f"apply_pStyle paragraph_index out of range: {idx} >= {paragraph_count}")
+        if sid not in all_allowed_style_ids:
+            raise ValueError(f"apply_pStyle[{idx}] uses disallowed styleId '{sid}'")
+        source_style = paragraphs[idx].get("pStyle")
+        if sid in allowed_existing_style_ids:
+            expected_source_styles = {source_style} if source_style else default_style_ids
+            if sid not in expected_source_styles:
+                source_description = source_style or f"default style ({sorted(default_style_ids)})"
+                raise ValueError(
+                    f"apply_pStyle[{idx}] reuses styleId '{sid}' but source paragraph uses {source_description}"
+                )
+
+    for role, spec in roles.items():
+        sid = spec["styleId"]
+        ex = int(spec["exemplar_paragraph_index"])
+        if sid not in all_allowed_style_ids:
+            raise ValueError(f"roles['{role}'] uses disallowed styleId '{sid}'")
+        para = paragraphs[ex]
+        text = (para.get("text") or "").strip()
+        source_style = para.get("pStyle")
+        if sid in allowed_existing_style_ids:
+            expected_source_styles = {source_style} if source_style else default_style_ids
+            if sid not in expected_source_styles:
+                source_description = source_style or f"default style ({sorted(default_style_ids)})"
+                raise ValueError(
+                    f"roles['{role}'] styleId '{sid}' does not match exemplar paragraph {ex} source {source_description}"
+                )
+        combined_section_style = (
+            role == "SectionTitle"
+            and sid == ROLE_TO_ARCH_STYLE["SectionID"]
+            and bool(RE_SECTION_WITH_TITLE.match(text))
+            and isinstance(roles.get("SectionID"), dict)
+            and roles["SectionID"].get("styleId") == sid
+            and int(roles["SectionID"].get("exemplar_paragraph_index", -1)) == ex
+        )
+        if sid in created_style_ids_seen and sid != ROLE_TO_ARCH_STYLE[role] and not combined_section_style:
+            raise ValueError(
+                f"roles['{role}'] must use its canonical generated styleId '{ROLE_TO_ARCH_STYLE[role]}', got '{sid}'"
+            )
 
 def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[str, Any]) -> None:
     paragraphs = slim_bundle.get("paragraphs", [])
     roles = instructions.get("roles", {}) or {}
     apply_map = {item["paragraph_index"]: item["styleId"] for item in instructions.get("apply_pStyle", []) or []}
     role_style = {role: spec.get("styleId") for role, spec in roles.items() if isinstance(spec, dict)}
-    expected_roles, strong_hits = infer_expected_roles(paragraphs)
+    expected_roles, strong_hits = infer_expected_roles(
+        paragraphs,
+        numbering_catalog=slim_bundle.get("numbering_catalog"),
+    )
+    strong_roles_by_index: Dict[int, Set[str]] = {}
+    for strong_role, indices in strong_hits.items():
+        for index in indices:
+            strong_roles_by_index.setdefault(int(index), set()).add(strong_role)
 
     nums = slim_bundle.get("numbering_catalog", {}).get("nums", {})
     abstracts = slim_bundle.get("numbering_catalog", {}).get("abstracts", {})
     style_catalog = slim_bundle.get("style_catalog", {})
 
-    classifiable = [p for p in paragraphs if is_classifiable_paragraph(p)]
-    has_alpha = any(re.match(r"^[A-Z]\.\s+", (p.get("text") or "").strip()) for p in classifiable)
-    has_numeric = any(re.match(r"^\d+\.\s+", (p.get("text") or "").strip()) for p in classifiable)
+    classifiable = [p for p in paragraphs if is_role_candidate_paragraph(p)]
 
     signals: Dict[int, StructureSignal] = {}
     numbered_families: Set[Tuple[Optional[str], Optional[str]]] = set()
     for p in classifiable:
         idx = int(p["paragraph_index"])
-        text = (p.get("text") or "").strip()
-        text_role = detect_role_signal(text, numeric_is_strong=has_alpha, lower_is_strong=has_numeric)
+        text_roles = strong_roles_by_index.get(idx, set())
+        text_role = next(iter(sorted(text_roles)), None)
 
         num_id: Optional[str] = None
         ilvl: Optional[str] = None
         source = "none"
         direct = p.get("numPr") if isinstance(p.get("numPr"), dict) else None
+        effective = p.get("effective_numPr") if isinstance(p.get("effective_numPr"), dict) else None
         style_numpr = style_catalog.get(p.get("pStyle"), {}).get("resolved_numPr") if p.get("pStyle") else None
 
         if isinstance(direct, dict) and (direct.get("numId") or direct.get("ilvl")):
             source = "direct_numpr"
-            num_id, ilvl = direct.get("numId"), direct.get("ilvl")
+            merged = effective or direct
+            num_id, ilvl = merged.get("numId"), merged.get("ilvl")
         elif isinstance(style_numpr, dict) and (style_numpr.get("numId") or style_numpr.get("ilvl")):
             source = "style_numpr"
             num_id, ilvl = style_numpr.get("numId"), style_numpr.get("ilvl")
@@ -857,14 +1412,14 @@ def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[
         abstract_num_id = nums.get(num_id, {}).get("abstractNumId") if num_id else None
         num_fmt = None
         lvl_text = None
-        if abstract_num_id and abstract_num_id in abstracts:
-            levels = abstracts[abstract_num_id].get("levels", [])
-            level = next((lv for lv in levels if lv.get("ilvl") == ilvl), None)
-            if level is None and levels:
-                level = levels[0]
-            if isinstance(level, dict):
-                num_fmt = level.get("numFmt")
-                lvl_text = level.get("lvlText")
+        pattern = _extract_numbering_pattern_from_numpr(
+            {"numId": num_id, "ilvl": ilvl} if num_id or ilvl else None,
+            slim_bundle.get("numbering_catalog", {}),
+        )
+        if pattern:
+            abstract_num_id = pattern.get("abstractNumId", abstract_num_id)
+            num_fmt = pattern.get("numFmt")
+            lvl_text = pattern.get("lvlText")
 
         family_key = None
         if source in {"style_numpr", "direct_numpr"} and (num_id or ilvl):
@@ -890,37 +1445,66 @@ def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[
     if numbered_families and not roles:
         raise ValueError("Semantic validation failed: numbered structure detected but roles is empty")
 
-    # Check that every numbered ilvl is covered by at least one role exemplar,
-    # rather than requiring every exact (abstractNumId, ilvl) family to be covered.
-    # Documents routinely use many different numbering definitions (per-section restarts)
-    # that all map to the same CSI hierarchy level.
-    covered_ilvls: Set[Optional[str]] = set()
+    # Numbering definitions are often duplicated to restart a sequence. Compare
+    # the rendered numbering signature rather than numId, but require every
+    # distinct level/pattern to have an explicit role exemplar. The former
+    # "deepest role absorbs everything below it" rule hid lost levels.
+    required_numbering_signatures: Set[Tuple[Optional[str], Optional[str], Optional[str]]] = {
+        (signal.ilvl, signal.num_fmt, signal.lvl_text)
+        for signal in signals.values()
+        if signal.family_key is not None
+    }
+    covered_numbering_signatures: Set[Tuple[Optional[str], Optional[str], Optional[str]]] = set()
     for spec in roles.values():
         if not isinstance(spec, dict):
             continue
         s = signals.get(int(spec["exemplar_paragraph_index"]))
         if s and s.family_key is not None:
-            covered_ilvls.add(s.family_key[1])  # ilvl component
+            covered_numbering_signatures.add((s.ilvl, s.num_fmt, s.lvl_text))
 
-    required_ilvls = {fk[1] for fk in numbered_families}
-
-    # ilvls beyond the deepest covered level are implicitly handled by the
-    # deepest role (e.g. SUBSUBPARAGRAPH absorbs ilvl 5+ when it covers ilvl 4).
-    numeric_covered = sorted(int(v) for v in covered_ilvls if v is not None)
-    max_covered = numeric_covered[-1] if numeric_covered else -1
-    missing_ilvls = sorted(
-        [v for v in (required_ilvls - covered_ilvls) if v is None or int(v) <= max_covered],
-        key=lambda x: (x is None, x),
-    )
-    if missing_ilvls:
-        raise ValueError(f"Semantic validation failed: missing numbered ilvl coverage {missing_ilvls}")
+    missing_numbering = required_numbering_signatures - covered_numbering_signatures
+    if missing_numbering:
+        rendered = sorted(
+            [f"ilvl={ilvl!r}, numFmt={num_fmt!r}, lvlText={lvl_text!r}" for ilvl, num_fmt, lvl_text in missing_numbering]
+        )
+        raise ValueError(
+            "Semantic validation failed: missing numbered hierarchy coverage: " + "; ".join(rendered)
+        )
 
     for role, spec in roles.items():
         exemplar_idx = int(spec["exemplar_paragraph_index"])
-        signal = signals.get(exemplar_idx).text_role if signals.get(exemplar_idx) else None
-        if signal is not None and signal != role:
+        candidates = strong_roles_by_index.get(exemplar_idx, set())
+        if candidates and role not in candidates:
             raise ValueError(
-                f"Semantic validation failed: roles['{role}'] exemplar paragraph {exemplar_idx} looks like {signal}"
+                f"Semantic validation failed: roles['{role}'] exemplar paragraph {exemplar_idx} looks like {sorted(candidates)}"
+            )
+
+    # A shared style is safe only when its source exemplars have the same
+    # observable source profile. This permits genuinely identical PART/ARTICLE
+    # styles but rejects role collapse onto an unrelated comment/default style.
+    roles_by_style: Dict[str, List[Tuple[str, int]]] = {}
+    for role, spec in roles.items():
+        roles_by_style.setdefault(spec["styleId"], []).append(
+            (role, int(spec["exemplar_paragraph_index"]))
+        )
+    for style_id, role_exemplars in roles_by_style.items():
+        if len(role_exemplars) < 2:
+            continue
+        profiles: Set[str] = set()
+        for _role, exemplar_idx in role_exemplars:
+            paragraph = paragraphs[exemplar_idx]
+            profile = {
+                "pStyle": paragraph.get("pStyle"),
+                "numPr": paragraph.get("effective_numPr") or paragraph.get("numPr"),
+                "pPr_hints": paragraph.get("pPr_hints"),
+                "rPr_hints": paragraph.get("rPr_hints"),
+            }
+            profiles.add(json.dumps(profile, sort_keys=True, separators=(",", ":")))
+        if len(profiles) > 1:
+            names = [role for role, _idx in role_exemplars]
+            raise ValueError(
+                f"Semantic validation failed: roles {names} collapse onto styleId '{style_id}' "
+                "despite different source formatting/numbering profiles"
             )
 
     for role, indices in strong_hits.items():
@@ -944,32 +1528,20 @@ def apply_instructions(extract_dir: Path, instructions: Dict[str, Any]) -> None:
     snap = snapshot_stability(extract_dir)
 
     styles_path = extract_dir / "word" / "styles.xml"
-    styles_text = styles_path.read_text(encoding="utf-8")
+    styles_text = read_xml_text(styles_path)
 
     doc_path = extract_dir / "word" / "document.xml"
-    doc_text = doc_path.read_text(encoding="utf-8")
+    doc_text = read_xml_text(doc_path)
 
     blocks = list(iter_paragraph_xml_blocks(doc_text))
     para_blocks = [b[2] for b in blocks]
     original_para_blocks = list(para_blocks)
 
-    # 1) Create derived styles (local formatting capture from exemplar paragraphs)
+    # 1) Build the portable stylesheet entirely in memory.  This preserves
+    # source-style inheritance and avoids a partial write if later validation
+    # fails.
     style_defs = instructions.get("create_styles") or []
-    derived_blocks: List[str] = []
-    for sd in style_defs:
-        style_id = sd["styleId"]
-        style_name = sd.get("name") or style_id
-        src_idx = sd["derive_from_paragraph_index"]
-        based_on = sd.get("basedOn")
-        if src_idx >= len(para_blocks):
-            raise ValueError(f"Style {style_id}: derive_from_paragraph_index out of range: {src_idx}")
-        exemplar_p = para_blocks[src_idx]
-        derived_def = derive_style_def_from_paragraph(style_id, style_name, exemplar_p, based_on=based_on)
-        derived_blocks.append(build_style_xml_block(derived_def))
-
-    styles_new = insert_styles_into_styles_xml(styles_text, derived_blocks)
-    if styles_new != styles_text:
-        styles_path.write_text(styles_new, encoding="utf-8")
+    styles_new = build_portable_styles_xml(extract_dir, instructions)
 
     styles_text_final = styles_new
     style_ids_in_styles = set(re.findall(r'w:styleId="([^"]+)"', styles_text_final))
@@ -1028,9 +1600,25 @@ def apply_instructions(extract_dir: Path, instructions: Dict[str, Any]) -> None:
         last_end = e
     out_parts.append(doc_text[last_end:])
     doc_new = "".join(out_parts)
-    doc_path.write_text(doc_new, encoding="utf-8")
 
-    verify_stability(extract_dir, snap)
+    styles_original_bytes = styles_path.read_bytes()
+    doc_original_bytes = doc_path.read_bytes()
+    styles_tmp = styles_path.with_name(styles_path.name + ".phase1.tmp")
+    doc_tmp = doc_path.with_name(doc_path.name + ".phase1.tmp")
+    try:
+        styles_tmp.write_bytes(styles_new.encode("utf-8"))
+        doc_tmp.write_bytes(prepare_xml_text_for_utf8(doc_new).encode("utf-8"))
+        styles_tmp.replace(styles_path)
+        doc_tmp.replace(doc_path)
+        verify_stability(extract_dir, snap)
+    except Exception:
+        styles_path.write_bytes(styles_original_bytes)
+        doc_path.write_bytes(doc_original_bytes)
+        raise
+    finally:
+        for temporary in (styles_tmp, doc_tmp):
+            if temporary.exists():
+                temporary.unlink()
 
 
 # -----------------------------
@@ -1108,7 +1696,7 @@ def _determine_numbering_provenance(
     """Determine whether numbering is from style, direct paragraph, literal text, or absent."""
     exemplar = paragraphs[exemplar_idx] if 0 <= exemplar_idx < len(paragraphs) else {}
     numpr = exemplar.get("numPr") if isinstance(exemplar, dict) else None
-    if isinstance(numpr, dict) and numpr.get("numId"):
+    if isinstance(numpr, dict) and (numpr.get("numId") or numpr.get("ilvl")):
         return "direct_numpr"
 
     styles_by_id = _build_styles_by_id(styles_xml_path)
@@ -1147,6 +1735,7 @@ def _extract_numbering_pattern_from_numpr(
 
     abstract_num_id = nums.get(num_id, {}).get("abstractNumId") if num_id else None
     if abstract_num_id:
+        pattern["abstractNumId"] = abstract_num_id
         levels = abstracts.get(abstract_num_id, {}).get("levels", [])
         level = next((lvl for lvl in levels if lvl.get("ilvl") == ilvl), None)
         if level is None and levels:
@@ -1156,6 +1745,14 @@ def _extract_numbering_pattern_from_numpr(
                 pattern["numFmt"] = level["numFmt"]
             if level.get("lvlText"):
                 pattern["lvlText"] = level["lvlText"]
+
+    if num_id:
+        overrides = nums.get(num_id, {}).get("levelOverrides", [])
+        override = next((item for item in overrides if item.get("ilvl") == ilvl), None)
+        if isinstance(override, dict):
+            for key in ("numFmt", "lvlText", "startOverride"):
+                if override.get(key) is not None:
+                    pattern[key] = override[key]
 
     return pattern if pattern else None
 
@@ -1176,10 +1773,16 @@ def build_style_registry_dict(
     source_docx_name: str,
     instructions: Dict[str, Any],
     pre_apply_bundle: Optional[Dict[str, Any]] = None,
+    styles_xml_path: Optional[Path] = None,
+    source_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the arch_style_registry payload dict without writing to disk."""
+    if source_sha256 is None:
+        raise ValueError("source_sha256 is required for the version 2 style registry")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        raise ValueError("source_sha256 must be a lowercase 64-character SHA-256 hex digest")
     roles = instructions.get("roles") or {}
-    styles_path = extract_dir / "word" / "styles.xml"
+    styles_path = styles_xml_path or (extract_dir / "word" / "styles.xml")
     name_map = _build_style_name_map(styles_path)
     bundle = pre_apply_bundle if pre_apply_bundle is not None else build_slim_bundle(extract_dir)
     paragraphs = bundle.get("paragraphs", [])
@@ -1196,7 +1799,7 @@ def build_style_registry_dict(
             used_num_ids.add(numpr["numId"])
         exemplar_idx = int(spec.get("exemplar_paragraph_index", -1))
         if 0 <= exemplar_idx < len(paragraphs):
-            direct_numpr = paragraphs[exemplar_idx].get("numPr")
+            direct_numpr = paragraphs[exemplar_idx].get("effective_numPr") or paragraphs[exemplar_idx].get("numPr")
             if isinstance(direct_numpr, dict) and direct_numpr.get("numId"):
                 used_num_ids.add(direct_numpr["numId"])
     numbering_catalog = build_numbering_catalog(extract_dir / "word" / "numbering.xml", used_num_ids)
@@ -1222,12 +1825,6 @@ def build_style_registry_dict(
                 resolved["rPr_hints"] = exemplar["rPr_hints"]
             if resolved:
                 entry["resolved_formatting"] = resolved
-            if style_id in created_style_ids and exemplar.get("pStyle"):
-                source_pstyle = exemplar.get("pStyle")
-                entry["warning"] = (
-                    f"Derived style exemplar had pre-existing source pStyle '{source_pstyle}'; verify inheritance"
-                )
-
         entry["numbering_provenance"] = _determine_numbering_provenance(
             style_id, exemplar_idx, paragraphs, styles_path
         )
@@ -1235,7 +1832,10 @@ def build_style_registry_dict(
         if entry["numbering_provenance"] == "style_numpr":
             pattern = _extract_numbering_pattern(style_id, styles_path, numbering_catalog)
         elif entry["numbering_provenance"] == "direct_numpr" and 0 <= exemplar_idx < len(paragraphs):
-            pattern = _extract_numbering_pattern_from_numpr(paragraphs[exemplar_idx].get("numPr"), numbering_catalog)
+            pattern = _extract_numbering_pattern_from_numpr(
+                paragraphs[exemplar_idx].get("effective_numPr") or paragraphs[exemplar_idx].get("numPr"),
+                numbering_catalog,
+            )
         if pattern:
             entry["numbering_pattern"] = pattern
 
@@ -1252,16 +1852,41 @@ def build_style_registry_dict(
             if text:
                 source_tokens[role_name] = text
 
-    return {
+    # Combined SECTION-number/title paragraphs legitimately use one style and
+    # one exemplar.  Preserve distinct tokens when possible for Phase 2's
+    # header/footer substitution logic.
+    if "SectionID" in source_tokens:
+        original_section_token = source_tokens["SectionID"]
+        combined = RE_SECTION_WITH_TITLE.match(original_section_token)
+        if combined and combined.group(2).strip():
+            source_tokens["SectionID"] = combined.group(1).strip()
+            if source_tokens.get("SectionTitle") in {None, original_section_token}:
+                source_tokens["SectionTitle"] = combined.group(2).strip(" -–—:")
+
+    payload: Dict[str, Any] = {
         "version": 2,
         "source_docx": source_docx_name,
         "source_tokens": source_tokens,
         "roles": out_roles,
     }
+    payload["source_sha256"] = source_sha256
+    return payload
 
 
-def emit_arch_style_registry(extract_dir: Path, source_docx_name: str, instructions: Dict[str, Any], out_path: Optional[Path] = None) -> Path:
-    payload = build_style_registry_dict(extract_dir, source_docx_name, instructions)
+def emit_arch_style_registry(
+    extract_dir: Path,
+    source_docx_name: str,
+    instructions: Dict[str, Any],
+    out_path: Optional[Path] = None,
+    *,
+    source_sha256: Optional[str] = None,
+) -> Path:
+    payload = build_style_registry_dict(
+        extract_dir,
+        source_docx_name,
+        instructions,
+        source_sha256=source_sha256,
+    )
 
     if out_path is None:
         out_path = extract_dir / "arch_style_registry.json"

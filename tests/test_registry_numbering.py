@@ -29,6 +29,7 @@ def test_direct_numpr_provenance(tmp_path: Path):
         extract_dir,
         "x.docx",
         {"roles": {"ARTICLE": {"styleId": "Normal", "exemplar_paragraph_index": 0}}},
+        source_sha256="a" * 64,
     )
     assert reg["version"] == 2
     assert reg["roles"]["ARTICLE"]["numbering_provenance"] == "direct_numpr"

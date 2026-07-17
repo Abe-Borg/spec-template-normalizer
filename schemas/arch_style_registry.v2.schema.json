@@ -2,13 +2,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "arch_style_registry.json (v2)",
   "type": "object",
-  "required": ["version", "source_docx", "roles"],
+  "required": ["version", "source_docx", "source_sha256", "source_tokens", "roles"],
   "additionalProperties": false,
   "properties": {
     "version": { "const": 2 },
     "source_docx": { "type": "string", "minLength": 1 },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source_tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "SectionID": { "type": "string", "minLength": 1 },
+        "SectionTitle": { "type": "string", "minLength": 1 }
+      }
+    },
     "roles": {
       "type": "object",
+      "minProperties": 1,
       "additionalProperties": false,
       "properties": {
         "SectionID": { "$ref": "#/$defs/roleSpec" },
@@ -17,14 +30,15 @@
         "ARTICLE": { "$ref": "#/$defs/roleSpec" },
         "PARAGRAPH": { "$ref": "#/$defs/roleSpec" },
         "SUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" },
-        "SUBSUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" }
+        "SUBSUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" },
+        "END_OF_SECTION": { "$ref": "#/$defs/roleSpec" }
       }
     }
   },
   "$defs": {
     "roleSpec": {
       "type": "object",
-      "required": ["style_id", "exemplar_paragraph_index"],
+      "required": ["style_id", "exemplar_paragraph_index", "numbering_provenance"],
       "additionalProperties": false,
       "properties": {
         "style_id": { "type": "string", "minLength": 1 },
@@ -42,11 +56,34 @@
           "properties": {
             "numId": { "type": "string" },
             "ilvl": { "type": "string" },
+            "abstractNumId": { "type": "string" },
+            "startOverride": { "type": "string" },
             "numFmt": { "type": "string" },
             "lvlText": { "type": "string" }
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "numbering_provenance": {
+                "enum": ["style_numpr", "direct_numpr"]
+              }
+            },
+            "required": ["numbering_provenance"]
+          },
+          "then": {
+            "required": ["numbering_pattern"],
+            "properties": {
+              "numbering_pattern": { "required": ["numId"] }
+            }
+          },
+          "else": {
+            "not": { "required": ["numbering_pattern"] }
+          }
+        }
+      ]
     }
   }
 }

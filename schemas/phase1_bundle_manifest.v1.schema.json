@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phase 1 template bundle manifest (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "bundle_format",
+    "manifest_version",
+    "bundle_id",
+    "created_utc",
+    "producer",
+    "source",
+    "required_artifacts",
+    "artifacts"
+  ],
+  "properties": {
+    "bundle_format": { "const": "spec-template-normalizer.phase1" },
+    "manifest_version": { "const": 1 },
+    "bundle_id": { "type": "string", "minLength": 1 },
+    "created_utc": { "type": "string", "format": "date-time" },
+    "producer": { "$ref": "#/$defs/producer" },
+    "source": { "$ref": "#/$defs/source" },
+    "required_artifacts": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "style_registry",
+          "template_registry",
+          "classification_audit",
+          "source_styles",
+          "portable_styles"
+        ]
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/artifact" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "run_id"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 },
+        "classifier": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "model"],
+          "properties": {
+            "provider": { "type": "string", "minLength": 1 },
+            "model": { "type": "string", "minLength": 1 }
+          }
+        },
+        "prompts": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": false,
+          "properties": {
+            "master_prompt_sha256": { "$ref": "#/$defs/sha256" },
+            "run_instruction_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256", "size_bytes"],
+      "properties": {
+        "filename": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "path",
+        "media_type",
+        "sha256",
+        "size_bytes",
+        "required",
+        "source_kind"
+      ],
+      "properties": {
+        "artifact_id": {
+          "enum": [
+            "style_registry",
+            "template_registry",
+            "classification_audit",
+            "source_styles",
+            "portable_styles",
+            "source_settings"
+          ]
+        },
+        "path": {
+          "enum": [
+            "arch_style_registry.json",
+            "arch_template_registry.json",
+            "classification_audit.json",
+            "source_styles.xml",
+            "portable_styles.xml",
+            "source_settings.xml"
+          ]
+        },
+        "media_type": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "required": { "type": "boolean" },
+        "source_kind": { "enum": ["generated", "source_exact"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "artifact_id": { "const": "style_registry" } } },
+          "then": { "properties": {
+            "path": { "const": "arch_style_registry.json" },
+            "media_type": { "const": "application/json" },
+            "required": { "const": true },
+            "source_kind": { "const": "generated" }
+          } }
+        },
+        {
+          "if": { "properties": { "artifact_id": { "const": "template_registry" } } },
+          "then": { "properties": {
+            "path": { "const": "arch_template_registry.json" },
+            "media_type": { "const": "application/json" },
+            "required": { "const": true },
+            "source_kind": { "const": "generated" }
+          } }
+        },
+        {
+          "if": { "properties": { "artifact_id": { "const": "classification_audit" } } },
+          "then": { "properties": {
+            "path": { "const": "classification_audit.json" },
+            "media_type": { "const": "application/json" },
+            "required": { "const": true },
+            "source_kind": { "const": "generated" }
+          } }
+        },
+        {
+          "if": { "properties": { "artifact_id": { "const": "source_styles" } } },
+          "then": { "properties": {
+            "path": { "const": "source_styles.xml" },
+            "media_type": { "const": "application/xml" },
+            "required": { "const": true },
+            "source_kind": { "const": "source_exact" }
+          } }
+        },
+        {
+          "if": { "properties": { "artifact_id": { "const": "portable_styles" } } },
+          "then": { "properties": {
+            "path": { "const": "portable_styles.xml" },
+            "media_type": { "const": "application/xml" },
+            "required": { "const": true },
+            "source_kind": { "const": "generated" }
+          } }
+        },
+        {
+          "if": { "properties": { "artifact_id": { "const": "source_settings" } } },
+          "then": { "properties": {
+            "path": { "const": "source_settings.xml" },
+            "media_type": { "const": "application/xml" },
+            "required": { "const": false },
+            "source_kind": { "const": "source_exact" }
+          } }
+        }
+      ]
+    }
+  }
+}

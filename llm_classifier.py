@@ -8,7 +8,6 @@ Design constraint: pure module with no CLI — imported by gui.py.
 """
 from __future__ import annotations
 
-import bisect
 import json
 import re
 import time
@@ -16,14 +15,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from paragraph_rules import (
     is_classifiable_paragraph,
-    detect_role_signal,
     infer_expected_roles,
-    RE_ALPHA_PARA,
-    RE_NUMERIC_SUB,
 )
 
 
-MAX_SINGLE_PASS_PARAGRAPHS = 500
+MAX_SINGLE_PASS_INPUT_TOKENS = 150_000
 
 
 def estimate_tokens(text: str) -> int:
@@ -65,7 +61,15 @@ def _call_api(
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
                 return stream.get_final_text()
-        except (anthropic.APIError, anthropic.APIConnectionError, anthropic.RateLimitError) as e:
+        except (anthropic.APIConnectionError, anthropic.RateLimitError) as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))
+        except anthropic.APIStatusError as e:
+            # Invalid credentials/requests will not heal on retry. Retry only
+            # transient server failures.
+            if getattr(e, "status_code", 0) < 500:
+                raise
             last_error = e
             if attempt < 2:
                 time.sleep(2 ** (attempt + 1))
@@ -75,22 +79,72 @@ def _call_api(
 def _parse_response(raw: str) -> dict:
     """Parse JSON from LLM response, handling code fences."""
     cleaned = _strip_code_fences(raw)
+
+    def reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"LLM response contains duplicate JSON key: {key!r}")
+            result[key] = value
+        return result
+
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as e:
+        parsed = json.loads(
+            cleaned,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"LLM response contains non-finite JSON number: {value}")
+            ),
+        )
+    except (json.JSONDecodeError, ValueError) as e:
         raise ValueError(
             f"LLM response is not valid JSON: {e}\n\nRaw response (first 2000 chars):\n{raw[:2000]}"
         ) from e
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response must be a JSON object")
+    return parsed
+
+
+def _normalize_known_exclusions(instructions: dict, slim_bundle: dict) -> int:
+    """Move deterministic editorial/copyright exclusions into the audit list."""
+    known_reasons = {
+        "editor_note": "Detected editor/specifier note",
+        "specifier_note": "Detected publisher editing instruction",
+        "copyright_notice": "Detected copyright/distribution notice",
+    }
+    excluded = {
+        int(paragraph["paragraph_index"]): known_reasons[paragraph["skip_reason"]]
+        for paragraph in slim_bundle.get("paragraphs", [])
+        if paragraph.get("skip_reason") in known_reasons
+    }
+    if not excluded:
+        return 0
+
+    original_apply = instructions.get("apply_pStyle", [])
+    instructions["apply_pStyle"] = [
+        item for item in original_apply if item.get("paragraph_index") not in excluded
+    ]
+    ignored = {
+        item["paragraph_index"]: item
+        for item in instructions.get("ignored_paragraphs", [])
+        if isinstance(item, dict) and isinstance(item.get("paragraph_index"), int)
+    }
+    for index, reason in excluded.items():
+        ignored.setdefault(index, {"paragraph_index": index, "reason": reason})
+    instructions["ignored_paragraphs"] = sorted(
+        ignored.values(), key=lambda item: item["paragraph_index"]
+    )
+    return len(excluded)
 
 
 def _extract_missing_indices(error: ValueError) -> Optional[List[int]]:
     """Parse missing paragraph indices from a coverage-mismatch ValueError.
 
-    Expected format: 'apply_pStyle coverage mismatch; missing=[35, 59], unexpected=[]'
+    Expected format: 'classification coverage mismatch; missing=[35, 59], unexpected=[]'
     Returns the list of missing indices, or None if this isn't a coverage error.
     """
     msg = str(error)
-    if "apply_pStyle coverage mismatch" not in msg:
+    if "classification coverage mismatch" not in msg:
         return None
 
     m = re.search(r"missing=\[([^\]]*)\]", msg)
@@ -148,22 +202,20 @@ def _repair_strong_signal_mismatches(
     paragraphs = slim_bundle.get("paragraphs", [])
     classifiable = [p for p in paragraphs if is_classifiable_paragraph(p)]
 
-    # Determine whether numeric/lower patterns are strong signals
-    has_alpha = any(
-        RE_ALPHA_PARA.match((p.get("text") or "").strip()) for p in classifiable
+    _expected, strong_hits = infer_expected_roles(
+        paragraphs,
+        numbering_catalog=slim_bundle.get("numbering_catalog"),
     )
-    has_numeric = any(
-        RE_NUMERIC_SUB.match((p.get("text") or "").strip()) for p in classifiable
-    )
+    signal_by_index = {
+        int(index): role
+        for role, indices in strong_hits.items()
+        for index in indices
+    }
 
     corrections = 0
     for p in classifiable:
         idx = p["paragraph_index"]
-        text = (p.get("text") or "").strip()
-
-        signal = detect_role_signal(
-            text, numeric_is_strong=has_alpha, lower_is_strong=has_numeric
-        )
+        signal = signal_by_index.get(int(idx))
         if signal is None:
             continue
 
@@ -200,7 +252,10 @@ def _repair_missing_roles(
         Number of roles added.
     """
     paragraphs = slim_bundle.get("paragraphs", [])
-    expected_roles, strong_hits = infer_expected_roles(paragraphs)
+    expected_roles, strong_hits = infer_expected_roles(
+        paragraphs,
+        numbering_catalog=slim_bundle.get("numbering_catalog"),
+    )
 
     roles = instructions.get("roles")
     if not isinstance(roles, dict):
@@ -219,6 +274,7 @@ def _repair_missing_roles(
         "PARAGRAPH": "CSI_Paragraph__ARCH",
         "SUBPARAGRAPH": "CSI_Subparagraph__ARCH",
         "SUBSUBPARAGRAPH": "CSI_Subsubparagraph__ARCH",
+        "END_OF_SECTION": "CSI_EndOfSection__ARCH",
     }
 
     ROLE_TO_STYLE_NAME = {
@@ -229,6 +285,7 @@ def _repair_missing_roles(
         "PARAGRAPH": "CSI Paragraph (Architect Template)",
         "SUBPARAGRAPH": "CSI Subparagraph (Architect Template)",
         "SUBSUBPARAGRAPH": "CSI Subsubparagraph (Architect Template)",
+        "END_OF_SECTION": "CSI End of Section (Architect Template)",
     }
 
     # Build working indices
@@ -253,32 +310,61 @@ def _repair_missing_roles(
 
         exemplar_idx = hits[0]
 
-        # Check if these paragraphs already share a single assigned style
-        assigned_styles: Set[str] = set()
-        for idx in hits:
-            entry = apply_map.get(idx)
-            if entry:
-                assigned_styles.add(entry["styleId"])
+        # A combined "SECTION 01 23 45 - TITLE" paragraph carries both
+        # SectionID and SectionTitle semantics and can only have one pStyle.
+        if role == "SectionTitle":
+            section_id_spec = roles.get("SectionID")
+            if (
+                isinstance(section_id_spec, dict)
+                and int(section_id_spec.get("exemplar_paragraph_index", -1)) == exemplar_idx
+                and section_id_spec.get("styleId")
+            ):
+                style_id = section_id_spec["styleId"]
+                roles[role] = {
+                    "styleId": style_id,
+                    "exemplar_paragraph_index": exemplar_idx,
+                }
+                added += 1
+                continue
 
-        if len(assigned_styles) == 1:
-            # All strong-hit paragraphs already have the same style — reuse it
-            style_id = assigned_styles.pop()
+        hit_paragraphs = [paragraphs[idx] for idx in hits]
+        source_styles = {p.get("pStyle") for p in hit_paragraphs}
+        source_style = hit_paragraphs[0].get("pStyle")
+        has_direct_paragraph_formatting = any(
+            p.get("pPr_hints")
+            or p.get("rPr_hints")
+            or p.get("numPr")
+            or p.get("has_direct_pPr")
+            or p.get("has_uniform_direct_rPr")
+            for p in hit_paragraphs
+        )
+
+        if len(source_styles) == 1 and source_style and not has_direct_paragraph_formatting:
+            style_id = source_style
         else:
-            # Need a CSI_*__ARCH style
             style_id = ROLE_TO_ARCH_STYLE.get(role)
             if not style_id:
                 continue
-
-            # Create the style definition if it doesn't already exist
             if style_id not in existing_style_ids and style_id not in created_style_ids:
-                create_list = instructions.setdefault("create_styles", [])
-                create_list.append({
+                style_spec = {
                     "styleId": style_id,
                     "name": ROLE_TO_STYLE_NAME.get(role, style_id),
                     "type": "paragraph",
                     "derive_from_paragraph_index": exemplar_idx,
-                    "basedOn": "Normal",
-                })
+                }
+                if source_style:
+                    style_spec["basedOn"] = source_style
+                else:
+                    defaults = [
+                        sid
+                        for sid, info in slim_bundle.get("style_catalog", {}).items()
+                        if isinstance(info, dict) and info.get("default") is True
+                    ]
+                    if len(defaults) == 1:
+                        style_spec["basedOn"] = defaults[0]
+                    elif "Normal" in existing_style_ids:
+                        style_spec["basedOn"] = "Normal"
+                instructions.setdefault("create_styles", []).append(style_spec)
                 created_style_ids.add(style_id)
 
         # Register the role
@@ -324,32 +410,19 @@ def _repair_role_exemplar_mismatches(
     if not by_index:
         return 0
 
-    _, strong_hits = infer_expected_roles(paragraphs)
-
-    has_alpha = any(
-        RE_ALPHA_PARA.match((p.get("text") or "").strip()) for p in classifiable
-    )
-    has_numeric = any(
-        RE_NUMERIC_SUB.match((p.get("text") or "").strip()) for p in classifiable
+    _, strong_hits = infer_expected_roles(
+        paragraphs,
+        numbering_catalog=slim_bundle.get("numbering_catalog"),
     )
 
     def _find_correct_exemplar(role: str) -> Optional[int]:
-        if role == "SectionTitle":
-            for section_id_idx in sorted(strong_hits.get("SectionID", [])):
-                candidate_idx = section_id_idx + 1
-                para = by_index.get(candidate_idx)
-                if not para:
-                    continue
-                text = (para.get("text") or "").strip()
-                signal = detect_role_signal(
-                    text, numeric_is_strong=has_alpha, lower_is_strong=has_numeric
-                )
-                if signal is None:
-                    return candidate_idx
-            return None
-
         hits = strong_hits.get(role, [])
         return hits[0] if hits else None
+
+    roles_by_index: Dict[int, Set[str]] = {}
+    for detected_role, indices in strong_hits.items():
+        for index in indices:
+            roles_by_index.setdefault(int(index), set()).add(detected_role)
 
     corrections = 0
     for role, spec in list(roles.items()):
@@ -364,12 +437,8 @@ def _repair_role_exemplar_mismatches(
         if not para:
             continue
 
-        text = (para.get("text") or "").strip()
-        signal = detect_role_signal(
-            text, numeric_is_strong=has_alpha, lower_is_strong=has_numeric
-        )
-
-        if signal is None or signal == role:
+        detected_roles = roles_by_index.get(exemplar_idx, set())
+        if not detected_roles or role in detected_roles:
             continue
 
         correct_idx = _find_correct_exemplar(role)
@@ -389,64 +458,15 @@ def _repair_role_exemplar_mismatches(
                 continue
             if sd.get("styleId") == style_id and sd.get("derive_from_paragraph_index") == exemplar_idx:
                 sd["derive_from_paragraph_index"] = correct_idx
+                corrected_source_style = by_index[correct_idx].get("pStyle")
+                if corrected_source_style:
+                    sd["basedOn"] = corrected_source_style
+                else:
+                    sd.pop("basedOn", None)
 
         corrections += 1
 
     return corrections
-
-
-def _repair_coverage_gaps(
-    instructions: dict,
-    slim_bundle: dict,
-) -> int:
-    """Fill remaining unclassified classifiable paragraphs by nearest-neighbor style."""
-    paragraphs = slim_bundle.get("paragraphs", [])
-    classifiable_indices = {
-        p["paragraph_index"] for p in paragraphs if is_classifiable_paragraph(p)
-    }
-    apply_list = instructions.setdefault("apply_pStyle", [])
-    apply_map: Dict[int, str] = {
-        item["paragraph_index"]: item["styleId"] for item in apply_list if isinstance(item, dict)
-    }
-
-    missing = sorted(classifiable_indices - set(apply_map.keys()))
-    if not missing:
-        return 0
-
-    classified_indices = sorted(apply_map.keys())
-    repairs = 0
-
-    for idx in missing:
-        insert_at = bisect.bisect_left(classified_indices, idx)
-
-        prev_style: Optional[str] = None
-        if insert_at > 0:
-            prev_style = apply_map.get(classified_indices[insert_at - 1])
-
-        next_style: Optional[str] = None
-        if insert_at < len(classified_indices):
-            next_style = apply_map.get(classified_indices[insert_at])
-
-        if prev_style and next_style:
-            chosen = prev_style if prev_style == next_style else prev_style
-        else:
-            chosen = prev_style or next_style
-
-        if not chosen:
-            continue
-
-        apply_list.append({"paragraph_index": idx, "styleId": chosen})
-        apply_map[idx] = chosen
-        bisect.insort(classified_indices, idx)
-        repairs += 1
-
-    if repairs:
-        instructions["apply_pStyle"] = sorted(
-            apply_list,
-            key=lambda x: x["paragraph_index"],
-        )
-
-    return repairs
 
 
 def _build_patch_prompt(
@@ -490,13 +510,68 @@ def _build_patch_prompt(
         f"Already-classified neighbors for context:\n"
         + "\n".join(neighbor_info) + "\n\n"
         f"Classify ONLY the following paragraph indices: {missing_indices}\n"
-        f"Use ONLY the styleIds from the roles above.\n\n"
+        f"Use ONLY the styleIds from the roles above. If a paragraph is genuinely non-CSI content, "
+        f"put it in ignored_paragraphs with a specific reason; never guess from a neighboring style.\n\n"
         f"Context paragraphs (surrounding the missed ones):\n"
         f"{json.dumps(context_paragraphs, indent=2)}\n\n"
-        f'Return ONLY a JSON object: {{"apply_pStyle": [{{"paragraph_index": N, "styleId": "..."}}]}}\n'
+        f'Return ONLY a JSON object with these keys: '
+        f'{{"apply_pStyle": [{{"paragraph_index": N, "styleId": "..."}}], '
+        f'"ignored_paragraphs": [{{"paragraph_index": N, "reason": "..."}}]}}\n'
         f"No prose, no markdown, no extra keys."
     )
     return prompt
+
+
+def _validate_patch_result(
+    patch_result: Dict[str, Any],
+    missing_indices: List[int],
+    instructions: Dict[str, Any],
+) -> None:
+    """Validate a targeted classifier response before merging any of it."""
+    if set(patch_result) != {"apply_pStyle", "ignored_paragraphs"}:
+        raise ValueError(
+            "Targeted classification response must contain exactly "
+            "apply_pStyle and ignored_paragraphs"
+        )
+    if not isinstance(patch_result["apply_pStyle"], list) or not isinstance(
+        patch_result["ignored_paragraphs"], list
+    ):
+        raise ValueError("Targeted classification response fields must be arrays")
+
+    allowed_indices = set(missing_indices)
+    allowed_styles = {
+        spec.get("styleId")
+        for spec in instructions.get("roles", {}).values()
+        if isinstance(spec, dict) and isinstance(spec.get("styleId"), str)
+    }
+    seen: Set[int] = set()
+    for position, item in enumerate(patch_result["apply_pStyle"]):
+        if not isinstance(item, dict) or set(item) != {"paragraph_index", "styleId"}:
+            raise ValueError(f"Targeted apply_pStyle[{position}] has an invalid shape")
+        index = item["paragraph_index"]
+        if type(index) is not int or index not in allowed_indices or index in seen:
+            raise ValueError(
+                f"Targeted apply_pStyle[{position}] must reference one unique missing paragraph"
+            )
+        if item["styleId"] not in allowed_styles:
+            raise ValueError(
+                f"Targeted apply_pStyle[{position}] uses a style not declared in roles"
+            )
+        seen.add(index)
+    for position, item in enumerate(patch_result["ignored_paragraphs"]):
+        if not isinstance(item, dict) or set(item) != {"paragraph_index", "reason"}:
+            raise ValueError(f"Targeted ignored_paragraphs[{position}] has an invalid shape")
+        index = item["paragraph_index"]
+        reason = item["reason"]
+        if type(index) is not int or index not in allowed_indices or index in seen:
+            raise ValueError(
+                f"Targeted ignored_paragraphs[{position}] must reference one unique missing paragraph"
+            )
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                f"Targeted ignored_paragraphs[{position}].reason must be non-empty"
+            )
+        seen.add(index)
 
 
 def classify_document(
@@ -510,10 +585,9 @@ def classify_document(
     """
     Classify all paragraphs in a slim bundle using the Anthropic API.
 
-    If the initial classification misses a small number of paragraphs
-    (coverage mismatch), automatically makes targeted follow-up calls
-    to classify just the missing indices. If coverage still fails after
-    all patch attempts, applies a nearest-neighbor fallback repair.
+    If the initial classification misses paragraphs, targeted follow-up calls
+    classify only those indices. Ambiguous gaps fail closed after the bounded
+    attempts; they are never assigned a neighboring style by position.
 
     Deterministic repairs are applied locally before validation:
     missing roles, role-exemplar mismatches, and strong-signal style
@@ -537,23 +611,29 @@ def classify_document(
                     after all patch attempts are exhausted.
     """
     paragraphs = slim_bundle.get("paragraphs", [])
-    if len(paragraphs) > MAX_SINGLE_PASS_PARAGRAPHS:
+    bundle_json = json.dumps(slim_bundle, indent=2)
+    input_tokens = estimate_tokens(master_prompt + run_instruction + bundle_json)
+    if input_tokens > MAX_SINGLE_PASS_INPUT_TOKENS:
         raise ValueError(
-            f"Unsupported document size: {len(paragraphs)} paragraphs exceeds "
-            f"single-pass limit ({MAX_SINGLE_PASS_PARAGRAPHS}). Chunked classification is intentionally disabled "
-            "pending two-pass redesign."
+            f"Document classification input is approximately {input_tokens:,} tokens, exceeding the "
+            f"safe single-pass limit ({MAX_SINGLE_PASS_INPUT_TOKENS:,}). Reduce the template or use a model "
+            "with a larger context window; no partial classification was produced."
         )
 
     import anthropic
     from docx_decomposer import validate_instructions
 
-    client = anthropic.Anthropic(api_key=api_key)
-
-    bundle_json = json.dumps(slim_bundle, indent=2)
+    # _call_api owns the bounded retry policy. Disable the SDK's implicit
+    # retries so transport attempts do not multiply behind that policy.
+    client = anthropic.Anthropic(api_key=api_key, timeout=180.0, max_retries=0)
     user_message = f"{run_instruction}\n\nSlim bundle:\n{bundle_json}"
 
     raw = _call_api(client, master_prompt, user_message, model)
     instructions = _parse_response(raw)
+
+    normalized_exclusions = _normalize_known_exclusions(instructions, slim_bundle)
+    if normalized_exclusions:
+        print(f"Recorded {normalized_exclusions} deterministic non-CSI exclusion(s)")
 
     # Auto-repair missing roles before other repairs.
     # When the LLM omits a role that strong text signals prove exists
@@ -585,11 +665,10 @@ def classify_document(
                 raise  # Not a coverage error
 
             if patch_attempt >= max_patch_attempts:
-                gap_fills = _repair_coverage_gaps(instructions, slim_bundle)
-                if gap_fills:
-                    print(f"Gap-filled {gap_fills} paragraph(s) via nearest-neighbor")
-                    break
-                raise  # Out of patch attempts and no deterministic gap fill was possible
+                raise ValueError(
+                    f"Classification remained incomplete after {max_patch_attempts} targeted patch attempt(s); "
+                    f"unresolved paragraph indices: {missing}"
+                ) from exc
 
             print(
                 f"Coverage patch attempt {patch_attempt + 1}/{max_patch_attempts}: "
@@ -599,21 +678,36 @@ def classify_document(
             patch_prompt = _build_patch_prompt(slim_bundle, instructions, missing)
             patch_raw = _call_api(client, master_prompt, patch_prompt, model)
             patch_result = _parse_response(patch_raw)
+            _validate_patch_result(patch_result, missing, instructions)
 
             # Merge patch results into instructions
             existing_indices = {
                 item["paragraph_index"]
                 for item in instructions.get("apply_pStyle", [])
             }
+            existing_indices.update(
+                item["paragraph_index"]
+                for item in instructions.get("ignored_paragraphs", [])
+                if isinstance(item, dict) and isinstance(item.get("paragraph_index"), int)
+            )
             for item in patch_result.get("apply_pStyle", []):
                 idx = item["paragraph_index"]
                 if idx not in existing_indices:
                     instructions.setdefault("apply_pStyle", []).append(item)
                     existing_indices.add(idx)
+            for item in patch_result.get("ignored_paragraphs", []):
+                idx = item["paragraph_index"]
+                if idx not in existing_indices:
+                    instructions.setdefault("ignored_paragraphs", []).append(item)
+                    existing_indices.add(idx)
 
             # Re-sort for deterministic output
             instructions["apply_pStyle"] = sorted(
                 instructions.get("apply_pStyle", []),
+                key=lambda x: x["paragraph_index"],
+            )
+            instructions["ignored_paragraphs"] = sorted(
+                instructions.get("ignored_paragraphs", []),
                 key=lambda x: x["paragraph_index"],
             )
 
@@ -629,17 +723,22 @@ def classify_document(
 
 def compute_coverage(slim_bundle: dict, instructions: dict) -> tuple:
     """
-    Compute what percentage of classifiable paragraphs received a style.
+    Compute what percentage of classifiable paragraphs were explicitly handled.
 
     Returns:
-        (coverage_fraction, styled_count, classifiable_count)
+        (coverage_fraction, handled_count, classifiable_count)
     """
     paragraphs = slim_bundle.get("paragraphs", [])
     classifiable_indices = {p["paragraph_index"] for p in paragraphs if is_classifiable_paragraph(p)}
     classifiable = len(classifiable_indices)
 
     styled_indices = {item["paragraph_index"] for item in instructions.get("apply_pStyle", [])}
-    styled_count = len(styled_indices & classifiable_indices)
+    ignored_indices = {
+        item["paragraph_index"]
+        for item in instructions.get("ignored_paragraphs", [])
+        if isinstance(item, dict) and isinstance(item.get("paragraph_index"), int)
+    }
+    handled_count = len((styled_indices | ignored_indices) & classifiable_indices)
 
-    coverage = styled_count / classifiable if classifiable > 0 else 1.0
-    return coverage, styled_count, classifiable
+    coverage = handled_count / classifiable if classifiable > 0 else 1.0
+    return coverage, handled_count, classifiable

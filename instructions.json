@@ -4,36 +4,31 @@
       "styleId": "CSI_SectionTitle__ARCH",
       "name": "CSI SectionTitle (Architect Template)",
       "type": "paragraph",
-      "derive_from_paragraph_index": 1,
-      "basedOn": "Normal"
+      "derive_from_paragraph_index": 1
     },
     {
       "styleId": "CSI_Part__ARCH",
       "name": "CSI Part (Architect Template)",
       "type": "paragraph",
-      "derive_from_paragraph_index": 2,
-      "basedOn": "Normal"
+      "derive_from_paragraph_index": 2
     },
     {
       "styleId": "CSI_Article__ARCH",
       "name": "CSI Article (Architect Template)",
       "type": "paragraph",
-      "derive_from_paragraph_index": 3,
-      "basedOn": "Normal"
+      "derive_from_paragraph_index": 3
     },
     {
       "styleId": "CSI_Paragraph__ARCH",
       "name": "CSI Paragraph (Architect Template)",
       "type": "paragraph",
-      "derive_from_paragraph_index": 4,
-      "basedOn": "Normal"
+      "derive_from_paragraph_index": 4
     },
     {
       "styleId": "CSI_Subparagraph__ARCH",
       "name": "CSI Subparagraph (Architect Template)",
       "type": "paragraph",
-      "derive_from_paragraph_index": 5,
-      "basedOn": "Normal"
+      "derive_from_paragraph_index": 5
     }
   ],
   "apply_pStyle": [
@@ -44,6 +39,7 @@
     { "paragraph_index": 4, "styleId": "CSI_Paragraph__ARCH" },
     { "paragraph_index": 5, "styleId": "CSI_Subparagraph__ARCH" }
   ],
+  "ignored_paragraphs": [],
   "roles": {
     "SectionID": { "styleId": "CSI_SectionID__ARCH", "exemplar_paragraph_index": 0 },
     "SectionTitle": { "styleId": "CSI_SectionTitle__ARCH", "exemplar_paragraph_index": 1 },

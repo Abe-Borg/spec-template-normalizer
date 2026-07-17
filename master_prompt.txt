@@ -13,8 +13,9 @@ Goal: classify architect template CSI semantics using paragraph styles (w:pStyle
 
 Rules:
 1) Do not propose changes to headers/footers or section properties (sectPr). Those must remain unchanged.
-2) Prefer reusing existing template styles if they match the current appearance.
-   Existing paragraph styles may be reusable even if they are currently unused in document paragraphs.
+2) Prefer reusing an existing template style only when the exemplar/current paragraphs actually carry that pStyle.
+   If matching appearance depends on direct formatting or a different source style, create the canonical CSI_*__ARCH
+   style from the exemplar instead of guessing that an unused style is visually equivalent.
 3) If a CSI role exists but paragraphs lack a style, propose creating a template-namespaced style that matches the current appearance
    (via derive_from_paragraph_index only). Allowed CSI_*__ARCH styleIds:
    - CSI_SectionTitle__ARCH
@@ -24,8 +25,12 @@ Rules:
    - CSI_Paragraph__ARCH
    - CSI_Subparagraph__ARCH
    - CSI_Subsubparagraph__ARCH
-4) If you create a new CSI_*__ARCH style, choose a derive_from_paragraph_index that is a “clean” exemplar of that role
-   (not END OF SECTION, not blank, not a section break, not in-table, not a weird edge-case).
+   - CSI_EndOfSection__ARCH
+4) If you create a new CSI_*__ARCH style, choose a derive_from_paragraph_index that is a clean exemplar of that role
+   (not blank, not a section break, not in-table, not a weird edge-case). END OF SECTION is a first-class role and
+   its own line is the correct exemplar for CSI_EndOfSection__ARCH.
+   If the exemplar has pStyle, basedOn MUST equal that exact pStyle. If it has no pStyle, use the catalog's default
+   paragraph style (or null when no default is identified). Never guess "Normal".
 5) Determine hierarchy using text patterns AND numbering/indent hints, including Word numbering metadata (numPr), not just visible numbering text.
 6) You MUST output a deterministic role→style mapping under top-level key "roles".
    Allowed role keys are EXACTLY:
@@ -36,22 +41,26 @@ Rules:
    - PARAGRAPH
    - SUBPARAGRAPH
    - SUBSUBPARAGRAPH (optional)
+   - END_OF_SECTION (when an END OF SECTION/DIVISION line exists)
    For each included role:
    - styleId: exact Word w:styleId string
    - exemplar_paragraph_index: paragraph_index used as exemplar
    If styleId is a created CSI_*__ARCH style, exemplar_paragraph_index MUST equal derive_from_paragraph_index.
    Include roles only when present in this architect document.
    Roles must be meaningful and should cover detected structural numbering families when numbering metadata exists.
-   Shared styles across roles are allowed when hierarchy remains structurally distinguishable.
-7) You MUST classify EVERY non-skipped, non-table content paragraph in apply_pStyle.
-   Skip ONLY:
+   Shared styles across roles are allowed only when the exemplars have the same source formatting and numbering
+   profile. A combined "SECTION number - title" paragraph may represent SectionID and SectionTitle with one style.
+7) You MUST explicitly account for EVERY non-skipped, non-table content paragraph. Put CSI content in apply_pStyle.
+   Put genuinely non-CSI content in ignored_paragraphs with a specific reason. Never copy the nearest paragraph's
+   style merely to obtain full coverage.
+   Mark these structural exclusions out of scope (do not list them):
    - Empty/blank paragraphs
    - Paragraphs with contains_sectPr=true
    - Paragraphs with in_table=true
-   - "END OF SECTION"
-   - Editor/specifier notes in brackets (e.g. "[SPECIFIER NOTE: ...]")
-   - Copyright/distribution notices (e.g. "Copyright 2011 by The American Institute of Architects")
-   - Unbracketed specifier editing instructions from the template publisher (e.g. "Retain first paragraph below...", "Revise this Section...", "See Editing Instruction No. 1...")
+   Put these semantic exclusions in ignored_paragraphs with their actual reason:
+   - Editor/specifier notes (including bracketed notes)
+   - Copyright/distribution notices
+   - Unbracketed publisher editing instructions (for example "Retain first paragraph below...")
 8) Output must be valid JSON only.
 
 Output schema:
@@ -67,6 +76,9 @@ Output schema:
   ],
   "apply_pStyle": [
     { "paragraph_index": 12, "styleId": "CSI_Part__ARCH" }
+  ],
+  "ignored_paragraphs": [
+    { "paragraph_index": 13, "reason": "Project metadata, not CSI specification content" }
   ],
   "roles": {
     "SectionTitle": { "styleId": "CSI_SectionTitle__ARCH", "exemplar_paragraph_index": 1 },
