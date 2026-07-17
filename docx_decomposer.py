@@ -675,21 +675,116 @@ def _xml_element_signature(element: ET.Element) -> Tuple[Any, ...]:
     )
 
 
+_XML_QNAME = r"[A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?"
+_XML_PREFIX_RE = re.compile(
+    r"(?:</?\s*|\s)([A-Za-z_][\w.-]*):[A-Za-z_][\w.-]*(?=\s|/?>|=)"
+)
+_XMLNS_ATTRIBUTE_RE = re.compile(
+    r"\sxmlns:(?P<prefix>[A-Za-z_][\w.-]*)\s*=\s*"
+    r"(?P<quote>['\"])(?P<uri>.*?)(?P=quote)",
+    flags=re.S,
+)
+
+
+def _xml_markup_end(xml_text: str, start: int) -> int:
+    """Return the exclusive end of markup beginning at *start*."""
+    if xml_text.startswith("<!--", start):
+        end = xml_text.find("-->", start + 4)
+        return len(xml_text) if end == -1 else end + 3
+    if xml_text.startswith("<![CDATA[", start):
+        end = xml_text.find("]]>", start + 9)
+        return len(xml_text) if end == -1 else end + 3
+    if xml_text.startswith("<?", start):
+        end = xml_text.find("?>", start + 2)
+        return len(xml_text) if end == -1 else end + 2
+
+    quote: Optional[str] = None
+    for index in range(start + 1, len(xml_text)):
+        char = xml_text[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == ">":
+            return index + 1
+    return len(xml_text)
+
+
+def _direct_xml_child_fragments(xml_text: str) -> List[str]:
+    """Return exact top-level element fragments from an XML inner string.
+
+    Run properties may be in Word extension namespaces (for example w14) and
+    may themselves contain nested elements.  A QName-aware lexical walk keeps
+    those fragments byte-for-byte without assuming a particular prefix.
+    """
+    fragments: List[str] = []
+    element_stack: List[str] = []
+    fragment_start: Optional[int] = None
+    position = 0
+
+    while True:
+        start = xml_text.find("<", position)
+        if start == -1:
+            break
+        end = _xml_markup_end(xml_text, start)
+        if end <= start or end > len(xml_text):
+            return []
+        token = xml_text[start:end]
+        position = end
+
+        if token.startswith(("<!--", "<![CDATA[", "<?", "<!")):
+            continue
+
+        if token.startswith("</"):
+            match = re.match(rf"</\s*({_XML_QNAME})\s*>", token, flags=re.S)
+            if not match or not element_stack or element_stack[-1] != match.group(1):
+                return []
+            element_stack.pop()
+            if not element_stack and fragment_start is not None:
+                fragments.append(xml_text[fragment_start:end].strip())
+                fragment_start = None
+            continue
+
+        match = re.match(rf"<\s*({_XML_QNAME})(?=\s|/?>)", token, flags=re.S)
+        if not match:
+            return []
+        if not element_stack:
+            fragment_start = start
+        if re.search(r"/\s*>$", token):
+            if not element_stack and fragment_start is not None:
+                fragments.append(xml_text[fragment_start:end].strip())
+                fragment_start = None
+        else:
+            element_stack.append(match.group(1))
+
+    return fragments if not element_stack else []
+
+
+def _fragment_namespace_declarations(xml_text: str) -> str:
+    """Declare prefixes synthetically so ElementTree can compare fragments."""
+    prefixes = set(_XML_PREFIX_RE.findall(xml_text)) - {"xml", "xmlns"}
+    declarations = []
+    for prefix in sorted(prefixes):
+        uri = W_NS if prefix == "w" else f"urn:phase1-ooxml-prefix:{prefix}"
+        declarations.append(f'xmlns:{prefix}="{xml_escape(uri)}"')
+    return " ".join(declarations)
+
+
 def _run_property_fragments(rpr_inner: str) -> List[Tuple[Tuple[Any, ...], str]]:
     """Split direct w:rPr children while preserving their original XML bytes."""
     fragments: List[Tuple[Tuple[Any, ...], str]] = []
-    pattern = re.compile(r"(<w:([A-Za-z_][\w.-]*)\b[^>]*(?:/>|>[\s\S]*?</w:\2>))")
-    for match in pattern.finditer(rpr_inner):
-        raw = match.group(1).strip()
+    for raw in _direct_xml_child_fragments(rpr_inner):
         try:
-            wrapper = ET.fromstring(f'<root xmlns:w="{W_NS}">{raw}</root>')
+            declarations = _fragment_namespace_declarations(raw)
+            wrapper = ET.fromstring(f"<root {declarations}>{raw}</root>")
             if not list(wrapper):
                 continue
             signature = _xml_element_signature(list(wrapper)[0])
         except ET.ParseError:
-            # Unknown extension prefixes are uncommon in run properties.  Keep
-            # a conservative normalized signature instead of throwing away a
-            # property that is demonstrably identical in every run.
+            # Keep a conservative signature rather than throwing away a
+            # property that is demonstrably identical in every visible run.
             signature = (re.sub(r"\s+", " ", raw).strip(),)
         fragments.append((signature, raw))
     return fragments
@@ -765,6 +860,68 @@ def _default_paragraph_style_id(styles_xml_text: str) -> Optional[str]:
     return "Normal" if re.search(r'w:styleId="Normal"', styles_xml_text) else None
 
 
+def _root_opening_tag_span(xml_text: str) -> Optional[Tuple[int, int]]:
+    """Locate the document element's opening tag without reserializing XML."""
+    position = 0
+    while True:
+        start = xml_text.find("<", position)
+        if start == -1:
+            return None
+        end = _xml_markup_end(xml_text, start)
+        token = xml_text[start:end]
+        position = end
+        if token.startswith(("<?", "<!--", "<!")):
+            continue
+        if token.startswith("</") or not re.match(rf"<\s*{_XML_QNAME}(?=\s|/?>)", token):
+            return None
+        return start, end
+
+
+def _root_namespace_declarations(xml_text: str) -> Dict[str, str]:
+    span = _root_opening_tag_span(xml_text)
+    if span is None:
+        return {}
+    opening_tag = xml_text[span[0]:span[1]]
+    return {
+        match.group("prefix"): html.unescape(match.group("uri"))
+        for match in _XMLNS_ATTRIBUTE_RE.finditer(opening_tag)
+    }
+
+
+def _propagate_style_fragment_namespaces(
+    styles_xml_text: str,
+    document_xml_text: str,
+    style_blocks: List[str],
+) -> str:
+    """Copy namespaces needed by derived fragments onto the styles root."""
+    if not style_blocks:
+        return styles_xml_text
+
+    used_prefixes = set(_XML_PREFIX_RE.findall("\n".join(style_blocks))) - {"xml", "xmlns"}
+    styles_namespaces = _root_namespace_declarations(styles_xml_text)
+    document_namespaces = _root_namespace_declarations(document_xml_text)
+    additions = {
+        prefix: document_namespaces[prefix]
+        for prefix in used_prefixes - set(styles_namespaces)
+        if prefix in document_namespaces
+    }
+    if not additions:
+        return styles_xml_text
+
+    span = _root_opening_tag_span(styles_xml_text)
+    if span is None:
+        raise ValueError("styles.xml does not contain a valid root opening tag")
+    opening_tag = styles_xml_text[span[0]:span[1]]
+    if re.search(r"/\s*>$", opening_tag):
+        raise ValueError("styles.xml root must not be self-closing")
+    declarations = "".join(
+        f' xmlns:{prefix}="{xml_escape(uri)}"'
+        for prefix, uri in sorted(additions.items())
+    )
+    updated_opening_tag = opening_tag[:-1] + declarations + ">"
+    return styles_xml_text[:span[0]] + updated_opening_tag + styles_xml_text[span[1]:]
+
+
 def build_portable_styles_xml(extract_dir: Path, instructions: Dict[str, Any]) -> str:
     """Build the portable stylesheet without mutating the extracted package."""
     slim_bundle = build_slim_bundle(extract_dir)
@@ -795,12 +952,23 @@ def build_portable_styles_xml(extract_dir: Path, instructions: Dict[str, Any]) -
         )
         derived_blocks.append(build_style_xml_block(derived))
 
-    portable = insert_styles_into_styles_xml(styles_text, derived_blocks)
+    portable = _propagate_style_fragment_namespaces(
+        insert_styles_into_styles_xml(styles_text, derived_blocks),
+        doc_text,
+        derived_blocks,
+    )
+    portable = prepare_xml_text_for_utf8(portable)
+    try:
+        ET.fromstring(portable)
+    except ET.ParseError as exc:
+        raise ValueError(
+            f"Generated portable styles.xml is not well-formed after namespace propagation: {exc}"
+        ) from exc
     style_ids = set(re.findall(r'w:styleId="([^"]+)"', portable))
     for item in instructions.get("apply_pStyle", []) or []:
         if item["styleId"] not in style_ids:
             raise ValueError(f"apply_pStyle references unknown styleId: {item['styleId']}")
-    return prepare_xml_text_for_utf8(portable)
+    return portable
 
 
 def build_style_xml_block(style_def: Dict[str, Any]) -> str:

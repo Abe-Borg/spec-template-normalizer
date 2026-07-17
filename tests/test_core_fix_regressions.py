@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import pytest
 
 from docx_decomposer import (
+    build_portable_styles_xml,
     build_slim_bundle,
     build_style_xml_block,
     derive_style_def_from_paragraph,
+    extract_paragraph_rpr_inner,
     paragraph_text_from_block,
 )
 from paragraph_rules import detect_role_signal, infer_expected_roles
 
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+W14_NS = "http://schemas.microsoft.com/office/word/2010/wordml"
 
 
 def test_visible_text_keeps_tabs_and_explicit_breaks_as_separators() -> None:
@@ -47,6 +51,88 @@ def test_one_bold_run_does_not_make_the_derived_style_bold() -> None:
     assert "<w:b/>" not in style_xml
     assert "<w:b>" not in style_xml
     assert "<w:b " not in style_xml
+
+
+def test_different_extension_run_properties_are_not_promoted() -> None:
+    paragraph = (
+        "<w:p>"
+        "<w:r><w:rPr><w:b/><w14:textFill><w14:solidFill>"
+        '<w14:srgbClr w14:val="FF0000"/>'
+        "</w14:solidFill></w14:textFill></w:rPr><w:t>First</w:t></w:r>"
+        "<w:r><w:rPr><w:b/><w14:textFill><w14:solidFill>"
+        '<w14:srgbClr w14:val="0000FF"/>'
+        "</w14:solidFill></w14:textFill></w:rPr><w:t>Second</w:t></w:r>"
+        "</w:p>"
+    )
+
+    rpr_inner = extract_paragraph_rpr_inner(paragraph)
+
+    assert "<w:b/>" in rpr_inner
+    assert "w14:textFill" not in rpr_inner
+    assert "w14:srgbClr" not in rpr_inner
+
+
+def test_portable_styles_preserve_extension_properties_and_declare_namespace(
+    tmp_path: Path,
+) -> None:
+    word_dir = tmp_path / "word"
+    word_dir.mkdir()
+    effect = (
+        '<w14:glow w14:rad="63500"><w14:srgbClr w14:val="ABCDEF"/>'
+        "</w14:glow>"
+        "<w14:textFill><w14:solidFill>"
+        '<w14:srgbClr w14:val="123456"/>'
+        "</w14:solidFill></w14:textFill>"
+    )
+    (word_dir / "document.xml").write_text(
+        f'<w:document xmlns:w="{W_NS}" xmlns:w14="{W14_NS}"><w:body>'
+        f"<w:p><w:r><w:rPr>{effect}</w:rPr><w:t>PROJECT </w:t></w:r>"
+        f"<w:r><w:rPr>{effect}</w:rPr><w:t>TITLE</w:t></w:r></w:p>"
+        "<w:sectPr/>"
+        "</w:body></w:document>",
+        encoding="utf-8",
+    )
+    (word_dir / "styles.xml").write_text(
+        f'<w:styles xmlns:w="{W_NS}">'
+        '<w:style w:type="paragraph" w:default="1" w:styleId="Normal">'
+        '<w:name w:val="Normal"/></w:style>'
+        "</w:styles>",
+        encoding="utf-8",
+    )
+    instructions = {
+        "create_styles": [
+            {
+                "styleId": "CSI_SectionTitle__ARCH",
+                "name": "Section Title",
+                "type": "paragraph",
+                "derive_from_paragraph_index": 0,
+            }
+        ],
+        "apply_pStyle": [
+            {"paragraph_index": 0, "styleId": "CSI_SectionTitle__ARCH"}
+        ],
+        "ignored_paragraphs": [],
+        "roles": {
+            "SectionTitle": {
+                "styleId": "CSI_SectionTitle__ARCH",
+                "exemplar_paragraph_index": 0,
+            }
+        },
+        "notes": [],
+    }
+
+    portable = build_portable_styles_xml(tmp_path, instructions)
+
+    assert f'xmlns:w14="{W14_NS}"' in portable
+    assert "<w14:glow" in portable
+    assert "<w14:textFill>" in portable
+    root = ET.fromstring(portable)
+    style = root.find(f"{{{W_NS}}}style[@{{{W_NS}}}styleId='CSI_SectionTitle__ARCH']")
+    assert style is not None
+    rpr = style.find(f"{{{W_NS}}}rPr")
+    assert rpr is not None
+    assert rpr.find(f"{{{W14_NS}}}glow") is not None
+    assert rpr.find(f"{{{W14_NS}}}textFill") is not None
 
 
 def test_derived_style_preserves_source_pstyle_and_direct_numpr() -> None:
