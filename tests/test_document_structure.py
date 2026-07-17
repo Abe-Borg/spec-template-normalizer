@@ -35,7 +35,7 @@ def test_nested_table_context_is_xml_aware(tmp_path: Path):
     assert bundle["paragraphs"][3]["in_table"] is False
 
 
-def test_501_paragraph_document_fails_with_explicit_message():
-    bundle = {"paragraphs": [{"paragraph_index": i, "text": "x"} for i in range(501)]}
-    with pytest.raises(ValueError, match="Unsupported document size"):
+def test_token_oversized_document_fails_before_api_call():
+    bundle = {"paragraphs": [{"paragraph_index": 0, "text": "x" * 700_000}]}
+    with pytest.raises(ValueError, match="safe single-pass limit"):
         classify_document(bundle, "m", "r", "fake-key")

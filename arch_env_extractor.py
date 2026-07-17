@@ -27,9 +27,12 @@ import base64
 import hashlib
 import re
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
+
+from ooxml_text import read_xml_text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,8 +43,15 @@ W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 
 SCHEMA_VERSION = "1.0.0"
+
+# Header/footer images should be small (logos, rules, and similar assets).  The
+# limits protect extraction from a relationship that points at an unexpectedly
+# large file without constraining normal templates.
+MAX_HEADER_FOOTER_MEDIA_BYTES = 16 * 1024 * 1024
+MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES = 64 * 1024 * 1024
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,7 +70,7 @@ def _read_xml_part(extract_dir: Path, internal_path: str) -> Optional[str]:
     """Read an XML part from extracted DOCX folder, return None if missing."""
     p = extract_dir / internal_path
     if p.exists():
-        return p.read_text(encoding="utf-8")
+        return read_xml_text(p)
     return None
 
 
@@ -70,6 +80,204 @@ def _read_xml_part_bytes(extract_dir: Path, internal_path: str) -> Optional[byte
     if p.exists():
         return p.read_bytes()
     return None
+
+
+def _parse_relationships_xml(xml_text: str, part_name: str) -> List[ET.Element]:
+    """Parse and minimally validate an OPC relationships part.
+
+    Relationship XML controls which files the extractor may read.  Treating a
+    malformed part as though it were empty hides package corruption and can
+    make the resulting registry incomplete, so callers receive a clear error.
+    """
+    if "<!DOCTYPE" in xml_text.upper():
+        raise ValueError(f"{part_name} must not contain a DOCTYPE declaration")
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ValueError(f"Malformed relationships XML in {part_name}: {exc}") from exc
+
+    relationships_tag = f"{{{REL_NS}}}Relationships"
+    relationship_tag = f"{{{REL_NS}}}Relationship"
+    if root.tag != relationships_tag:
+        raise ValueError(
+            f"Invalid relationships root in {part_name}: expected {relationships_tag!r}"
+        )
+
+    relationships: List[ET.Element] = []
+    seen_ids = set()
+    for child in root:
+        if child.tag != relationship_tag:
+            raise ValueError(f"Unexpected element {child.tag!r} in {part_name}")
+
+        rel_id = child.get("Id")
+        rel_type = child.get("Type")
+        target = child.get("Target")
+        if not rel_id or not rel_type or not target:
+            raise ValueError(
+                f"Relationship in {part_name} must have non-empty Id, Type, and Target"
+            )
+        if rel_id in seen_ids:
+            raise ValueError(f"Duplicate relationship Id {rel_id!r} in {part_name}")
+        seen_ids.add(rel_id)
+
+        target_mode = child.get("TargetMode")
+        if target_mode not in (None, "Internal", "External"):
+            raise ValueError(
+                f"Invalid TargetMode {target_mode!r} for relationship {rel_id!r} "
+                f"in {part_name}"
+            )
+        relationships.append(child)
+
+    return relationships
+
+
+def _resolve_internal_relationship_target(
+    extract_dir: Path,
+    source_part: str,
+    target: str,
+) -> Tuple[Path, str]:
+    """Resolve an internal relationship target without leaving *extract_dir*.
+
+    OPC targets are URI paths.  Absolute paths, Windows drive/UNC paths,
+    backslash-separated paths, URI schemes, and parent traversal are rejected
+    before touching the filesystem.  ``Path.resolve`` then catches escapes via
+    symlinks already present in the extraction tree.
+    """
+    if not target or "\x00" in target:
+        raise ValueError(f"Unsafe empty or NUL-containing relationship target {target!r}")
+
+    decoded_target = unquote(target)
+    parsed = urlsplit(decoded_target)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError(f"Unsafe URI relationship target {target!r}")
+    if "\\" in decoded_target:
+        raise ValueError(f"Unsafe backslash relationship target {target!r}")
+    if decoded_target.startswith(("/", "//")):
+        raise ValueError(f"Unsafe absolute relationship target {target!r}")
+
+    windows_target = PureWindowsPath(decoded_target)
+    if windows_target.drive or windows_target.is_absolute():
+        raise ValueError(f"Unsafe drive or UNC relationship target {target!r}")
+
+    target_path = PurePosixPath(decoded_target)
+    if target_path.is_absolute() or ".." in target_path.parts:
+        raise ValueError(f"Unsafe traversing relationship target {target!r}")
+
+    source_path = PurePosixPath(source_part)
+    if source_path.is_absolute() or ".." in source_path.parts:
+        raise ValueError(f"Unsafe source part name {source_part!r}")
+
+    package_path = source_path.parent.joinpath(target_path)
+    package_parts = tuple(part for part in package_path.parts if part not in ("", "."))
+    package_path = PurePosixPath(*package_parts)
+
+    extraction_root = extract_dir.resolve()
+    candidate = extraction_root.joinpath(*package_path.parts).resolve(strict=False)
+    try:
+        candidate.relative_to(extraction_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Relationship target {target!r} escapes extraction root via a symlink"
+        ) from exc
+
+    return candidate, package_path.as_posix()
+
+
+def _valid_content_type(value: Optional[str]) -> bool:
+    """Return whether *value* is safe to emit as a MIME content type."""
+    if not value or len(value) > 255 or any(ord(ch) < 32 for ch in value):
+        return False
+    return re.fullmatch(
+        r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+",
+        value,
+    ) is not None
+
+
+def _load_content_types(extract_dir: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Load OPC content-type defaults and overrides, falling back safely."""
+    xml_text = _read_xml_part(extract_dir, "[Content_Types].xml")
+    if not xml_text or "<!DOCTYPE" in xml_text.upper():
+        return {}, {}
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return {}, {}
+    if root.tag != f"{{{CONTENT_TYPES_NS}}}Types":
+        return {}, {}
+
+    defaults: Dict[str, str] = {}
+    overrides: Dict[str, str] = {}
+    for child in root:
+        if child.tag == f"{{{CONTENT_TYPES_NS}}}Default":
+            extension = (child.get("Extension") or "").lower().lstrip(".")
+            content_type = child.get("ContentType")
+            if extension and _valid_content_type(content_type):
+                defaults[extension] = content_type  # type: ignore[assignment]
+        elif child.tag == f"{{{CONTENT_TYPES_NS}}}Override":
+            part_name = (child.get("PartName") or "").replace("\\", "/")
+            content_type = child.get("ContentType")
+            if part_name.startswith("/") and _valid_content_type(content_type):
+                overrides[part_name] = content_type  # type: ignore[assignment]
+    return defaults, overrides
+
+
+def _content_type_for_part(
+    package_part: str,
+    defaults: Dict[str, str],
+    overrides: Dict[str, str],
+) -> str:
+    """Return the package-declared MIME type or a conservative known fallback."""
+    override = overrides.get(f"/{package_part}")
+    if override:
+        return override
+
+    extension = PurePosixPath(package_part).suffix.lower().lstrip(".")
+    declared_default = defaults.get(extension)
+    if declared_default:
+        return declared_default
+
+    safe_fallbacks = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "bmp": "image/bmp",
+        "tif": "image/tiff",
+        "tiff": "image/tiff",
+        "svg": "image/svg+xml",
+        "emf": "image/x-emf",
+        "wmf": "image/x-wmf",
+    }
+    return safe_fallbacks.get(extension, "application/octet-stream")
+
+
+def _on_off_value(xml_text: str, tag: str) -> bool:
+    """Read an OOXML on/off element, including explicit false values."""
+    match = re.search(rf"<w:{re.escape(tag)}\b(?P<attrs>[^>]*)>", xml_text)
+    if not match:
+        return False
+    value_match = re.search(
+        r"(?<![\w:])w:val\s*=\s*(['\"])(?P<value>.*?)\1",
+        match.group("attrs"),
+        flags=re.IGNORECASE,
+    )
+    if not value_match:
+        return True
+    return value_match.group("value").strip().lower() not in {"0", "false", "off"}
+
+
+def _on_off_attribute(attrs: str, name: str, default: bool = False) -> bool:
+    """Read an OOXML on/off attribute from an opening tag's attribute text."""
+    value_match = re.search(
+        rf"(?<![\w:])w:{re.escape(name)}\s*=\s*(['\"])(?P<value>.*?)\1",
+        attrs,
+        flags=re.IGNORECASE,
+    )
+    if not value_match:
+        return default
+    return value_match.group("value").strip().lower() not in {"0", "false", "off"}
 
 
 def _extract_block(xml_text: str, tag: str, ns_prefix: str = "w",
@@ -274,10 +482,10 @@ def extract_style_defs(styles_xml: str) -> List[Dict[str, Any]]:
         
         # UI properties
         ui_priority_m = re.search(r'<w:uiPriority\s+w:val="([^"]+)"', block)
-        qformat = "<w:qFormat" in block
-        semi_hidden = "<w:semiHidden" in block
-        unhide_when_used = "<w:unhideWhenUsed" in block
-        locked = "<w:locked" in block
+        qformat = _on_off_value(block, "qFormat")
+        semi_hidden = _on_off_value(block, "semiHidden")
+        unhide_when_used = _on_off_value(block, "unhideWhenUsed")
+        locked = _on_off_value(block, "locked")
         
         # Extract raw pPr and rPr blocks
         pPr = _extract_first_block(block, "pPr")
@@ -413,6 +621,8 @@ def extract_page_layout(document_xml: str, extract_dir: Path) -> Dict[str, Any]:
     
     # Parse relationships for header/footer refs
     rels_xml = _read_xml_part(extract_dir, "word/_rels/document.xml.rels")
+    if rels_xml:
+        _parse_relationships_xml(rels_xml, "word/_rels/document.xml.rels")
     
     for idx, sect in enumerate(sect_blocks):
         sect_info = _parse_sectpr(sect, rels_xml, idx)
@@ -456,7 +666,7 @@ def _parse_sectpr(sect_xml: str, rels_xml: Optional[str], section_index: int) ->
     if pg_mar_m:
         attrs = pg_mar_m.group(1)
         for margin in ["top", "right", "bottom", "left", "header", "footer", "gutter"]:
-            m = re.search(rf'w:{margin}="(\d+)"', attrs)
+            m = re.search(rf'w:{margin}="([+-]?\d+)"', attrs)
             info["page_margins"][margin] = int(m.group(1)) if m else 0
     
     # Columns
@@ -468,7 +678,7 @@ def _parse_sectpr(sect_xml: str, rels_xml: Optional[str], section_index: int) ->
         info["columns"] = {
             "num": int(num_m.group(1)) if num_m else 1,
             "space": int(space_m.group(1)) if space_m else 720,
-            "sep": "w:sep" in attrs
+            "sep": _on_off_attribute(attrs, "sep"),
         }
     
     # Document grid
@@ -500,60 +710,89 @@ def _parse_sectpr(sect_xml: str, rels_xml: Optional[str], section_index: int) ->
 
 def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
     """Extract all header and footer parts."""
+    extract_dir = Path(extract_dir)
+    content_type_defaults, content_type_overrides = _load_content_types(extract_dir)
+    total_media_bytes = 0
 
-    def _content_type_from_suffix(path_like: str) -> str:
-        suffix = Path(path_like).suffix.lower()
-        if suffix == ".png":
-            return "image/png"
-        if suffix in {".jpg", ".jpeg"}:
-            return "image/jpeg"
-        if suffix == ".gif":
-            return "image/gif"
-        if suffix == ".emf":
-            return "image/x-emf"
-        if suffix == ".wmf":
-            return "image/x-wmf"
-        return "application/octet-stream"
+    def _read_bounded_media(media_path: Path, relationship_label: str) -> bytes:
+        nonlocal total_media_bytes
 
-    def _extract_media_from_rels(part_name: str, rels_xml: Optional[str]) -> List[Dict[str, str]]:
+        size = media_path.stat().st_size
+        if size > MAX_HEADER_FOOTER_MEDIA_BYTES:
+            raise ValueError(
+                f"Header/footer media {relationship_label} is {size} bytes; "
+                f"limit is {MAX_HEADER_FOOTER_MEDIA_BYTES} bytes"
+            )
+        if total_media_bytes + size > MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES:
+            raise ValueError(
+                "Total header/footer media exceeds "
+                f"{MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES} bytes"
+            )
+
+        with media_path.open("rb") as stream:
+            data = stream.read(MAX_HEADER_FOOTER_MEDIA_BYTES + 1)
+        if len(data) > MAX_HEADER_FOOTER_MEDIA_BYTES:
+            raise ValueError(
+                f"Header/footer media {relationship_label} grew beyond "
+                f"{MAX_HEADER_FOOTER_MEDIA_BYTES} bytes while being read"
+            )
+        if total_media_bytes + len(data) > MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES:
+            raise ValueError(
+                "Total header/footer media exceeds "
+                f"{MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES} bytes"
+            )
+        total_media_bytes += len(data)
+        return data
+
+    def _extract_media_from_rels(
+        part_name: str,
+        rels_part_name: str,
+        rels_xml: Optional[str],
+    ) -> List[Dict[str, str]]:
         if not rels_xml:
             return []
 
         media_items: List[Dict[str, str]] = []
-        rels_dir = Path(part_name).parent
+        for rel in _parse_relationships_xml(rels_xml, rels_part_name):
+            # External image links may point to file://, UNC, or network URLs.
+            # Preserve the relationship XML, but never dereference the target.
+            if rel.get("TargetMode") == "External":
+                continue
+            if not (rel.get("Type") or "").endswith("/image"):
+                continue
 
-        try:
-            root = ET.fromstring(rels_xml)
-        except ET.ParseError:
-            return media_items
-
-        for rel in root.findall(f"{{{REL_NS}}}Relationship"):
             rel_id = rel.get("Id")
             target = rel.get("Target")
-            if not rel_id or not target:
-                continue
-
-            normalized_target = target.replace("\\", "/")
-            target_name = Path(normalized_target).name.lower()
-            if "/media/" not in f"/{normalized_target.lower()}" and not target_name.startswith("image"):
-                continue
-
-            resolved_rel_path = (rels_dir / normalized_target).as_posix()
-            media_rel_idx = resolved_rel_path.lower().find("media/")
-            if media_rel_idx == -1:
-                continue
-            media_rel_target = resolved_rel_path[media_rel_idx:]
-
-            media_path = extract_dir / resolved_rel_path
+            assert rel_id is not None and target is not None  # validated above
+            media_path, package_part = _resolve_internal_relationship_target(
+                extract_dir,
+                part_name,
+                target,
+            )
             if not media_path.exists() or not media_path.is_file():
                 continue
 
+            word_root = PurePosixPath("word")
+            package_part_path = PurePosixPath(package_part)
+            try:
+                registry_target = package_part_path.relative_to(word_root).as_posix()
+            except ValueError:
+                registry_target = package_part
+
+            data = _read_bounded_media(
+                media_path,
+                f"{rels_part_name}:{rel_id}",
+            )
             media_items.append(
                 {
                     "rel_id": rel_id,
-                    "target": media_rel_target,
-                    "content_type": _content_type_from_suffix(media_rel_target),
-                    "data_base64": base64.b64encode(media_path.read_bytes()).decode("ascii"),
+                    "target": registry_target,
+                    "content_type": _content_type_for_part(
+                        package_part,
+                        content_type_defaults,
+                        content_type_overrides,
+                    ),
+                    "data_base64": base64.b64encode(data).decode("ascii"),
                 }
             )
 
@@ -569,24 +808,46 @@ def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
     
     # Read relationships to map rId to part names
     rels_xml = _read_xml_part(extract_dir, "word/_rels/document.xml.rels")
-    rid_to_target = {}
+    rid_to_part = {}
     if rels_xml:
-        for m in re.finditer(r'<Relationship[^>]+Id="([^"]+)"[^>]+Target="([^"]+)"', rels_xml):
-            rid_to_target[m.group(1)] = m.group(2)
+        for rel in _parse_relationships_xml(
+            rels_xml,
+            "word/_rels/document.xml.rels",
+        ):
+            if rel.get("TargetMode") == "External":
+                continue
+            rel_type = rel.get("Type") or ""
+            if not rel_type.endswith(("/header", "/footer")):
+                continue
+
+            rel_id = rel.get("Id")
+            target = rel.get("Target")
+            assert rel_id is not None and target is not None  # validated above
+            _, package_part = _resolve_internal_relationship_target(
+                extract_dir,
+                "word/document.xml",
+                target,
+            )
+            rid_to_part[rel_id] = package_part
     
     # Collect headers
     for hdr_path in sorted(word_dir.glob("header*.xml")):
         part_name = f"word/{hdr_path.name}"
-        xml_content = hdr_path.read_text(encoding="utf-8")
-        rels_content = _read_xml_part(extract_dir, f"word/_rels/{hdr_path.name}.rels")
-        media_entries = _extract_media_from_rels(part_name, rels_content)
+        xml_content = read_xml_text(hdr_path)
+        rels_part_name = f"word/_rels/{hdr_path.name}.rels"
+        rels_content = _read_xml_part(extract_dir, rels_part_name)
+        media_entries = _extract_media_from_rels(
+            part_name,
+            rels_part_name,
+            rels_content,
+        )
         for media_entry in media_entries:
             header_footer_media.add(media_entry["target"])
         
         # Find the rId for this part
         rel_id = None
-        for rid, target in rid_to_target.items():
-            if target == hdr_path.name or target == part_name:
+        for rid, target_part in rid_to_part.items():
+            if target_part == part_name:
                 rel_id = rid
                 break
         
@@ -601,15 +862,20 @@ def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
     # Collect footers
     for ftr_path in sorted(word_dir.glob("footer*.xml")):
         part_name = f"word/{ftr_path.name}"
-        xml_content = ftr_path.read_text(encoding="utf-8")
-        rels_content = _read_xml_part(extract_dir, f"word/_rels/{ftr_path.name}.rels")
-        media_entries = _extract_media_from_rels(part_name, rels_content)
+        xml_content = read_xml_text(ftr_path)
+        rels_part_name = f"word/_rels/{ftr_path.name}.rels"
+        rels_content = _read_xml_part(extract_dir, rels_part_name)
+        media_entries = _extract_media_from_rels(
+            part_name,
+            rels_part_name,
+            rels_content,
+        )
         for media_entry in media_entries:
             header_footer_media.add(media_entry["target"])
         
         rel_id = None
-        for rid, target in rid_to_target.items():
-            if target == ftr_path.name or target == part_name:
+        for rid, target_part in rid_to_part.items():
+            if target_part == part_name:
                 rel_id = rid
                 break
         
@@ -691,6 +957,7 @@ def extract_relationships(extract_dir: Path) -> Dict[str, Any]:
     # document.xml.rels
     doc_rels = _read_xml_part(extract_dir, "word/_rels/document.xml.rels")
     if doc_rels:
+        _parse_relationships_xml(doc_rels, "word/_rels/document.xml.rels")
         result["relationships"].append({
             "part": "word/document.xml",
             "rels_xml": _canonicalize(doc_rels, strip_rsid=False)
@@ -758,8 +1025,11 @@ def extract_arch_template_registry(
         "fonts": extract_fonts(extract_dir),
         "custom_xml": extract_relationships(extract_dir),
         "capture_policy": {
-            "store_raw_xml_blocks": True,
-            "canonicalize_whitespace": True,
+            # XML fragments are source-derived but deliberately normalized by
+            # removing volatile rsid attributes and proofing markers.
+            "store_raw_xml_blocks": False,
+            "store_normalized_xml_blocks": True,
+            "canonicalize_whitespace": False,
             "strip_rsids": True,
             "strip_proofing": True
         }

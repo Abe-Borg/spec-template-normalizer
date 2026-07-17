@@ -20,9 +20,12 @@ Coverage:
 from __future__ import annotations
 
 import base64
+import os
 import xml.etree.ElementTree as ET
 
 import pytest
+
+import arch_env_extractor as env_extractor
 
 from arch_env_extractor import (
     _extract_first_block,
@@ -36,6 +39,7 @@ from arch_env_extractor import (
     extract_theme,
     extract_fonts,
     extract_headers_footers,
+    extract_arch_template_registry,
 )
 
 
@@ -695,7 +699,9 @@ class TestExtractHeadersFooters:
         )
         (rels_dir / "document.xml.rels").write_text(
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId10" Target="header1.xml" />'
+            '<Relationship Id="rId10" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" '
+            'Target="header1.xml" />'
             '</Relationships>',
             encoding="utf-8",
         )
@@ -720,3 +726,262 @@ class TestExtractHeadersFooters:
         assert header["media"][0]["content_type"] == "image/png"
         assert base64.b64decode(header["media"][0]["data_base64"]) == b"PNGDATA"
         assert extracted["header_footer_media"] == ["media/image1.png"]
+
+
+def _write_header_relationship_package(
+    extract_dir,
+    image_target: str,
+    *,
+    target_mode: str | None = None,
+) -> None:
+    """Create the header/relationship portion of a synthetic DOCX package."""
+    word_dir = extract_dir / "word"
+    rels_dir = word_dir / "_rels"
+    rels_dir.mkdir(parents=True)
+    (word_dir / "header1.xml").write_text(
+        '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+        encoding="utf-8",
+    )
+    # Put Target before Id to guard against attribute-order-sensitive parsing.
+    (rels_dir / "document.xml.rels").write_text(
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Target="header1.xml" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" '
+        'Id="rId10"/>'
+        '</Relationships>',
+        encoding="utf-8",
+    )
+    target_mode_attr = f' TargetMode="{target_mode}"' if target_mode else ""
+    escaped_target = image_target.replace("&", "&amp;").replace('"', "&quot;")
+    (rels_dir / "header1.xml.rels").write_text(
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Target="'
+        + escaped_target
+        + '" Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"'
+        + target_mode_attr
+        + "/></Relationships>",
+        encoding="utf-8",
+    )
+
+
+class TestHeaderFooterRelationshipHardening:
+    def test_document_relationship_attributes_are_order_independent(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "media/image1.png")
+        media_dir = extract_dir / "word" / "media"
+        media_dir.mkdir()
+        (media_dir / "image1.png").write_bytes(b"image")
+
+        extracted = extract_headers_footers(extract_dir)
+
+        assert extracted["headers"][0]["rel_id"] == "rId10"
+
+    def test_absolute_target_cannot_disclose_a_local_file(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        outside_media = tmp_path / "outside" / "media"
+        outside_media.mkdir(parents=True)
+        secret_path = outside_media / "image-secret.png"
+        secret_path.write_bytes(b"LOCAL_SECRET_BYTES")
+        _write_header_relationship_package(extract_dir, secret_path.as_posix())
+
+        with pytest.raises(ValueError, match="Unsafe"):
+            extract_headers_footers(extract_dir)
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "../media/image1.png",
+            "..\\media\\image1.png",
+            "C:/sensitive/media/image1.png",
+            "//server/share/media/image1.png",
+            "%2e%2e/media/image1.png",
+        ],
+    )
+    def test_unsafe_internal_targets_are_rejected(self, tmp_path, target):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, target)
+
+        with pytest.raises(ValueError, match="Unsafe"):
+            extract_headers_footers(extract_dir)
+
+    def test_external_image_target_is_never_dereferenced(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        outside_media = tmp_path / "outside" / "media"
+        outside_media.mkdir(parents=True)
+        secret_path = outside_media / "image-secret.png"
+        secret_path.write_bytes(b"LOCAL_SECRET_BYTES")
+        _write_header_relationship_package(
+            extract_dir,
+            secret_path.as_uri(),
+            target_mode="External",
+        )
+
+        extracted = extract_headers_footers(extract_dir)
+
+        assert extracted["headers"][0]["media"] == []
+        assert extracted["header_footer_media"] == []
+
+    def test_symlink_escape_is_rejected(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        outside_media = tmp_path / "outside-media"
+        outside_media.mkdir()
+        (outside_media / "image1.png").write_bytes(b"LOCAL_SECRET_BYTES")
+        link_parent = extract_dir / "word" / "media"
+        link_parent.mkdir(parents=True)
+        link = link_parent / "linked"
+        try:
+            os.symlink(outside_media, link, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"Creating symlinks is unavailable: {exc}")
+        _write_header_relationship_package(extract_dir, "media/linked/image1.png")
+
+        with pytest.raises(ValueError, match="symlink"):
+            extract_headers_footers(extract_dir)
+
+    def test_malformed_relationship_xml_fails_closed(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "media/image1.png")
+        rels_path = extract_dir / "word" / "_rels" / "header1.xml.rels"
+        rels_path.write_text("<Relationships><Relationship", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Malformed relationships XML"):
+            extract_headers_footers(extract_dir)
+
+    def test_relationship_missing_required_attribute_fails_closed(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "media/image1.png")
+        rels_path = extract_dir / "word" / "_rels" / "header1.xml.rels"
+        rels_path.write_text(
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Target="media/image1.png"/>'
+            '</Relationships>',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="Id, Type, and Target"):
+            extract_headers_footers(extract_dir)
+
+    def test_media_read_is_bounded(self, tmp_path, monkeypatch):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "media/image1.png")
+        media_dir = extract_dir / "word" / "media"
+        media_dir.mkdir()
+        (media_dir / "image1.png").write_bytes(b"oversized")
+        monkeypatch.setattr(env_extractor, "MAX_HEADER_FOOTER_MEDIA_BYTES", 4)
+
+        with pytest.raises(ValueError, match="limit is 4 bytes"):
+            extract_headers_footers(extract_dir)
+
+    def test_content_type_override_is_used(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "media/image1.bin")
+        media_dir = extract_dir / "word" / "media"
+        media_dir.mkdir()
+        (media_dir / "image1.bin").write_bytes(b"image")
+        (extract_dir / "[Content_Types].xml").write_text(
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="bin" ContentType="application/octet-stream"/>'
+            '<Override PartName="/word/media/image1.bin" ContentType="image/x-template"/>'
+            '</Types>',
+            encoding="utf-8",
+        )
+
+        extracted = extract_headers_footers(extract_dir)
+
+        assert extracted["headers"][0]["media"][0]["content_type"] == "image/x-template"
+
+    def test_invalid_content_type_uses_safe_fallback(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "media/image1.png")
+        media_dir = extract_dir / "word" / "media"
+        media_dir.mkdir()
+        (media_dir / "image1.png").write_bytes(b"image")
+        (extract_dir / "[Content_Types].xml").write_text(
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="png" ContentType="not-a-mime-type"/>'
+            '</Types>',
+            encoding="utf-8",
+        )
+
+        extracted = extract_headers_footers(extract_dir)
+
+        assert extracted["headers"][0]["media"][0]["content_type"] == "image/png"
+
+
+class TestOOXMLValueSemantics:
+    def test_style_on_off_values_respect_explicit_false(self):
+        styles_xml = (
+            '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:style w:type="paragraph" w:styleId="FalseFlags">'
+            '<w:qFormat w:val="0"/><w:semiHidden w:val="false"/>'
+            '<w:unhideWhenUsed w:val="off"/><w:locked w:val="1"/>'
+            '</w:style>'
+            '<w:style w:type="paragraph" w:styleId="ImplicitTrue">'
+            '<w:qFormat/><w:semiHidden/><w:unhideWhenUsed/><w:locked/>'
+            '</w:style>'
+            '</w:styles>'
+        )
+
+        false_flags, implicit_true = extract_style_defs(styles_xml)
+
+        assert false_flags["qformat"] is False
+        assert false_flags["semi_hidden"] is False
+        assert false_flags["unhide_when_used"] is False
+        assert false_flags["locked"] is True
+        assert implicit_true["qformat"] is True
+        assert implicit_true["semi_hidden"] is True
+        assert implicit_true["unhide_when_used"] is True
+        assert implicit_true["locked"] is True
+
+    def test_signed_margins_and_false_column_separator(self, tmp_path):
+        document_xml = (
+            '<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:sectPr>'
+            '<w:pgMar w:top="-720" w:right="1440" w:bottom="+360" '
+            'w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>'
+            '<w:cols w:num="2" w:sep="false"/>'
+            '</w:sectPr>'
+            '</w:body>'
+        )
+
+        section = extract_page_layout(document_xml, tmp_path)["section_chain"][0]
+
+        assert section["page_margins"]["top"] == -720
+        assert section["page_margins"]["bottom"] == 360
+        assert section["columns"]["sep"] is False
+
+    def test_true_column_separator(self, tmp_path):
+        document_xml = (
+            '<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:sectPr><w:cols w:sep="on"/></w:sectPr>'
+            '</w:body>'
+        )
+
+        section = extract_page_layout(document_xml, tmp_path)["section_chain"][0]
+
+        assert section["columns"]["sep"] is True
+
+
+def test_capture_policy_describes_normalized_not_raw_xml(tmp_path):
+    word_dir = tmp_path / "word"
+    word_dir.mkdir()
+    (word_dir / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+        encoding="utf-8",
+    )
+    (word_dir / "document.xml").write_text(
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:body/></w:document>',
+        encoding="utf-8",
+    )
+
+    policy = extract_arch_template_registry(tmp_path)["capture_policy"]
+
+    assert policy == {
+        "store_raw_xml_blocks": False,
+        "store_normalized_xml_blocks": True,
+        "canonicalize_whitespace": False,
+        "strip_rsids": True,
+        "strip_proofing": True,
+    }

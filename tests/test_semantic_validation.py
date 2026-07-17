@@ -29,20 +29,20 @@ def test_auto_numbered_roles_empty_fails():
 def test_shared_style_part_article_allowed():
     bundle = {
         "paragraphs": [
-            {"paragraph_index": 0, "text": "PART 1 - GENERAL", "contains_sectPr": False, "in_table": False, "skip_reason": None},
-            {"paragraph_index": 1, "text": "1.01 SUMMARY", "contains_sectPr": False, "in_table": False, "skip_reason": None},
+            {"paragraph_index": 0, "text": "PART 1 - GENERAL", "contains_sectPr": False, "in_table": False, "skip_reason": None, "pStyle": "Shared"},
+            {"paragraph_index": 1, "text": "1.01 SUMMARY", "contains_sectPr": False, "in_table": False, "skip_reason": None, "pStyle": "Shared"},
         ],
-        "style_catalog": {"Normal": {"styleId": "Normal"}},
+        "style_catalog": {"Shared": {"styleId": "Shared"}},
     }
     validate_instructions(
         {
             "apply_pStyle": [
-                {"paragraph_index": 0, "styleId": "CSI_Part__ARCH"},
-                {"paragraph_index": 1, "styleId": "CSI_Part__ARCH"},
+                {"paragraph_index": 0, "styleId": "Shared"},
+                {"paragraph_index": 1, "styleId": "Shared"},
             ],
             "roles": {
-                "PART": {"styleId": "CSI_Part__ARCH", "exemplar_paragraph_index": 0},
-                "ARTICLE": {"styleId": "CSI_Part__ARCH", "exemplar_paragraph_index": 1},
+                "PART": {"styleId": "Shared", "exemplar_paragraph_index": 0},
+                "ARTICLE": {"styleId": "Shared", "exemplar_paragraph_index": 1},
             },
         },
         slim_bundle=bundle,

@@ -17,7 +17,8 @@
         "ARTICLE": { "$ref": "#/$defs/roleSpec" },
         "PARAGRAPH": { "$ref": "#/$defs/roleSpec" },
         "SUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" },
-        "SUBSUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" }
+        "SUBSUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" },
+        "END_OF_SECTION": { "$ref": "#/$defs/roleSpec" }
       }
     }
   },

@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phase 1 classification audit (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "audit_version",
+    "source_sha256",
+    "instructions_sha256",
+    "paragraphs_sha256",
+    "expected_paragraph_indices",
+    "instructions",
+    "paragraphs"
+  ],
+  "properties": {
+    "audit_version": { "const": 1 },
+    "source_sha256": { "$ref": "#/$defs/sha256" },
+    "instructions_sha256": { "$ref": "#/$defs/sha256" },
+    "paragraphs_sha256": { "$ref": "#/$defs/sha256" },
+    "expected_paragraph_indices": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 0 }
+    },
+    "instructions": { "$ref": "phase1_instructions.schema.json" },
+    "paragraphs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/paragraph" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "paragraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "paragraph_index",
+        "text",
+        "slim_text_sha256",
+        "text_was_truncated",
+        "skip_reason",
+        "classification"
+      ],
+      "properties": {
+        "paragraph_index": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string" },
+        "slim_text_sha256": { "$ref": "#/$defs/sha256" },
+        "text_was_truncated": { "type": "boolean" },
+        "skip_reason": { "type": ["string", "null"] },
+        "classification": { "enum": ["styled", "ignored", "out_of_scope"] },
+        "style_id": { "type": "string", "minLength": 1 },
+        "ignore_reason": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "classification": { "const": "styled" } } },
+          "then": {
+            "required": ["style_id"],
+            "not": { "required": ["ignore_reason"] }
+          }
+        },
+        {
+          "if": { "properties": { "classification": { "const": "ignored" } } },
+          "then": {
+            "required": ["ignore_reason"],
+            "not": { "required": ["style_id"] }
+          }
+        },
+        {
+          "if": { "properties": { "classification": { "const": "out_of_scope" } } },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["style_id"] },
+                { "required": ["ignore_reason"] }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

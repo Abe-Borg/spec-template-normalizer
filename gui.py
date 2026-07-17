@@ -6,20 +6,16 @@ library functions as the smoke test.
 """
 from __future__ import annotations
 
-import json
 import re
 import os
 import queue
-import shutil
-import sys
 import threading
 import traceback
 import tkinter as tk
 import customtkinter as ctk
-from tkinter import filedialog, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext
 from pathlib import Path
 from typing import Optional
-from datetime import datetime
 
 
 COLORS = {
@@ -38,11 +34,6 @@ COLORS = {
     "warning": "#F59E0B",
     "error": "#EF4444",
 }
-
-CLEANUP_ON_FAILURE = True
-
-
-
 
 def _load_prompt_file(path: Path) -> str:
     if not path.exists():
@@ -78,7 +69,9 @@ class PipelineThread(threading.Thread):
         log_queue: queue.Queue,
         result_queue: queue.Queue,
     ) -> None:
-        super().__init__(daemon=True)
+        # Publication is transactional, but killing a daemon thread at process
+        # exit could still strand private staging data. Let an active run finish.
+        super().__init__(daemon=False)
         self.docx_path = docx_path
         self.api_key = api_key
         self.output_dir = output_dir
@@ -88,150 +81,33 @@ class PipelineThread(threading.Thread):
     def _log(self, msg: str) -> None:
         self.log_queue.put(msg)
 
-    def _choose_extract_dir(self, docx_path: Path) -> Path:
-        base_dir = Path(self.output_dir) if self.output_dir else docx_path.parent
-        candidate = base_dir / f"{docx_path.stem}_extracted"
-        if not candidate.exists():
-            return candidate
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return base_dir / f"{docx_path.stem}_extracted__{stamp}"
-
     def run(self) -> None:
-        extract_dir: Optional[Path] = None
         try:
-            from docx_decomposer import (
-                extract_docx,
-                build_slim_bundle,
-                apply_instructions,
-                build_style_registry_dict,
-            )
-            from llm_classifier import classify_document, compute_coverage
+            from phase1_pipeline import run_phase1
 
             docx_path = Path(self.docx_path)
-            extract_dir = self._choose_extract_dir(docx_path)
-
-            # 1) Extract
-            self._log(f"Extracting {docx_path.name}...")
-            extract_docx(docx_path, extract_dir)
-
-            # 2) Build slim bundle
-            self._log("Building slim bundle...")
-            bundle = build_slim_bundle(extract_dir)
-
-            n_paras = len(bundle.get("paragraphs", []))
-            self._log(f"Slim bundle: {n_paras} paragraphs")
-
-            # 3) Read prompts
-            script_dir = Path(__file__).resolve().parent
-            master_prompt = _load_prompt_file(script_dir / "master_prompt.txt")
-            run_instruction = _load_prompt_file(script_dir / "run_instruction_prompt.txt")
-
-            # 4) Classify (redirect stdout so classifier repair logs appear in GUI)
-            self._log("Classifying via LLM...")
-            old_stdout = sys.stdout
-            sys.stdout = LogRedirector(self.log_queue)
-            try:
-                instructions = classify_document(
-                    slim_bundle=bundle,
-                    master_prompt=master_prompt,
-                    run_instruction=run_instruction,
-                    api_key=self.api_key,
-                )
-            finally:
-                sys.stdout = old_stdout
-
-            # 5) Coverage
-            coverage, styled, classifiable = compute_coverage(bundle, instructions)
-            coverage_msg = f"Coverage: {coverage:.1%} ({styled}/{classifiable})"
-            self._log(coverage_msg)
-            if coverage < 1.0:
-                raise ValueError(f"Coverage must be 100% for classifiable paragraphs; got {coverage_msg}")
-
-            # 6) Apply
-            self._log("Applying instructions...")
-            # Redirect stdout so apply_instructions prints go to our log
-            old_stdout = sys.stdout
-            sys.stdout = LogRedirector(self.log_queue)
-            try:
-                apply_instructions(extract_dir, instructions)
-            finally:
-                sys.stdout = old_stdout
-
-            # 7) Build registries in memory
-            self._log("Building style registry...")
-            style_registry = build_style_registry_dict(
-                extract_dir,
-                docx_path.name,
-                instructions,
-                pre_apply_bundle=bundle,
+            output_root = Path(self.output_dir) if self.output_dir else docx_path.parent
+            result = run_phase1(
+                source_docx=docx_path,
+                output_root=output_root,
+                api_key=self.api_key,
+                progress=self._log,
             )
-
-            self._log("Extracting environment...")
-            from arch_env_extractor import extract_arch_template_registry
-            template_registry = extract_arch_template_registry(extract_dir, docx_path)
-
-            # 8) Validate both registries before writing
-            from phase1_validator import validate_phase1_contracts
-            self._log("Validating Phase 1 contracts...")
-            validate_phase1_contracts(style_registry, template_registry)
-
-            # 9) Write registries (only reached if validation passes)
-            reg_path = extract_dir / "arch_style_registry.json"
-            reg_path.write_text(json.dumps(style_registry, indent=2), encoding="utf-8")
-            self._log(f"Style registry: {reg_path.name}")
-
-            env_path = extract_dir / "arch_template_registry.json"
-            env_path.write_text(json.dumps(template_registry, indent=2), encoding="utf-8")
-            self._log(f"Environment registry: {env_path.name}")
-
-            # 10) Copy deliverables to output_dir if specified
-            output_dir_path = Path(self.output_dir) if self.output_dir else extract_dir
-            if output_dir_path != extract_dir:
-                output_dir_path.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(reg_path, output_dir_path / reg_path.name)
-                self._log(f"Copied {reg_path.name} to {output_dir_path}")
-                shutil.copy2(env_path, output_dir_path / env_path.name)
-                self._log(f"Copied {env_path.name} to {output_dir_path}")
-
-            raw_styles_src = extract_dir / "word" / "styles.xml"
-            raw_settings_src = extract_dir / "word" / "settings.xml"
-            raw_styles_dst = output_dir_path / "arch_styles_raw.xml"
-            raw_settings_dst = output_dir_path / "arch_settings_raw.xml"
-
-            if raw_styles_src.exists():
-                shutil.copy2(raw_styles_src, raw_styles_dst)
-                self._log(f"Preserved raw styles.xml as {raw_styles_dst.name}")
-
-            if raw_settings_src.exists():
-                shutil.copy2(raw_settings_src, raw_settings_dst)
-                self._log(f"Preserved raw settings.xml as {raw_settings_dst.name}")
-
-            if extract_dir.resolve() != output_dir_path.resolve():
-                try:
-                    shutil.rmtree(extract_dir)
-                    self._log(f"Cleaned up working directory: {extract_dir.name}")
-                except Exception as cleanup_err:
-                    self._log(f"Warning: could not clean up {extract_dir.name}: {cleanup_err}")
-
+            coverage_msg = (
+                f"Coverage: {result.coverage:.1%} "
+                f"({result.handled_paragraphs}/{result.classifiable_paragraphs})"
+            )
+            self._log(coverage_msg)
             self.result_queue.put({
                 "success": True,
-                "extract_dir": str(extract_dir),
-                "output_dir": str(output_dir_path),
-                "registry_path": str(output_dir_path / reg_path.name),
-                "env_path": str(output_dir_path / env_path.name),
+                "output_dir": str(result.bundle_dir),
+                "bundle_dir": str(result.bundle_dir),
+                "manifest_path": str(result.manifest_path),
                 "coverage": coverage_msg,
             })
 
         except Exception:
             self._log(f"ERROR:\n{traceback.format_exc()}")
-            if CLEANUP_ON_FAILURE and extract_dir and extract_dir.exists():
-                try:
-                    output_dir_path = Path(self.output_dir) if self.output_dir else extract_dir
-                    if extract_dir.resolve() != output_dir_path.resolve():
-                        shutil.rmtree(extract_dir)
-                        self._log(f"Cleaned up working directory after failure: {extract_dir.name}")
-                except Exception:
-                    pass
             self.result_queue.put({"success": False})
 
 
@@ -246,13 +122,26 @@ class App(ctk.CTk):
         self.log_queue: queue.Queue = queue.Queue()
         self.result_queue: queue.Queue = queue.Queue()
         self._result: Optional[dict] = None
+        self._worker_thread: Optional[PipelineThread] = None
         self._help_windows: list[ctk.CTkToplevel] = []
 
         self._inputs_expanded = True
         self._log_expanded = True
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_queues()
+
+    def _on_close(self) -> None:
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            messagebox.showwarning(
+                "Phase 1 is still running",
+                "The active run must finish before this window can close. "
+                "This prevents hidden API work and stranded private files.",
+                parent=self,
+            )
+            return
+        self.destroy()
 
     def _build_ui(self) -> None:
         container = ctk.CTkFrame(self, fg_color="transparent")
@@ -785,14 +674,14 @@ class App(ctk.CTk):
         self.progress_bar.configure(mode="indeterminate")
         self.progress_bar.start()
 
-        thread = PipelineThread(
+        self._worker_thread = PipelineThread(
             docx_path=docx_path,
             api_key=api_key,
             output_dir=self.output_dir_var.get().strip() or None,
             log_queue=self.log_queue,
             result_queue=self.result_queue,
         )
-        thread.start()
+        self._worker_thread.start()
 
     def _poll_queues(self) -> None:
         while True:
@@ -807,6 +696,10 @@ class App(ctk.CTk):
 
         try:
             result = self.result_queue.get_nowait()
+            if self._worker_thread is not None:
+                self._worker_thread.join(timeout=0)
+                if not self._worker_thread.is_alive():
+                    self._worker_thread = None
             self._result = result
             self.progress_bar.stop()
             self.progress_bar.pack_forget()
@@ -816,7 +709,7 @@ class App(ctk.CTk):
                 self.status_label.configure(text_color=COLORS["success"])
 
                 self.log_text.configure(state="normal")
-                self.log_text.insert("end", "\nPhase 1 complete. Both registries ready for Phase 2.\n")
+                self.log_text.insert("end", "\nPhase 1 complete. Validated bundle ready for Phase 2.\n")
                 self.log_text.see("end")
                 self.log_text.configure(state="disabled")
             else:
@@ -855,16 +748,20 @@ HOW_TO_USE_TEXT = """
 5. **Review results**
    When complete, the status bar shows the coverage result.
 
-# Output Files
+# Output Bundle
 
-- `arch_style_registry.json`: Maps CSI structural roles (PART, Article, Paragraph, etc.) to Word paragraph styles.
-- `arch_template_registry.json`: A complete snapshot of the architect's formatting environment.
+Each run publishes one uniquely named `.phase1` folder. Give that whole folder to Phase 2. It contains:
 
-Both files are required inputs for the Phase 2 formatting tool.
+- `phase1_bundle_manifest.json`: Version, source identity, artifact sizes, and SHA-256 checksums.
+- `arch_style_registry.json`: CSI role-to-style mappings and numbering provenance.
+- `arch_template_registry.json`: The captured formatting environment.
+- `classification_audit.json`: Every candidate paragraph and its styled/ignored disposition.
+- `source_styles.xml` and optional `source_settings.xml`: Exact source bytes.
+- `portable_styles.xml`: Source styles plus safely derived CSI styles.
 
 # If Something Goes Wrong
 
-- **"Coverage must be 100%"** — The AI didn't classify every paragraph. Click **Run Phase 1** again; this usually resolves on retry.
+- **"Coverage" / "classification incomplete"** — Review the exact unresolved indices in the log. The tool will not guess a neighboring style.
 - **"File not found"** — Make sure the `.docx` file isn't open in Word when you run.
 - **"No API key"** — Check that your key is pasted correctly and hasn't expired.
 - Any other error — The full error message is in the activity log. The document is never modified in place; re-running is always safe.
@@ -883,8 +780,8 @@ This tool automates the first step: reading and understanding an architect's Wor
 
 This tool is **Phase 1** of a two-step process.
 
-- **Phase 1 (this tool):** Analyzes the architect's template and produces two output files that describe its structure and formatting.
-- **Phase 2 (separate tool):** Uses those output files to apply the architect's formatting to MEP consultant specs.
+- **Phase 1 (this tool):** Analyzes the architect's template and publishes one checksummed, versioned bundle.
+- **Phase 2 (separate tool):** Validates that bundle before applying the architect's formatting to MEP consultant specs.
 
 # What Phase 1 Actually Does
 
@@ -904,21 +801,19 @@ This tool is **Phase 1** of a two-step process.
 4. **Derive Formatting Locally**
    For each CSI role, the tool identifies a representative exemplar paragraph from the template and extracts exact formatting from it to create a new style.
 
-5. **Apply Styles (Surgically)**
-   The tool writes new paragraph styles and tags each paragraph with its assigned style.
-   Only the style tag is added. Text, spacing, numbering, and layout remain unchanged.
+5. **Build Portable Styles Without Mutating the Source**
+   The tool derives any needed CSI styles into a separate stylesheet. The extracted source document is not retagged or normalized.
 
 6. **Capture the Formatting Environment**
-   The tool snapshots additional document settings including font defaults, theme colors, compatibility flags, page layout, headers/footers, and numbering definitions.
+   The tool captures supported document settings including font defaults, theme colors, compatibility flags, page layout, headers/footers, and numbering definitions. The registry states its capture limits explicitly.
 
 7. **Validate and Write Output**
    Before writing anything, the tool verifies required roles, full classification coverage, and byte-for-byte integrity for protected document components.
    If any check fails, the run aborts.
 
-# The Two Output Files
+# The Output Bundle
 
-- `arch_style_registry.json`: Maps each CSI role to the Word style that represents it.
-- `arch_template_registry.json`: Captures the template's broader formatting environment for downstream rendering consistency.
+The `.phase1` folder contains the two registries, exact source XML parts, a portable stylesheet, a paragraph-level classification audit, and a manifest that authenticates every artifact.
 
 # What This Tool Does Not Do
 

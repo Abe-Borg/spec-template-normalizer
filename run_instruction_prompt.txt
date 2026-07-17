@@ -6,16 +6,22 @@ Using the slim bundle, normalize CSI semantics by ensuring consistent paragraph 
 - Paragraphs (A., B.)
 - Subparagraphs (1., 2.)
 - Sub-subparagraphs (a., b.)
+- End-of-section markers
 
 You MUST also output a "roles" mapping (role → {styleId, exemplar_paragraph_index}) as described in the master prompt.
 
-IMPORTANT: Classify all classifiable paragraphs (all non-skipped, non-table content paragraphs).
-The apply_pStyle array must include every classifiable paragraph.
-Skip only empty paragraphs, sectPr paragraphs, in-table paragraphs, "END OF SECTION", editor notes in brackets, copyright/distribution notices, and unbracketed specifier editing instructions.
+IMPORTANT: Account for all classifiable paragraphs (all non-skipped, non-table content paragraphs).
+Use apply_pStyle for CSI content and ignored_paragraphs for genuinely non-CSI content, with a specific reason.
+Never guess a missing classification from the preceding/following paragraph. END OF SECTION is classifiable as
+END_OF_SECTION. Automatic Word numbering (effective_numPr/numbering_role) is stronger evidence than absent visible markers.
+Only empty paragraphs, sectPr paragraphs, and in-table paragraphs are out of scope. Put editor/specifier notes,
+copyright/distribution notices, and publisher editing instructions in ignored_paragraphs with a concrete reason.
 
 Constraints:
 - Do not change headers/footers or sectPr.
-- Reuse existing paragraph styles from the style catalog when possible, even if those styles are currently unused.
+- Reuse an existing paragraph style only when every paragraph assigned to that role already carries that exact pStyle
+  and the role exemplar has no direct paragraph or uniform run formatting. Never select a currently unused style.
 - When numbering metadata exists, use it as structural evidence.
 - If you create styles, do NOT describe formatting. Use derive_from_paragraph_index only.
+- If a created style's exemplar has pStyle, basedOn must be that exact pStyle; otherwise use the declared default style or null.
 - Return JSON instructions only (no prose, no XML, no markdown).

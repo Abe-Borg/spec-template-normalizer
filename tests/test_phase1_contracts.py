@@ -200,7 +200,9 @@ def test_style_registry_includes_numbering_provenance_metadata(tmp_path: Path):
         }
     }
 
-    reg = build_style_registry_dict(extract_dir, "test.docx", instructions)
+    reg = build_style_registry_dict(
+        extract_dir, "test.docx", instructions, source_sha256="a" * 64
+    )
 
     assert reg["roles"]["PART"]["numbering_provenance"] == "style_numpr"
     assert reg["roles"]["PART"]["numbering_pattern"]["numFmt"] == "upperLetter"
