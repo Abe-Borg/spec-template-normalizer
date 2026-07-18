@@ -408,4 +408,8 @@ def test_classifier_disables_hidden_sdk_retries(monkeypatch) -> None:
     classify_document(bundle, "master", "run", "fake-key", max_patch_attempts=0)
 
     assert captured["max_retries"] == 0
-    assert captured["timeout"] == 600.0
+    timeout = captured["timeout"]
+    assert timeout.connect == 5.0
+    assert timeout.read == 600.0
+    assert timeout.write == 600.0
+    assert timeout.pool == 600.0
