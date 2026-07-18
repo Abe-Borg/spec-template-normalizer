@@ -54,9 +54,8 @@ def _call_api(
             with client.messages.stream(
                 model=model,
                 max_tokens=max_tokens,
-                temperature=1,
                 thinking={"type": "adaptive"},
-                output_config={"effort":"max"},
+                output_config={"effort": "high"},
                 system=system,
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
@@ -579,7 +578,7 @@ def classify_document(
     master_prompt: str,
     run_instruction: str,
     api_key: str,
-    model: str = "claude-opus-4-6",
+    model: str = "claude-opus-4-8",
     max_patch_attempts: int = 3,
 ) -> dict:
     """
@@ -621,11 +620,19 @@ def classify_document(
         )
 
     import anthropic
+    import httpx
     from docx_decomposer import validate_instructions
 
     # _call_api owns the bounded retry policy. Disable the SDK's implicit
     # retries so transport attempts do not multiply behind that policy.
-    client = anthropic.Anthropic(api_key=api_key, timeout=180.0, max_retries=0)
+    # Opus 4.8 turns run longer at high effort on large documents; allow the
+    # SDK-default 10-minute read window, but keep the short connect timeout
+    # so an unreachable endpoint fails fast instead of stalling every retry.
+    client = anthropic.Anthropic(
+        api_key=api_key,
+        timeout=httpx.Timeout(600.0, connect=5.0),
+        max_retries=0,
+    )
     user_message = f"{run_instruction}\n\nSlim bundle:\n{bundle_json}"
 
     raw = _call_api(client, master_prompt, user_message, model)
