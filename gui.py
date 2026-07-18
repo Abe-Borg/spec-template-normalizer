@@ -35,6 +35,65 @@ COLORS = {
     "error": "#EF4444",
 }
 
+# --- Fonts ---------------------------------------------------------------
+# CustomTkinter's CTkFont interprets ``size`` as PIXELS (it stores ``-abs(size)``)
+# and multiplies it by the monitor's DPI/widget-scaling factor at draw time. The
+# original Tkinter GUI used POINT sizes; when the UI was ported to CustomTkinter
+# the same numbers were kept as pixel sizes, so every label silently shrank to
+# ~75% of its intended size (1pt is ~1.333px at 96 DPI). Centralizing the sizes
+# here — and using pixel values sized for legibility — keeps the scale from
+# drifting again.
+UI_FONT = "Segoe UI"
+MONO_FONT = "Consolas"
+
+FONT_TITLE = 30
+FONT_SUBTITLE = 15
+FONT_SECTION = 13
+FONT_LABEL = 15
+FONT_ENTRY = 15
+FONT_BUTTON = 15
+FONT_RUN = 17
+FONT_LOG = 15
+FONT_STATUS = 13
+FONT_ARROW = 13
+FONT_CLEAR = 13
+
+# Help pop-up (raw-Tk Markdown) sizes, in pixels before DPI scaling is applied.
+POPUP_TITLE = 22
+POPUP_BODY = 15
+POPUP_H1 = 22
+POPUP_H2 = 18
+POPUP_H3 = 15
+POPUP_CODE = 14
+
+
+def _ctk_font(size: int, weight: str = "normal", family: str = UI_FONT) -> ctk.CTkFont:
+    """Build a CTkFont. CTk applies DPI/widget scaling to these automatically."""
+    return ctk.CTkFont(family=family, size=size, weight=weight)
+
+
+def _tk_scaling(widget) -> float:
+    """The DPI/widget scaling factor CustomTkinter applies to its own widgets.
+
+    Raw tkinter widgets (the Markdown help pop-ups) are not scaled automatically,
+    so we query this and apply it by hand to keep them consistent with the UI.
+    """
+    try:
+        return ctk.ScalingTracker.get_widget_scaling(widget)
+    except Exception:
+        return 1.0
+
+
+def _tk_font(family: str, size: int, scaling: float, weight: str = "normal") -> tuple:
+    """A font tuple for a raw tkinter widget, sized in pixels and pre-scaled to
+    match CustomTkinter's DPI scaling. A negative size means pixels, exactly as
+    CTkFont encodes it internally."""
+    scaled = -max(1, round(size * scaling))
+    if weight != "normal":
+        return (family, scaled, weight)
+    return (family, scaled)
+
+
 def _load_prompt_file(path: Path) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Missing required prompt file: {path}")
@@ -115,8 +174,8 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("DOCX CSI Normalizer — Phase 1")
-        self.geometry("900x750")
-        self.minsize(750, 600)
+        self.geometry("960x820")
+        self.minsize(820, 660)
         self.configure(fg_color=COLORS["bg_dark"])
 
         self.log_queue: queue.Queue = queue.Queue()
@@ -158,7 +217,7 @@ class App(ctk.CTk):
             title_row,
             text="DOCX CSI NORMALIZER",
             text_color=COLORS["text_primary"],
-            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
+            font=_ctk_font(FONT_TITLE, "bold"),
         ).pack(side="left")
 
         help_btn_frame = ctk.CTkFrame(title_row, fg_color="transparent")
@@ -168,9 +227,9 @@ class App(ctk.CTk):
             help_btn_frame,
             text="How It Works",
             command=lambda: self._show_info_popup("How It Works", HOW_IT_WORKS_TEXT),
-            width=100,
-            height=32,
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            width=132,
+            height=36,
+            font=_ctk_font(FONT_BUTTON),
             fg_color=COLORS["bg_input"],
             hover_color=COLORS["border"],
             border_width=1,
@@ -182,9 +241,9 @@ class App(ctk.CTk):
             help_btn_frame,
             text="How to Use",
             command=lambda: self._show_info_popup("How to Use", HOW_TO_USE_TEXT),
-            width=100,
-            height=32,
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            width=132,
+            height=36,
+            font=_ctk_font(FONT_BUTTON),
             fg_color=COLORS["bg_input"],
             hover_color=COLORS["border"],
             border_width=1,
@@ -196,7 +255,7 @@ class App(ctk.CTk):
             header,
             text="Phase 1 Pipeline — Architect Template Analysis",
             text_color=COLORS["text_secondary"],
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            font=_ctk_font(FONT_SUBTITLE),
         ).pack(fill="x", pady=(6, 0), anchor="w")
 
         # --- Inputs card ---
@@ -210,7 +269,7 @@ class App(ctk.CTk):
         self._inputs_arrow = ctk.CTkLabel(
             inputs_header,
             text="▼",
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=_ctk_font(FONT_ARROW, family=MONO_FONT),
             text_color=COLORS["text_muted"],
             width=20,
         )
@@ -220,7 +279,7 @@ class App(ctk.CTk):
         inputs_lbl = ctk.CTkLabel(
             inputs_header,
             text="INPUTS",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            font=_ctk_font(FONT_SECTION, "bold"),
             text_color=COLORS["text_muted"],
         )
         inputs_lbl.pack(side="left", padx=(4, 0))
@@ -233,7 +292,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             self._inputs_content,
             text="Template",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            font=_ctk_font(FONT_LABEL),
             text_color=COLORS["text_secondary"],
             width=100,
             anchor="w",
@@ -248,7 +307,7 @@ class App(ctk.CTk):
             template_frame,
             textvariable=self.path_var,
             placeholder_text="Select architect template .docx",
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=_ctk_font(FONT_ENTRY, family=MONO_FONT),
             fg_color=COLORS["bg_input"],
             border_color=COLORS["border"],
             text_color=COLORS["text_primary"],
@@ -262,7 +321,7 @@ class App(ctk.CTk):
             width=70,
             command=self._browse,
             height=36,
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            font=_ctk_font(FONT_BUTTON),
             fg_color=COLORS["bg_input"],
             hover_color=COLORS["border"],
             border_width=1,
@@ -274,7 +333,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             self._inputs_content,
             text="API Key",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            font=_ctk_font(FONT_LABEL),
             text_color=COLORS["text_secondary"],
             width=100,
             anchor="w",
@@ -290,7 +349,7 @@ class App(ctk.CTk):
             textvariable=self.key_var,
             show="•",
             placeholder_text="sk-ant-...",
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=_ctk_font(FONT_ENTRY, family=MONO_FONT),
             fg_color=COLORS["bg_input"],
             border_color=COLORS["border"],
             text_color=COLORS["text_primary"],
@@ -305,7 +364,7 @@ class App(ctk.CTk):
             command=self._toggle_key,
             width=70,
             height=36,
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            font=_ctk_font(FONT_BUTTON),
             fg_color=COLORS["bg_input"],
             hover_color=COLORS["border"],
             border_width=1,
@@ -318,7 +377,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(
             self._inputs_content,
             text="Output Folder",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            font=_ctk_font(FONT_LABEL),
             text_color=COLORS["text_secondary"],
             width=100,
             anchor="w",
@@ -332,7 +391,7 @@ class App(ctk.CTk):
         self.output_entry = ctk.CTkEntry(
             output_frame,
             textvariable=self.output_dir_var,
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=_ctk_font(FONT_ENTRY, family=MONO_FONT),
             fg_color=COLORS["bg_input"],
             border_color=COLORS["border"],
             text_color=COLORS["text_primary"],
@@ -346,7 +405,7 @@ class App(ctk.CTk):
             command=self._browse_output,
             width=70,
             height=36,
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            font=_ctk_font(FONT_BUTTON),
             fg_color=COLORS["bg_input"],
             hover_color=COLORS["border"],
             border_width=1,
@@ -361,7 +420,7 @@ class App(ctk.CTk):
             container,
             text="Run Phase 1",
             command=self._run,
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            font=_ctk_font(FONT_RUN, "bold"),
             height=44,
             corner_radius=8,
             fg_color=COLORS["accent"],
@@ -389,7 +448,7 @@ class App(ctk.CTk):
         self._log_arrow = ctk.CTkLabel(
             log_header,
             text="▼",
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=_ctk_font(FONT_ARROW, family=MONO_FONT),
             text_color=COLORS["text_muted"],
             width=20,
         )
@@ -399,7 +458,7 @@ class App(ctk.CTk):
         log_lbl = ctk.CTkLabel(
             log_header,
             text="ACTIVITY LOG",
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            font=_ctk_font(FONT_SECTION, "bold"),
             text_color=COLORS["text_muted"],
         )
         log_lbl.pack(side="left", padx=(4, 0))
@@ -408,9 +467,9 @@ class App(ctk.CTk):
         ctk.CTkButton(
             log_header,
             text="Clear",
-            width=50,
-            height=24,
-            font=ctk.CTkFont(size=11),
+            width=56,
+            height=26,
+            font=_ctk_font(FONT_CLEAR),
             fg_color="transparent",
             hover_color=COLORS["bg_input"],
             text_color=COLORS["text_muted"],
@@ -424,7 +483,7 @@ class App(ctk.CTk):
             self._log_content,
             fg_color=COLORS["bg_input"],
             corner_radius=4,
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=_ctk_font(FONT_LOG, family=MONO_FONT),
             text_color=COLORS["text_secondary"],
             wrap="word",
             state="disabled",
@@ -442,7 +501,7 @@ class App(ctk.CTk):
             textvariable=self.status_var,
             anchor="w",
             text_color=COLORS["text_secondary"],
-            font=ctk.CTkFont(family="Segoe UI", size=11),
+            font=_ctk_font(FONT_STATUS),
         )
         self.status_label.pack(side="left")
 
@@ -489,26 +548,30 @@ class App(ctk.CTk):
             frame,
             text=title,
             text_color=COLORS["text_primary"],
-            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+            font=_ctk_font(POPUP_TITLE, "bold"),
         ).pack(fill="x", padx=14, pady=(14, 8), anchor="w")
 
         text_frame = ctk.CTkFrame(frame, fg_color=COLORS["bg_input"], corner_radius=4)
         text_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
+        # ScrolledText is a raw tkinter widget, so CustomTkinter does not scale its
+        # font for DPI the way it does for CTk widgets. Apply that scaling by hand
+        # so the help text matches the rest of the UI instead of rendering tiny.
+        scaling = _tk_scaling(popup)
         text_widget = scrolledtext.ScrolledText(
             text_frame,
             wrap="word",
-            font=("Segoe UI", 10),
+            font=_tk_font(UI_FONT, POPUP_BODY, scaling),
             bg=COLORS["bg_input"],
             fg=COLORS["text_secondary"],
             insertbackground=COLORS["text_primary"],
             relief="flat",
             highlightthickness=0,
-            padx=12,
-            pady=10,
+            padx=max(1, round(12 * scaling)),
+            pady=max(1, round(10 * scaling)),
         )
         text_widget.pack(fill="both", expand=True)
-        self._insert_markdown(text_widget, body)
+        self._insert_markdown(text_widget, body, scaling)
         text_widget.configure(state="disabled")
 
         ctk.CTkButton(
@@ -516,7 +579,7 @@ class App(ctk.CTk):
             text="Close",
             width=100,
             height=32,
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            font=_ctk_font(FONT_BUTTON),
             fg_color=COLORS["accent"],
             hover_color=COLORS["accent_hover"],
             command=popup.destroy,
@@ -530,13 +593,25 @@ class App(ctk.CTk):
             self._help_windows.remove(popup)
         popup.destroy()
 
-    def _insert_markdown(self, text_widget: scrolledtext.ScrolledText, markdown_text: str) -> None:
-        """Render a small markdown subset into a Tk text widget."""
-        text_widget.tag_configure("h1", font=("Segoe UI", 15, "bold"), spacing1=8, spacing3=6)
-        text_widget.tag_configure("h2", font=("Segoe UI", 13, "bold"), spacing1=6, spacing3=4)
-        text_widget.tag_configure("h3", font=("Segoe UI", 11, "bold"), spacing1=4, spacing3=2)
-        text_widget.tag_configure("bold", font=("Segoe UI", 10, "bold"))
-        text_widget.tag_configure("code", font=("Consolas", 10), background="#2D2D2D")
+    def _insert_markdown(
+        self,
+        text_widget: scrolledtext.ScrolledText,
+        markdown_text: str,
+        scaling: float = 1.0,
+    ) -> None:
+        """Render a small markdown subset into a Tk text widget.
+
+        ``scaling`` is CustomTkinter's DPI/widget scaling factor; fonts and spacing
+        are pre-scaled so this raw-Tk widget tracks the rest of the UI.
+        """
+        def sp(value: int) -> int:
+            return max(1, round(value * scaling))
+
+        text_widget.tag_configure("h1", font=_tk_font(UI_FONT, POPUP_H1, scaling, "bold"), spacing1=sp(8), spacing3=sp(6))
+        text_widget.tag_configure("h2", font=_tk_font(UI_FONT, POPUP_H2, scaling, "bold"), spacing1=sp(6), spacing3=sp(4))
+        text_widget.tag_configure("h3", font=_tk_font(UI_FONT, POPUP_H3, scaling, "bold"), spacing1=sp(4), spacing3=sp(2))
+        text_widget.tag_configure("bold", font=_tk_font(UI_FONT, POPUP_BODY, scaling, "bold"))
+        text_widget.tag_configure("code", font=_tk_font(MONO_FONT, POPUP_CODE, scaling), background="#2D2D2D")
 
         for raw_line in markdown_text.strip().splitlines():
             line = raw_line.rstrip()
