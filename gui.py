@@ -1,100 +1,52 @@
-"""
-Tkinter GUI wrapper for the Phase 1 DOCX CSI Normalizer pipeline.
+"""Single-window GUI for architect-template specification formatting."""
 
-This is a thin wrapper — no business logic. It imports and calls the same
-library functions as the smoke test.
-"""
 from __future__ import annotations
 
-import re
 import os
 import queue
 import threading
 import traceback
-import tkinter as tk
-import customtkinter as ctk
-from tkinter import filedialog, messagebox, scrolledtext
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional, Tuple
+
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+
+from spec_formatter.pipeline import (
+    FormatRunResult,
+    collect_target_specs,
+    default_template_cache_dir,
+    format_specifications,
+)
 
 
 COLORS = {
-    "bg_dark": "#0D0D0D",
-    "bg_card": "#1A1A1A",
-    "bg_input": "#252525",
-    "border": "#333333",
-    "text_primary": "#FFFFFF",
-    "text_secondary": "#B0B0B0",
-    "text_muted": "#707070",
+    "bg": "#0D0D0D",
+    "card": "#191919",
+    "input": "#252525",
+    "border": "#353535",
+    "text": "#FFFFFF",
+    "secondary": "#B0B0B0",
+    "muted": "#737373",
     "accent": "#3B82F6",
     "accent_hover": "#2563EB",
-    "accent_glow": "#60A5FA",
     "success": "#22C55E",
-    "success_glow": "#4ADE80",
     "warning": "#F59E0B",
     "error": "#EF4444",
 }
 
-# --- Fonts ---------------------------------------------------------------
-# CustomTkinter's CTkFont interprets ``size`` as PIXELS (it stores ``-abs(size)``)
-# and multiplies it by the monitor's DPI/widget-scaling factor at draw time. The
-# original Tkinter GUI used POINT sizes; when the UI was ported to CustomTkinter
-# the same numbers were kept as pixel sizes, so every label silently shrank to
-# ~75% of its intended size (1pt is ~1.333px at 96 DPI). Centralizing the sizes
-# here — and using pixel values sized for legibility — keeps the scale from
-# drifting again.
 UI_FONT = "Segoe UI"
 MONO_FONT = "Consolas"
 
-FONT_TITLE = 30
-FONT_SUBTITLE = 15
-FONT_SECTION = 13
-FONT_LABEL = 15
-FONT_ENTRY = 15
-FONT_BUTTON = 15
-FONT_RUN = 17
-FONT_LOG = 15
-FONT_STATUS = 13
-FONT_ARROW = 13
-FONT_CLEAR = 13
 
-# Help pop-up (raw-Tk Markdown) sizes, in pixels before DPI scaling is applied.
-POPUP_TITLE = 22
-POPUP_BODY = 15
-POPUP_H1 = 22
-POPUP_H2 = 18
-POPUP_H3 = 15
-POPUP_CODE = 14
-
-
-def _ctk_font(size: int, weight: str = "normal", family: str = UI_FONT) -> ctk.CTkFont:
-    """Build a CTkFont. CTk applies DPI/widget scaling to these automatically."""
+def _font(size: int, weight: str = "normal", family: str = UI_FONT) -> ctk.CTkFont:
     return ctk.CTkFont(family=family, size=size, weight=weight)
 
 
-def _tk_scaling(widget) -> float:
-    """The DPI/widget scaling factor CustomTkinter applies to its own widgets.
-
-    Raw tkinter widgets (the Markdown help pop-ups) are not scaled automatically,
-    so we query this and apply it by hand to keep them consistent with the UI.
-    """
-    try:
-        return ctk.ScalingTracker.get_widget_scaling(widget)
-    except Exception:
-        return 1.0
-
-
-def _tk_font(family: str, size: int, scaling: float, weight: str = "normal") -> tuple:
-    """A font tuple for a raw tkinter widget, sized in pixels and pre-scaled to
-    match CustomTkinter's DPI scaling. A negative size means pixels, exactly as
-    CTkFont encodes it internally."""
-    scaled = -max(1, round(size * scaling))
-    if weight != "normal":
-        return (family, scaled, weight)
-    return (family, scaled)
-
-
 def _load_prompt_file(path: Path) -> str:
+    """Compatibility helper retained for the template-engine contract tests."""
+
     if not path.exists():
         raise FileNotFoundError(f"Missing required prompt file: {path}")
     try:
@@ -103,807 +55,635 @@ def _load_prompt_file(path: Path) -> str:
         raise RuntimeError(f"Failed reading prompt file {path}: {exc}") from exc
 
 
-class LogRedirector:
-    """Redirects writes to a thread-safe queue for GUI consumption."""
+def discover_target_docx(folder: Path) -> list[Path]:
+    """Compatibility helper used by tests and folder-preview code."""
 
-    def __init__(self, log_queue: queue.Queue) -> None:
-        self._queue = log_queue
-
-    def write(self, text: str) -> None:
-        if text.strip():
-            self._queue.put(text)
-
-    def flush(self) -> None:
-        pass
+    return list(collect_target_specs([Path(folder)]))
 
 
-class PipelineThread(threading.Thread):
-    """Runs the full Phase 1 pipeline in a background thread."""
+def summarize_batch_results(results: Iterable[object]) -> Tuple[str, str]:
+    """Return a compact status and message for per-target result objects."""
+
+    items = list(results)
+    if not items:
+        return "empty", "No target specs found"
+    succeeded = sum(1 for item in items if bool(getattr(item, "success", False)))
+    total = len(items)
+    if succeeded == total:
+        return "success", f"Complete: {succeeded}/{total} formatted"
+    if succeeded == 0:
+        return "failed", f"Failed: 0/{total} formatted"
+    return "partial", f"Partial: {succeeded}/{total} formatted"
+
+
+class FormatWorker(threading.Thread):
+    """Run the unified pipeline without blocking Tk's event loop."""
 
     def __init__(
         self,
-        docx_path: str,
+        architect_template: Path,
+        target_inputs: tuple[Path, ...],
+        output_dir: Path,
         api_key: str,
-        output_dir: Optional[str],
-        log_queue: queue.Queue,
-        result_queue: queue.Queue,
+        reuse_template_analysis: bool,
+        max_workers: int,
+        events: queue.Queue,
     ) -> None:
-        # Publication is transactional, but killing a daemon thread at process
-        # exit could still strand private staging data. Let an active run finish.
         super().__init__(daemon=False)
-        self.docx_path = docx_path
-        self.api_key = api_key
+        self.architect_template = architect_template
+        self.target_inputs = target_inputs
         self.output_dir = output_dir
-        self.log_queue = log_queue
-        self.result_queue = result_queue
+        self.api_key = api_key
+        self.reuse_template_analysis = reuse_template_analysis
+        self.max_workers = max_workers
+        self.events = events
 
-    def _log(self, msg: str) -> None:
-        self.log_queue.put(msg)
+    def _progress(self, message: str) -> None:
+        self.events.put(("progress", message))
 
     def run(self) -> None:
         try:
-            from phase1_pipeline import run_phase1
-
-            docx_path = Path(self.docx_path)
-            output_root = Path(self.output_dir) if self.output_dir else docx_path.parent
-            result = run_phase1(
-                source_docx=docx_path,
-                output_root=output_root,
+            result = format_specifications(
+                architect_template=self.architect_template,
+                target_specs=self.target_inputs,
+                output_dir=self.output_dir,
                 api_key=self.api_key,
-                progress=self._log,
+                cache_dir=default_template_cache_dir(),
+                force_template_analysis=not self.reuse_template_analysis,
+                max_workers=self.max_workers,
+                progress=self._progress,
             )
-            coverage_msg = (
-                f"Coverage: {result.coverage:.1%} "
-                f"({result.handled_paragraphs}/{result.classifiable_paragraphs})"
+            self.events.put(("complete", result))
+        except Exception as exc:
+            self.events.put(
+                (
+                    "error",
+                    {
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
             )
-            self._log(coverage_msg)
-            self.result_queue.put({
-                "success": True,
-                "output_dir": str(result.bundle_dir),
-                "bundle_dir": str(result.bundle_dir),
-                "manifest_path": str(result.manifest_path),
-                "coverage": coverage_msg,
-            })
-
-        except Exception:
-            self._log(f"ERROR:\n{traceback.format_exc()}")
-            self.result_queue.put({"success": False})
 
 
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("DOCX CSI Normalizer — Phase 1")
-        self.geometry("960x820")
-        self.minsize(820, 660)
-        self.configure(fg_color=COLORS["bg_dark"])
+        self.title("Specification Formatter")
+        self.geometry("980x860")
+        self.minsize(820, 720)
+        self.configure(fg_color=COLORS["bg"])
 
-        self.log_queue: queue.Queue = queue.Queue()
-        self.result_queue: queue.Queue = queue.Queue()
-        self._result: Optional[dict] = None
-        self._worker_thread: Optional[PipelineThread] = None
-        self._help_windows: list[ctk.CTkToplevel] = []
-
-        self._inputs_expanded = True
-        self._log_expanded = True
+        self.architect_var = ctk.StringVar()
+        self.output_var = ctk.StringVar()
+        self.api_key_var = ctk.StringVar(value=os.environ.get("ANTHROPIC_API_KEY", ""))
+        self.show_key_var = ctk.BooleanVar(value=False)
+        self.reuse_var = ctk.BooleanVar(value=True)
+        self.workers_var = ctk.StringVar(value="3")
+        self.target_inputs: list[Path] = []
+        self.output_is_automatic = False
+        self.events: queue.Queue = queue.Queue()
+        self.worker: Optional[FormatWorker] = None
+        self.last_result: Optional[FormatRunResult] = None
+        self.active_output_dir: Optional[Path] = None
+        self.advanced_visible = False
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._poll_queues()
+        self.after(100, self._poll_events)
+
+    def _build_ui(self) -> None:
+        shell = ctk.CTkFrame(self, fg_color="transparent")
+        shell.pack(fill="both", expand=True, padx=28, pady=24)
+
+        header = ctk.CTkFrame(shell, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 16))
+        ctk.CTkLabel(
+            header,
+            text="SPECIFICATION FORMATTER",
+            text_color=COLORS["text"],
+            font=_font(30, "bold"),
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            header,
+            text="Apply an architect's Word template to one or more target specifications.",
+            text_color=COLORS["secondary"],
+            font=_font(15),
+        ).pack(anchor="w", pady=(5, 0))
+
+        card = ctk.CTkFrame(
+            shell,
+            fg_color=COLORS["card"],
+            border_width=1,
+            border_color=COLORS["border"],
+            corner_radius=10,
+        )
+        card.pack(fill="x")
+
+        self._section_label(card, "1   Architect template")
+        self._path_row(
+            card,
+            self.architect_var,
+            "Select the architect's .docx template",
+            self._choose_architect,
+            "Choose File",
+        )
+
+        self._section_label(card, "2   Target specifications", top=18)
+        target_toolbar = ctk.CTkFrame(card, fg_color="transparent")
+        target_toolbar.pack(fill="x", padx=22)
+        ctk.CTkButton(
+            target_toolbar,
+            text="Add Files",
+            command=self._add_target_files,
+            width=112,
+            height=36,
+            font=_font(14),
+            fg_color=COLORS["input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+        ).pack(side="left")
+        ctk.CTkButton(
+            target_toolbar,
+            text="Add Folder",
+            command=self._add_target_folder,
+            width=112,
+            height=36,
+            font=_font(14),
+            fg_color=COLORS["input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            target_toolbar,
+            text="Clear",
+            command=self._clear_targets,
+            width=76,
+            height=36,
+            font=_font(14),
+            fg_color="transparent",
+            hover_color=COLORS["border"],
+            text_color=COLORS["secondary"],
+        ).pack(side="right")
+
+        self.target_box = ctk.CTkTextbox(
+            card,
+            height=86,
+            fg_color=COLORS["input"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["secondary"],
+            font=_font(13),
+            activate_scrollbars=True,
+        )
+        self.target_box.pack(fill="x", padx=22, pady=(9, 0))
+        self.target_box.configure(state="disabled")
+        self._refresh_target_preview()
+
+        self._section_label(card, "3   Output folder", top=18)
+        self._path_row(
+            card,
+            self.output_var,
+            "Formatted Specs",
+            self._choose_output,
+            "Choose Folder",
+        )
+
+        self._section_label(card, "4   Anthropic API key", top=18)
+        key_row = ctk.CTkFrame(card, fg_color="transparent")
+        key_row.pack(fill="x", padx=22)
+        self.api_entry = ctk.CTkEntry(
+            key_row,
+            textvariable=self.api_key_var,
+            placeholder_text="Required when template or target analysis needs AI",
+            show="•",
+            height=40,
+            fg_color=COLORS["input"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            font=_font(14),
+        )
+        self.api_entry.pack(side="left", fill="x", expand=True)
+        ctk.CTkCheckBox(
+            key_row,
+            text="Show",
+            variable=self.show_key_var,
+            command=self._toggle_key,
+            width=72,
+            text_color=COLORS["secondary"],
+            font=_font(13),
+            fg_color=COLORS["accent"],
+        ).pack(side="left", padx=(12, 0))
+
+        advanced_button = ctk.CTkButton(
+            card,
+            text="Advanced settings  ▸",
+            command=self._toggle_advanced,
+            width=170,
+            height=30,
+            fg_color="transparent",
+            hover_color=COLORS["input"],
+            text_color=COLORS["muted"],
+            font=_font(13),
+        )
+        advanced_button.pack(anchor="w", padx=16, pady=(14, 0))
+        self.advanced_button = advanced_button
+
+        self.advanced_frame = ctk.CTkFrame(card, fg_color=COLORS["input"])
+        ctk.CTkCheckBox(
+            self.advanced_frame,
+            text="Reuse analysis when the architect template has not changed",
+            variable=self.reuse_var,
+            text_color=COLORS["secondary"],
+            font=_font(13),
+            fg_color=COLORS["accent"],
+        ).pack(side="left", padx=14, pady=12)
+        workers = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
+        workers.pack(side="right", padx=14, pady=8)
+        ctk.CTkLabel(
+            workers,
+            text="Concurrent files",
+            text_color=COLORS["secondary"],
+            font=_font(13),
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkOptionMenu(
+            workers,
+            values=["1", "2", "3", "4", "5", "6"],
+            variable=self.workers_var,
+            width=66,
+            height=30,
+            fg_color=COLORS["border"],
+            button_color=COLORS["accent"],
+            button_hover_color=COLORS["accent_hover"],
+            font=_font(13),
+        ).pack(side="left")
+
+        action_row = ctk.CTkFrame(card, fg_color="transparent")
+        self.action_row = action_row
+        action_row.pack(fill="x", padx=22, pady=20)
+        self.run_button = ctk.CTkButton(
+            action_row,
+            text="FORMAT SPECS",
+            command=self._start,
+            height=48,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#FFFFFF",
+            font=_font(17, "bold"),
+        )
+        self.run_button.pack(side="left", fill="x", expand=True)
+        self.open_button = ctk.CTkButton(
+            action_row,
+            text="Open Output Folder",
+            command=self._open_output,
+            width=170,
+            height=48,
+            state="disabled",
+            fg_color=COLORS["input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+            font=_font(14),
+        )
+        self.open_button.pack(side="left", padx=(10, 0))
+
+        status_row = ctk.CTkFrame(shell, fg_color="transparent")
+        status_row.pack(fill="x", pady=(15, 7))
+        self.status_label = ctk.CTkLabel(
+            status_row,
+            text="Ready",
+            text_color=COLORS["muted"],
+            font=_font(13),
+        )
+        self.status_label.pack(side="left")
+        self.progress = ctk.CTkProgressBar(
+            status_row,
+            mode="indeterminate",
+            width=190,
+            height=8,
+            progress_color=COLORS["accent"],
+            fg_color=COLORS["border"],
+        )
+        self.progress.pack(side="right")
+        self.progress.set(0)
+
+        self.log_box = ctk.CTkTextbox(
+            shell,
+            height=170,
+            fg_color=COLORS["card"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["secondary"],
+            font=_font(13, family=MONO_FONT),
+        )
+        self.log_box.pack(fill="both", expand=True)
+        self.log_box.configure(state="disabled")
+
+    def _section_label(self, parent: ctk.CTkFrame, text: str, top: int = 20) -> None:
+        ctk.CTkLabel(
+            parent,
+            text=text,
+            text_color=COLORS["text"],
+            font=_font(14, "bold"),
+        ).pack(anchor="w", padx=22, pady=(top, 8))
+
+    def _path_row(
+        self,
+        parent: ctk.CTkFrame,
+        variable: ctk.StringVar,
+        placeholder: str,
+        command,
+        button_text: str,
+    ) -> None:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=22)
+        entry = ctk.CTkEntry(
+            row,
+            textvariable=variable,
+            placeholder_text=placeholder,
+            height=40,
+            fg_color=COLORS["input"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            font=_font(14),
+        )
+        entry.pack(side="left", fill="x", expand=True)
+        if variable is self.output_var:
+            self.output_entry = entry
+            entry.bind(
+                "<KeyPress>",
+                lambda _event: setattr(self, "output_is_automatic", False),
+            )
+        ctk.CTkButton(
+            row,
+            text=button_text,
+            command=command,
+            width=126,
+            height=40,
+            fg_color=COLORS["input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+            font=_font(14),
+        ).pack(side="left", padx=(10, 0))
+
+    def _choose_architect(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Choose architect template",
+            filetypes=[("Word documents", "*.docx")],
+        )
+        if selected:
+            self.architect_var.set(selected)
+
+    def _add_target_files(self) -> None:
+        selected = filedialog.askopenfilenames(
+            title="Choose target specifications",
+            filetypes=[("Word documents", "*.docx")],
+        )
+        if selected:
+            self.target_inputs.extend(Path(item) for item in selected)
+            self._deduplicate_target_inputs()
+            self._set_default_output()
+            self._refresh_target_preview()
+
+    def _add_target_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Choose folder containing target specs")
+        if selected:
+            self.target_inputs.append(Path(selected))
+            self._deduplicate_target_inputs()
+            self._set_default_output()
+            self._refresh_target_preview()
+
+    def _choose_output(self) -> None:
+        selected = filedialog.askdirectory(title="Choose output folder")
+        if selected:
+            self.output_var.set(selected)
+            self.output_is_automatic = False
+
+    def _deduplicate_target_inputs(self) -> None:
+        unique: dict[str, Path] = {}
+        for item in self.target_inputs:
+            unique.setdefault(os.path.normcase(str(item.resolve())), item)
+        self.target_inputs = list(unique.values())
+
+    def _set_default_output(self) -> None:
+        if (self.output_var.get().strip() and not self.output_is_automatic) or not self.target_inputs:
+            return
+        first = self.target_inputs[0]
+        base = first if first.is_dir() else first.parent
+        self.output_var.set(str(base / "Formatted Specs"))
+        self.output_is_automatic = True
+
+    def _clear_targets(self) -> None:
+        self.target_inputs.clear()
+        if self.output_is_automatic:
+            self.output_var.set("")
+            self.output_is_automatic = False
+        self._refresh_target_preview()
+
+    def _refresh_target_preview(self) -> None:
+        self.target_box.configure(state="normal")
+        self.target_box.delete("1.0", "end")
+        if not self.target_inputs:
+            text = "No target specifications selected. Add files or a folder."
+        else:
+            try:
+                targets = collect_target_specs(self.target_inputs)
+                lines = [f"{len(targets)} target specification(s)"]
+                lines.extend(f"  • {item.name}" for item in targets[:6])
+                if len(targets) > 6:
+                    lines.append(f"  • … and {len(targets) - 6} more")
+                text = "\n".join(lines)
+            except Exception as exc:
+                text = f"Could not preview targets: {exc}"
+        self.target_box.insert("1.0", text)
+        self.target_box.configure(state="disabled")
+
+    def _toggle_key(self) -> None:
+        self.api_entry.configure(show="" if self.show_key_var.get() else "•")
+
+    def _toggle_advanced(self) -> None:
+        self.advanced_visible = not self.advanced_visible
+        if self.advanced_visible:
+            self.advanced_frame.pack(
+                fill="x",
+                padx=22,
+                pady=(8, 0),
+                before=self.action_row,
+            )
+            self.advanced_button.configure(text="Advanced settings  ▾")
+        else:
+            self.advanced_frame.pack_forget()
+            self.advanced_button.configure(text="Advanced settings  ▸")
+
+    def _append_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", f"[{timestamp}] {message.rstrip()}\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def _clear_log(self) -> None:
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+    def _start(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            return
+        architect = self.architect_var.get().strip()
+        output = self.output_var.get().strip()
+        if not architect:
+            messagebox.showerror("Missing architect template", "Choose the architect's DOCX template.")
+            return
+        if not self.target_inputs:
+            messagebox.showerror("Missing target specs", "Add at least one target specification.")
+            return
+        if not output:
+            messagebox.showerror("Missing output folder", "Choose an output folder.")
+            return
+
+        self.last_result = None
+        self.active_output_dir = Path(output)
+        self._clear_log()
+        self._append_log("Starting specification formatting...")
+        self.run_button.configure(state="disabled", text="FORMATTING…")
+        self.open_button.configure(state="disabled")
+        self.status_label.configure(text="Checking files", text_color=COLORS["secondary"])
+        self.progress.start()
+        self.worker = FormatWorker(
+            architect_template=Path(architect),
+            target_inputs=tuple(self.target_inputs),
+            output_dir=Path(output),
+            api_key=self.api_key_var.get(),
+            reuse_template_analysis=self.reuse_var.get(),
+            max_workers=int(self.workers_var.get()),
+            events=self.events,
+        )
+        self.worker.start()
+
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "progress":
+                    self.status_label.configure(text=str(payload))
+                    self._append_log(str(payload))
+                elif kind == "complete":
+                    self._handle_complete(payload)
+                elif kind == "error":
+                    self._handle_error(payload)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_events)
+
+    def _finish_busy_state(self) -> None:
+        self.progress.stop()
+        self.progress.set(0)
+        self.run_button.configure(state="normal", text="FORMAT SPECS")
+
+    def _handle_complete(self, result: FormatRunResult) -> None:
+        self._finish_busy_state()
+        self.last_result = result
+        status, summary = summarize_batch_results(result.targets)
+        color = {
+            "success": COLORS["success"],
+            "partial": COLORS["warning"],
+            "failed": COLORS["error"],
+        }.get(status, COLORS["muted"])
+        self.status_label.configure(text=summary, text_color=color)
+        for item in result.targets:
+            if item.success and item.output_path is not None:
+                self._append_log(f"Output: {item.output_path}")
+            else:
+                self._append_log(f"Failed: {item.source_path.name} — {item.error}")
+        self.open_button.configure(state="normal")
+        log_path = self._save_log(result.output_dir)
+        if log_path is not None:
+            self._append_log(f"Log saved: {log_path}")
+        self.active_output_dir = None
+        if status == "success":
+            messagebox.showinfo("Formatting complete", summary, parent=self)
+        elif status == "partial":
+            messagebox.showwarning(
+                "Formatting partially complete",
+                f"{summary}. Successful outputs are available in the output folder.",
+                parent=self,
+            )
+        else:
+            messagebox.showerror("Formatting failed", summary, parent=self)
+
+    def _handle_error(self, payload: dict) -> None:
+        self._finish_busy_state()
+        message = payload.get("message") or "Formatting failed."
+        self.status_label.configure(text="Formatting failed", text_color=COLORS["error"])
+        self._append_log(message)
+        output_dir = self.active_output_dir
+        if output_dir is not None:
+            diagnostic = self._save_diagnostic(
+                output_dir,
+                payload.get("traceback", ""),
+            )
+            if diagnostic is not None:
+                self._append_log(f"Diagnostic log saved: {diagnostic}")
+            self._save_log(output_dir)
+        self.active_output_dir = None
+        messagebox.showerror("Formatting failed", message, parent=self)
+
+    def _save_diagnostic(self, output_dir: Path, traceback_text: str) -> Optional[Path]:
+        if not traceback_text:
+            return None
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = output_dir / f"spec_formatter_diagnostic_{stamp}.log"
+            path.write_text(traceback_text.rstrip() + "\n", encoding="utf-8")
+            return path
+        except OSError:
+            return None
+
+    def _save_log(self, output_dir: Path) -> Optional[Path]:
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            log_path = output_dir / f"spec_formatter_{stamp}.log"
+            content = self.log_box.get("1.0", "end").rstrip() + "\n"
+            log_path.write_text(content, encoding="utf-8")
+            return log_path
+        except OSError:
+            return None
+
+    def _open_output(self) -> None:
+        output = (
+            self.last_result.output_dir
+            if self.last_result is not None
+            else Path(self.output_var.get().strip())
+        )
+        if not output.is_dir():
+            messagebox.showerror("Output folder unavailable", f"Folder not found: {output}")
+            return
+        try:
+            os.startfile(str(output))  # type: ignore[attr-defined]
+        except OSError as exc:
+            messagebox.showerror("Could not open folder", str(exc))
 
     def _on_close(self) -> None:
-        if self._worker_thread is not None and self._worker_thread.is_alive():
+        if self.worker is not None and self.worker.is_alive():
             messagebox.showwarning(
-                "Phase 1 is still running",
-                "The active run must finish before this window can close. "
-                "This prevents hidden API work and stranded private files.",
+                "Formatting is still running",
+                "Wait for the active formatting run to finish before closing.",
                 parent=self,
             )
             return
         self.destroy()
 
-    def _build_ui(self) -> None:
-        container = ctk.CTkFrame(self, fg_color="transparent")
-        container.pack(fill="both", expand=True, padx=24, pady=24)
-
-        # --- Header ---
-        header = ctk.CTkFrame(container, fg_color="transparent")
-        header.pack(fill="x", pady=(0, 10))
-
-        title_row = ctk.CTkFrame(header, fg_color="transparent")
-        title_row.pack(fill="x")
-
-        ctk.CTkLabel(
-            title_row,
-            text="DOCX CSI NORMALIZER",
-            text_color=COLORS["text_primary"],
-            font=_ctk_font(FONT_TITLE, "bold"),
-        ).pack(side="left")
-
-        help_btn_frame = ctk.CTkFrame(title_row, fg_color="transparent")
-        help_btn_frame.pack(side="right")
-
-        ctk.CTkButton(
-            help_btn_frame,
-            text="How It Works",
-            command=lambda: self._show_info_popup("How It Works", HOW_IT_WORKS_TEXT),
-            width=132,
-            height=36,
-            font=_ctk_font(FONT_BUTTON),
-            fg_color=COLORS["bg_input"],
-            hover_color=COLORS["border"],
-            border_width=1,
-            border_color=COLORS["border"],
-            text_color=COLORS["text_secondary"],
-        ).pack(side="right", padx=(8, 0))
-
-        ctk.CTkButton(
-            help_btn_frame,
-            text="How to Use",
-            command=lambda: self._show_info_popup("How to Use", HOW_TO_USE_TEXT),
-            width=132,
-            height=36,
-            font=_ctk_font(FONT_BUTTON),
-            fg_color=COLORS["bg_input"],
-            hover_color=COLORS["border"],
-            border_width=1,
-            border_color=COLORS["border"],
-            text_color=COLORS["text_secondary"],
-        ).pack(side="right")
-
-        ctk.CTkLabel(
-            header,
-            text="Phase 1 Pipeline — Architect Template Analysis",
-            text_color=COLORS["text_secondary"],
-            font=_ctk_font(FONT_SUBTITLE),
-        ).pack(fill="x", pady=(6, 0), anchor="w")
-
-        # --- Inputs card ---
-        inputs_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=8)
-        inputs_card.pack(fill="x", pady=(0, 12))
-
-        inputs_header = ctk.CTkFrame(inputs_card, fg_color="transparent", cursor="hand2")
-        inputs_header.pack(fill="x", padx=16, pady=12)
-        inputs_header.bind("<Button-1>", self._toggle_inputs)
-
-        self._inputs_arrow = ctk.CTkLabel(
-            inputs_header,
-            text="▼",
-            font=_ctk_font(FONT_ARROW, family=MONO_FONT),
-            text_color=COLORS["text_muted"],
-            width=20,
-        )
-        self._inputs_arrow.pack(side="left")
-        self._inputs_arrow.bind("<Button-1>", self._toggle_inputs)
-
-        inputs_lbl = ctk.CTkLabel(
-            inputs_header,
-            text="INPUTS",
-            font=_ctk_font(FONT_SECTION, "bold"),
-            text_color=COLORS["text_muted"],
-        )
-        inputs_lbl.pack(side="left", padx=(4, 0))
-        inputs_lbl.bind("<Button-1>", self._toggle_inputs)
-
-        self._inputs_content = ctk.CTkFrame(inputs_card, fg_color="transparent")
-        self._inputs_content.pack(fill="x", padx=16, pady=(0, 16))
-
-        # Row 0: Template
-        ctk.CTkLabel(
-            self._inputs_content,
-            text="Template",
-            font=_ctk_font(FONT_LABEL),
-            text_color=COLORS["text_secondary"],
-            width=100,
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w", pady=8)
-
-        template_frame = ctk.CTkFrame(self._inputs_content, fg_color="transparent")
-        template_frame.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=8)
-        template_frame.columnconfigure(0, weight=1)
-
-        self.path_var = tk.StringVar()
-        self.path_entry = ctk.CTkEntry(
-            template_frame,
-            textvariable=self.path_var,
-            placeholder_text="Select architect template .docx",
-            font=_ctk_font(FONT_ENTRY, family=MONO_FONT),
-            fg_color=COLORS["bg_input"],
-            border_color=COLORS["border"],
-            text_color=COLORS["text_primary"],
-            height=36,
-        )
-        self.path_entry.grid(row=0, column=0, sticky="ew")
-
-        ctk.CTkButton(
-            template_frame,
-            text="Browse",
-            width=70,
-            command=self._browse,
-            height=36,
-            font=_ctk_font(FONT_BUTTON),
-            fg_color=COLORS["bg_input"],
-            hover_color=COLORS["border"],
-            border_width=1,
-            border_color=COLORS["border"],
-            text_color=COLORS["text_secondary"],
-        ).grid(row=0, column=1, padx=(8, 0))
-
-        # Row 1: API Key
-        ctk.CTkLabel(
-            self._inputs_content,
-            text="API Key",
-            font=_ctk_font(FONT_LABEL),
-            text_color=COLORS["text_secondary"],
-            width=100,
-            anchor="w",
-        ).grid(row=1, column=0, sticky="w", pady=8)
-
-        key_frame = ctk.CTkFrame(self._inputs_content, fg_color="transparent")
-        key_frame.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=8)
-        key_frame.columnconfigure(0, weight=1)
-
-        self.key_var = tk.StringVar(value=os.environ.get("ANTHROPIC_API_KEY", ""))
-        self.key_entry = ctk.CTkEntry(
-            key_frame,
-            textvariable=self.key_var,
-            show="•",
-            placeholder_text="sk-ant-...",
-            font=_ctk_font(FONT_ENTRY, family=MONO_FONT),
-            fg_color=COLORS["bg_input"],
-            border_color=COLORS["border"],
-            text_color=COLORS["text_primary"],
-            height=36,
-        )
-        self.key_entry.grid(row=0, column=0, sticky="ew")
-        self._key_visible = False
-
-        self.key_toggle = ctk.CTkButton(
-            key_frame,
-            text="Show",
-            command=self._toggle_key,
-            width=70,
-            height=36,
-            font=_ctk_font(FONT_BUTTON),
-            fg_color=COLORS["bg_input"],
-            hover_color=COLORS["border"],
-            border_width=1,
-            border_color=COLORS["border"],
-            text_color=COLORS["text_secondary"],
-        )
-        self.key_toggle.grid(row=0, column=1, padx=(8, 0))
-
-        # Row 2: Output Folder
-        ctk.CTkLabel(
-            self._inputs_content,
-            text="Output Folder",
-            font=_ctk_font(FONT_LABEL),
-            text_color=COLORS["text_secondary"],
-            width=100,
-            anchor="w",
-        ).grid(row=2, column=0, sticky="w", pady=8)
-
-        output_frame = ctk.CTkFrame(self._inputs_content, fg_color="transparent")
-        output_frame.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=8)
-        output_frame.columnconfigure(0, weight=1)
-
-        self.output_dir_var = tk.StringVar()
-        self.output_entry = ctk.CTkEntry(
-            output_frame,
-            textvariable=self.output_dir_var,
-            font=_ctk_font(FONT_ENTRY, family=MONO_FONT),
-            fg_color=COLORS["bg_input"],
-            border_color=COLORS["border"],
-            text_color=COLORS["text_primary"],
-            height=36,
-        )
-        self.output_entry.grid(row=0, column=0, sticky="ew")
-
-        ctk.CTkButton(
-            output_frame,
-            text="Browse",
-            command=self._browse_output,
-            width=70,
-            height=36,
-            font=_ctk_font(FONT_BUTTON),
-            fg_color=COLORS["bg_input"],
-            hover_color=COLORS["border"],
-            border_width=1,
-            border_color=COLORS["border"],
-            text_color=COLORS["text_secondary"],
-        ).grid(row=0, column=1, padx=(8, 0))
-
-        self._inputs_content.columnconfigure(1, weight=1)
-
-        # --- Run button ---
-        self.run_btn = ctk.CTkButton(
-            container,
-            text="Run Phase 1",
-            command=self._run,
-            font=_ctk_font(FONT_RUN, "bold"),
-            height=44,
-            corner_radius=8,
-            fg_color=COLORS["accent"],
-            hover_color=COLORS["accent_hover"],
-        )
-        self.run_btn.pack(fill="x", pady=(0, 0))
-
-        self.progress_bar = ctk.CTkProgressBar(
-            container,
-            height=4,
-            corner_radius=2,
-            fg_color=COLORS["bg_input"],
-            progress_color=COLORS["accent"],
-            indeterminate_speed=0.5,
-        )
-
-        # --- Log card ---
-        log_card = ctk.CTkFrame(container, fg_color=COLORS["bg_card"], corner_radius=8)
-        log_card.pack(fill="both", expand=True, pady=(12, 0))
-
-        log_header = ctk.CTkFrame(log_card, fg_color="transparent", cursor="hand2")
-        log_header.pack(fill="x", padx=16, pady=12)
-        log_header.bind("<Button-1>", self._toggle_log)
-
-        self._log_arrow = ctk.CTkLabel(
-            log_header,
-            text="▼",
-            font=_ctk_font(FONT_ARROW, family=MONO_FONT),
-            text_color=COLORS["text_muted"],
-            width=20,
-        )
-        self._log_arrow.pack(side="left")
-        self._log_arrow.bind("<Button-1>", self._toggle_log)
-
-        log_lbl = ctk.CTkLabel(
-            log_header,
-            text="ACTIVITY LOG",
-            font=_ctk_font(FONT_SECTION, "bold"),
-            text_color=COLORS["text_muted"],
-        )
-        log_lbl.pack(side="left", padx=(4, 0))
-        log_lbl.bind("<Button-1>", self._toggle_log)
-
-        ctk.CTkButton(
-            log_header,
-            text="Clear",
-            width=56,
-            height=26,
-            font=_ctk_font(FONT_CLEAR),
-            fg_color="transparent",
-            hover_color=COLORS["bg_input"],
-            text_color=COLORS["text_muted"],
-            command=self._clear_log,
-        ).pack(side="right")
-
-        self._log_content = ctk.CTkFrame(log_card, fg_color="transparent")
-        self._log_content.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-
-        self.log_text = ctk.CTkTextbox(
-            self._log_content,
-            fg_color=COLORS["bg_input"],
-            corner_radius=4,
-            font=_ctk_font(FONT_LOG, family=MONO_FONT),
-            text_color=COLORS["text_secondary"],
-            wrap="word",
-            state="disabled",
-            activate_scrollbars=True,
-        )
-        self.log_text.pack(fill="both", expand=True)
-
-        # --- Status bar ---
-        status_frame = ctk.CTkFrame(container, fg_color="transparent")
-        status_frame.pack(fill="x", pady=(8, 0))
-
-        self.status_var = tk.StringVar(value="Ready")
-        self.status_label = ctk.CTkLabel(
-            status_frame,
-            textvariable=self.status_var,
-            anchor="w",
-            text_color=COLORS["text_secondary"],
-            font=_ctk_font(FONT_STATUS),
-        )
-        self.status_label.pack(side="left")
-
-    def _toggle_inputs(self, event=None) -> None:
-        if self._inputs_expanded:
-            self._inputs_content.pack_forget()
-            self._inputs_arrow.configure(text="▶")
-            self._inputs_expanded = False
-        else:
-            self._inputs_content.pack(fill="x", padx=16, pady=(0, 16))
-            self._inputs_arrow.configure(text="▼")
-            self._inputs_expanded = True
-
-    def _toggle_log(self, event=None) -> None:
-        if self._log_expanded:
-            self._log_content.pack_forget()
-            self._log_arrow.configure(text="▶")
-            self._log_expanded = False
-        else:
-            self._log_content.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-            self._log_arrow.configure(text="▼")
-            self._log_expanded = True
-
-    def _clear_log(self) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
-
-    def _show_info_popup(self, title: str, body: str) -> None:
-        popup = ctk.CTkToplevel(self)
-        popup.title(title)
-        popup.geometry("760x650")
-        popup.minsize(640, 480)
-        popup.configure(fg_color=COLORS["bg_dark"])
-        popup.transient(self)
-        popup.grab_set()
-        popup.lift()
-        popup.focus_force()
-
-        frame = ctk.CTkFrame(popup, fg_color=COLORS["bg_card"], corner_radius=8)
-        frame.pack(fill="both", expand=True, padx=16, pady=16)
-
-        ctk.CTkLabel(
-            frame,
-            text=title,
-            text_color=COLORS["text_primary"],
-            font=_ctk_font(POPUP_TITLE, "bold"),
-        ).pack(fill="x", padx=14, pady=(14, 8), anchor="w")
-
-        text_frame = ctk.CTkFrame(frame, fg_color=COLORS["bg_input"], corner_radius=4)
-        text_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
-
-        # ScrolledText is a raw tkinter widget, so CustomTkinter does not scale its
-        # font for DPI the way it does for CTk widgets. Apply that scaling by hand
-        # so the help text matches the rest of the UI instead of rendering tiny.
-        scaling = _tk_scaling(popup)
-        text_widget = scrolledtext.ScrolledText(
-            text_frame,
-            wrap="word",
-            font=_tk_font(UI_FONT, POPUP_BODY, scaling),
-            bg=COLORS["bg_input"],
-            fg=COLORS["text_secondary"],
-            insertbackground=COLORS["text_primary"],
-            relief="flat",
-            highlightthickness=0,
-            padx=max(1, round(12 * scaling)),
-            pady=max(1, round(10 * scaling)),
-        )
-        text_widget.pack(fill="both", expand=True)
-        self._insert_markdown(text_widget, body, scaling)
-        text_widget.configure(state="disabled")
-
-        ctk.CTkButton(
-            frame,
-            text="Close",
-            width=100,
-            height=32,
-            font=_ctk_font(FONT_BUTTON),
-            fg_color=COLORS["accent"],
-            hover_color=COLORS["accent_hover"],
-            command=popup.destroy,
-        ).pack(pady=(0, 16))
-
-        self._help_windows.append(popup)
-        popup.protocol("WM_DELETE_WINDOW", lambda p=popup: self._close_help_popup(p))
-
-    def _close_help_popup(self, popup: ctk.CTkToplevel) -> None:
-        if popup in self._help_windows:
-            self._help_windows.remove(popup)
-        popup.destroy()
-
-    def _insert_markdown(
-        self,
-        text_widget: scrolledtext.ScrolledText,
-        markdown_text: str,
-        scaling: float = 1.0,
-    ) -> None:
-        """Render a small markdown subset into a Tk text widget.
-
-        ``scaling`` is CustomTkinter's DPI/widget scaling factor; fonts and spacing
-        are pre-scaled so this raw-Tk widget tracks the rest of the UI.
-        """
-        def sp(value: int) -> int:
-            return max(1, round(value * scaling))
-
-        text_widget.tag_configure("h1", font=_tk_font(UI_FONT, POPUP_H1, scaling, "bold"), spacing1=sp(8), spacing3=sp(6))
-        text_widget.tag_configure("h2", font=_tk_font(UI_FONT, POPUP_H2, scaling, "bold"), spacing1=sp(6), spacing3=sp(4))
-        text_widget.tag_configure("h3", font=_tk_font(UI_FONT, POPUP_H3, scaling, "bold"), spacing1=sp(4), spacing3=sp(2))
-        text_widget.tag_configure("bold", font=_tk_font(UI_FONT, POPUP_BODY, scaling, "bold"))
-        text_widget.tag_configure("code", font=_tk_font(MONO_FONT, POPUP_CODE, scaling), background="#2D2D2D")
-
-        for raw_line in markdown_text.strip().splitlines():
-            line = raw_line.rstrip()
-            stripped = line.strip()
-
-            if not stripped:
-                text_widget.insert("end", "\n")
-                continue
-
-            heading_level = 0
-            if stripped.startswith("### "):
-                heading_level = 3
-                stripped = stripped[4:]
-            elif stripped.startswith("## "):
-                heading_level = 2
-                stripped = stripped[3:]
-            elif stripped.startswith("# "):
-                heading_level = 1
-                stripped = stripped[2:]
-
-            if heading_level:
-                text_widget.insert("end", stripped + "\n", (f"h{heading_level}",))
-                continue
-
-            bullet_match = re.match(r"^[-*]\s+(.*)$", stripped)
-            numbered_match = re.match(r"^(\d+)\.\s+(.*)$", stripped)
-            if bullet_match:
-                text_widget.insert("end", "• ")
-                self._insert_inline_markdown(text_widget, bullet_match.group(1))
-                text_widget.insert("end", "\n")
-                continue
-            if numbered_match:
-                text_widget.insert("end", f"{numbered_match.group(1)}. ")
-                self._insert_inline_markdown(text_widget, numbered_match.group(2))
-                text_widget.insert("end", "\n")
-                continue
-
-            self._insert_inline_markdown(text_widget, stripped)
-            text_widget.insert("end", "\n")
-
-    def _insert_inline_markdown(self, text_widget: scrolledtext.ScrolledText, text: str) -> None:
-        token_pattern = re.compile(r"(`[^`]+`|\*\*[^*]+\*\*)")
-        pos = 0
-        for match in token_pattern.finditer(text):
-            if match.start() > pos:
-                text_widget.insert("end", text[pos:match.start()])
-
-            token = match.group(0)
-            if token.startswith("**") and token.endswith("**"):
-                text_widget.insert("end", token[2:-2], ("bold",))
-            elif token.startswith("`") and token.endswith("`"):
-                text_widget.insert("end", token[1:-1], ("code",))
-            else:
-                text_widget.insert("end", token)
-
-            pos = match.end()
-
-        if pos < len(text):
-            text_widget.insert("end", text[pos:])
-
-    def _browse(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("Word Documents", "*.docx")])
-        if path:
-            self.path_var.set(path)
-            self.output_dir_var.set(str(Path(path).parent))
-
-    def _browse_output(self) -> None:
-        folder = filedialog.askdirectory()
-        if folder:
-            self.output_dir_var.set(folder)
-
-    def _toggle_key(self) -> None:
-        self._key_visible = not self._key_visible
-        self.key_entry.configure(show="" if self._key_visible else "•")
-        self.key_toggle.configure(text="Hide" if self._key_visible else "Show")
-
-    def _set_run_processing(self) -> None:
-        self.run_btn.configure(
-            text="Processing...",
-            state="disabled",
-            text_color_disabled="#FFFFFF",
-        )
-
-    def _set_run_complete(self) -> None:
-        self.run_btn.configure(
-            text="✓ Complete",
-            fg_color=COLORS["success"],
-            state="disabled",
-        )
-        self.after(2500, self._reset_run_button)
-
-    def _set_run_failed(self) -> None:
-        self.run_btn.configure(
-            text="✗ Failed",
-            fg_color=COLORS["error"],
-            state="disabled",
-        )
-        self.after(2500, self._reset_run_button)
-
-    def _reset_run_button(self) -> None:
-        self.run_btn.configure(
-            text="Run Phase 1",
-            fg_color=COLORS["accent"],
-            hover_color=COLORS["accent_hover"],
-            state="normal",
-        )
-
-    def _run(self) -> None:
-        docx_path = self.path_var.get().strip()
-        api_key = self.key_var.get().strip()
-
-        if not docx_path:
-            self.status_var.set("Error: No template selected")
-            self.status_label.configure(text_color=COLORS["error"])
-            return
-        if not Path(docx_path).exists():
-            self.status_var.set("Error: File not found")
-            self.status_label.configure(text_color=COLORS["error"])
-            return
-        if not api_key:
-            self.status_var.set("Error: No API key")
-            self.status_label.configure(text_color=COLORS["error"])
-            return
-
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
-
-        self._set_run_processing()
-        self.status_var.set("Running...")
-        self.status_label.configure(text_color=COLORS["text_secondary"])
-        self._result = None
-
-        self.progress_bar.pack(fill="x", pady=(8, 0), after=self.run_btn)
-        self.progress_bar.configure(mode="indeterminate")
-        self.progress_bar.start()
-
-        self._worker_thread = PipelineThread(
-            docx_path=docx_path,
-            api_key=api_key,
-            output_dir=self.output_dir_var.get().strip() or None,
-            log_queue=self.log_queue,
-            result_queue=self.result_queue,
-        )
-        self._worker_thread.start()
-
-    def _poll_queues(self) -> None:
-        while True:
-            try:
-                msg = self.log_queue.get_nowait()
-                self.log_text.configure(state="normal")
-                self.log_text.insert("end", msg + "\n")
-                self.log_text.see("end")
-                self.log_text.configure(state="disabled")
-            except queue.Empty:
-                break
-
-        try:
-            result = self.result_queue.get_nowait()
-            if self._worker_thread is not None:
-                self._worker_thread.join(timeout=0)
-                if not self._worker_thread.is_alive():
-                    self._worker_thread = None
-            self._result = result
-            self.progress_bar.stop()
-            self.progress_bar.pack_forget()
-            if result["success"]:
-                self._set_run_complete()
-                self.status_var.set("Success — " + result.get("coverage", ""))
-                self.status_label.configure(text_color=COLORS["success"])
-
-                self.log_text.configure(state="normal")
-                self.log_text.insert("end", "\nPhase 1 complete. Validated bundle ready for Phase 2.\n")
-                self.log_text.see("end")
-                self.log_text.configure(state="disabled")
-            else:
-                self._set_run_failed()
-                self.status_var.set("Failed — see log for details")
-                self.status_label.configure(text_color=COLORS["error"])
-        except queue.Empty:
-            pass
-
-        self.after(100, self._poll_queues)
-
-
-HOW_TO_USE_TEXT = """
-# What You Need Before Starting
-
-- An architect's Word specification template (`.docx`)
-- An Anthropic API key (get one at console.anthropic.com)
-
-# Steps
-
-1. **Select the template**
-   Click **Browse** next to Template and select the architect's `.docx` spec file.
-
-2. **Enter your API key**
-   Paste your Anthropic API key into the API Key field. Click **Show** to verify it if needed.
-   The key is pre-filled automatically if the `ANTHROPIC_API_KEY` environment variable is set on your machine.
-
-3. **Set an output folder (optional)**
-   By default, output files are saved to the same folder as the `.docx` you selected.
-   Click **Browse** next to Output Folder to choose a different location.
-
-4. **Run**
-   Click **Run Phase 1**. The activity log will show live progress.
-   Processing typically takes 1–3 minutes depending on document length.
-
-5. **Review results**
-   When complete, the status bar shows the coverage result.
-
-# Output Bundle
-
-Each run publishes one uniquely named `.phase1` folder. Give that whole folder to Phase 2. It contains:
-
-- `phase1_bundle_manifest.json`: Version, source identity, artifact sizes, and SHA-256 checksums.
-- `arch_style_registry.json`: CSI role-to-style mappings and numbering provenance.
-- `arch_template_registry.json`: The captured formatting environment.
-- `classification_audit.json`: Every candidate paragraph and its styled/ignored disposition.
-- `source_styles.xml` and optional `source_settings.xml`: Exact source bytes.
-- `portable_styles.xml`: Source styles plus safely derived CSI styles.
-
-# If Something Goes Wrong
-
-- **"Coverage" / "classification incomplete"** — Review the exact unresolved indices in the log. The tool will not guess a neighboring style.
-- **"File not found"** — Make sure the `.docx` file isn't open in Word when you run.
-- **"No API key"** — Check that your key is pasted correctly and hasn't expired.
-- Any other error — The full error message is in the activity log. The document is never modified in place; re-running is always safe.
-"""
-
-
-HOW_IT_WORKS_TEXT = """
-# The Problem This Solves
-
-Every architecture firm formats their specification templates differently.
-When a mechanical, electrical, or plumbing consultant needs to reformat their specs to match the architect's style — fonts, indentation, numbering appearance, heading weights — it's tedious manual work that has to be repeated for every project and every architect.
-
-This tool automates the first step: reading and understanding an architect's Word template so that the formatting can be applied to other documents automatically.
-
-# The Two-Phase Pipeline
-
-This tool is **Phase 1** of a two-step process.
-
-- **Phase 1 (this tool):** Analyzes the architect's template and publishes one checksummed, versioned bundle.
-- **Phase 2 (separate tool):** Validates that bundle before applying the architect's formatting to MEP consultant specs.
-
-# What Phase 1 Actually Does
-
-1. **Unpack the Document**
-   A `.docx` file is actually a ZIP archive containing XML files.
-   The tool unpacks it into a working folder so it can be read and modified safely.
-   Your original file is never touched.
-
-2. **Read the Structure**
-   The tool reads every paragraph in the document and records its text, indentation, numbering, and any existing paragraph style.
-   It strips out everything that isn't needed for classification and produces a compact summary (the slim bundle), which is what gets sent to the AI.
-
-3. **AI Classification**
-   The slim bundle is sent to Claude (Anthropic's AI) with detailed instructions.
-   Claude identifies the CSI structural role of each paragraph (Section Title, PART, Article, Paragraph, Subparagraph).
-
-4. **Derive Formatting Locally**
-   For each CSI role, the tool identifies a representative exemplar paragraph from the template and extracts exact formatting from it to create a new style.
-
-5. **Build Portable Styles Without Mutating the Source**
-   The tool derives any needed CSI styles into a separate stylesheet. The extracted source document is not retagged or normalized.
-
-6. **Capture the Formatting Environment**
-   The tool captures supported document settings including font defaults, theme colors, compatibility flags, page layout, headers/footers, and numbering definitions. The registry states its capture limits explicitly.
-
-7. **Validate and Write Output**
-   Before writing anything, the tool verifies required roles, full classification coverage, and byte-for-byte integrity for protected document components.
-   If any check fails, the run aborts.
-
-# The Output Bundle
-
-The `.phase1` folder contains the two registries, exact source XML parts, a portable stylesheet, a paragraph-level classification audit, and a manifest that authenticates every artifact.
-
-# What This Tool Does Not Do
-
-- It does not change how the architect's template looks.
-- It does not generate new content.
-- It does not modify headers, footers, or page layout.
-- It does not produce a new `.docx` file.
-- It does not touch numbering definitions.
-"""
-
 
 def main() -> None:
     ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("blue")
-    App().mainloop()
+    app = App()
+    app.mainloop()
 
 
 if __name__ == "__main__":

@@ -501,7 +501,9 @@ def _scan_paragraph_xml_blocks(document_xml_text: str) -> List[_ScannedParagraph
 
         starts_excluded = qname in _OUT_OF_SCOPE_CONTAINER_NAMES
         if paragraph_start is not None:
-            if qname == "w:sectPr":
+            # Section properties in a nested drawing/text-box story do not
+            # belong to the visible host paragraph.
+            if qname == "w:sectPr" and excluded_depth == 0:
                 paragraph_contains_sectpr = True
             if qname in {"w:drawing", "w:pict", "w:object"}:
                 paragraph_contains_drawing = True
@@ -592,6 +594,25 @@ def _strip_out_of_scope_subtrees(xml_text: str) -> str:
     return "".join(pieces)
 
 
+def _mask_text_box_subtrees(p_xml: str) -> str:
+    """Hide text-box story XML while preserving every original index.
+
+    Metadata reads and paragraph-level edits use the masked string to locate
+    only the host paragraph's properties. Splices are then made against the
+    original XML, so the complete ``w:txbxContent`` subtree remains byte exact.
+    """
+    pieces: List[str] = []
+    cursor = 0
+    for start, end in _named_xml_block_ranges(p_xml, "w:txbxContent"):
+        pieces.append(p_xml[cursor:start])
+        pieces.append(" " * (end - start))
+        cursor = end
+    if cursor == 0:
+        return p_xml
+    pieces.append(p_xml[cursor:])
+    return "".join(pieces)
+
+
 def paragraph_text_from_block(p_xml: str) -> str:
     # Deleted/moved-from text, field instructions, and drawing/text-box content
     # are not visible in-scope paragraph content for Phase 1 classification.
@@ -645,19 +666,20 @@ def paragraph_text_from_block(p_xml: str) -> str:
 
 
 def paragraph_contains_sectpr(p_xml: str) -> bool:
-    return "<w:sectPr" in p_xml
+    return "<w:sectPr" in _mask_text_box_subtrees(p_xml)
 
 
 def paragraph_pstyle_from_block(p_xml: str) -> Optional[str]:
-    m = re.search(r"<w:pStyle\b[^>]*w:val=\"([^\"]+)\"", p_xml)
+    m = re.search(r"<w:pStyle\b[^>]*w:val=\"([^\"]+)\"", _mask_text_box_subtrees(p_xml))
     return m.group(1) if m else None
 
 
 def paragraph_numpr_from_block(p_xml: str) -> Dict[str, Optional[str]]:
     numId = None
     ilvl = None
-    m1 = re.search(r"<w:numId\b[^>]*w:val=\"([^\"]+)\"", p_xml)
-    m2 = re.search(r"<w:ilvl\b[^>]*w:val=\"([^\"]+)\"", p_xml)
+    outer_xml = _mask_text_box_subtrees(p_xml)
+    m1 = re.search(r"<w:numId\b[^>]*w:val=\"([^\"]+)\"", outer_xml)
+    m2 = re.search(r"<w:ilvl\b[^>]*w:val=\"([^\"]+)\"", outer_xml)
     if m1:
         numId = m1.group(1)
     if m2:
@@ -667,14 +689,15 @@ def paragraph_numpr_from_block(p_xml: str) -> Dict[str, Optional[str]]:
 
 def paragraph_ppr_hints_from_block(p_xml: str) -> Dict[str, Any]:
     # lightweight hints (alignment + ind + spacing)
+    outer_xml = _mask_text_box_subtrees(p_xml)
     hints: Dict[str, Any] = {}
-    m = re.search(r"<w:jc\b[^>]*w:val=\"([^\"]+)\"", p_xml)
+    m = re.search(r"<w:jc\b[^>]*w:val=\"([^\"]+)\"", outer_xml)
     if m:
         hints["jc"] = m.group(1)
 
     ind = {}
     for k in ["left", "right", "firstLine", "hanging"]:
-        m2 = re.search(rf"<w:ind\b[^>]*w:{k}=\"([^\"]+)\"", p_xml)
+        m2 = re.search(rf"<w:ind\b[^>]*w:{k}=\"([^\"]+)\"", outer_xml)
         if m2:
             ind[k] = m2.group(1)
     if ind:
@@ -682,7 +705,7 @@ def paragraph_ppr_hints_from_block(p_xml: str) -> Dict[str, Any]:
 
     spacing = {}
     for k in ["before", "after", "line", "lineRule"]:
-        m3 = re.search(rf"<w:spacing\b[^>]*w:{k}=\"([^\"]+)\"", p_xml)
+        m3 = re.search(rf"<w:spacing\b[^>]*w:{k}=\"([^\"]+)\"", outer_xml)
         if m3:
             spacing[k] = m3.group(1)
     if spacing:
@@ -948,19 +971,37 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
 # -----------------------------
 
 def strip_pstyle_from_paragraph(p_xml: str) -> str:
-    result = re.sub(r"<w:pStyle\b[^>]*/>", "", p_xml)
-    # Also remove empty pPr that might result
-    result = re.sub(r"<w:pPr>\s*</w:pPr>", "", result)
-    result = re.sub(r"<w:pPr\s*/>", "", result)
+    outer_xml = _mask_text_box_subtrees(p_xml)
+    pstyle = re.search(r"<w:pStyle\b[^>]*/\s*>", outer_xml, flags=re.S)
+    result = p_xml
+    if pstyle:
+        result = p_xml[:pstyle.start()] + p_xml[pstyle.end():]
+
+    # Also remove an outer empty pPr that might result. Nested text-box pPr
+    # nodes are a separate story and must remain byte-identical.
+    outer_result = _mask_text_box_subtrees(result)
+    empty_ppr = re.search(
+        r"<w:pPr\b[^>]*>\s*</w:pPr\s*>|<w:pPr\b[^>]*/\s*>",
+        outer_result,
+        flags=re.S,
+    )
+    if empty_ppr:
+        result = result[:empty_ppr.start()] + result[empty_ppr.end():]
     return result
 
 def ppr_without_pstyle(p_xml: str) -> str:
-    m = re.search(r"<w:pPr\b[\s\S]*?</w:pPr>", p_xml)
+    outer_xml = _mask_text_box_subtrees(p_xml)
+    if re.search(r"<w:pPr\b[^>]*/\s*>", outer_xml, flags=re.S):
+        return ""
+    m = re.search(
+        r"<w:pPr\b[^>]*>(?P<inner>.*?)</w:pPr\s*>",
+        outer_xml,
+        flags=re.S,
+    )
     if not m:
         return ""
-    ppr = m.group(0)
-    # Remove pStyle
-    ppr = re.sub(r"<w:pStyle\b[^>]*/>", "", ppr)
+    ppr = p_xml[m.start():m.end()]
+    ppr = re.sub(r"<w:pStyle\b[^>]*/\s*>", "", ppr, count=1)
     # If pPr is now empty, return empty string
     inner = re.sub(r"<w:pPr\b[^>]*>([\s\S]*)</w:pPr>", r"\1", ppr, flags=re.S)
     if not inner.strip():
@@ -987,12 +1028,13 @@ def _strip_proofing_for_cmp(xml_text: str) -> str:
 
 
 def extract_paragraph_ppr_inner(p_xml: str) -> str:
-    if re.search(r"<w:pPr\b[^>]*/>", p_xml):
+    outer_xml = _mask_text_box_subtrees(p_xml)
+    if re.search(r"<w:pPr\b[^>]*/>", outer_xml):
         return ""
-    m = re.search(r"<w:pPr\b[^>]*>(.*?)</w:pPr>", p_xml, flags=re.S)
+    m = re.search(r"<w:pPr\b[^>]*>(.*?)</w:pPr>", outer_xml, flags=re.S)
     if not m:
         return ""
-    inner = m.group(1)
+    inner = p_xml[m.start(1):m.end(1)]
     inner = re.sub(r"<w:pStyle\b[^>]*/>", "", inner)
     # A visible paragraph may also carry a section break.  It is part of the
     # document structure, not reusable paragraph formatting: copying it into
@@ -1137,7 +1179,8 @@ def extract_paragraph_rpr_inner(p_xml: str) -> str:
     An absent rPr is therefore a real empty set, and mixed formatting yields
     only the exact properties shared by every visible run.
     """
-    visible_xml = re.sub(r"<w:(?:del|moveFrom)\b[^>]*>[\s\S]*?</w:(?:del|moveFrom)>", "", p_xml)
+    visible_xml = _mask_text_box_subtrees(p_xml)
+    visible_xml = re.sub(r"<w:(?:del|moveFrom)\b[^>]*>[\s\S]*?</w:(?:del|moveFrom)>", "", visible_xml)
     run_properties: List[List[Tuple[Tuple[Any, ...], str]]] = []
 
     for rm in re.finditer(r"<w:r\b[^>]*>(.*?)</w:r>", visible_xml, flags=re.S):
@@ -1370,35 +1413,39 @@ def insert_styles_into_styles_xml(styles_xml_text: str, style_blocks: List[str])
 
 
 def apply_pstyle_to_paragraph_block(p_xml: str, styleId: str) -> str:
-    if re.search(r"<w:pStyle\b", p_xml):
-        return re.sub(
-            r'(<w:pStyle\b[^>]*w:val=")([^"]+)(")',
-            rf'\g<1>{styleId}\g<3>',
-            p_xml,
-            count=1
+    outer_xml = _mask_text_box_subtrees(p_xml)
+    escaped_style_id = xml_escape(styleId)
+    pstyle = re.search(
+        r"<w:pStyle\b[^>]*\bw:val=(?P<quote>['\"])(?P<value>[^'\"]*)(?P=quote)",
+        outer_xml,
+        flags=re.S,
+    )
+    if pstyle:
+        return p_xml[:pstyle.start("value")] + escaped_style_id + p_xml[pstyle.end("value"):]
+
+    self_closing_ppr = re.search(r"<w:pPr\b[^>]*/\s*>", outer_xml, flags=re.S)
+    if self_closing_ppr:
+        return (
+            p_xml[:self_closing_ppr.start()]
+            + f'<w:pPr><w:pStyle w:val="{escaped_style_id}"/></w:pPr>'
+            + p_xml[self_closing_ppr.end():]
         )
 
-    if re.search(r"<w:pPr\b[^>]*/>", p_xml):
-        return re.sub(
-            r"<w:pPr\b[^>]*/>",
-            rf'<w:pPr><w:pStyle w:val="{styleId}"/></w:pPr>',
-            p_xml,
-            count=1
+    opening_ppr = re.search(r"<w:pPr\b[^>]*>", outer_xml, flags=re.S)
+    if opening_ppr:
+        return (
+            p_xml[:opening_ppr.end()]
+            + f'<w:pStyle w:val="{escaped_style_id}"/>'
+            + p_xml[opening_ppr.end():]
         )
 
-    if "<w:pPr" in p_xml:
-        return re.sub(
-            r'(<w:pPr\b[^>]*>)',
-            rf'\1<w:pStyle w:val="{styleId}"/>',
-            p_xml,
-            count=1
-        )
-
-    return re.sub(
-        r'(<w:p\b[^>]*>)',
-        rf'\1<w:pPr><w:pStyle w:val="{styleId}"/></w:pPr>',
-        p_xml,
-        count=1
+    opening_p = re.search(r"<w:p\b[^>]*>", outer_xml, flags=re.S)
+    if not opening_p:
+        return p_xml
+    return (
+        p_xml[:opening_p.end()]
+        + f'<w:pPr><w:pStyle w:val="{escaped_style_id}"/></w:pPr>'
+        + p_xml[opening_p.end():]
     )
 
 

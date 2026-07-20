@@ -39,7 +39,7 @@ from phase1_bundle import (
 from phase1_validator import validate_style_registry, validate_template_registry
 
 
-PIPELINE_VERSION = "2.0.0"
+PIPELINE_VERSION = "2.2.0"
 DEFAULT_MODEL = "claude-opus-4-8"
 ProgressCallback = Callable[[str], None]
 Classifier = Callable[..., Dict[str, Any]]

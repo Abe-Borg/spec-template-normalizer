@@ -1,0 +1,154 @@
+import json
+import threading
+import types
+
+import pytest
+
+from spec_formatter.style_application.core.llm_classifier import classify_target_document, _merge_chunk_results
+
+
+class _FakeStream:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def get_final_text(self):
+        return self.payload
+
+
+class _FakeMessages:
+    def __init__(self, payload='{"classifications": []}'):
+        self.last_kwargs = None
+        self.payload = payload
+
+    def stream(self, **kwargs):
+        self.last_kwargs = kwargs
+        return _FakeStream(self.payload)
+
+
+class _FakeClient:
+    def __init__(self):
+        self.messages = _FakeMessages()
+
+
+def test_output_config_is_dict(monkeypatch):
+    fake = _FakeClient()
+
+    fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake)
+    monkeypatch.setitem(__import__("sys").modules, "anthropic", fake_anthropic)
+
+    bundle = {
+        "paragraphs": [],
+        "available_roles": ["PART"],
+        "deterministic_classifications": [],
+    }
+    result = classify_target_document(bundle, ["PART"], api_key="x", model="m")
+    assert fake.messages.last_kwargs is None
+    assert result["notes"] == ["LLM skipped: all paragraphs classified deterministically."]
+
+
+def test_classify_calls_llm_for_unresolved(monkeypatch):
+    fake = _FakeClient()
+    fake.messages.payload = '{"classifications": [{"paragraph_index": 3, "csi_role": "PART"}]}'
+    fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake)
+    monkeypatch.setitem(__import__("sys").modules, "anthropic", fake_anthropic)
+
+    bundle = {
+        "paragraphs": [{"paragraph_index": 3, "text": "A"}],
+        "available_roles": ["PART"],
+        "deterministic_classifications": [],
+    }
+    classify_target_document(bundle, ["PART"], api_key="x", model="m")
+    assert fake.messages.last_kwargs["output_config"] == {"effort": "high"}
+
+
+def test_split_bundle_terminates_when_filter_report_dominates():
+    # Regression: a bundle pushed over the char threshold by a huge
+    # filter_report (not by paragraph volume) used to yield a
+    # paras_per_chunk <= _CHUNK_OVERLAP, so the chunk window walked
+    # backwards and the split loop never terminated.
+    from spec_formatter.style_application.core.llm_classifier import _CHUNK_OVERLAP, _split_bundle_into_chunks
+
+    paragraphs = [{"paragraph_index": i, "text": f"P{i}"} for i in range(21)]
+    bundle = {
+        "available_roles": ["PART"],
+        "filter_report": {
+            "paragraphs_removed_entirely": [
+                {
+                    "paragraph_index": i,
+                    "tags": ["masterspec_instruction"],
+                    "original_text_preview": "x" * 120,
+                }
+                for i in range(3000)
+            ],
+            "paragraphs_stripped": [],
+        },
+        "paragraphs": paragraphs,
+    }
+
+    chunks = _split_bundle_into_chunks(bundle, max_chars=240_000)
+
+    covered = [p["paragraph_index"] for chunk in chunks for p in chunk["paragraphs"]]
+    assert set(covered) == set(range(21))
+    for chunk in chunks[:-1]:
+        assert len(chunk["paragraphs"]) > _CHUNK_OVERLAP
+
+
+def test_merge_chunk_results_conflict_raises():
+    with pytest.raises(ValueError, match="conflicts"):
+        _merge_chunk_results([
+            {"classifications": [{"paragraph_index": 4, "csi_role": "PART"}], "notes": []},
+            {"classifications": [{"paragraph_index": 4, "csi_role": "ARTICLE"}], "notes": []},
+        ])
+
+
+class _CountingMessages:
+    def __init__(self):
+        self.call_count = 0
+        self.lock = threading.Lock()
+
+    def stream(self, **kwargs):
+        with self.lock:
+            self.call_count += 1
+        content = kwargs["messages"][0]["content"]
+        json_start = content.rfind("\n\n{")
+        slim_bundle = json.loads(content[json_start + 2:])
+        classifications = [
+            {"paragraph_index": p["paragraph_index"], "csi_role": "PART"}
+            for p in slim_bundle.get("paragraphs", [])
+        ]
+        return _FakeStream(json.dumps({"classifications": classifications}))
+
+
+class _CountingClient:
+    def __init__(self):
+        self.messages = _CountingMessages()
+
+
+def test_chunk_classification_runs_all_chunks(monkeypatch):
+    fake = _CountingClient()
+    fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake)
+    monkeypatch.setitem(__import__("sys").modules, "anthropic", fake_anthropic)
+
+    bundle = {
+        "paragraphs": [{"paragraph_index": i, "text": f"P{i}"} for i in range(8)],
+        "available_roles": ["PART"],
+        "deterministic_classifications": [],
+    }
+
+    from spec_formatter.style_application.core import llm_classifier as lc
+
+    monkeypatch.setattr(lc, "_split_bundle_into_chunks", lambda slim_bundle: [
+        {"paragraphs": bundle["paragraphs"][:4]},
+        {"paragraphs": bundle["paragraphs"][4:]},
+    ])
+
+    result = classify_target_document(bundle, ["PART"], api_key="x", model="m")
+
+    assert fake.messages.call_count == 2
+    assert len(result["classifications"]) == 8

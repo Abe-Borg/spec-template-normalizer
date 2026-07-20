@@ -9,10 +9,19 @@ from docx_decomposer import (
     build_portable_styles_xml,
     build_slim_bundle,
     extract_document_sectpr_blocks,
+    extract_paragraph_ppr_inner,
+    extract_paragraph_rpr_inner,
     extract_sectpr_block,
     iter_paragraph_xml_blocks,
+    paragraph_contains_sectpr,
+    paragraph_numpr_from_block,
+    paragraph_ppr_hints_from_block,
+    paragraph_pstyle_from_block,
+    paragraph_rpr_hints_from_block,
     paragraph_text_from_block,
+    ppr_without_pstyle,
     snapshot_headers_footers,
+    strip_pstyle_from_paragraph,
 )
 from llm_classifier import classify_document
 
@@ -42,6 +51,91 @@ def test_nested_table_context_is_xml_aware(tmp_path: Path):
     assert bundle["paragraphs"][1]["in_table"] is True
     assert bundle["paragraphs"][2]["in_table"] is True
     assert bundle["paragraphs"][3]["in_table"] is False
+
+
+def test_text_box_paragraphs_keep_outer_blocks_aligned(tmp_path: Path):
+    extract_dir = tmp_path / "x"
+    (extract_dir / "word").mkdir(parents=True)
+    (extract_dir / "word" / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:styles>',
+        encoding="utf-8",
+    )
+    text_box = (
+        '<w:p><w:r><w:drawing><w:txbxContent>'
+        '<w:p><w:pPr><w:sectPr/></w:pPr><w:r><w:t>Text box text</w:t></w:r></w:p>'
+        '</w:txbxContent></w:drawing></w:r></w:p>'
+    )
+    document_xml = (
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+        '<w:p><w:r><w:t>Body text</w:t></w:r></w:p>'
+        '<w:tbl><w:tr><w:tc>'
+        '<w:p><w:r><w:t>Outer cell</w:t></w:r></w:p>'
+        '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Inner cell</w:t></w:r></w:p>'
+        '</w:tc></w:tr></w:tbl>'
+        '</w:tc></w:tr></w:tbl>'
+        f'{text_box}<w:sectPr/>'
+        '</w:body></w:document>'
+    )
+    (extract_dir / "word" / "document.xml").write_text(document_xml, encoding="utf-8")
+
+    blocks = list(iter_paragraph_xml_blocks(document_xml))
+    assert len(blocks) == 4
+    assert blocks[-1][2] == text_box
+    assert all(left[1] <= right[0] for left, right in zip(blocks, blocks[1:]))
+
+    bundle = build_slim_bundle(extract_dir)
+
+    assert [paragraph["text"] for paragraph in bundle["paragraphs"]] == [
+        "Body text",
+        "Outer cell",
+        "Inner cell",
+        "",
+    ]
+    assert [paragraph["skip_reason"] for paragraph in bundle["paragraphs"]] == [
+        None,
+        "in_table",
+        "in_table",
+        "text_box",
+    ]
+
+
+def test_text_box_properties_are_isolated_from_host_paragraph():
+    text_box_subtree = (
+        '<w:txbxContent data-sentinel="keep-byte-identical">'
+        '<w:p><w:pPr><w:pStyle w:val="InnerStyle"/>'
+        '<w:numPr><w:ilvl w:val="2"/><w:numId w:val="41"/></w:numPr>'
+        '<w:jc w:val="center"/><w:ind w:left="720"/>'
+        '<w:spacing w:before="120"/><w:sectPr/>'
+        '</w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>Inner box text</w:t></w:r></w:p>'
+        '</w:txbxContent>'
+    )
+    host = (
+        '<w:p><w:r><w:t>Visible host text</w:t></w:r>'
+        f'<w:r><w:drawing>{text_box_subtree}</w:drawing></w:r></w:p>'
+    )
+
+    assert paragraph_text_from_block(host) == "Visible host text"
+    assert paragraph_pstyle_from_block(host) is None
+    assert paragraph_numpr_from_block(host) == {"numId": None, "ilvl": None}
+    assert paragraph_ppr_hints_from_block(host) == {}
+    assert paragraph_rpr_hints_from_block(host) == {}
+    assert extract_paragraph_ppr_inner(host) == ""
+    assert extract_paragraph_rpr_inner(host) == ""
+    assert paragraph_contains_sectpr(host) is False
+    assert ppr_without_pstyle(host) == ""
+    assert strip_pstyle_from_paragraph(host) == host
+
+    styled = apply_pstyle_to_paragraph_block(host, "OuterStyle")
+
+    assert paragraph_pstyle_from_block(styled) == "OuterStyle"
+    assert styled.startswith(
+        '<w:p><w:pPr><w:pStyle w:val="OuterStyle"/></w:pPr>'
+        '<w:r><w:t>Visible host text</w:t></w:r>'
+    )
+    start = styled.index("<w:txbxContent")
+    end = styled.index("</w:txbxContent>", start) + len("</w:txbxContent>")
+    assert styled[start:end] == text_box_subtree
+    assert strip_pstyle_from_paragraph(styled) == host
 
 
 def test_token_oversized_document_fails_before_api_call():
