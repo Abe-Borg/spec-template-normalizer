@@ -329,6 +329,25 @@ def test_extra_target_start_override_prevents_deterministic_match(tmp_path: Path
     assert bundle["paragraphs"][0]["numbering_match_candidates"] == []
 
 
+def test_deep_typed_csi_markers_are_detected_and_preclassified(tmp_path: Path):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:r><w:t>1) Fifth level</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>a) Sixth level</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>(1) Seventh level</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>(a) Eighth level</w:t></w:r></w:p>',
+    )
+    roles = [f"SUBPARAGRAPH_LEVEL_{level}" for level in range(5, 9)]
+
+    bundle = build_phase2_slim_bundle(extract_dir, available_roles=roles)
+
+    assert bundle["paragraphs"] == []
+    assert bundle["deterministic_classifications"] == [
+        {"paragraph_index": index, "csi_role": role}
+        for index, role in enumerate(roles)
+    ]
+
+
 def test_preclassify_markers():
     paragraphs = [
         {"paragraph_index": 0, "text": "PART 1 GENERAL", "in_table": False, "marker_type": None},
@@ -336,14 +355,32 @@ def test_preclassify_markers():
         {"paragraph_index": 2, "text": "A. Scope", "in_table": False, "marker_type": "upper_alpha"},
         {"paragraph_index": 3, "text": "1. Sub item", "in_table": False, "marker_type": "number"},
         {"paragraph_index": 4, "text": "a. Lower", "in_table": False, "marker_type": "lower_alpha"},
+        {"paragraph_index": 5, "text": "1) Deeper", "in_table": False, "marker_type": "deep_level_5"},
+        {"paragraph_index": 6, "text": "a) Deeper", "in_table": False, "marker_type": "deep_level_6"},
+        {"paragraph_index": 7, "text": "(1) Deeper", "in_table": False, "marker_type": "deep_level_7"},
+        {"paragraph_index": 8, "text": "(a) Deeper", "in_table": False, "marker_type": "deep_level_8"},
     ]
-    roles = ["PART", "ARTICLE", "PARAGRAPH", "SUBPARAGRAPH", "SUBSUBPARAGRAPH"]
+    roles = [
+        "PART",
+        "ARTICLE",
+        "PARAGRAPH",
+        "SUBPARAGRAPH",
+        "SUBSUBPARAGRAPH",
+        "SUBPARAGRAPH_LEVEL_5",
+        "SUBPARAGRAPH_LEVEL_6",
+        "SUBPARAGRAPH_LEVEL_7",
+        "SUBPARAGRAPH_LEVEL_8",
+    ]
     out = preclassify_paragraphs(paragraphs, roles)
     assert out[0] == "PART"
     assert out[1] == "ARTICLE"
     assert out[2] == "PARAGRAPH"
     assert out[3] == "SUBPARAGRAPH"
     assert out[4] == "SUBSUBPARAGRAPH"
+    assert out[5] == "SUBPARAGRAPH_LEVEL_5"
+    assert out[6] == "SUBPARAGRAPH_LEVEL_6"
+    assert out[7] == "SUBPARAGRAPH_LEVEL_7"
+    assert out[8] == "SUBPARAGRAPH_LEVEL_8"
 
 
 def test_end_of_section_is_deterministic_not_boilerplate_removed(tmp_path: Path):

@@ -31,15 +31,24 @@ CSI Hierarchy (for reference):
 - PARAGRAPH: Lettered paragraphs (A., B., C.)
 - SUBPARAGRAPH: Numbered under letters (1., 2., 3.)
 - SUBSUBPARAGRAPH: Lettered under numbers (a., b., c.)
+- SUBPARAGRAPH_LEVEL_5: Fifth-level subparagraphs: 1), 2), 3)
+- SUBPARAGRAPH_LEVEL_6: Sixth-level subparagraphs: a), b), c)
+- SUBPARAGRAPH_LEVEL_7: Seventh-level subparagraphs: (1), (2), (3)
+- SUBPARAGRAPH_LEVEL_8: Eighth-level subparagraphs: (a), (b), (c)
 
 The target may already use Canadian numeric PageFormat markers. In that form,
-ARTICLE commonly renders as 1.1 and each subordinate level as .1, .2, etc.;
-use list level, indentation, and surrounding hierarchy to distinguish those
-repeated numeric levels. Automatic Word numbering metadata is stronger evidence
-than the absence of a visible marker.
+PART may render as 1 GENERAL, ARTICLE commonly renders as 1.1, and every
+subordinate level may render as .1, .2, etc. Use automatic Word list level,
+indentation, and surrounding hierarchy to distinguish those repeated numeric
+markers. Automatic Word numbering metadata is stronger evidence than the
+absence of a visible marker.
 
 Fallback rules when a role is not available:
 - If SectionID not available but SectionTitle is -> classify section numbers as SectionTitle
+- If SUBPARAGRAPH_LEVEL_8 is unavailable -> use SUBPARAGRAPH_LEVEL_7, then the closest available parent
+- If SUBPARAGRAPH_LEVEL_7 is unavailable -> use SUBPARAGRAPH_LEVEL_6, then the closest available parent
+- If SUBPARAGRAPH_LEVEL_6 is unavailable -> use SUBPARAGRAPH_LEVEL_5, then the closest available parent
+- If SUBPARAGRAPH_LEVEL_5 is unavailable -> classify as SUBSUBPARAGRAPH
 - If SUBSUBPARAGRAPH not available -> classify as SUBPARAGRAPH
 - If SUBPARAGRAPH not available -> classify as PARAGRAPH
 

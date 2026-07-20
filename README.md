@@ -13,7 +13,8 @@ The original template and target files are never modified.
 2. Validates and caches that template analysis by the template's SHA-256 hash,
    engine version, prompt hashes, and classifier model.
 3. Classifies each target spec's in-scope paragraphs.
-4. Optionally converts conventional CSI numbering (`1.01 / A. / 1. / a.`)
+4. Optionally converts conventional CSI numbering (`1.01 / A. / 1. / a. /
+   1) / a) / (1) / (a)`)
    to the Canadian numeric hierarchy demonstrated by the architect template.
 5. Applies the architect's formatting while preserving technical wording,
    tables, drawings, text boxes, and unmanaged document structure.
@@ -68,7 +69,9 @@ and legacy `_PHASE2_FORMATTED.docx` outputs.
 Canadian mode is one option inside the same GUI and pipeline. It recognizes
 typical CSI article and list levels, removes manually typed CSI markers without
 altering the requirement text, and retargets both typed and automatic source
-numbering to the architect template's Canadian automatic Word numbering.
+numbering to the architect template's Canadian automatic Word numbering. The
+recognized hierarchy continues through the deeper `1)`, `a)`, `(1)`, and
+`(a)` subparagraph levels supported by Word's nine-level list model.
 
 For a fail-closed conversion, the architect template must demonstrate true
 automatic Canadian numbering for every numbered role used by the targets:
@@ -179,7 +182,8 @@ is a bounded, normalized representation; use its exact `source_styles.xml` and
 optional `source_settings.xml` companion parts when byte identity matters.
 
 The supported CSI roles are `SectionID`, `SectionTitle`, `PART`, `ARTICLE`,
-`PARAGRAPH`, `SUBPARAGRAPH`, `SUBSUBPARAGRAPH`, and `END_OF_SECTION`. Every
+`PARAGRAPH`, `SUBPARAGRAPH`, `SUBSUBPARAGRAPH`, the deeper semantic roles
+`SUBPARAGRAPH_LEVEL_5` through `SUBPARAGRAPH_LEVEL_8`, and `END_OF_SECTION`. Every
 in-scope paragraph must be explicitly styled or ignored; unresolved coverage
 fails closed and is never filled from a neighboring paragraph. The classifier
 selects roles, dispositions, and exemplars only. Formatting properties come

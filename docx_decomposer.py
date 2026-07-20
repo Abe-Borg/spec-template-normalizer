@@ -50,6 +50,11 @@ from paragraph_rules import (
     is_role_candidate_paragraph,
 )
 from ooxml_text import prepare_xml_text_for_utf8, read_xml_text
+from spec_formatter.role_contract import (
+    ALLOWED_ROLES,
+    NUMBERED_BODY_ROLES,
+    ROLE_TO_ARCH_STYLE,
+)
 
 
 # -----------------------------
@@ -58,18 +63,6 @@ from ooxml_text import prepare_xml_text_for_utf8, read_xml_text
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
-
-ROLE_TO_ARCH_STYLE: Dict[str, str] = {
-    "SectionID": "CSI_SectionID__ARCH",
-    "SectionTitle": "CSI_SectionTitle__ARCH",
-    "PART": "CSI_Part__ARCH",
-    "ARTICLE": "CSI_Article__ARCH",
-    "PARAGRAPH": "CSI_Paragraph__ARCH",
-    "SUBPARAGRAPH": "CSI_Subparagraph__ARCH",
-    "SUBSUBPARAGRAPH": "CSI_Subsubparagraph__ARCH",
-    "END_OF_SECTION": "CSI_EndOfSection__ARCH",
-}
-ALLOWED_ROLES: Set[str] = set(ROLE_TO_ARCH_STYLE)
 
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
@@ -1787,7 +1780,7 @@ def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[
         elif isinstance(style_numpr, dict) and (style_numpr.get("numId") or style_numpr.get("ilvl")):
             source = "style_numpr"
             num_id, ilvl = style_numpr.get("numId"), style_numpr.get("ilvl")
-        elif text_role in {"ARTICLE", "PARAGRAPH", "SUBPARAGRAPH", "SUBSUBPARAGRAPH"}:
+        elif text_role in NUMBERED_BODY_ROLES:
             source = "text_literal"
 
         abstract_num_id = nums.get(num_id, {}).get("abstractNumId") if num_id else None
@@ -1830,11 +1823,16 @@ def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[
     # the rendered numbering signature rather than numId, but require every
     # distinct level/pattern to have an explicit role exemplar. The former
     # "deepest role absorbs everything below it" rule hid lost levels.
-    required_numbering_signatures: Set[Tuple[Optional[str], Optional[str], Optional[str]]] = {
-        (signal.ilvl, signal.num_fmt, signal.lvl_text)
-        for signal in signals.values()
-        if signal.family_key is not None
-    }
+    required_numbering_signatures: Dict[
+        Tuple[Optional[str], Optional[str], Optional[str]], List[int]
+    ] = {}
+    for signal in signals.values():
+        if signal.family_key is None:
+            continue
+        signature = (signal.ilvl, signal.num_fmt, signal.lvl_text)
+        required_numbering_signatures.setdefault(signature, []).append(
+            signal.paragraph_index
+        )
     covered_numbering_signatures: Set[Tuple[Optional[str], Optional[str], Optional[str]]] = set()
     for spec in roles.values():
         if not isinstance(spec, dict):
@@ -1843,11 +1841,29 @@ def validate_semantic_structure(instructions: Dict[str, Any], slim_bundle: Dict[
         if s and s.family_key is not None:
             covered_numbering_signatures.add((s.ilvl, s.num_fmt, s.lvl_text))
 
-    missing_numbering = required_numbering_signatures - covered_numbering_signatures
+    missing_numbering = (
+        set(required_numbering_signatures) - covered_numbering_signatures
+    )
     if missing_numbering:
-        rendered = sorted(
-            [f"ilvl={ilvl!r}, numFmt={num_fmt!r}, lvlText={lvl_text!r}" for ilvl, num_fmt, lvl_text in missing_numbering]
-        )
+        paragraph_by_index = {
+            int(paragraph["paragraph_index"]): paragraph
+            for paragraph in paragraphs
+            if isinstance(paragraph, dict)
+            and type(paragraph.get("paragraph_index")) is int
+        }
+        rendered = []
+        for ilvl, num_fmt, lvl_text in missing_numbering:
+            indices = sorted(required_numbering_signatures[(ilvl, num_fmt, lvl_text)])
+            previews = [
+                str(paragraph_by_index[index].get("text") or "").strip()[:80]
+                for index in indices[:5]
+                if index in paragraph_by_index
+            ]
+            rendered.append(
+                f"ilvl={ilvl!r}, numFmt={num_fmt!r}, lvlText={lvl_text!r}, "
+                f"paragraph_indices={indices[:20]!r}, text_previews={previews!r}"
+            )
+        rendered.sort()
         raise ValueError(
             "Semantic validation failed: missing numbered hierarchy coverage: " + "; ".join(rendered)
         )
@@ -2086,6 +2102,10 @@ def _determine_numbering_provenance(
         r"^\s*[A-Z]\.\s+",
         r"^\s*\d+\.\s+",
         r"^\s*[a-z]\.\s+",
+        r"^\s*\.\d+\s+",
+        r"^\s*\(\d+\)\s+",
+        r"^\s*\([A-Za-z]+\)\s+",
+        r"^\s*[ivxlcdm]+[.)]\s+",
     ]
     if any(re.match(pat, txt) for pat in marker_patterns):
         return "text_literal"

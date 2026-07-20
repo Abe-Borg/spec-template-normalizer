@@ -17,6 +17,8 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from urllib.parse import unquote, urlsplit
 from xml.sax.saxutils import escape as _sax_escape
 
+from spec_formatter.role_contract import ALLOWED_ROLES
+
 from .ooxml_namespaces import W_NS
 from .ooxml_text import prepare_xml_text_for_utf8
 from .opc_paths import (
@@ -62,10 +64,7 @@ _PHASE1_ARTIFACT_SPECS = {
     ),
 }
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_ALLOWED_ROLE_NAMES = {
-    "SectionID", "SectionTitle", "PART", "ARTICLE", "PARAGRAPH",
-    "SUBPARAGRAPH", "SUBSUBPARAGRAPH", "END_OF_SECTION",
-}
+_ALLOWED_ROLE_NAMES = set(ALLOWED_ROLES)
 
 _PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 _EMBEDDED_FONT_TAGS = {

@@ -78,6 +78,10 @@ def _canadian_role_specs(*roles: str):
         "PARAGRAPH": ".%3",
         "SUBPARAGRAPH": ".%4",
         "SUBSUBPARAGRAPH": ".%5",
+        "SUBPARAGRAPH_LEVEL_5": ".%6",
+        "SUBPARAGRAPH_LEVEL_6": ".%7",
+        "SUBPARAGRAPH_LEVEL_7": ".%8",
+        "SUBPARAGRAPH_LEVEL_8": ".%9",
     }
     levels = {
         "PART": "0",
@@ -85,6 +89,10 @@ def _canadian_role_specs(*roles: str):
         "PARAGRAPH": "2",
         "SUBPARAGRAPH": "3",
         "SUBSUBPARAGRAPH": "4",
+        "SUBPARAGRAPH_LEVEL_5": "5",
+        "SUBPARAGRAPH_LEVEL_6": "6",
+        "SUBPARAGRAPH_LEVEL_7": "7",
+        "SUBPARAGRAPH_LEVEL_8": "8",
     }
     return {
         role: {
@@ -161,6 +169,48 @@ def test_literal_csi_hierarchy_is_removed_for_architect_automatic_numbering():
     assert [edit.source_marker for edit in plan.report.edits] == [
         "PART 1", "1.01", "A.", "1.", "a."
     ]
+
+
+def test_fifth_level_csi_marker_converts_to_sixth_pageformat_level():
+    roles = (
+        "PART",
+        "ARTICLE",
+        "PARAGRAPH",
+        "SUBPARAGRAPH",
+        "SUBSUBPARAGRAPH",
+        "SUBPARAGRAPH_LEVEL_5",
+    )
+    source = _document(
+        _paragraph("PART 1 GENERAL"),
+        _paragraph("1.01 SUMMARY"),
+        _paragraph("A. Work Included"),
+        _paragraph("1. Pumps"),
+        _paragraph("a. Steel"),
+        _paragraph("1) Factory welds"),
+    )
+    specs = _canadian_role_specs(*roles)
+    # The failing architect sample uses numeric CSC Part numbering rather than
+    # a literal PART prefix in its automatic level text.
+    specs["PART"]["numbering_pattern"]["lvlText"] = "%1."
+
+    plan = plan_csi_to_canadian(
+        source,
+        _styles(),
+        _classifications(*roles),
+        specs,
+    )
+
+    assert _texts(plan.document_xml)[:6] == [
+        "GENERAL",
+        "SUMMARY",
+        "Work Included",
+        "Pumps",
+        "Steel",
+        "Factory welds",
+    ]
+    assert plan.report.literal_markers_removed == 6
+    assert plan.report.edits[-1].role == "SUBPARAGRAPH_LEVEL_5"
+    assert plan.report.edits[-1].source_marker == "1)"
 
 
 def test_canonical_counters_restart_under_each_new_parent():

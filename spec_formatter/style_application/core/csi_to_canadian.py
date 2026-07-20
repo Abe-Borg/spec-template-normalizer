@@ -16,7 +16,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from spec_formatter.numbering_roles import role_from_numbering_signature
+from spec_formatter.numbering_roles import (
+    role_from_numbering_catalog,
+    role_from_numbering_signature,
+)
+from spec_formatter.role_contract import (
+    BODY_HIERARCHY_ROLES,
+    NUMBERED_BODY_ROLES,
+    ROLE_LEVEL,
+    ROLE_PARENT,
+)
 
 from .classification import (
     _build_numbering_catalog,
@@ -38,9 +47,7 @@ from .xml_helpers import (
 FORMAT_ONLY = "format_only"
 CSI_TO_CANADIAN = "csi_to_canadian"
 VALID_CONVERSION_MODES = frozenset({FORMAT_ONLY, CSI_TO_CANADIAN})
-NUMBERED_ROLES = frozenset(
-    {"ARTICLE", "PARAGRAPH", "SUBPARAGRAPH", "SUBSUBPARAGRAPH"}
-)
+NUMBERED_ROLES = NUMBERED_BODY_ROLES
 
 
 def validate_conversion_mode(value: object) -> str:
@@ -139,9 +146,21 @@ _ROLE_MARKERS = {
         re.IGNORECASE,
     ),
     "ARTICLE": re.compile(r"^\s*(?P<marker>\d{1,2}\.\d{1,3})(?=\s|$)"),
-    "PARAGRAPH": re.compile(r"^\s*(?P<marker>[A-Z][.)]|\.\d+)(?=\s|$)"),
-    "SUBPARAGRAPH": re.compile(r"^\s*(?P<marker>\d+[.)]|\.\d+)(?=\s|$)"),
-    "SUBSUBPARAGRAPH": re.compile(r"^\s*(?P<marker>[a-z][.)]|\.\d+)(?=\s|$)"),
+    "PARAGRAPH": re.compile(r"^\s*(?P<marker>[A-Z]\.|\.\d+)(?=\s|$)"),
+    "SUBPARAGRAPH": re.compile(r"^\s*(?P<marker>\d+\.|\.\d+)(?=\s|$)"),
+    "SUBSUBPARAGRAPH": re.compile(r"^\s*(?P<marker>[a-z]\.|\.\d+)(?=\s|$)"),
+    "SUBPARAGRAPH_LEVEL_5": re.compile(
+        r"^\s*(?P<marker>\d+\)|\.\d+)(?=\s|$)"
+    ),
+    "SUBPARAGRAPH_LEVEL_6": re.compile(
+        r"^\s*(?P<marker>[a-z]\)|\.\d+)(?=\s|$)"
+    ),
+    "SUBPARAGRAPH_LEVEL_7": re.compile(
+        r"^\s*(?P<marker>\(\d+\)|\.\d+)(?=\s|$)"
+    ),
+    "SUBPARAGRAPH_LEVEL_8": re.compile(
+        r"^\s*(?P<marker>\([a-z]\)|\.\d+)(?=\s|$)"
+    ),
 }
 # These variants omit delimiter lookaheads because a visible delimiter can be
 # a sibling ``w:tab`` element and therefore absent from the joined ``w:t``
@@ -152,13 +171,19 @@ _RAW_ROLE_MARKERS = {
         re.IGNORECASE,
     ),
     "ARTICLE": re.compile(r"^\s*(?P<marker>\d{1,2}\.\d{1,3})"),
-    "PARAGRAPH": re.compile(r"^\s*(?P<marker>[A-Z][.)]|\.\d+)"),
-    "SUBPARAGRAPH": re.compile(r"^\s*(?P<marker>\d+[.)]|\.\d+)"),
-    "SUBSUBPARAGRAPH": re.compile(r"^\s*(?P<marker>[a-z][.)]|\.\d+)"),
+    "PARAGRAPH": re.compile(r"^\s*(?P<marker>[A-Z]\.|\.\d+)"),
+    "SUBPARAGRAPH": re.compile(r"^\s*(?P<marker>\d+\.|\.\d+)"),
+    "SUBSUBPARAGRAPH": re.compile(r"^\s*(?P<marker>[a-z]\.|\.\d+)"),
+    "SUBPARAGRAPH_LEVEL_5": re.compile(r"^\s*(?P<marker>\d+\)|\.\d+)"),
+    "SUBPARAGRAPH_LEVEL_6": re.compile(r"^\s*(?P<marker>[a-z]\)|\.\d+)"),
+    "SUBPARAGRAPH_LEVEL_7": re.compile(r"^\s*(?P<marker>\(\d+\)|\.\d+)"),
+    "SUBPARAGRAPH_LEVEL_8": re.compile(r"^\s*(?P<marker>\([a-z]\)|\.\d+)"),
 }
 _ANY_MARKERS = (
     re.compile(r"^\s*\d{1,2}\.\d{1,3}"),
     re.compile(r"^\s*\.\d+"),
+    re.compile(r"^\s*\(\d+\)"),
+    re.compile(r"^\s*\([a-z]\)"),
     re.compile(r"^\s*[A-Z][.)]"),
     re.compile(r"^\s*[a-z][.)]"),
     re.compile(r"^\s*\d+[.)]"),
@@ -223,7 +248,12 @@ def _detect_any_literal_marker(text: str) -> Optional[str]:
     return None
 
 
-def _validate_canadian_role_contract(role: str, spec: object) -> None:
+def _validate_canadian_role_contract(
+    role: str,
+    spec: object,
+    *,
+    allow_numeric_part: bool = False,
+) -> None:
     if not isinstance(spec, dict):
         raise ValueError(
             f"Canadian conversion requires a complete architect role contract for {role}."
@@ -259,8 +289,12 @@ def _validate_canadian_role_contract(role: str, spec: object) -> None:
             f"(numFmt={num_fmt!r})."
         )
     if role == "PART":
-        valid = re.fullmatch(r"\s*PART\s+%\d+\s*", lvl_text, re.IGNORECASE)
-        expected = "PART %1"
+        labeled_part = re.fullmatch(
+            r"\s*PART\s+%\d+\s*", lvl_text, re.IGNORECASE
+        )
+        numeric_part = re.fullmatch(r"\s*%\d+\.?\s*", lvl_text)
+        valid = labeled_part or (numeric_part if allow_numeric_part else None)
+        expected = "PART %1 (or %1 / %1. in a proven CSC hierarchy)"
     elif role == "ARTICLE":
         valid = re.fullmatch(r"\s*%\d+\s*\.\s*%\d+\s*", lvl_text)
         expected = "%1.%2"
@@ -285,19 +319,34 @@ def _validate_complete_article_hierarchy(
             "Canadian article conversion requires a classified PART heading in the target "
             "so Word can establish the article's part number."
         )
-    _validate_canadian_role_contract("PART", role_specs.get("PART"))
+    _validate_canadian_role_contract(
+        "PART",
+        role_specs.get("PART"),
+        allow_numeric_part=True,
+    )
     expected_levels = {
-        "PART": ("0", re.compile(r"\s*PART\s+%1\s*", re.IGNORECASE)),
+        "PART": (
+            "0",
+            re.compile(r"\s*(?:PART\s+%1|%1\.?)\s*", re.IGNORECASE),
+        ),
         "ARTICLE": ("1", re.compile(r"\s*%1\s*\.\s*%2\s*")),
-        "PARAGRAPH": ("2", re.compile(r"\s*\.\s*%3\s*")),
-        "SUBPARAGRAPH": ("3", re.compile(r"\s*\.\s*%4\s*")),
-        "SUBSUBPARAGRAPH": ("4", re.compile(r"\s*\.\s*%5\s*")),
+        **{
+            role: (
+                str(ROLE_LEVEL[role]),
+                re.compile(rf"\s*\.\s*%{ROLE_LEVEL[role] + 1}\s*"),
+            )
+            for role in BODY_HIERARCHY_ROLES[2:]
+        },
     }
     relevant = [role for role in expected_levels if role in roles_in_target]
     reference_num_id: Optional[str] = None
     for role in relevant:
         spec = role_specs.get(role)
-        _validate_canadian_role_contract(role, spec)
+        _validate_canadian_role_contract(
+            role,
+            spec,
+            allow_numeric_part=(role == "PART"),
+        )
         assert isinstance(spec, dict)
         pattern = spec["numbering_pattern"]
         num_id = str(pattern.get("numId") or "")
@@ -310,9 +359,13 @@ def _validate_complete_article_hierarchy(
                 f"hierarchy; architect role {role} has ilvl={ilvl!r}, "
                 f"lvlText={lvl_text!r}."
             )
+        if not num_id:
+            raise ValueError(
+                f"Architect role {role} is missing its Word numbering list identifier."
+            )
         if reference_num_id is None:
             reference_num_id = num_id
-        elif not num_id or num_id != reference_num_id:
+        elif num_id != reference_num_id:
             raise ValueError(
                 "Canadian PART, article, and subordinate roles must share one Word "
                 "multilevel numbering list."
@@ -392,19 +445,18 @@ def _literal_counter(role: str, literal: _LiteralMarker) -> Tuple[Optional[int],
         return int(part), int(article)
     if marker.startswith("."):
         return None, int(marker[1:])
-    value = marker[:-1]
-    if role in {"PARAGRAPH", "SUBSUBPARAGRAPH"}:
+    value = marker[1:-1] if marker.startswith("(") else marker[:-1]
+    if role in {
+        "PARAGRAPH",
+        "SUBSUBPARAGRAPH",
+        "SUBPARAGRAPH_LEVEL_6",
+        "SUBPARAGRAPH_LEVEL_8",
+    }:
         return None, _alpha_to_int(value)
     return None, int(value)
 
 
-_ROLE_LEVEL = {
-    "PART": 0,
-    "ARTICLE": 1,
-    "PARAGRAPH": 2,
-    "SUBPARAGRAPH": 3,
-    "SUBSUBPARAGRAPH": 4,
-}
+_ROLE_LEVEL = ROLE_LEVEL
 
 
 def _validate_source_sequence(evidence: list[_SourceEvidence]) -> None:
@@ -428,11 +480,9 @@ def _validate_source_sequence(evidence: list[_SourceEvidence]) -> None:
             if deeper_level > level:
                 active.pop(deeper_role, None)
 
-        parent = {
-            "ARTICLE": "PART",
-            "SUBPARAGRAPH": "PARAGRAPH",
-            "SUBSUBPARAGRAPH": "SUBPARAGRAPH",
-        }.get(item.role)
+        parent = ROLE_PARENT.get(item.role)
+        if item.role == "PARAGRAPH":
+            parent = None
         if item.role == "PARAGRAPH" and "ARTICLE" in roles_present:
             parent = "ARTICLE"
         if parent is not None and parent not in active:
@@ -557,6 +607,7 @@ def _validate_numbering_start(
 def _validate_automatic_source(
     item: _SourceEvidence,
     numbering_root: Optional[ET.Element],
+    numbering_catalog: Dict[str, Any],
 ) -> None:
     if numbering_root is None or item.automatic_numpr is None:
         raise ValueError(
@@ -568,16 +619,22 @@ def _validate_automatic_source(
         raise ValueError(
             f"Paragraph {item.paragraph_index} automatic numbering cannot be resolved."
         )
-    inferred = role_from_numbering_signature(
-        pattern.get("numFmt"), pattern.get("lvlText"), pattern.get("ilvl")
+    num_id = str(item.automatic_numpr["numId"])
+    ilvl = str(item.automatic_numpr.get("ilvl", "0"))
+    inferred = role_from_numbering_catalog(
+        numbering_catalog,
+        num_id,
+        ilvl,
     )
+    if inferred is None:
+        inferred = role_from_numbering_signature(
+            pattern.get("numFmt"), pattern.get("lvlText"), pattern.get("ilvl")
+        )
     if inferred != item.role:
         raise ValueError(
             f"Paragraph {item.paragraph_index} is classified as {item.role}, but its "
             f"automatic numbering signature resolves to {inferred or 'no safe role'}."
         )
-    num_id = str(item.automatic_numpr["numId"])
-    ilvl = str(item.automatic_numpr.get("ilvl", "0"))
     level, override = _find_numbering_level(numbering_root, num_id, ilvl)
     _validate_numbering_start(
         level,
@@ -785,7 +842,11 @@ def plan_csi_to_canadian(
     if "PART" in roles_in_target and isinstance(part_spec, dict) and part_spec.get(
         "numbering_provenance"
     ) in {"style_numpr", "direct_numpr"}:
-        _validate_canadian_role_contract("PART", part_spec)
+        _validate_canadian_role_contract(
+            "PART",
+            part_spec,
+            allow_numeric_part=("ARTICLE" in roles_in_target),
+        )
         roles_to_convert.add("PART")
     if architect_numbering_xml is not None:
         _validate_architect_numbering(
@@ -898,7 +959,7 @@ def plan_csi_to_canadian(
     for item in evidence:
         if item.source_kind != "automatic":
             continue
-        _validate_automatic_source(item, numbering_root)
+        _validate_automatic_source(item, numbering_root, numbering_catalog)
         assert item.automatic_numpr is not None
         automatic_ids.setdefault(item.role, set()).add(item.automatic_numpr["numId"])
         automatic_by_index[item.paragraph_index] = item

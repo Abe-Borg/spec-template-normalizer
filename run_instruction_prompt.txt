@@ -6,6 +6,9 @@ Using the slim bundle, normalize CSI semantics by ensuring consistent paragraph 
 - Paragraphs (CSI A., B. or Canadian .1, .2)
 - Subparagraphs (CSI 1., 2. or the next indented Canadian .1, .2 level)
 - Sub-subparagraphs (CSI a., b. or the next indented Canadian .1, .2 level)
+- Deeper numbered subparagraph levels through Word ilvl 8, using
+  SUBPARAGRAPH_LEVEL_5 through SUBPARAGRAPH_LEVEL_8 without collapsing them
+  into SUBSUBPARAGRAPH
 - End-of-section markers
 
 You MUST also output a "roles" mapping (role → {styleId, exemplar_paragraph_index}) as described in the master prompt.

@@ -14,6 +14,11 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, Iterable, List, Optional, Set
 
+from spec_formatter.role_contract import (
+    ALLOWED_ARCH_STYLE_IDS as _ALLOWED_ARCH_STYLE_IDS,
+    ALLOWED_ROLES as _ALLOWED_ROLES,
+)
+
 
 # ---------------------------------------------------------------------------
 # OOXML namespace declarations for wrapping XML fragments
@@ -67,33 +72,10 @@ _REQUIRED_TOP_LEVEL_KEYS = {
 }
 _TEMPLATE_SCHEMA_VERSION = "1.0.0"
 
-# All supported roles for the architect style contract.
-_ALLOWED_ROLES = {
-    "SectionID",
-    "SectionTitle",
-    "PART",
-    "ARTICLE",
-    "PARAGRAPH",
-    "SUBPARAGRAPH",
-    "SUBSUBPARAGRAPH",
-    "END_OF_SECTION",
-}
-
-_ALLOWED_ARCH_STYLE_IDS = {
-    "CSI_SectionTitle__ARCH",
-    "CSI_SectionID__ARCH",
-    "CSI_Part__ARCH",
-    "CSI_Article__ARCH",
-    "CSI_Paragraph__ARCH",
-    "CSI_Subparagraph__ARCH",
-    "CSI_Subsubparagraph__ARCH",
-    "CSI_EndOfSection__ARCH",
-}
-
 # Public immutable views for callers that need to build prompts or perform
 # additional semantic checks without maintaining a second role list.
-ALLOWED_ROLES = frozenset(_ALLOWED_ROLES)
-ALLOWED_ARCH_STYLE_IDS = frozenset(_ALLOWED_ARCH_STYLE_IDS)
+ALLOWED_ROLES = _ALLOWED_ROLES
+ALLOWED_ARCH_STYLE_IDS = _ALLOWED_ARCH_STYLE_IDS
 
 
 # ---------------------------------------------------------------------------

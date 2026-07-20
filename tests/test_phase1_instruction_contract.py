@@ -38,6 +38,50 @@ def test_instruction_contract_supports_end_of_section_and_partitioned_coverage()
     validate_instruction_contract(_instructions(), expected_paragraph_indices=[0, 1, 2])
 
 
+def test_instruction_and_registry_contracts_accept_deep_subparagraph_role():
+    instructions = {
+        "create_styles": [
+            {
+                "styleId": "CSI_SubparagraphLevel5__ARCH",
+                "derive_from_paragraph_index": 0,
+                "role": "SUBPARAGRAPH_LEVEL_5",
+            }
+        ],
+        "apply_pStyle": [
+            {"paragraph_index": 0, "styleId": "CSI_SubparagraphLevel5__ARCH"}
+        ],
+        "ignored_paragraphs": [],
+        "roles": {
+            "SUBPARAGRAPH_LEVEL_5": {
+                "styleId": "CSI_SubparagraphLevel5__ARCH",
+                "exemplar_paragraph_index": 0,
+            }
+        },
+    }
+    validate_instruction_contract(instructions, expected_paragraph_indices=[0])
+    validate_style_registry(
+        {
+            "version": 2,
+            "source_docx": "source.docx",
+            "source_sha256": "a" * 64,
+            "source_tokens": {},
+            "roles": {
+                "SUBPARAGRAPH_LEVEL_5": {
+                    "style_id": "CSI_SubparagraphLevel5__ARCH",
+                    "exemplar_paragraph_index": 0,
+                    "numbering_provenance": "direct_numpr",
+                    "numbering_pattern": {
+                        "numId": "9",
+                        "ilvl": "5",
+                        "numFmt": "decimal",
+                        "lvlText": ".%6",
+                    },
+                }
+            },
+        }
+    )
+
+
 def test_instruction_contract_rejects_overlap_between_applied_and_ignored():
     instructions = _instructions()
     instructions["ignored_paragraphs"].append({"paragraph_index": 0, "reason": "wrong"})
@@ -172,3 +216,9 @@ def test_json_schemas_expose_runtime_contract_fields():
     assert "source_tokens" in style_v2["properties"]
     assert "source_sha256" in style_v2["properties"]
     assert "END_OF_SECTION" in style_v2["properties"]["roles"]["properties"]
+    for level in range(5, 9):
+        role = f"SUBPARAGRAPH_LEVEL_{level}"
+        style_id = f"CSI_SubparagraphLevel{level}__ARCH"
+        assert role in instructions["properties"]["roles"]["properties"]
+        assert style_id in instructions["$defs"]["reservedStyleId"]["enum"]
+        assert role in style_v2["properties"]["roles"]["properties"]

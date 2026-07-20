@@ -3,7 +3,10 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from spec_formatter.numbering_roles import role_from_numbering_signature
+from spec_formatter.numbering_roles import (
+    role_from_numbering_catalog,
+    role_from_numbering_signature,
+)
 
 # CSI headings occur in substantially more forms than the canonical examples in
 # the prompt. In particular, Word templates commonly use non-breaking spaces,
@@ -26,6 +29,10 @@ RE_ARTICLE = re.compile(r"^\d{1,2}\.\d{2,3}(?:\s+|$)")
 RE_ALPHA_PARA = re.compile(r"^[A-Z](?:\.|\))\s+")
 RE_NUMERIC_SUB = re.compile(r"^\d+(?:\.|\))\s+")
 RE_LOWER_SUBSUB = re.compile(r"^[a-z](?:\.|\))\s+")
+RE_LEVEL_5_SUB = re.compile(r"^\d+\)\s+")
+RE_LEVEL_6_SUB = re.compile(r"^[a-z]\)\s+")
+RE_LEVEL_7_SUB = re.compile(r"^\(\d+\)\s+")
+RE_LEVEL_8_SUB = re.compile(r"^\([a-z]\)\s+")
 RE_END_OF_SECTION = re.compile(
     rf"^END{_WS}+OF{_WS}+(?:SECTION|DIVISION)"
     rf"(?:{_WS}+\d{{2}}(?:{_WS}*[-\u2010-\u2015]?{_WS}*\d{{2}}){{2}})?"
@@ -165,7 +172,13 @@ def is_role_candidate_paragraph(paragraph: Dict[str, Any]) -> bool:
     ) is None
 
 
-def detect_role_signal(text: str, *, numeric_is_strong: bool, lower_is_strong: bool) -> Optional[str]:
+def detect_role_signal(
+    text: str,
+    *,
+    numeric_is_strong: bool,
+    lower_is_strong: bool,
+    deep_is_strong: bool = False,
+) -> Optional[str]:
     txt = (text or "").strip()
     if not txt:
         return None
@@ -179,6 +192,14 @@ def detect_role_signal(text: str, *, numeric_is_strong: bool, lower_is_strong: b
         return "ARTICLE"
     if RE_ALPHA_PARA.match(txt):
         return "PARAGRAPH"
+    if deep_is_strong and RE_LEVEL_7_SUB.match(txt):
+        return "SUBPARAGRAPH_LEVEL_7"
+    if deep_is_strong and RE_LEVEL_8_SUB.match(txt):
+        return "SUBPARAGRAPH_LEVEL_8"
+    if deep_is_strong and RE_LEVEL_5_SUB.match(txt):
+        return "SUBPARAGRAPH_LEVEL_5"
+    if deep_is_strong and RE_LEVEL_6_SUB.match(txt):
+        return "SUBPARAGRAPH_LEVEL_6"
     if numeric_is_strong and RE_NUMERIC_SUB.match(txt):
         return "SUBPARAGRAPH"
     if lower_is_strong and RE_LOWER_SUBSUB.match(txt):
@@ -224,7 +245,9 @@ def detect_numbering_role(
             lvl_text = str(override.get("lvlText", lvl_text) or "")
             break
 
-    return role_from_numbering_signature(num_fmt, lvl_text, ilvl)
+    return role_from_numbering_catalog(numbering_catalog, num_id, ilvl) or (
+        role_from_numbering_signature(num_fmt, lvl_text, ilvl)
+    )
 
 
 def infer_expected_roles(
@@ -242,6 +265,10 @@ def infer_expected_roles(
         "PARAGRAPH": [],
         "SUBPARAGRAPH": [],
         "SUBSUBPARAGRAPH": [],
+        "SUBPARAGRAPH_LEVEL_5": [],
+        "SUBPARAGRAPH_LEVEL_6": [],
+        "SUBPARAGRAPH_LEVEL_7": [],
+        "SUBPARAGRAPH_LEVEL_8": [],
         "END_OF_SECTION": [],
     }
 
@@ -251,6 +278,7 @@ def infer_expected_roles(
     # in a title page or option list into a structural role.
     alpha_context = False
     numeric_context = False
+    deep_context = False
     for p in classifiable:
         idx = int(p["paragraph_index"])
         text = (p.get("text") or "").strip()
@@ -258,6 +286,7 @@ def infer_expected_roles(
             text,
             numeric_is_strong=alpha_context,
             lower_is_strong=numeric_context,
+            deep_is_strong=deep_context,
         )
         if signal:
             expected.add(signal)
@@ -272,11 +301,22 @@ def infer_expected_roles(
             if signal in {"SectionID", "SectionTitle", "PART", "ARTICLE", "END_OF_SECTION"}:
                 alpha_context = False
                 numeric_context = False
+                deep_context = False
             elif signal == "PARAGRAPH":
                 alpha_context = True
                 numeric_context = False
+                deep_context = True
             elif signal == "SUBPARAGRAPH":
                 numeric_context = True
+                deep_context = True
+            elif signal in {
+                "SUBSUBPARAGRAPH",
+                "SUBPARAGRAPH_LEVEL_5",
+                "SUBPARAGRAPH_LEVEL_6",
+                "SUBPARAGRAPH_LEVEL_7",
+                "SUBPARAGRAPH_LEVEL_8",
+            }:
+                deep_context = True
 
     for idx in section_indices:
         nxt = next((p for p in classifiable if int(p["paragraph_index"]) == idx + 1), None)

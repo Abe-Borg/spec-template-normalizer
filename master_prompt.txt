@@ -25,13 +25,17 @@ Rules:
    - CSI_Paragraph__ARCH
    - CSI_Subparagraph__ARCH
    - CSI_Subsubparagraph__ARCH
+   - CSI_SubparagraphLevel5__ARCH
+   - CSI_SubparagraphLevel6__ARCH
+   - CSI_SubparagraphLevel7__ARCH
+   - CSI_SubparagraphLevel8__ARCH
    - CSI_EndOfSection__ARCH
 4) If you create a new CSI_*__ARCH style, choose a derive_from_paragraph_index that is a clean exemplar of that role
    (not blank, not an empty structural section break, not in-table, not a weird edge-case). END OF SECTION is a first-class role and
    its own line is the correct exemplar for CSI_EndOfSection__ARCH.
    If the exemplar has pStyle, basedOn MUST equal that exact pStyle. If it has no pStyle, use the catalog's default
    paragraph style (or null when no default is identified). Never guess "Normal".
-5) Determine hierarchy using text patterns AND numbering/indent hints, including Word numbering metadata (numPr), not just visible numbering text. The architect template may use conventional CSI markers (1.01 / A. / 1. / a.) or Canadian CSC PageFormat numeric markers (1.1 / .1 / .1 / .1); use indentation, list level, and surrounding hierarchy to distinguish repeated Canadian .1 levels.
+5) Determine hierarchy using text patterns AND numbering/indent hints, including Word numbering metadata (numPr), not just visible numbering text. The architect template may use conventional CSI markers (1.01 / A. / 1. / a. / 1) / a) / (1) / (a)) or Canadian CSC PageFormat numeric markers (1.1 / .1 / .1 / .1); use indentation, list level, and surrounding hierarchy to distinguish repeated Canadian .1 levels. Preserve every distinct numbered level through Word ilvl 8. When hierarchy continues below SUBSUBPARAGRAPH, use SUBPARAGRAPH_LEVEL_5, SUBPARAGRAPH_LEVEL_6, SUBPARAGRAPH_LEVEL_7, and SUBPARAGRAPH_LEVEL_8. In a full CSC list whose PART and ARTICLE occupy ilvl 0 and 1, those roles correspond to ilvl 5 through 8; in other list layouts use the complete list context rather than assuming that absolute mapping. Never collapse a deeper numbered level into SUBSUBPARAGRAPH merely because its visible marker repeats.
 6) You MUST output a deterministic role→style mapping under top-level key "roles".
    Allowed role keys are EXACTLY:
    - SectionID (optional; only if section number line exists as its own paragraph)
@@ -41,6 +45,10 @@ Rules:
    - PARAGRAPH
    - SUBPARAGRAPH
    - SUBSUBPARAGRAPH (optional)
+   - SUBPARAGRAPH_LEVEL_5 (optional; hierarchy below SUBSUBPARAGRAPH)
+   - SUBPARAGRAPH_LEVEL_6 (optional)
+   - SUBPARAGRAPH_LEVEL_7 (optional)
+   - SUBPARAGRAPH_LEVEL_8 (optional)
    - END_OF_SECTION (when an END OF SECTION/DIVISION line exists)
    For each included role:
    - styleId: exact Word w:styleId string

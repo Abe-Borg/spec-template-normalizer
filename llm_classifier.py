@@ -17,6 +17,7 @@ from paragraph_rules import (
     is_classifiable_paragraph,
     infer_expected_roles,
 )
+from spec_formatter.role_contract import ROLE_TO_ARCH_STYLE, ROLE_TO_STYLE_NAME
 
 
 MAX_SINGLE_PASS_INPUT_TOKENS = 150_000
@@ -264,29 +265,7 @@ def _repair_missing_roles(
     if not missing:
         return 0
 
-    # Mapping: role name → canonical CSI_*__ARCH styleId
-    ROLE_TO_ARCH_STYLE = {
-        "SectionID": "CSI_SectionID__ARCH",
-        "SectionTitle": "CSI_SectionTitle__ARCH",
-        "PART": "CSI_Part__ARCH",
-        "ARTICLE": "CSI_Article__ARCH",
-        "PARAGRAPH": "CSI_Paragraph__ARCH",
-        "SUBPARAGRAPH": "CSI_Subparagraph__ARCH",
-        "SUBSUBPARAGRAPH": "CSI_Subsubparagraph__ARCH",
-        "END_OF_SECTION": "CSI_EndOfSection__ARCH",
-    }
-
-    ROLE_TO_STYLE_NAME = {
-        "SectionID": "CSI SectionID (Architect Template)",
-        "SectionTitle": "CSI SectionTitle (Architect Template)",
-        "PART": "CSI Part (Architect Template)",
-        "ARTICLE": "CSI Article (Architect Template)",
-        "PARAGRAPH": "CSI Paragraph (Architect Template)",
-        "SUBPARAGRAPH": "CSI Subparagraph (Architect Template)",
-        "SUBSUBPARAGRAPH": "CSI Subsubparagraph (Architect Template)",
-        "END_OF_SECTION": "CSI End of Section (Architect Template)",
-    }
-
+    # Canonical role/style metadata is shared with both contract validators.
     # Build working indices
     apply_list = instructions.get("apply_pStyle", [])
     apply_map: Dict[int, dict] = {

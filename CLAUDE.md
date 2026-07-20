@@ -128,6 +128,10 @@ Allowed roles and reserved generated style IDs are:
 | `PARAGRAPH` | `CSI_Paragraph__ARCH` |
 | `SUBPARAGRAPH` | `CSI_Subparagraph__ARCH` |
 | `SUBSUBPARAGRAPH` | `CSI_Subsubparagraph__ARCH` |
+| `SUBPARAGRAPH_LEVEL_5` | `CSI_SubparagraphLevel5__ARCH` |
+| `SUBPARAGRAPH_LEVEL_6` | `CSI_SubparagraphLevel6__ARCH` |
+| `SUBPARAGRAPH_LEVEL_7` | `CSI_SubparagraphLevel7__ARCH` |
+| `SUBPARAGRAPH_LEVEL_8` | `CSI_SubparagraphLevel8__ARCH` |
 | `END_OF_SECTION` | `CSI_EndOfSection__ARCH` |
 
 Role expectations come from text signals and effective Word numbering, including numbering inherited through paragraph styles. Do not treat arbitrary `A.`, `1.`, or `a.` text globally as proof of CSI hierarchy. Validate exemplars, role/style coherence, numbering family/level coverage, style inheritance, and style references against the source catalogs.

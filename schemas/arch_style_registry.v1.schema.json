@@ -18,6 +18,10 @@
         "PARAGRAPH": { "$ref": "#/$defs/roleSpec" },
         "SUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" },
         "SUBSUBPARAGRAPH": { "$ref": "#/$defs/roleSpec" },
+        "SUBPARAGRAPH_LEVEL_5": { "$ref": "#/$defs/roleSpec" },
+        "SUBPARAGRAPH_LEVEL_6": { "$ref": "#/$defs/roleSpec" },
+        "SUBPARAGRAPH_LEVEL_7": { "$ref": "#/$defs/roleSpec" },
+        "SUBPARAGRAPH_LEVEL_8": { "$ref": "#/$defs/roleSpec" },
         "END_OF_SECTION": { "$ref": "#/$defs/roleSpec" }
       }
     }

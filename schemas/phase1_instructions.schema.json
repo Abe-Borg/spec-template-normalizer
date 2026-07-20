@@ -44,6 +44,10 @@
         "PARAGRAPH": {"$ref": "#/$defs/roleSpec"},
         "SUBPARAGRAPH": {"$ref": "#/$defs/roleSpec"},
         "SUBSUBPARAGRAPH": {"$ref": "#/$defs/roleSpec"},
+        "SUBPARAGRAPH_LEVEL_5": {"$ref": "#/$defs/roleSpec"},
+        "SUBPARAGRAPH_LEVEL_6": {"$ref": "#/$defs/roleSpec"},
+        "SUBPARAGRAPH_LEVEL_7": {"$ref": "#/$defs/roleSpec"},
+        "SUBPARAGRAPH_LEVEL_8": {"$ref": "#/$defs/roleSpec"},
         "END_OF_SECTION": {"$ref": "#/$defs/roleSpec"}
       }
     },
@@ -72,6 +76,10 @@
         "CSI_Paragraph__ARCH",
         "CSI_Subparagraph__ARCH",
         "CSI_Subsubparagraph__ARCH",
+        "CSI_SubparagraphLevel5__ARCH",
+        "CSI_SubparagraphLevel6__ARCH",
+        "CSI_SubparagraphLevel7__ARCH",
+        "CSI_SubparagraphLevel8__ARCH",
         "CSI_EndOfSection__ARCH"
       ]
     },

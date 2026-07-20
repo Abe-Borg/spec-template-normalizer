@@ -10,7 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
 
-from spec_formatter.numbering_roles import role_from_numbering_signature
+from spec_formatter.numbering_roles import (
+    role_from_numbering_catalog,
+    role_from_numbering_signature,
+)
+from spec_formatter.role_contract import BODY_HIERARCHY_ROLES, ROLE_FALLBACKS
 
 from .xml_helpers import (
     iter_paragraph_xml_blocks,
@@ -130,6 +134,10 @@ _MARKER_RX = [
     (re.compile(r"^\s*[A-Z]\.\s+"), "upper_alpha"),
     (re.compile(r"^\s*\d+\.\s+"), "number"),
     (re.compile(r"^\s*[a-z]\.\s+"), "lower_alpha"),
+    (re.compile(r"^\s*\d+\)\s+"), "deep_level_5"),
+    (re.compile(r"^\s*[a-z]\)\s+"), "deep_level_6"),
+    (re.compile(r"^\s*\(\d+\)\s+"), "deep_level_7"),
+    (re.compile(r"^\s*\([a-z]\)\s+"), "deep_level_8"),
 ]
 
 
@@ -373,17 +381,16 @@ def _numbering_role_candidates(
 
 
 def _resolve_role(preferred: str, available_roles: List[str]) -> Optional[str]:
-    fallback_chain = {
+    special_fallbacks = {
         "SectionID": ["SectionID", "SectionTitle"],
         "END_OF_SECTION": ["END_OF_SECTION"],
-        "SUBSUBPARAGRAPH": ["SUBSUBPARAGRAPH", "SUBPARAGRAPH", "PARAGRAPH"],
-        "SUBPARAGRAPH": ["SUBPARAGRAPH", "PARAGRAPH"],
-        "PARAGRAPH": ["PARAGRAPH"],
-        "PART": ["PART"],
-        "ARTICLE": ["ARTICLE"],
         "SectionTitle": ["SectionTitle"],
     }
-    for candidate in fallback_chain.get(preferred, [preferred]):
+    fallback_chain = special_fallbacks.get(
+        preferred,
+        ROLE_FALLBACKS.get(preferred, (preferred,)),
+    )
+    for candidate in fallback_chain:
         if candidate in available_roles:
             return candidate
     return None
@@ -427,6 +434,14 @@ def _deterministic_role_for_paragraph(paragraph: Dict[str, Any], prev_text: str 
         return "SUBPARAGRAPH"
     if marker_type == "lower_alpha":
         return "SUBSUBPARAGRAPH"
+    if marker_type == "deep_level_5":
+        return "SUBPARAGRAPH_LEVEL_5"
+    if marker_type == "deep_level_6":
+        return "SUBPARAGRAPH_LEVEL_6"
+    if marker_type == "deep_level_7":
+        return "SUBPARAGRAPH_LEVEL_7"
+    if marker_type == "deep_level_8":
+        return "SUBPARAGRAPH_LEVEL_8"
     return None
 
 
@@ -509,11 +524,7 @@ def build_phase2_slim_bundle(
         available_roles = [
             "SectionID",
             "SectionTitle",
-            "PART",
-            "ARTICLE",
-            "PARAGRAPH",
-            "SUBPARAGRAPH",
-            "SUBSUBPARAGRAPH",
+            *BODY_HIERARCHY_ROLES,
         ]
 
     for idx, (start, _e, p_xml) in enumerate(raw_paragraphs):
@@ -581,6 +592,15 @@ def build_phase2_slim_bundle(
             role_specs,
             available_roles,
         )
+        contextual_numbering_role = None
+        if isinstance(effective_numpr, dict):
+            contextual_numbering_role = role_from_numbering_catalog(
+                numbering_catalog,
+                effective_numpr.get("numId"),
+                effective_numpr.get("ilvl", "0"),
+            )
+            if contextual_numbering_role not in available_roles:
+                contextual_numbering_role = None
         pstyle = paragraph_pstyle_from_block(analysis_xml)
         ppr_hints = paragraph_ppr_hints_from_block(analysis_xml)
         rpr_hints = _extract_rpr_hints(analysis_xml)
@@ -600,7 +620,11 @@ def build_phase2_slim_bundle(
             "effective_numPr": effective_numpr,
             "numbering_pattern": numbering_pattern,
             "numbering_match_candidates": numbering_candidates,
-            "numbering_role": numbering_candidates[0] if len(numbering_candidates) == 1 else None,
+            "numbering_role": (
+                numbering_candidates[0]
+                if len(numbering_candidates) == 1
+                else contextual_numbering_role
+            ),
             "contains_sectPr": paragraph_contains_sectpr(analysis_xml),
         })
 
