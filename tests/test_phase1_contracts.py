@@ -87,7 +87,6 @@ def test_coverage_gap_rejected():
     "field,value,match",
     [
         ("text", "", "blank"),
-        ("contains_sectPr", True, "contains sectPr"),
         ("in_table", True, "inside a table"),
     ],
 )

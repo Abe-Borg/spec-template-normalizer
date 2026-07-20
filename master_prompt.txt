@@ -27,7 +27,7 @@ Rules:
    - CSI_Subsubparagraph__ARCH
    - CSI_EndOfSection__ARCH
 4) If you create a new CSI_*__ARCH style, choose a derive_from_paragraph_index that is a clean exemplar of that role
-   (not blank, not a section break, not in-table, not a weird edge-case). END OF SECTION is a first-class role and
+   (not blank, not an empty structural section break, not in-table, not a weird edge-case). END OF SECTION is a first-class role and
    its own line is the correct exemplar for CSI_EndOfSection__ARCH.
    If the exemplar has pStyle, basedOn MUST equal that exact pStyle. If it has no pStyle, use the catalog's default
    paragraph style (or null when no default is identified). Never guess "Normal".
@@ -55,8 +55,10 @@ Rules:
    style merely to obtain full coverage.
    Mark these structural exclusions out of scope (do not list them):
    - Empty/blank paragraphs
-   - Paragraphs with contains_sectPr=true
    - Paragraphs with in_table=true
+   - Paragraphs whose skip_reason is drawing or text_box
+   A visible paragraph may contain sectPr. Classify/style that paragraph normally; the local tool changes only
+   w:pStyle and preserves the sectPr subtree exactly.
    Put these semantic exclusions in ignored_paragraphs with their actual reason:
    - Editor/specifier notes (including bracketed notes)
    - Copyright/distribution notices

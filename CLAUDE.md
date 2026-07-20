@@ -77,7 +77,7 @@ The LLM may select roles, explicit ignored paragraphs, and exemplar indices. It 
 
 ### 4. Explicit classification universe
 
-Structurally out-of-scope paragraphs are limited to empty paragraphs, table paragraphs, and paragraphs containing section properties. Every other candidate index must occur exactly once in one of:
+Structurally out-of-scope paragraphs are limited to empty paragraphs, table paragraphs, and empty structural section-break paragraphs. A visible paragraph remains in the classification universe when its paragraph properties contain `w:sectPr`; its section properties must be preserved exactly. Every other candidate index must occur exactly once in one of:
 
 - `apply_pStyle`: styled CSI content
 - `ignored_paragraphs`: non-CSI/editorial content with a non-empty reason
