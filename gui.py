@@ -14,6 +14,8 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
 from spec_formatter.pipeline import (
+    CSI_TO_CANADIAN,
+    FORMAT_ONLY,
     FormatRunResult,
     collect_target_specs,
     default_template_cache_dir,
@@ -76,6 +78,25 @@ def summarize_batch_results(results: Iterable[object]) -> Tuple[str, str]:
     return "partial", f"Partial: {succeeded}/{total} formatted"
 
 
+def conversion_report_log_lines(item: object) -> tuple[str, ...]:
+    """Render conversion diagnostics for successful or failed target results."""
+
+    report = getattr(item, "conversion_report", None)
+    if report is None:
+        return ()
+    source_path = Path(getattr(item, "source_path", "target.docx"))
+    lines = [
+        f"{source_path.name}: Canadian conversion processed "
+        f"{report.paragraphs_converted} numbered paragraphs and removed "
+        f"{report.literal_markers_removed} typed markers."
+    ]
+    lines.extend(
+        f"{source_path.name} warning p[{issue.paragraph_index}]: {issue.message}"
+        for issue in report.warnings
+    )
+    return tuple(lines)
+
+
 class FormatWorker(threading.Thread):
     """Run the unified pipeline without blocking Tk's event loop."""
 
@@ -87,6 +108,7 @@ class FormatWorker(threading.Thread):
         api_key: str,
         reuse_template_analysis: bool,
         max_workers: int,
+        conversion_mode: str,
         events: queue.Queue,
     ) -> None:
         super().__init__(daemon=False)
@@ -96,6 +118,7 @@ class FormatWorker(threading.Thread):
         self.api_key = api_key
         self.reuse_template_analysis = reuse_template_analysis
         self.max_workers = max_workers
+        self.conversion_mode = conversion_mode
         self.events = events
 
     def _progress(self, message: str) -> None:
@@ -111,6 +134,7 @@ class FormatWorker(threading.Thread):
                 cache_dir=default_template_cache_dir(),
                 force_template_analysis=not self.reuse_template_analysis,
                 max_workers=self.max_workers,
+                conversion_mode=self.conversion_mode,
                 progress=self._progress,
             )
             self.events.put(("complete", result))
@@ -130,7 +154,7 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Specification Formatter")
-        self.geometry("980x860")
+        self.geometry("980x930")
         self.minsize(820, 720)
         self.configure(fg_color=COLORS["bg"])
 
@@ -140,6 +164,8 @@ class App(ctk.CTk):
         self.show_key_var = ctk.BooleanVar(value=False)
         self.reuse_var = ctk.BooleanVar(value=True)
         self.workers_var = ctk.StringVar(value="3")
+        self.conversion_mode_var = ctk.StringVar(value=FORMAT_ONLY)
+        self.mode_controls: list[ctk.CTkRadioButton] = []
         self.target_inputs: list[Path] = []
         self.output_is_automatic = False
         self.events: queue.Queue = queue.Queue()
@@ -242,7 +268,41 @@ class App(ctk.CTk):
         self.target_box.configure(state="disabled")
         self._refresh_target_preview()
 
-        self._section_label(card, "3   Output folder", top=18)
+        self._section_label(card, "3   Output mode", top=18)
+        mode_row = ctk.CTkFrame(card, fg_color="transparent")
+        mode_row.pack(fill="x", padx=22)
+        for label, value in (
+            ("Format only", FORMAT_ONLY),
+            ("Convert CSI hierarchy to Canadian CSC PageFormat", CSI_TO_CANADIAN),
+        ):
+            control = ctk.CTkRadioButton(
+                mode_row,
+                text=label,
+                value=value,
+                variable=self.conversion_mode_var,
+                text_color=COLORS["secondary"],
+                font=_font(13),
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_hover"],
+            )
+            control.pack(side="left", padx=(0, 28))
+            self.mode_controls.append(control)
+        ctk.CTkLabel(
+            card,
+            text=(
+                "Canadian mode converts recognized CSI numbering and hierarchy before "
+                "formatting. The architect template must use automatic Canadian 1.1/.1 "
+                "numbering; each target article needs a preceding Part, and the architect "
+                "must use one coherent automatic Part/list hierarchy. It does not revise "
+                "codes, standards, units, terminology, or technical requirements."
+            ),
+            wraplength=870,
+            justify="left",
+            text_color=COLORS["muted"],
+            font=_font(12),
+        ).pack(anchor="w", padx=22, pady=(7, 0))
+
+        self._section_label(card, "4   Output folder", top=18)
         self._path_row(
             card,
             self.output_var,
@@ -251,7 +311,7 @@ class App(ctk.CTk):
             "Choose Folder",
         )
 
-        self._section_label(card, "4   Anthropic API key", top=18)
+        self._section_label(card, "5   Anthropic API key", top=18)
         key_row = ctk.CTkFrame(card, fg_color="transparent")
         key_row.pack(fill="x", padx=22)
         self.api_entry = ctk.CTkEntry(
@@ -548,8 +608,16 @@ class App(ctk.CTk):
         self.last_result = None
         self.active_output_dir = Path(output)
         self._clear_log()
-        self._append_log("Starting specification formatting...")
-        self.run_button.configure(state="disabled", text="FORMATTING…")
+        conversion_mode = self.conversion_mode_var.get()
+        mode_label = (
+            "Canadian CSC PageFormat conversion"
+            if conversion_mode == CSI_TO_CANADIAN
+            else "Format only"
+        )
+        self._append_log(f"Starting specification processing. Output mode: {mode_label}")
+        self.run_button.configure(state="disabled", text="PROCESSING...")
+        for control in self.mode_controls:
+            control.configure(state="disabled")
         self.open_button.configure(state="disabled")
         self.status_label.configure(text="Checking files", text_color=COLORS["secondary"])
         self.progress.start()
@@ -560,6 +628,7 @@ class App(ctk.CTk):
             api_key=self.api_key_var.get(),
             reuse_template_analysis=self.reuse_var.get(),
             max_workers=int(self.workers_var.get()),
+            conversion_mode=conversion_mode,
             events=self.events,
         )
         self.worker.start()
@@ -583,6 +652,8 @@ class App(ctk.CTk):
         self.progress.stop()
         self.progress.set(0)
         self.run_button.configure(state="normal", text="FORMAT SPECS")
+        for control in self.mode_controls:
+            control.configure(state="normal")
 
     def _handle_complete(self, result: FormatRunResult) -> None:
         self._finish_busy_state()
@@ -599,6 +670,8 @@ class App(ctk.CTk):
                 self._append_log(f"Output: {item.output_path}")
             else:
                 self._append_log(f"Failed: {item.source_path.name} — {item.error}")
+            for line in conversion_report_log_lines(item):
+                self._append_log(line)
         self.open_button.configure(state="normal")
         log_path = self._save_log(result.output_dir)
         if log_path is not None:

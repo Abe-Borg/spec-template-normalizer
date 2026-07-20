@@ -2,10 +2,10 @@ Task:
 Using the slim bundle, normalize CSI semantics by ensuring consistent paragraph styles for:
 - Section header (SectionID optional + SectionTitle)
 - PART headings
-- Articles (1.01…)
-- Paragraphs (A., B.)
-- Subparagraphs (1., 2.)
-- Sub-subparagraphs (a., b.)
+- Articles (CSI 1.01… or Canadian 1.1…)
+- Paragraphs (CSI A., B. or Canadian .1, .2)
+- Subparagraphs (CSI 1., 2. or the next indented Canadian .1, .2 level)
+- Sub-subparagraphs (CSI a., b. or the next indented Canadian .1, .2 level)
 - End-of-section markers
 
 You MUST also output a "roles" mapping (role → {styleId, exemplar_paragraph_index}) as described in the master prompt.

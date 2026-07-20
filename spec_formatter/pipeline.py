@@ -25,6 +25,12 @@ from .style_application.batch_runner import (
     load_and_validate_shared_config,
     process_single_file,
 )
+from .style_application.core.csi_to_canadian import (
+    CSI_TO_CANADIAN,
+    FORMAT_ONLY,
+    CanadianConversionReport,
+    validate_conversion_mode,
+)
 
 
 ProgressCallback = Callable[[str], None]
@@ -32,7 +38,11 @@ TemplateClassifier = Callable[..., dict[str, Any]]
 TemplateAnalyzer = Callable[..., template_analysis.Phase1Result]
 TargetProcessor = Callable[..., BatchResult]
 
-_FORMATTED_SUFFIXES = ("_FORMATTED.DOCX", "_PHASE2_FORMATTED.DOCX")
+_FORMATTED_SUFFIXES = (
+    "_FORMATTED.DOCX",
+    "_CANADIAN_FORMATTED.DOCX",
+    "_PHASE2_FORMATTED.DOCX",
+)
 _MAX_WORKERS = 6
 
 
@@ -55,6 +65,7 @@ class TargetFormatResult:
     log: tuple[str, ...]
     error: Optional[str]
     duration_seconds: float
+    conversion_report: Optional[CanadianConversionReport] = None
 
 
 @dataclass(frozen=True)
@@ -411,7 +422,10 @@ def _safe_filename_fragment(value: str) -> str:
 def _plan_output_paths(
     targets: Sequence[Path],
     output_dir: Path,
+    conversion_mode: str = FORMAT_ONLY,
 ) -> dict[Path, Path]:
+    conversion_mode = validate_conversion_mode(conversion_mode)
+    suffix = "_CANADIAN_FORMATTED.docx" if conversion_mode == CSI_TO_CANADIAN else "_FORMATTED.docx"
     stem_counts: dict[str, int] = {}
     for target in targets:
         key = target.stem.casefold()
@@ -422,11 +436,11 @@ def _plan_output_paths(
     for target in targets:
         stem = target.stem
         if stem_counts[stem.casefold()] == 1:
-            filename = f"{stem}_FORMATTED.docx"
+            filename = f"{stem}{suffix}"
         else:
             parent = _safe_filename_fragment(target.parent.name)
             digest = hashlib.sha1(str(target).encode("utf-8")).hexdigest()[:8]
-            filename = f"{stem}__{parent}-{digest}_FORMATTED.docx"
+            filename = f"{stem}__{parent}-{digest}{suffix}"
         folded = filename.casefold()
         if folded in used_names:
             raise ValueError(f"Could not create unique output name for {target}")
@@ -459,8 +473,11 @@ def _format_one_target(
     api_key: str,
     model: str,
     processor: TargetProcessor,
+    conversion_mode: str,
 ) -> TargetFormatResult:
     start = time.monotonic()
+    processor_log: tuple[str, ...] = ()
+    conversion_report: Optional[CanadianConversionReport] = None
     try:
         snapshot = staging_dir / "source" / target.name
         snapshot_sha256 = _snapshot_input(target, snapshot)
@@ -476,16 +493,19 @@ def _format_one_target(
             arch_root=shared.arch_root,
             model=model,
             role_specs=shared.role_specs,
+            conversion_mode=conversion_mode,
         )
-        log = tuple(result.log)
+        processor_log = tuple(result.log)
+        conversion_report = result.conversion_report
         if not result.success:
             return TargetFormatResult(
                 source_path=target,
                 success=False,
                 output_path=None,
-                log=log,
+                log=processor_log,
                 error=result.error or "Target formatting failed.",
                 duration_seconds=result.duration_seconds,
+                conversion_report=conversion_report,
             )
         if result.output_path is None or not result.output_path.is_file():
             raise RuntimeError("Style application reported success without an output DOCX.")
@@ -499,18 +519,20 @@ def _format_one_target(
             source_path=target,
             success=True,
             output_path=final_output,
-            log=log,
+            log=processor_log,
             error=None,
             duration_seconds=result.duration_seconds,
+            conversion_report=conversion_report,
         )
     except Exception as exc:
         return TargetFormatResult(
             source_path=target,
             success=False,
             output_path=None,
-            log=(f"FAILED: {exc}",),
+            log=processor_log + (f"FAILED: {exc}",),
             error=str(exc),
             duration_seconds=time.monotonic() - start,
+            conversion_report=conversion_report,
         )
 
 
@@ -525,6 +547,7 @@ def format_specifications(
     max_workers: int = 3,
     template_model: str = template_analysis.DEFAULT_MODEL,
     target_model: str = "claude-sonnet-5",
+    conversion_mode: str = FORMAT_ONLY,
     template_prompt_dir: Optional[Path] = None,
     template_classifier: Optional[TemplateClassifier] = None,
     progress: Optional[ProgressCallback] = None,
@@ -538,10 +561,12 @@ def format_specifications(
     validated before any classifier work begins.  The architect template is
     analyzed once for this run (or reused from a matching validated profile),
     then every target is processed independently so one bad target does not
-    discard successful outputs.
+    discard successful outputs. ``conversion_mode`` selects either formatting
+    only or fail-closed CSI-to-Canadian hierarchy conversion in the same run.
     """
 
     _emit(progress, "Checking input files...")
+    conversion_mode = validate_conversion_mode(conversion_mode)
     if not isinstance(api_key, str):
         raise ValueError("Anthropic API key must be text.")
     normalized_api_key = api_key.strip()
@@ -550,7 +575,7 @@ def format_specifications(
         tuple(target_specs),
         output_dir,
     )
-    planned_outputs = _plan_output_paths(targets, destination)
+    planned_outputs = _plan_output_paths(targets, destination, conversion_mode)
     _validate_output_plan(architect, targets, planned_outputs)
     workers = max(1, min(int(max_workers), _MAX_WORKERS, len(targets)))
     profile_cache = (
@@ -596,6 +621,7 @@ def format_specifications(
                     normalized_api_key,
                     target_model,
                     _target_processor,
+                    conversion_mode,
                 )
                 futures[future] = target
 
@@ -629,6 +655,8 @@ def format_specifications(
 
 __all__ = [
     "FormatRunResult",
+    "CSI_TO_CANADIAN",
+    "FORMAT_ONLY",
     "TargetFormatResult",
     "TemplateProfile",
     "collect_target_specs",

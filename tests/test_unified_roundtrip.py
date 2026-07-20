@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from spec_formatter.pipeline import format_specifications
+from spec_formatter.pipeline import CSI_TO_CANADIAN, format_specifications
 from spec_formatter.style_application.phase2_invariants import validate_docx_package
 
 
@@ -261,6 +261,16 @@ def _write_docx(path: Path, *, architect: bool) -> None:
             package.writestr(name, payload)
 
 
+def _rewrite_docx_parts(path: Path, replacements: dict[str, str]) -> None:
+    with zipfile.ZipFile(path, "r") as package:
+        parts = {name: package.read(name) for name in package.namelist()}
+    for name, text in replacements.items():
+        parts[name] = text.encode("utf-8")
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        for name, payload in parts.items():
+            package.writestr(name, payload)
+
+
 def _deterministic_classifier(**kwargs):
     classifiable = [
         item for item in kwargs["slim_bundle"].get("paragraphs", [])
@@ -499,3 +509,94 @@ def test_unified_formatter_keeps_valid_output_when_another_target_is_corrupt(
         path: _sha256(path)
         for path in (architect, valid_target, corrupt_target)
     } == input_hashes
+
+
+def test_unified_canadian_mode_converts_typed_csi_markers_end_to_end(
+    tmp_path: Path,
+) -> None:
+    architect = tmp_path / "canadian-architect.docx"
+    target = tmp_path / "csi-target.docx"
+    _write_docx(architect, architect=True)
+    _write_docx(target, architect=False)
+
+    with zipfile.ZipFile(architect) as package:
+        architect_document = package.read("word/document.xml").decode("utf-8")
+        architect_numbering = package.read("word/numbering.xml").decode("utf-8")
+    architect_document = architect_document.replace(
+        '<w:ilvl w:val="2"/><w:numId w:val="5"/>',
+        '<w:ilvl w:val="1"/><w:numId w:val="5"/>',
+        1,
+    )
+    architect_numbering = architect_numbering.replace(
+        '<w:numFmt w:val="upperLetter"/><w:lvlText w:val="%1."/>',
+        '<w:numFmt w:val="decimal"/><w:lvlText w:val=".%1"/>',
+        1,
+    ).replace(
+        '<w:lvl w:ilvl="2">',
+        '<w:lvl w:ilvl="1">',
+        1,
+    ).replace(
+        '<w:lvlText w:val="%3)"/>',
+        '<w:lvlText w:val=".%2"/>',
+        1,
+    )
+    _rewrite_docx_parts(
+        architect,
+        {
+            "word/document.xml": architect_document,
+            "word/numbering.xml": architect_numbering,
+        },
+    )
+
+    with zipfile.ZipFile(target) as package:
+        target_document = package.read("word/document.xml").decode("utf-8")
+    target_document = re.sub(
+        r'(<w:body><w:p>)<w:pPr><w:numPr>[\s\S]*?</w:numPr></w:pPr>',
+        r"\1",
+        target_document,
+        count=1,
+    )
+    target_document = target_document.replace(
+        '<w:pPr><w:pStyle w:val="TargetLevel2"/></w:pPr>',
+        "",
+        1,
+    ).replace(
+        "Architect paragraph one",
+        "A. Work Included",
+        1,
+    ).replace(
+        "Architect paragraph two",
+        "1. Pumps",
+        1,
+    )
+    _rewrite_docx_parts(target, {"word/document.xml": target_document})
+    target_sha = _sha256(target)
+
+    run = format_specifications(
+        architect_template=architect,
+        target_specs=[target],
+        output_dir=tmp_path / "formatted",
+        cache_dir=tmp_path / "template-cache",
+        api_key="",
+        max_workers=1,
+        conversion_mode=CSI_TO_CANADIAN,
+        template_model="canadian-roundtrip-fixture",
+        template_classifier=_deterministic_classifier,
+    )
+
+    assert run.success, "\n".join(run.targets[0].log)
+    result = run.targets[0]
+    assert result.output_path is not None
+    assert result.output_path.name == "csi-target_CANADIAN_FORMATTED.docx"
+    assert result.conversion_report is not None
+    assert result.conversion_report.literal_markers_removed == 2
+    assert _sha256(target) == target_sha
+
+    validate_docx_package(result.output_path)
+    with zipfile.ZipFile(result.output_path) as package:
+        output_document = package.read("word/document.xml")
+        output_numbering = package.read("word/numbering.xml").decode("utf-8")
+    assert _xml_text_sequence(output_document)[:2] == ["Work Included", "Pumps"]
+    assert '<w:lvlText w:val=".%1"/>' in output_numbering
+    assert '<w:lvlText w:val=".%2"/>' in output_numbering
+    assert b'<w:numId w:val="17"/>' not in output_document

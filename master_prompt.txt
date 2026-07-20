@@ -31,7 +31,7 @@ Rules:
    its own line is the correct exemplar for CSI_EndOfSection__ARCH.
    If the exemplar has pStyle, basedOn MUST equal that exact pStyle. If it has no pStyle, use the catalog's default
    paragraph style (or null when no default is identified). Never guess "Normal".
-5) Determine hierarchy using text patterns AND numbering/indent hints, including Word numbering metadata (numPr), not just visible numbering text.
+5) Determine hierarchy using text patterns AND numbering/indent hints, including Word numbering metadata (numPr), not just visible numbering text. The architect template may use conventional CSI markers (1.01 / A. / 1. / a.) or Canadian CSC PageFormat numeric markers (1.1 / .1 / .1 / .1); use indentation, list level, and surrounding hierarchy to distinguish repeated Canadian .1 levels.
 6) You MUST output a deterministic role→style mapping under top-level key "roles".
    Allowed role keys are EXACTLY:
    - SectionID (optional; only if section number line exists as its own paragraph)

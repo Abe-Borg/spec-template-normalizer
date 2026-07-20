@@ -242,8 +242,14 @@ def paragraph_text_from_block(p_xml: str) -> str:
         return ""
     joined = html.unescape(
         "".join(
-            text if text else (" " if separator else "\u2011")
-            for text, separator, _nonbreaking_hyphen in pieces
+            text
+            if text
+            else (
+                " "
+                if separator
+                else ("\u2011" if nonbreaking_hyphen else "")
+            )
+            for text, separator, nonbreaking_hyphen in pieces
         )
     )
     joined = re.sub(r"\s+", " ", joined).strip()

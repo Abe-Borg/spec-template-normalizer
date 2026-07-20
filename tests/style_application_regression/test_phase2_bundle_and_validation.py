@@ -186,6 +186,45 @@ def test_direct_numbering_override_uniquely_matches_role_signature(tmp_path: Pat
     ]
 
 
+def test_typical_automatic_csi_signature_is_recognized_against_canadian_template(
+    tmp_path: Path,
+):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/>'
+        '</w:numPr></w:pPr><w:r><w:t>Scope</w:t></w:r></w:p>',
+    )
+    _write_numbering_parts(
+        extract_dir,
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+        '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:abstractNum w:abstractNumId="3"><w:lvl w:ilvl="0">'
+        '<w:numFmt w:val="upperLetter"/><w:lvlText w:val="%1."/>'
+        '</w:lvl></w:abstractNum><w:num w:numId="7">'
+        '<w:abstractNumId w:val="3"/></w:num></w:numbering>',
+    )
+    canadian_role = {
+        "numbering_provenance": "style_numpr",
+        "numbering_pattern": {
+            "numId": "99",
+            "ilvl": "0",
+            "numFmt": "decimal",
+            "lvlText": ".%1",
+        },
+    }
+
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PARAGRAPH"],
+        role_specs={"PARAGRAPH": canadian_role},
+    )
+
+    assert bundle["paragraphs"] == []
+    assert bundle["deterministic_classifications"] == [
+        {"paragraph_index": 0, "csi_role": "PARAGRAPH"}
+    ]
+
+
 def test_style_inherited_numbering_is_resolved_and_matched(tmp_path: Path):
     extract_dir = _write_document_xml(
         tmp_path,

@@ -16,6 +16,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .arch_env_applier import apply_environment_to_target
 from .core.classification import apply_phase2_classifications, build_phase2_slim_bundle
+from .core.csi_to_canadian import (
+    CSI_TO_CANADIAN,
+    FORMAT_ONLY,
+    CanadianConversionReport,
+    apply_csi_to_canadian,
+    validate_conversion_mode,
+)
 from .core.token_utils import extract_target_tokens
 from .core.batch_classifier import (
     BatchClassificationError,
@@ -61,6 +68,7 @@ class BatchResult:
     log: List[str]
     error: Optional[str]
     duration_seconds: float
+    conversion_report: Optional[CanadianConversionReport] = None
 
 
 @dataclass(frozen=True)
@@ -234,9 +242,16 @@ def _build_and_patch_output(
     env_result: Dict[str, Any],
     output_dir: Path,
     arch_template_registry: Optional[Dict[str, Any]] = None,
+    conversion_mode: str = FORMAT_ONLY,
 ) -> Path:
+    conversion_mode = validate_conversion_mode(conversion_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / (docx_path.stem + "_PHASE2_FORMATTED.docx")
+    suffix = (
+        "_CANADIAN_FORMATTED.docx"
+        if conversion_mode == CSI_TO_CANADIAN
+        else "_PHASE2_FORMATTED.docx"
+    )
+    output_path = output_dir / (docx_path.stem + suffix)
     replacements = {
         "word/document.xml": (extract_dir / "word" / "document.xml").read_bytes(),
         "word/styles.xml": (extract_dir / "word" / "styles.xml").read_bytes(),
@@ -313,13 +328,16 @@ def process_single_file(
     arch_root: Optional[Path] = None,
     model: str = "claude-sonnet-5",
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    conversion_mode: str = FORMAT_ONLY,
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log: List[str] = []
     filename = docx_path.name
     output_path: Optional[Path] = None
+    conversion_report: Optional[CanadianConversionReport] = None
 
     try:
+        conversion_mode = validate_conversion_mode(conversion_mode)
         with tempfile.TemporaryDirectory(prefix="phase2_") as tmp_root:
             digest = hashlib.sha256(str(docx_path.resolve()).encode("utf-8")).hexdigest()[:8]
             extract_dir_name = f"{docx_path.stem}_{digest}_extracted"
@@ -361,6 +379,18 @@ def process_single_file(
             per_file_log.append(f"Classifications saved: {classifications_path}")
 
             target_tokens = extract_target_tokens(extract_dir, classifications)
+
+            if conversion_mode == CSI_TO_CANADIAN:
+                per_file_log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
+                conversion_report = apply_csi_to_canadian(
+                    extract_dir,
+                    classifications,
+                    role_specs,
+                    per_file_log,
+                    architect_numbering_xml=(
+                        env_registry.get("numbering", {}).get("numbering_xml") or ""
+                    ),
+                )
 
             env_result = apply_environment_to_target(
                 target_extract_dir=extract_dir,
@@ -447,6 +477,7 @@ def process_single_file(
                 env_result,
                 output_dir,
                 arch_template_registry=env_registry,
+                conversion_mode=conversion_mode,
             )
 
             classified, total, unresolved = _coverage_counts(bundle, classifications)
@@ -466,6 +497,7 @@ def process_single_file(
             log=per_file_log,
             error=None,
             duration_seconds=time.monotonic() - start,
+            conversion_report=conversion_report,
         )
     except Exception as exc:
         per_file_log.append(f"FAILED: {exc}")
@@ -476,6 +508,7 @@ def process_single_file(
             log=per_file_log,
             error=str(exc),
             duration_seconds=time.monotonic() - start,
+            conversion_report=conversion_report,
         )
 
 
@@ -517,18 +550,33 @@ def _apply_batch_result(
     source_tokens: Optional[Dict[str, str]] = None,
     arch_root: Optional[Path] = None,
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    conversion_mode: str = FORMAT_ONLY,
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log = list(prepared.prep_log)
     output_path: Optional[Path] = None
+    conversion_report: Optional[CanadianConversionReport] = None
     filename = prepared.docx_path.name
 
     try:
+        conversion_mode = validate_conversion_mode(conversion_mode)
         classifications_path = prepared.extract_dir / "phase2_classifications.json"
         classifications_path.write_text(json.dumps(classifications, indent=2), encoding="utf-8")
         per_file_log.append(f"Classifications saved: {classifications_path}")
 
         target_tokens = extract_target_tokens(prepared.extract_dir, classifications)
+
+        if conversion_mode == CSI_TO_CANADIAN:
+            per_file_log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
+            conversion_report = apply_csi_to_canadian(
+                prepared.extract_dir,
+                classifications,
+                role_specs,
+                per_file_log,
+                architect_numbering_xml=(
+                    env_registry.get("numbering", {}).get("numbering_xml") or ""
+                ),
+            )
 
         env_result = apply_environment_to_target(
             target_extract_dir=prepared.extract_dir,
@@ -614,6 +662,7 @@ def _apply_batch_result(
             env_result,
             output_dir,
             arch_template_registry=env_registry,
+            conversion_mode=conversion_mode,
         )
 
         classified, total, unresolved = _coverage_counts(prepared.bundle, classifications)
@@ -633,6 +682,7 @@ def _apply_batch_result(
             log=per_file_log,
             error=None,
             duration_seconds=time.monotonic() - start,
+            conversion_report=conversion_report,
         )
     except Exception as exc:
         per_file_log.append(f"FAILED: {exc}")
@@ -643,6 +693,7 @@ def _apply_batch_result(
             log=per_file_log,
             error=str(exc),
             duration_seconds=time.monotonic() - start,
+            conversion_report=conversion_report,
         )
 
 
@@ -659,7 +710,9 @@ def run_batch_concurrent(
     max_workers: int = 3,
     on_file_complete: Optional[Callable[[BatchResult], None]] = None,
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    conversion_mode: str = FORMAT_ONLY,
 ) -> List[BatchResult]:
+    conversion_mode = validate_conversion_mode(conversion_mode)
     if not docx_paths:
         return []
 
@@ -667,7 +720,12 @@ def run_batch_concurrent(
     results: List[BatchResult] = []
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        if source_tokens is None and arch_root is None and role_specs is None:
+        if (
+            source_tokens is None
+            and arch_root is None
+            and role_specs is None
+            and conversion_mode == FORMAT_ONLY
+        ):
             futures = {
                 executor.submit(
                     process_single_file,
@@ -695,6 +753,7 @@ def run_batch_concurrent(
                     source_tokens=source_tokens,
                     arch_root=arch_root,
                     role_specs=role_specs,
+                    conversion_mode=conversion_mode,
                 ): docx_path
                 for docx_path in docx_paths
             }
@@ -724,7 +783,9 @@ def run_batch_api(
     on_batch_poll: Optional[Callable[[str, str, Any], None]] = None,
     model: str = "claude-sonnet-5",
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    conversion_mode: str = FORMAT_ONLY,
 ) -> List[BatchResult]:
+    conversion_mode = validate_conversion_mode(conversion_mode)
     if not docx_paths:
         return []
 
@@ -765,7 +826,12 @@ def run_batch_api(
 
         results: List[BatchResult] = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            if source_tokens is None and arch_root is None and role_specs is None:
+            if (
+                source_tokens is None
+                and arch_root is None
+                and role_specs is None
+                and conversion_mode == FORMAT_ONLY
+            ):
                 futures = {
                     executor.submit(
                         _apply_batch_result,
@@ -791,6 +857,7 @@ def run_batch_api(
                         source_tokens,
                         arch_root,
                         role_specs,
+                        conversion_mode,
                     ): file_key
                     for file_key, prepared in prepared_files.items()
                 }

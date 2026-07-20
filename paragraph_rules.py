@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from spec_formatter.numbering_roles import role_from_numbering_signature
+
 # CSI headings occur in substantially more forms than the canonical examples in
 # the prompt. In particular, Word templates commonly use non-breaking spaces,
 # compact six-digit section numbers, and a combined "SECTION ... - TITLE" line.
@@ -222,25 +224,7 @@ def detect_numbering_role(
             lvl_text = str(override.get("lvlText", lvl_text) or "")
             break
 
-    fmt = str(num_fmt or "").lower()
-    marker = lvl_text.upper()
-    placeholder_count = len(re.findall(r"%\d+", lvl_text))
-    try:
-        level_number = int(ilvl) if ilvl is not None else None
-    except (TypeError, ValueError):
-        level_number = None
-
-    if "PART" in marker:
-        return "PART"
-    if placeholder_count >= 2 and fmt in {"decimal", "decimalzero"} and level_number in {0, 1}:
-        return "ARTICLE"
-    if fmt in {"upperletter", "upperalpha"}:
-        return "PARAGRAPH"
-    if fmt in {"lowerletter", "loweralpha"}:
-        return "SUBSUBPARAGRAPH"
-    if fmt in {"decimal", "decimalzero"} and level_number is not None and level_number >= 2:
-        return "SUBPARAGRAPH"
-    return None
+    return role_from_numbering_signature(num_fmt, lvl_text, ilvl)
 
 
 def infer_expected_roles(

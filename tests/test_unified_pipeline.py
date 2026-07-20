@@ -8,6 +8,9 @@ import pytest
 
 from spec_formatter import pipeline
 from spec_formatter.style_application.batch_runner import BatchResult, SharedConfig
+from spec_formatter.style_application.core.csi_to_canadian import (
+    CanadianConversionReport,
+)
 
 
 def _write_input(path: Path, contents: bytes) -> Path:
@@ -492,6 +495,7 @@ def test_folder_discovery_excludes_lock_files_and_current_or_legacy_outputs(
     target = _write_input(specs / "target.docx", b"target")
     _write_input(specs / "target_FORMATTED.docx", b"current-output")
     _write_input(specs / "target_PHASE2_FORMATTED.docx", b"legacy-output")
+    _write_input(specs / "target_CANADIAN_FORMATTED.docx", b"canadian-output")
     _write_input(specs / "another_formatted.docx", b"case-insensitive-output")
     _write_input(specs / "~$target.docx", b"word-lock-file")
     _write_input(specs / "nested" / "nested.docx", b"non-recursive")
@@ -499,3 +503,113 @@ def test_folder_discovery_excludes_lock_files_and_current_or_legacy_outputs(
     discovered = pipeline.collect_target_specs([specs, target])
 
     assert discovered == (target.resolve(),)
+
+
+def test_canadian_mode_reaches_target_processor_and_uses_distinct_output_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    received_modes: list[str] = []
+
+    def capturing_processor(**kwargs) -> BatchResult:
+        received_modes.append(kwargs["conversion_mode"])
+        return processor(**kwargs)
+
+    result = pipeline.format_specifications(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        api_key="offline-test-key",
+        cache_dir=tmp_path / "profile-cache",
+        max_workers=1,
+        conversion_mode=pipeline.CSI_TO_CANADIAN,
+        _template_analyzer=analyzer,
+        _config_loader=config_loader,
+        _target_processor=capturing_processor,
+    )
+
+    assert result.success
+    assert received_modes == [pipeline.CSI_TO_CANADIAN]
+    assert result.output_paths[0].name == "target_CANADIAN_FORMATTED.docx"
+    assert target.read_bytes() == b"target-original"
+
+
+def test_invalid_conversion_mode_fails_before_analysis_or_filesystem_writes(
+    tmp_path: Path,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    calls: list[str] = []
+
+    def unexpected_dependency(*args, **kwargs):
+        calls.append("called")
+        raise AssertionError("pipeline work started for an invalid conversion mode")
+
+    with pytest.raises(ValueError, match="conversion_mode"):
+        pipeline.format_specifications(
+            architect,
+            [target],
+            tmp_path / "formatted",
+            api_key="offline-test-key",
+            conversion_mode="not-a-real-mode",
+            _template_analyzer=unexpected_dependency,
+            _config_loader=unexpected_dependency,
+            _target_processor=unexpected_dependency,
+        )
+
+    assert calls == []
+    assert not (tmp_path / "formatted").exists()
+
+
+def test_publication_failure_preserves_processor_log_and_conversion_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _write_input(tmp_path / "target.docx", b"source")
+    staging = tmp_path / "staging"
+    report = CanadianConversionReport(
+        paragraphs_examined=1,
+        paragraphs_converted=1,
+        literal_markers_removed=1,
+        automatic_numbering_retargeted=0,
+        unnumbered_paragraphs_numbered=0,
+        edits=(),
+        warnings=(),
+    )
+
+    def processor(**kwargs) -> BatchResult:
+        output = Path(kwargs["output_dir"]) / "target_CANADIAN_FORMATTED.docx"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"formatted")
+        return BatchResult(
+            filename="target.docx",
+            success=True,
+            output_path=output,
+            log=["conversion complete"],
+            error=None,
+            duration_seconds=0.1,
+            conversion_report=report,
+        )
+
+    monkeypatch.setattr(
+        pipeline.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("publish failed")),
+    )
+    result = pipeline._format_one_target(
+        target,
+        tmp_path / "final.docx",
+        staging,
+        SharedConfig({}, {}, "", [], {}, tmp_path, {}),
+        "",
+        "test-model",
+        processor,
+        pipeline.CSI_TO_CANADIAN,
+    )
+
+    assert result.success is False
+    assert result.conversion_report is report
+    assert result.log == ("conversion complete", "FAILED: publish failed")

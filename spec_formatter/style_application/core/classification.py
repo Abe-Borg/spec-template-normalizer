@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
 
+from spec_formatter.numbering_roles import role_from_numbering_signature
+
 from .xml_helpers import (
     iter_paragraph_xml_blocks,
     iter_element_xml_blocks,
@@ -407,7 +409,16 @@ def _deterministic_role_for_paragraph(paragraph: Dict[str, Any], prev_text: str 
     # numbering metadata must remain in the LLM input.
     if paragraph.get("effective_numPr"):
         numbering_role = paragraph.get("numbering_role")
-        return numbering_role if isinstance(numbering_role, str) else None
+        if isinstance(numbering_role, str):
+            return numbering_role
+        pattern = paragraph.get("numbering_pattern")
+        if isinstance(pattern, dict):
+            return role_from_numbering_signature(
+                pattern.get("numFmt"),
+                pattern.get("lvlText"),
+                pattern.get("ilvl"),
+            )
+        return None
 
     marker_type = paragraph.get("marker_type")
     if marker_type == "upper_alpha":

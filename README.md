@@ -13,9 +13,11 @@ The original template and target files are never modified.
 2. Validates and caches that template analysis by the template's SHA-256 hash,
    engine version, prompt hashes, and classifier model.
 3. Classifies each target spec's in-scope paragraphs.
-4. Applies the architect's formatting while preserving text, tables, drawings,
-   text boxes, and unmanaged document structure.
-5. Validates each complete DOCX package before publishing it.
+4. Optionally converts conventional CSI numbering (`1.01 / A. / 1. / a.`)
+   to the Canadian numeric hierarchy demonstrated by the architect template.
+5. Applies the architect's formatting while preserving technical wording,
+   tables, drawings, text boxes, and unmanaged document structure.
+6. Validates each complete DOCX package before publishing it.
 
 The internal template profile remains a checksummed integrity boundary, but it
 is not part of the user workflow. If the architect template has not changed,
@@ -46,17 +48,58 @@ In the single window:
 
 1. Choose the architect's template DOCX.
 2. Add target DOCX files, or add a folder containing target specs.
-3. Choose the output folder.
-4. Enter the Anthropic API key when needed.
-5. Click **Format Specs**.
+3. Choose **Format only** or **Convert CSI hierarchy to Canadian CSC PageFormat**.
+4. Choose the output folder.
+5. Enter the Anthropic API key when needed.
+6. Click **Format Specs**.
 
-Outputs are named `<target>_FORMATTED.docx`. When selected targets from
-different folders share the same filename, the app adds a stable source suffix
-so neither output can overwrite the other. A timestamped activity log is saved
-beside the formatted documents.
+Format-only outputs are named `<target>_FORMATTED.docx`; Canadian outputs are
+named `<target>_CANADIAN_FORMATTED.docx`, so the two modes cannot silently
+replace each other. When selected targets from different folders share the
+same filename, the app adds a stable source suffix so neither output can
+overwrite the other. A timestamped activity log is saved beside the formatted
+documents.
 
 Folder discovery ignores Word lock files, current `_FORMATTED.docx` outputs,
 and legacy `_PHASE2_FORMATTED.docx` outputs.
+
+## Canadian CSC PageFormat mode
+
+Canadian mode is one option inside the same GUI and pipeline. It recognizes
+typical CSI article and list levels, removes manually typed CSI markers without
+altering the requirement text, and retargets both typed and automatic source
+numbering to the architect template's Canadian automatic Word numbering.
+
+For a fail-closed conversion, the architect template must demonstrate true
+automatic Canadian numbering for every numbered role used by the targets:
+articles such as `1.1` and subordinate levels such as `.1`. A template that
+still uses `A. / 1. / a.`, literal typed numbering, or no numbering for a used
+role is rejected in Canadian mode instead of producing a misleading result.
+Mixed paragraphs that contain both a typed marker and Word automatic numbering
+are also rejected as ambiguous.
+
+The first implementation deliberately supports the sequence it can prove:
+source counters must start at 1, be contiguous, and appear under their expected
+parent level. Gaps, unnumbered list items, custom starts/restarts, or automatic
+source list-instance changes stop that target without publishing a partial
+conversion. Every paragraph sharing a converted automatic source list must
+participate in the conversion; a filtered table or boilerplate list item is
+rejected because omitting it would shift later counters. A typed Canadian
+decimal such as `.1` is treated as a marker only when Word stores a structural
+list tab after it; this prevents a leading value such as `.125 mm` from being
+deleted. For targets containing ARTICLE headings,
+the target must contain a preceding classified PART heading, and the current
+engine requires the architect's PART, ARTICLE, and used subordinate roles to be
+levels of one coherent automatic multilevel Word list. That is an application
+safety limitation, not a claim that CSC PageFormat requires one particular
+Word/OOXML implementation.
+
+Conversion counts and diagnostics are included in the application's saved
+activity log, including when a later validation or publication step fails.
+
+This mode converts numbering hierarchy and presentation only. It does **not**
+reorder articles, replace US codes or standards, convert units, change spelling
+or terminology, revise technical requirements, or certify NMS compliance.
 
 ## Build one Windows executable
 
@@ -84,6 +127,7 @@ result = format_specifications(
     target_specs=[Path("Mechanical.docx"), Path("Electrical Specs")],
     output_dir=Path("Formatted Specs"),
     api_key="...",
+    conversion_mode="csi_to_canadian",  # omit for format-only behavior
 )
 
 for target in result.targets:
@@ -108,9 +152,10 @@ architect template DOCX
 target specification DOCX files
     -> bounded extraction
     -> deterministic/AI paragraph classification
+    -> optional fail-closed CSI-to-Canadian hierarchy conversion
     -> environment, numbering, style, header/footer, and layout application
     -> stability and complete-package validation
-    -> atomic publication as *_FORMATTED.docx
+    -> atomic publication as *_FORMATTED.docx or *_CANADIAN_FORMATTED.docx
 ```
 
 The architect-template engine remains available through
@@ -159,6 +204,9 @@ section-break paragraphs remain classifiable and retain their `sectPr`.
 - Tables and drawing/text-box content are excluded from paragraph restyling.
 - Formatting is applied through validated architect styles and numbering
   definitions; unknown roles are not guessed.
+- Canadian conversion edits only recognized leading numbering markers in
+  classified paragraphs and verifies that substantive text and protected OOXML
+  remain unchanged.
 - Each output is fully validated before it replaces an earlier formatted output.
 
 ## Tests
