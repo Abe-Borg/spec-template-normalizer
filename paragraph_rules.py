@@ -117,8 +117,6 @@ def compute_skip_reason(raw_text: str, contains_sectpr: bool, in_table: bool) ->
     text = (raw_text or "").strip()
     if not text:
         return "empty"
-    if contains_sectpr:
-        return "sectPr"
     if in_table:
         return "in_table"
     if is_editor_note(text):
@@ -137,14 +135,20 @@ def is_classifiable_paragraph(paragraph: Dict[str, Any]) -> bool:
     structural exclusions are outside the classification universe.
     """
     if "skip_reason" in paragraph:
-        return paragraph.get("skip_reason") not in {"empty", "sectPr", "in_table"}
+        return paragraph.get("skip_reason") not in {
+            "empty",
+            "sectPr",  # accepted for compatibility with older slim bundles
+            "in_table",
+            "drawing",
+            "text_box",
+        }
     text = (paragraph.get("text") or "").strip()
     skip_reason = compute_skip_reason(
         text,
         bool(paragraph.get("contains_sectPr", False)),
         bool(paragraph.get("in_table", False)),
     )
-    return skip_reason not in {"empty", "sectPr", "in_table"}
+    return skip_reason not in {"empty", "sectPr", "in_table", "drawing", "text_box"}
 
 
 def is_role_candidate_paragraph(paragraph: Dict[str, Any]) -> bool:

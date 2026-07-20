@@ -74,7 +74,7 @@ def test_compute_skip_reason_integration() -> None:
             "copyright_notice",
         ),
         ("Retain first paragraph below...", False, False, "specifier_note"),
-        ("Retain first paragraph below...", True, False, "sectPr"),
+        ("Retain first paragraph below...", True, False, "specifier_note"),
         ("Retain first paragraph below...", False, True, "in_table"),
         ("Install hangers and supports...", False, False, None),
     ]

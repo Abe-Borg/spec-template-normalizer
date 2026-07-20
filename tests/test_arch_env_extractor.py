@@ -461,6 +461,48 @@ class TestExtractPageLayout:
         # default_section should be set
         assert result["default_section"] is not None
 
+    def test_header_footer_references_accept_single_quotes_and_paired_elements(
+        self,
+        tmp_path,
+    ):
+        word_dir = tmp_path / "word"
+        rels_dir = word_dir / "_rels"
+        custom_dir = word_dir / "custom"
+        rels_dir.mkdir(parents=True)
+        custom_dir.mkdir()
+        (custom_dir / "odd.xml").write_text(
+            '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+            encoding="utf-8",
+        )
+        (custom_dir / "closing.xml").write_text(
+            '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+            encoding="utf-8",
+        )
+        (rels_dir / "document.xml.rels").write_text(
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rIdHeader" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" '
+            'Target="custom/odd.xml"/>'
+            '<Relationship Id="rIdFooter" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" '
+            'Target="custom/closing.xml"/>'
+            '</Relationships>',
+            encoding="utf-8",
+        )
+        document_xml = (
+            '<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<w:sectPr>'
+            "<w:headerReference w:type='first' r:id='rIdHeader'></w:headerReference>"
+            '<w:footerReference r:id="rIdFooter" w:type="even"></w:footerReference>'
+            '</w:sectPr></w:body>'
+        )
+
+        section = extract_page_layout(document_xml, tmp_path)["section_chain"][0]
+
+        assert section["header_refs"]["first"] == "rIdHeader"
+        assert section["footer_refs"]["even"] == "rIdFooter"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Integration tests — extract_numbering
@@ -684,6 +726,38 @@ class TestExtractFonts:
         result = extract_fonts(tmp_path)
         assert result["font_table_xml"] is None
 
+    def test_embedded_font_declaration_is_rejected(self, tmp_path):
+        word_dir = tmp_path / "word"
+        word_dir.mkdir()
+        (word_dir / "fontTable.xml").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<w:font w:name="Embedded"><w:embedRegular r:id="rId1"/></w:font>'
+            '</w:fonts>',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="Embedded fonts are unsupported"):
+            extract_fonts(tmp_path)
+
+    def test_font_table_relationship_part_is_rejected(self, tmp_path):
+        word_dir = tmp_path / "word"
+        rels_dir = word_dir / "_rels"
+        rels_dir.mkdir(parents=True)
+        (word_dir / "fontTable.xml").write_text(self.FONT_TABLE_XML, encoding="utf-8")
+        (rels_dir / "fontTable.xml.rels").write_text(
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/font" '
+            'Target="fonts/font1.odttf"/>'
+            '</Relationships>',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="Embedded fonts are unsupported"):
+            extract_fonts(tmp_path)
+
 
 class TestExtractHeadersFooters:
     def test_extracts_media_and_rels_xml(self, tmp_path):
@@ -719,6 +793,7 @@ class TestExtractHeadersFooters:
 
         header = extracted["headers"][0]
         assert header["part_name"] == "word/header1.xml"
+        assert header["rels_part_name"] == "word/_rels/header1.xml.rels"
         assert header["rel_id"] == "rId10"
         assert isinstance(header["rels_xml"], str)
         assert len(header["media"]) == 1
@@ -777,6 +852,60 @@ class TestHeaderFooterRelationshipHardening:
 
         assert extracted["headers"][0]["rel_id"] == "rId10"
 
+    def test_nested_custom_part_uses_adjacent_relationships_part(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        word_dir = extract_dir / "word"
+        document_rels_dir = word_dir / "_rels"
+        header_dir = word_dir / "headers"
+        header_rels_dir = header_dir / "_rels"
+        media_dir = word_dir / "media" / "brand"
+        document_rels_dir.mkdir(parents=True)
+        header_rels_dir.mkdir(parents=True)
+        media_dir.mkdir(parents=True)
+
+        (header_dir / "default.xml").write_text(
+            '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+            'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<w:p><w:r><w:drawing><a:blip r:embed="rIdLogo"/>'
+            '</w:drawing></w:r></w:p></w:hdr>',
+            encoding="utf-8",
+        )
+        (document_rels_dir / "document.xml.rels").write_text(
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rIdCustomHeader" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" '
+            'Target="headers/default.xml"/>'
+            '</Relationships>',
+            encoding="utf-8",
+        )
+        (header_rels_dir / "default.xml.rels").write_text(
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rIdLogo" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+            'Target="../media/brand/logo.png"/>'
+            '</Relationships>',
+            encoding="utf-8",
+        )
+        (media_dir / "logo.png").write_bytes(b"nested-logo")
+        # A matching filename that is not named by document relationships is
+        # deliberately ignored; relationship reachability is authoritative.
+        (word_dir / "headerOrphan.xml").write_text(
+            '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+            encoding="utf-8",
+        )
+
+        extracted = extract_headers_footers(extract_dir)
+
+        assert len(extracted["headers"]) == 1
+        header = extracted["headers"][0]
+        assert header["part_name"] == "word/headers/default.xml"
+        assert header["rels_part_name"] == "word/headers/_rels/default.xml.rels"
+        assert header["rel_id"] == "rIdCustomHeader"
+        assert header["media"][0]["rel_id"] == "rIdLogo"
+        assert header["media"][0]["target"] == "media/brand/logo.png"
+        assert base64.b64decode(header["media"][0]["data_base64"]) == b"nested-logo"
+
     def test_absolute_target_cannot_disclose_a_local_file(self, tmp_path):
         extract_dir = tmp_path / "package"
         outside_media = tmp_path / "outside" / "media"
@@ -791,7 +920,7 @@ class TestHeaderFooterRelationshipHardening:
     @pytest.mark.parametrize(
         "target",
         [
-            "../media/image1.png",
+            "../../media/image1.png",
             "..\\media\\image1.png",
             "C:/sensitive/media/image1.png",
             "//server/share/media/image1.png",
@@ -821,6 +950,83 @@ class TestHeaderFooterRelationshipHardening:
 
         assert extracted["headers"][0]["media"] == []
         assert extracted["header_footer_media"] == []
+
+    def test_missing_internal_image_fails_closed(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "media/missing.png")
+
+        with pytest.raises(ValueError, match="targets missing package part"):
+            extract_headers_footers(extract_dir)
+
+    def test_internal_non_image_relationship_is_rejected(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "charts/chart1.xml")
+        rels_path = extract_dir / "word" / "_rels" / "header1.xml.rels"
+        rels_path.write_text(
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" '
+            'Target="charts/chart1.xml"/>'
+            '</Relationships>',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="Only internal images and external relationships"):
+            extract_headers_footers(extract_dir)
+
+    def test_external_hyperlink_is_preserved_and_reference_is_validated(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "https://example.test", target_mode="External")
+        header_path = extract_dir / "word" / "header1.xml"
+        header_path.write_text(
+            '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<w:p><w:hyperlink r:id="rId1"><w:r><w:t>Link</w:t></w:r></w:hyperlink></w:p>'
+            '</w:hdr>',
+            encoding="utf-8",
+        )
+        rels_path = extract_dir / "word" / "_rels" / "header1.xml.rels"
+        rels_path.write_text(
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+            'Target="https://example.test" TargetMode="External"/>'
+            '</Relationships>',
+            encoding="utf-8",
+        )
+
+        extracted = extract_headers_footers(extract_dir)
+
+        assert 'TargetMode="External"' in extracted["headers"][0]["rels_xml"]
+        assert extracted["headers"][0]["media"] == []
+
+    def test_dangling_header_relationship_reference_is_rejected(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "media/image1.png")
+        header_path = extract_dir / "word" / "header1.xml"
+        header_path.write_text(
+            '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<w:p><w:r><w:drawing><a:blip '
+            'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            'r:embed="rIdMissing"/></w:drawing></w:r></w:p>'
+            '</w:hdr>',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="IDs absent"):
+            extract_headers_footers(extract_dir)
+
+    def test_nested_image_target_is_captured_without_basename_collapse(self, tmp_path):
+        extract_dir = tmp_path / "package"
+        _write_header_relationship_package(extract_dir, "media/linked/image1.png")
+        media_dir = extract_dir / "word" / "media" / "linked"
+        media_dir.mkdir(parents=True)
+        (media_dir / "image1.png").write_bytes(b"nested-image")
+
+        extracted = extract_headers_footers(extract_dir)
+
+        assert extracted["headers"][0]["media"][0]["target"] == "media/linked/image1.png"
 
     def test_symlink_escape_is_rejected(self, tmp_path):
         extract_dir = tmp_path / "package"

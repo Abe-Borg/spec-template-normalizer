@@ -54,7 +54,7 @@ The supported CSI roles are:
 - `SUBSUBPARAGRAPH` -> `CSI_Subsubparagraph__ARCH`
 - `END_OF_SECTION` -> `CSI_EndOfSection__ARCH`
 
-Empty paragraphs, paragraphs that contain section properties, and table paragraphs are structurally out of scope. Every other candidate paragraph must appear exactly once in either `apply_pStyle` or `ignored_paragraphs`. Editor notes, copyright notices, and other non-CSI text are recorded as explicit ignored decisions rather than silently disappearing from coverage.
+Empty paragraphs, empty structural section-break paragraphs, and table paragraphs are structurally out of scope. A visible paragraph remains classifiable when its paragraph properties contain a section break; Phase 2 styles that visible paragraph while preserving its `sectPr`. Every other candidate paragraph must appear exactly once in either `apply_pStyle` or `ignored_paragraphs`. Editor notes, copyright notices, and other non-CSI text are recorded as explicit ignored decisions rather than silently disappearing from coverage.
 
 Coverage must be 100 percent over that styled-or-ignored universe. Targeted classifier follow-ups are bounded; unresolved indices fail the run. Phase 1 never fills a gap by copying a neighboring paragraph's style.
 

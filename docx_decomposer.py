@@ -27,14 +27,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 import shutil
 import stat
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Set, Tuple
 import html
+from urllib.parse import unquote, urlsplit
 
 import xml.etree.ElementTree as ET  # only used for styles.xml name lookup + optional catalogs
 from paragraph_rules import (
@@ -54,6 +57,7 @@ from ooxml_text import prepare_xml_text_for_utf8, read_xml_text
 # -----------------------------
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 ROLE_TO_ARCH_STYLE: Dict[str, str] = {
     "SectionID": "CSI_SectionID__ARCH",
@@ -95,6 +99,16 @@ class StabilitySnapshot:
 class ParagraphContext:
     in_table: bool
     contains_sectPr: bool
+    contains_drawing: bool = False
+    contains_textbox: bool = False
+
+
+@dataclass(frozen=True)
+class _ScannedParagraph:
+    start: int
+    end: int
+    xml: str
+    context: ParagraphContext
 
 
 @dataclass(frozen=True)
@@ -111,11 +125,49 @@ class StructureSignal:
 
 
 def snapshot_headers_footers(extract_dir: Path) -> Dict[str, str]:
-    wf = extract_dir / "word"
+    """Hash header/footer owners named by document relationships."""
     hashes: Dict[str, str] = {}
-    for p in sorted(wf.glob("header*.xml")) + sorted(wf.glob("footer*.xml")):
-        rel = str(p.relative_to(extract_dir)).replace("\\", "/")
-        hashes[rel] = sha256_bytes(p.read_bytes())
+    rels_path = extract_dir / "word" / "_rels" / "document.xml.rels"
+    if not rels_path.is_file():
+        return hashes
+    root = ET.fromstring(rels_path.read_bytes())
+    for rel in root.findall(f"{{{PKG_REL_NS}}}Relationship"):
+        rel_type = rel.attrib.get("Type", "")
+        if not rel_type.endswith(("/header", "/footer")):
+            continue
+        if rel.attrib.get("TargetMode") == "External":
+            continue
+        target = rel.attrib.get("Target", "")
+        decoded = unquote(target)
+        parsed = urlsplit(decoded)
+        windows_target = PureWindowsPath(decoded)
+        if (
+            not decoded
+            or "%2e" in target.casefold()
+            or parsed.scheme
+            or parsed.netloc
+            or parsed.query
+            or parsed.fragment
+            or "\\" in decoded
+            or decoded.startswith("/")
+            or windows_target.drive
+            or windows_target.is_absolute()
+        ):
+            raise ValueError(f"Unsafe target header/footer relationship: {target!r}")
+        part_name = posixpath.normpath(posixpath.join("word", decoded))
+        if part_name in {"", ".", ".."} or part_name.startswith("../"):
+            raise ValueError(f"Unsafe target header/footer relationship: {target!r}")
+        part_path = extract_dir / Path(*PurePosixPath(part_name).parts)
+        if not part_path.is_file():
+            raise ValueError(f"Referenced header/footer part is missing: {part_name}")
+        hashes[part_name] = sha256_bytes(part_path.read_bytes())
+        owner = PurePosixPath(part_name)
+        rels_name = (
+            owner.parent / "_rels" / f"{owner.name}.rels"
+        ).as_posix()
+        owner_rels = extract_dir / Path(*PurePosixPath(rels_name).parts)
+        if owner_rels.is_file():
+            hashes[rels_name] = sha256_bytes(owner_rels.read_bytes())
     return hashes
 
 
@@ -126,10 +178,38 @@ def snapshot_doc_rels_hash(extract_dir: Path) -> str:
     return sha256_bytes(rels_path.read_bytes())
 
 
+def extract_document_sectpr_blocks(document_xml: str) -> List[str]:
+    """Return real document section properties outside tables/drawings."""
+    ranges: List[Tuple[int, int]] = []
+    for qname in (
+        "w:tbl",
+        "w:drawing",
+        "w:pict",
+        "w:object",
+        "w:txbxContent",
+        "v:textbox",
+        "wps:txbx",
+    ):
+        ranges.extend(_named_xml_block_ranges(document_xml, qname))
+    merged: List[Tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    pieces: List[str] = []
+    cursor = 0
+    for start, end in merged:
+        pieces.append(document_xml[cursor:start])
+        cursor = end
+    pieces.append(document_xml[cursor:])
+    analysis_xml = "".join(pieces)
+    return _extract_named_xml_blocks(analysis_xml, "w:sectPr")
+
+
 def extract_sectpr_block(document_xml: str) -> str:
-    # pragmatic stability check: exact raw text blocks
-    blocks = re.findall(r"(<w:sectPr[\s\S]*?</w:sectPr>)", document_xml)
-    return "\n".join(blocks)
+    # Preserve exact paired and self-closing in-scope blocks for the stability hash.
+    return "\n".join(extract_document_sectpr_blocks(document_xml))
 
 
 def snapshot_stability(extract_dir: Path) -> StabilitySnapshot:
@@ -284,27 +364,282 @@ def extract_docx(docx_path: Path, extract_dir: Path, *, overwrite: bool = False)
 # Slim bundle construction (LLM input)
 # -----------------------------
 
+_OUT_OF_SCOPE_CONTAINER_NAMES = {
+    "w:drawing",
+    "w:pict",
+    "w:object",
+    "w:txbxContent",
+    "v:textbox",
+    "wps:txbx",
+}
+
+
+def _element_token_info(token: str) -> Optional[Tuple[str, bool, bool]]:
+    """Return ``(qname, closing, self_closing)`` for an element token."""
+    if token.startswith(("<!--", "<![CDATA[", "<?", "<!")):
+        return None
+    closing_match = re.match(r"</\s*([A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?)\s*>", token)
+    if closing_match:
+        return closing_match.group(1), True, False
+    opening_match = re.match(
+        r"<\s*([A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?)(?=\s|/?>)",
+        token,
+    )
+    if not opening_match:
+        return None
+    return opening_match.group(1), False, bool(re.search(r"/\s*>$", token))
+
+
+def _iter_markup_tokens(xml_text: str):
+    position = 0
+    while True:
+        start = xml_text.find("<", position)
+        if start == -1:
+            return
+        end = _xml_markup_end(xml_text, start)
+        if end <= start or end > len(xml_text) or not xml_text[end - 1 : end] in {">"}:
+            raise ValueError(f"Malformed XML markup beginning at character {start}")
+        yield start, end, xml_text[start:end]
+        position = end
+
+
+def _named_xml_block_ranges(xml_text: str, qname: str) -> List[Tuple[int, int]]:
+    """Return outermost paired/self-closing *qname* ranges."""
+    ranges: List[Tuple[int, int]] = []
+    depth = 0
+    block_start: Optional[int] = None
+    for start, end, token in _iter_markup_tokens(xml_text):
+        info = _element_token_info(token)
+        if info is None:
+            continue
+        token_qname, closing, self_closing = info
+        if token_qname != qname:
+            continue
+        if closing:
+            if depth == 0 or block_start is None:
+                raise ValueError(f"Unexpected closing tag </{qname}>")
+            depth -= 1
+            if depth == 0:
+                ranges.append((block_start, end))
+                block_start = None
+            continue
+        if depth == 0:
+            block_start = start
+        if self_closing:
+            if depth == 0 and block_start is not None:
+                ranges.append((block_start, end))
+                block_start = None
+        else:
+            depth += 1
+    if depth or block_start is not None:
+        raise ValueError(f"Unclosed <{qname}> element")
+    return ranges
+
+
+def _extract_named_xml_blocks(xml_text: str, qname: str) -> List[str]:
+    """Extract paired and self-closing *qname* blocks with depth tracking."""
+    return [xml_text[start:end] for start, end in _named_xml_block_ranges(xml_text, qname)]
+
+
+def _scan_paragraph_xml_blocks(document_xml_text: str) -> List[_ScannedParagraph]:
+    """Lexically scan non-overlapping document paragraphs.
+
+    Paragraphs nested inside another paragraph occur in drawing text boxes.
+    They are deliberately not assigned Phase 1 paragraph indices; their host
+    paragraph is marked out of scope instead.  Table depth is tracked with a
+    real element stack, so a nested table cannot make later paragraphs appear
+    to be outside their containing table.
+    """
+    scanned: List[_ScannedParagraph] = []
+    stack: List[Tuple[str, bool]] = []
+    table_depth = 0
+    excluded_depth = 0
+    paragraph_start: Optional[int] = None
+    paragraph_stack_depth: Optional[int] = None
+    paragraph_in_table = False
+    paragraph_contains_sectpr = False
+    paragraph_contains_drawing = False
+    paragraph_contains_textbox = False
+
+    for start, end, token in _iter_markup_tokens(document_xml_text):
+        info = _element_token_info(token)
+        if info is None:
+            continue
+        qname, closing, self_closing = info
+
+        if closing:
+            if not stack or stack[-1][0] != qname:
+                raise ValueError(f"Mismatched XML closing tag </{qname}>")
+            _open_qname, opened_excluded = stack.pop()
+
+            if (
+                qname == "w:p"
+                and paragraph_start is not None
+                and paragraph_stack_depth == len(stack)
+            ):
+                scanned.append(
+                    _ScannedParagraph(
+                        start=paragraph_start,
+                        end=end,
+                        xml=document_xml_text[paragraph_start:end],
+                        context=ParagraphContext(
+                            in_table=paragraph_in_table,
+                            contains_sectPr=paragraph_contains_sectpr,
+                            contains_drawing=paragraph_contains_drawing,
+                            contains_textbox=paragraph_contains_textbox,
+                        ),
+                    )
+                )
+                paragraph_start = None
+                paragraph_stack_depth = None
+
+            if qname == "w:tbl":
+                table_depth -= 1
+            if opened_excluded:
+                excluded_depth -= 1
+            continue
+
+        starts_excluded = qname in _OUT_OF_SCOPE_CONTAINER_NAMES
+        if paragraph_start is not None:
+            if qname == "w:sectPr":
+                paragraph_contains_sectpr = True
+            if qname in {"w:drawing", "w:pict", "w:object"}:
+                paragraph_contains_drawing = True
+            if qname in {"w:txbxContent", "v:textbox", "wps:txbx"}:
+                paragraph_contains_textbox = True
+
+        if qname == "w:p" and paragraph_start is None and excluded_depth == 0:
+            paragraph_start = start
+            paragraph_stack_depth = len(stack)
+            paragraph_in_table = table_depth > 0
+            paragraph_contains_sectpr = False
+            paragraph_contains_drawing = False
+            paragraph_contains_textbox = False
+            if self_closing:
+                scanned.append(
+                    _ScannedParagraph(
+                        start=start,
+                        end=end,
+                        xml=document_xml_text[start:end],
+                        context=ParagraphContext(
+                            in_table=paragraph_in_table,
+                            contains_sectPr=False,
+                        ),
+                    )
+                )
+                paragraph_start = None
+                paragraph_stack_depth = None
+                continue
+
+        if self_closing:
+            continue
+        stack.append((qname, starts_excluded))
+        if qname == "w:tbl":
+            table_depth += 1
+        if starts_excluded:
+            excluded_depth += 1
+
+    if stack:
+        raise ValueError(f"Unclosed XML element <{stack[-1][0]}>")
+    if paragraph_start is not None:
+        raise ValueError("Unclosed w:p paragraph")
+    return scanned
+
+
 def iter_paragraph_xml_blocks(document_xml_text: str):
-    # Match both paired <w:p>...</w:p> and self-closing <w:p ... />
-    for m in re.finditer(r"(<w:p\b(?:[^>]*/>|[\s\S]*?</w:p>))", document_xml_text):
-        yield m.start(), m.end(), m.group(1)
+    for paragraph in _scan_paragraph_xml_blocks(document_xml_text):
+        yield paragraph.start, paragraph.end, paragraph.xml
+
+
+def _strip_out_of_scope_subtrees(xml_text: str) -> str:
+    """Remove drawing/text-box subtrees from an analysis-only XML string."""
+    spans: List[Tuple[int, int]] = []
+    stack: List[Tuple[str, bool, Optional[int]]] = []
+    excluded_depth = 0
+    for start, end, token in _iter_markup_tokens(xml_text):
+        info = _element_token_info(token)
+        if info is None:
+            continue
+        qname, closing, self_closing = info
+        if closing:
+            if not stack or stack[-1][0] != qname:
+                raise ValueError(f"Mismatched XML closing tag </{qname}>")
+            _name, opened_excluded, span_start = stack.pop()
+            if opened_excluded:
+                excluded_depth -= 1
+                if excluded_depth == 0 and span_start is not None:
+                    spans.append((span_start, end))
+            continue
+
+        starts_excluded = qname in _OUT_OF_SCOPE_CONTAINER_NAMES
+        if self_closing:
+            if starts_excluded and excluded_depth == 0:
+                spans.append((start, end))
+            continue
+        span_start = start if starts_excluded and excluded_depth == 0 else None
+        stack.append((qname, starts_excluded, span_start))
+        if starts_excluded:
+            excluded_depth += 1
+
+    if not spans:
+        return xml_text
+    pieces: List[str] = []
+    last_end = 0
+    for start, end in spans:
+        pieces.append(xml_text[last_end:start])
+        last_end = end
+    pieces.append(xml_text[last_end:])
+    return "".join(pieces)
 
 
 def paragraph_text_from_block(p_xml: str) -> str:
-    # Deleted/moved-from text and field instructions are not visible paragraph
-    # content and must not influence semantic classification.
-    visible = re.sub(r"<w:(?:del|moveFrom)\b[^>]*>[\s\S]*?</w:(?:del|moveFrom)>", "", p_xml)
+    # Deleted/moved-from text, field instructions, and drawing/text-box content
+    # are not visible in-scope paragraph content for Phase 1 classification.
+    visible = _strip_out_of_scope_subtrees(p_xml)
+    visible = re.sub(r"<w:(?:del|moveFrom)\b[^>]*>[\s\S]*?</w:(?:del|moveFrom)>", "", visible)
     visible = re.sub(r"<w:instrText\b[^>]*>[\s\S]*?</w:instrText>", "", visible)
     # Tabs and explicit line breaks separate words in Word even though they do
-    # not live inside w:t nodes.  The old extractor concatenated either side.
+    # not live inside w:t nodes.  Keep non-breaking hyphens semantically a
+    # hyphen and omit optional soft hyphens.
     separator_token = "\ue000"
-    visible = re.sub(r"<w:(?:tab|br|cr)\b[^>]*/>", separator_token, visible)
-    visible = re.sub(r"<w:noBreakHyphen\b[^>]*/>", "-", visible)
-    visible = re.sub(r"<w:softHyphen\b[^>]*/>", "", visible)
-    pieces = re.findall(rf"<w:t\b[^>]*>([\s\S]*?)</w:t>|({separator_token})", visible)
+    no_break_hyphen_token = "\ue001"
+    # Empty OOXML controls may be serialized either as ``<w:tab/>`` or as a
+    # paired empty element such as ``<w:tab></w:tab>``.  Normalize both forms
+    # before collecting text so they have identical visible semantics.
+    visible = re.sub(
+        r"<w:(tab|br|cr)\b[^>]*>\s*</w:\1\s*>",
+        separator_token,
+        visible,
+    )
+    visible = re.sub(r"<w:(?:tab|br|cr)\b[^>]*/\s*>", separator_token, visible)
+    visible = re.sub(
+        r"<w:noBreakHyphen\b[^>]*>\s*</w:noBreakHyphen\s*>",
+        no_break_hyphen_token,
+        visible,
+    )
+    visible = re.sub(
+        r"<w:noBreakHyphen\b[^>]*/\s*>",
+        no_break_hyphen_token,
+        visible,
+    )
+    visible = re.sub(
+        r"<w:softHyphen\b[^>]*>\s*</w:softHyphen\s*>",
+        "",
+        visible,
+    )
+    visible = re.sub(r"<w:softHyphen\b[^>]*/\s*>", "", visible)
+    pieces = re.findall(
+        rf"<w:t\b[^>]*>([\s\S]*?)</w:t>|({separator_token})|({no_break_hyphen_token})",
+        visible,
+    )
     if not pieces:
         return ""
-    joined = html.unescape("".join(text if text else " " for text, _separator in pieces))
+    joined = html.unescape(
+        "".join(
+            text if text else (" " if separator else "\u2011")
+            for text, separator, _hyphen in pieces
+        )
+    )
     joined = re.sub(r"\s+", " ", joined).strip()
     return joined
 
@@ -402,26 +737,12 @@ def paragraph_rpr_hints_from_block(p_xml: str) -> Dict[str, Any]:
     return hints
 
 
-def _localname(tag: str) -> str:
-    return tag.rsplit('}', 1)[-1]
-
-
 def collect_paragraph_contexts(document_xml_path: Path) -> List[ParagraphContext]:
-    tree = ET.parse(document_xml_path)
-    root = tree.getroot()
-    out: List[ParagraphContext] = []
-
-    def walk(node: ET.Element, in_table: bool = False) -> None:
-        local = _localname(node.tag)
-        next_in_table = in_table or (local == "tbl")
-        if local == "p":
-            has_sect = node.find(f".//{_q('sectPr')}") is not None
-            out.append(ParagraphContext(in_table=next_in_table, contains_sectPr=has_sect))
-        for child in list(node):
-            walk(child, in_table=next_in_table)
-
-    walk(root)
-    return out
+    # ElementTree supplies a strict well-formedness check without rewriting
+    # the source bytes; the lexical scanner supplies exact byte ranges.
+    ET.parse(document_xml_path)
+    document_xml_text = read_xml_text(document_xml_path)
+    return [item.context for item in _scan_paragraph_xml_blocks(document_xml_text)]
 
 
 def build_style_catalog(styles_xml_path: Path, used_style_ids: Set[str]) -> Dict[str, Any]:
@@ -532,22 +853,23 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
     used_style_ids: Set[str] = set()
     used_num_ids: Set[str] = set()
 
-    contexts = collect_paragraph_contexts(doc_path)
-    blocks = list(iter_paragraph_xml_blocks(doc_text))
-    if len(contexts) != len(blocks):
-        raise ValueError(
-            f"Paragraph extraction mismatch: xml_contexts={len(contexts)} blocks={len(blocks)}"
-        )
+    # Validate the complete part, then use one lexical scan for exact ranges
+    # and structural context.  This avoids the old regex/DOM index mismatch
+    # when a drawing contains nested text-box paragraphs.
+    ET.parse(doc_path)
+    blocks = _scan_paragraph_xml_blocks(doc_text)
 
-    for idx, (_s, _e, p_xml) in enumerate(blocks):
-        ctx = contexts[idx]
+    for idx, block in enumerate(blocks):
+        p_xml = block.xml
+        ctx = block.context
+        analysis_xml = _strip_out_of_scope_subtrees(p_xml)
         raw_text = paragraph_text_from_block(p_xml)
-        pStyle = paragraph_pstyle_from_block(p_xml)
-        numpr = paragraph_numpr_from_block(p_xml)
-        hints = paragraph_ppr_hints_from_block(p_xml)
-        rpr_hints = paragraph_rpr_hints_from_block(p_xml)
-        has_direct_ppr = bool(extract_paragraph_ppr_inner(p_xml))
-        has_uniform_direct_rpr = bool(extract_paragraph_rpr_inner(p_xml))
+        pStyle = paragraph_pstyle_from_block(analysis_xml)
+        numpr = paragraph_numpr_from_block(analysis_xml)
+        hints = paragraph_ppr_hints_from_block(analysis_xml)
+        rpr_hints = paragraph_rpr_hints_from_block(analysis_xml)
+        has_direct_ppr = bool(extract_paragraph_ppr_inner(analysis_xml))
+        has_uniform_direct_rpr = bool(extract_paragraph_rpr_inner(analysis_xml))
         contains_sect = ctx.contains_sectPr
         in_table = ctx.in_table
 
@@ -560,6 +882,14 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
         if len(raw_text) > 200:
             display_text = raw_text[:200] + "…"
         skip_reason = compute_skip_reason(raw_text, contains_sect, in_table)
+        # A drawing/text box is itself out of scope, but it does not make
+        # visible host text out of scope.  Empty host paragraphs remain
+        # explicitly reported as drawing/text-box containers.
+        if not raw_text.strip():
+            if ctx.contains_textbox:
+                skip_reason = "text_box"
+            elif ctx.contains_drawing:
+                skip_reason = "drawing"
 
         paragraphs.append({
             "paragraph_index": idx,
@@ -571,6 +901,8 @@ def build_slim_bundle(extract_dir: Path) -> Dict[str, Any]:
             "has_direct_pPr": has_direct_ppr,
             "has_uniform_direct_rPr": has_uniform_direct_rpr,
             "contains_sectPr": contains_sect,
+            "contains_drawing": ctx.contains_drawing,
+            "contains_textbox": ctx.contains_textbox,
             "in_table": in_table,
             "skip_reason": skip_reason,
             "text_was_truncated": len(raw_text) > 200,
@@ -662,6 +994,13 @@ def extract_paragraph_ppr_inner(p_xml: str) -> str:
         return ""
     inner = m.group(1)
     inner = re.sub(r"<w:pStyle\b[^>]*/>", "", inner)
+    # A visible paragraph may also carry a section break.  It is part of the
+    # document structure, not reusable paragraph formatting: copying it into
+    # a derived style would leak document relationship IDs into styles.xml and
+    # can make the emitted package invalid.  The original paragraph-level
+    # sectPr remains untouched in document.xml.
+    for sectpr_block in _extract_named_xml_blocks(inner, "w:sectPr"):
+        inner = inner.replace(sectpr_block, "", 1)
     return inner.strip()
 
 
@@ -1031,9 +1370,6 @@ def insert_styles_into_styles_xml(styles_xml_text: str, style_blocks: List[str])
 
 
 def apply_pstyle_to_paragraph_block(p_xml: str, styleId: str) -> str:
-    if "<w:sectPr" in p_xml:
-        return p_xml
-
     if re.search(r"<w:pStyle\b", p_xml):
         return re.sub(
             r'(<w:pStyle\b[^>]*w:val=")([^"]+)(")',
@@ -1234,8 +1570,6 @@ def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Di
         skip_reason = para.get("skip_reason")
         if skip_reason is None:
             skip_reason = compute_skip_reason(text, bool(para.get("contains_sectPr")), bool(para.get("in_table")))
-        if skip_reason == "sectPr":
-            raise ValueError(f"roles['{role}'] exemplar paragraph {ex} contains sectPr")
         if skip_reason == "in_table":
             raise ValueError(f"roles['{role}'] exemplar paragraph {ex} is inside a table")
         if skip_reason == "editor_note":
@@ -1560,8 +1894,6 @@ def apply_instructions(extract_dir: Path, instructions: Dict[str, Any]) -> None:
             raise ValueError(f"roles['{role}'] references unknown styleId: {sid}")
         if ex < 0 or ex >= len(para_blocks):
             raise ValueError(f"roles['{role}'] exemplar_paragraph_index out of range: {ex}")
-        if paragraph_contains_sectpr(para_blocks[ex]):
-            raise ValueError(f"roles['{role}'] exemplar paragraph {ex} contains sectPr; refuse.")
 
     # 2) Apply paragraph styles by index (pStyle insertion ONLY)
     idx_map: Dict[int, str] = {}
@@ -1573,8 +1905,6 @@ def apply_instructions(extract_dir: Path, instructions: Dict[str, Any]) -> None:
     for idx, sid in idx_map.items():
         if idx < 0 or idx >= len(para_blocks):
             raise ValueError(f"paragraph_index out of range: {idx}")
-        if paragraph_contains_sectpr(para_blocks[idx]):
-            raise ValueError(f"Refusing to apply style to paragraph {idx} because it contains sectPr.")
         para_blocks[idx] = apply_pstyle_to_paragraph_block(para_blocks[idx], sid)
 
     # drift checks: only pStyle may differ

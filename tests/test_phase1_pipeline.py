@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import codecs
+import json
 import os
 import stat
 import zipfile
@@ -29,7 +31,29 @@ SOURCE_STYLES = (
 ).encode("utf-8")
 
 
-def _write_minimal_docx(path: Path) -> None:
+def _encode_declared_xml(body: str, encoding_case: str) -> bytes:
+    declarations = {
+        "utf8-bom": "UTF-8",
+        "utf16-le": "UTF-16",
+        "utf16-be": "UTF-16",
+        "latin1": "iso-8859-1",
+    }
+    text = f'<?xml version="1.0" encoding="{declarations[encoding_case]}"?>{body}'
+    if encoding_case == "utf8-bom":
+        return codecs.BOM_UTF8 + text.encode("utf-8")
+    if encoding_case == "utf16-le":
+        return codecs.BOM_UTF16_LE + text.encode("utf-16-le")
+    if encoding_case == "utf16-be":
+        return codecs.BOM_UTF16_BE + text.encode("utf-16-be")
+    return text.encode("iso-8859-1")
+
+
+def _write_minimal_docx(
+    path: Path,
+    *,
+    styles_bytes: bytes = SOURCE_STYLES,
+    settings_bytes: bytes | None = None,
+) -> None:
     content_types = (
         f'<Types xmlns="{CONTENT_TYPES_NS}">'
         '<Default Extension="rels" '
@@ -59,7 +83,9 @@ def _write_minimal_docx(path: Path) -> None:
         package.writestr("[Content_Types].xml", content_types)
         package.writestr("_rels/.rels", root_rels)
         package.writestr("word/document.xml", document)
-        package.writestr("word/styles.xml", SOURCE_STYLES)
+        package.writestr("word/styles.xml", styles_bytes)
+        if settings_bytes is not None:
+            package.writestr("word/settings.xml", settings_bytes)
 
 
 def _write_prompts(prompt_dir: Path) -> None:
@@ -142,6 +168,48 @@ def test_injected_classifier_runs_pipeline_and_publishes_valid_bundle(tmp_path: 
     assert not any(path.name == "extracted" for path in output_root.rglob("*"))
     assert not any(path.name.startswith(".phase1-work-") for path in output_root.rglob("*"))
     assert not any(path.name.startswith(".phase1-bundle-staging-") for path in output_root.rglob("*"))
+
+
+@pytest.mark.parametrize(
+    "encoding_case",
+    ["utf8-bom", "utf16-le", "utf16-be", "latin1"],
+)
+def test_registry_xml_is_utf8_normalized_while_source_artifacts_remain_exact(
+    tmp_path: Path,
+    encoding_case: str,
+) -> None:
+    source = tmp_path / f"architect-{encoding_case}.docx"
+    output_root = tmp_path / "output"
+    prompt_dir = tmp_path / "prompts"
+    styles_bytes = _encode_declared_xml(SOURCE_STYLES.decode("utf-8"), encoding_case)
+    settings_body = (
+        f'<w:settings xmlns:w="{W_NS}"><w:docVar w:name="caf\u00e9" w:val="1"/>'
+        '<w:zoom w:percent="100"/></w:settings>'
+    )
+    settings_bytes = _encode_declared_xml(settings_body, encoding_case)
+    _write_minimal_docx(
+        source,
+        styles_bytes=styles_bytes,
+        settings_bytes=settings_bytes,
+    )
+    _write_prompts(prompt_dir)
+
+    result = run_phase1(
+        source,
+        output_root,
+        api_key="",
+        model="deterministic-test-model",
+        prompt_dir=prompt_dir,
+        classifier=lambda **_kwargs: _end_of_section_instructions(),
+    )
+
+    registry = json.loads(
+        (result.bundle_dir / "arch_template_registry.json").read_text(encoding="utf-8")
+    )
+    assert 'encoding="UTF-8"' in registry["settings"]["settings_xml"]
+    assert "caf\u00e9" in registry["settings"]["settings_xml"]
+    assert (result.bundle_dir / "source_styles.xml").read_bytes() == styles_bytes
+    assert (result.bundle_dir / "source_settings.xml").read_bytes() == settings_bytes
 
 
 @pytest.mark.parametrize(

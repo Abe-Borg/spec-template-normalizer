@@ -14,7 +14,8 @@ IMPORTANT: Account for all classifiable paragraphs (all non-skipped, non-table c
 Use apply_pStyle for CSI content and ignored_paragraphs for genuinely non-CSI content, with a specific reason.
 Never guess a missing classification from the preceding/following paragraph. END OF SECTION is classifiable as
 END_OF_SECTION. Automatic Word numbering (effective_numPr/numbering_role) is stronger evidence than absent visible markers.
-Only empty paragraphs, sectPr paragraphs, and in-table paragraphs are out of scope. Put editor/specifier notes,
+Only empty paragraphs, in-table paragraphs, and paragraphs reported with drawing/text_box skip reasons are out of scope.
+Visible paragraphs that contain sectPr remain classifiable; styling changes only w:pStyle and preserves sectPr. Put editor/specifier notes,
 copyright/distribution notices, and publisher editing instructions in ignored_paragraphs with a concrete reason.
 
 Constraints:

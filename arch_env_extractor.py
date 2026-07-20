@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import posixpath
 import re
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -32,7 +33,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
-from ooxml_text import read_xml_text
+from ooxml_text import prepare_xml_text_for_utf8, read_xml_text
+from docx_decomposer import extract_document_sectpr_blocks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,6 +134,39 @@ def _parse_relationships_xml(xml_text: str, part_name: str) -> List[ET.Element]:
     return relationships
 
 
+def _relationship_references(xml_text: str, part_name: str) -> List[Tuple[str, str]]:
+    """Return ``(relationship_id, attribute_name)`` references in an XML part.
+
+    Header/footer content can refer to relationships through ``r:id``,
+    ``r:embed``, or ``r:link``.  Keeping this check next to relationship
+    capture prevents a registry from carrying XML that Phase 2 cannot wire
+    back to a real relationship.
+    """
+    if "<!DOCTYPE" in xml_text.upper():
+        raise ValueError(f"{part_name} must not contain a DOCTYPE declaration")
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ValueError(f"Malformed XML in {part_name}: {exc}") from exc
+
+    references: List[Tuple[str, str]] = []
+    relationship_attributes = {
+        f"{{{R_NS}}}id": "r:id",
+        f"{{{R_NS}}}embed": "r:embed",
+        f"{{{R_NS}}}link": "r:link",
+    }
+    for element in root.iter():
+        for attribute, display_name in relationship_attributes.items():
+            rel_id = element.get(attribute)
+            if rel_id is not None:
+                if not rel_id.strip():
+                    raise ValueError(
+                        f"Empty {display_name} relationship reference in {part_name}"
+                    )
+                references.append((rel_id, display_name))
+    return references
+
+
 def _resolve_internal_relationship_target(
     extract_dir: Path,
     source_part: str,
@@ -139,15 +174,20 @@ def _resolve_internal_relationship_target(
 ) -> Tuple[Path, str]:
     """Resolve an internal relationship target without leaving *extract_dir*.
 
-    OPC targets are URI paths.  Absolute paths, Windows drive/UNC paths,
-    backslash-separated paths, URI schemes, and parent traversal are rejected
-    before touching the filesystem.  ``Path.resolve`` then catches escapes via
-    symlinks already present in the extraction tree.
+    OPC targets are URI paths. Absolute paths, Windows drive/UNC paths,
+    backslash-separated paths, URI schemes, and targets that escape the
+    package root are rejected before touching the filesystem. Legal parent
+    segments remain supported for nested owners (for example a custom header
+    at ``word/headers/default.xml`` targeting ``../media/logo.png``).
+    ``Path.resolve`` then catches escapes via symlinks already present in the
+    extraction tree.
     """
     if not target or "\x00" in target:
         raise ValueError(f"Unsafe empty or NUL-containing relationship target {target!r}")
 
     decoded_target = unquote(target)
+    if re.search(r"%2e", target, flags=re.IGNORECASE):
+        raise ValueError(f"Unsafe encoded-dot relationship target {target!r}")
     parsed = urlsplit(decoded_target)
     if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
         raise ValueError(f"Unsafe URI relationship target {target!r}")
@@ -160,17 +200,25 @@ def _resolve_internal_relationship_target(
     if windows_target.drive or windows_target.is_absolute():
         raise ValueError(f"Unsafe drive or UNC relationship target {target!r}")
 
-    target_path = PurePosixPath(decoded_target)
-    if target_path.is_absolute() or ".." in target_path.parts:
-        raise ValueError(f"Unsafe traversing relationship target {target!r}")
-
     source_path = PurePosixPath(source_part)
-    if source_path.is_absolute() or ".." in source_path.parts:
+    if (
+        source_path.is_absolute()
+        or ".." in source_path.parts
+        or "\\" in source_part
+        or any(":" in part for part in source_path.parts)
+    ):
         raise ValueError(f"Unsafe source part name {source_part!r}")
 
-    package_path = source_path.parent.joinpath(target_path)
-    package_parts = tuple(part for part in package_path.parts if part not in ("", "."))
-    package_path = PurePosixPath(*package_parts)
+    joined = posixpath.normpath(
+        posixpath.join(source_path.parent.as_posix(), decoded_target)
+    )
+    if joined in {"", ".", ".."} or joined.startswith("../"):
+        raise ValueError(f"Unsafe traversing relationship target {target!r}")
+    package_path = PurePosixPath(joined)
+    if package_path.is_absolute() or any(
+        part in {"", ".", ".."} or ":" in part for part in package_path.parts
+    ):
+        raise ValueError(f"Unsafe relationship target {target!r}")
 
     extraction_root = extract_dir.resolve()
     candidate = extraction_root.joinpath(*package_path.parts).resolve(strict=False)
@@ -182,6 +230,29 @@ def _resolve_internal_relationship_target(
         ) from exc
 
     return candidate, package_path.as_posix()
+
+
+def _relationship_part_name(source_part: str) -> str:
+    """Return the OPC relationships-part name adjacent to *source_part*.
+
+    Relationship parts live in an ``_rels`` directory beside their owning
+    part.  Building this name from the complete owner path is important for
+    legal custom locations such as ``word/layout/headerFirst.xml``; using only
+    the basename would incorrectly look under ``word/_rels``.
+    """
+    source_path = PurePosixPath(source_part)
+    if (
+        source_path.is_absolute()
+        or not source_path.name
+        or ".." in source_path.parts
+        or "\\" in source_part
+    ):
+        raise ValueError(f"Unsafe source part name {source_part!r}")
+    return (
+        source_path.parent
+        / "_rels"
+        / f"{source_path.name}.rels"
+    ).as_posix()
 
 
 def _valid_content_type(value: Optional[str]) -> bool:
@@ -278,6 +349,15 @@ def _on_off_attribute(attrs: str, name: str, default: bool = False) -> bool:
     if not value_match:
         return default
     return value_match.group("value").strip().lower() not in {"0", "false", "off"}
+
+
+def _qualified_attribute(attrs: str, name: str) -> Optional[str]:
+    """Read a qualified XML attribute using either XML quote style."""
+    value_match = re.search(
+        rf"(?<![\w:]){re.escape(name)}\s*=\s*(['\"])(?P<value>.*?)\1",
+        attrs,
+    )
+    return value_match.group("value") if value_match else None
 
 
 def _extract_block(xml_text: str, tag: str, ns_prefix: str = "w",
@@ -386,12 +466,18 @@ def _strip_proofing(xml_text: str) -> str:
 
 
 def _canonicalize(xml_text: str, strip_rsid: bool = True, strip_proof: bool = True) -> str:
-    """Apply standard cleanup to XML text."""
+    """Apply standard cleanup and make registry XML UTF-8 serializable.
+
+    Source-exact artifacts are copied as bytes by :mod:`phase1_pipeline` and
+    never pass through this helper.  Every XML string carried inside the JSON
+    registry does, so a UTF-16 or legacy declaration must be changed to match
+    the UTF-8 JSON file that contains it.
+    """
     if strip_rsid:
         xml_text = _strip_rsids(xml_text)
     if strip_proof:
         xml_text = _strip_proofing(xml_text)
-    return xml_text
+    return prepare_xml_text_for_utf8(xml_text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -617,15 +703,50 @@ def extract_page_layout(document_xml: str, extract_dir: Path) -> Dict[str, Any]:
     }
     
     # Find all sectPr blocks in document.xml
-    sect_blocks = _extract_all_blocks(document_xml, "sectPr")
+    sect_blocks = extract_document_sectpr_blocks(document_xml)
     
     # Parse relationships for header/footer refs
-    rels_xml = _read_xml_part(extract_dir, "word/_rels/document.xml.rels")
-    if rels_xml:
-        _parse_relationships_xml(rels_xml, "word/_rels/document.xml.rels")
+    rels_part_name = "word/_rels/document.xml.rels"
+    rels_xml = _read_xml_part(extract_dir, rels_part_name)
+    document_relationships = (
+        _parse_relationships_xml(rels_xml, rels_part_name) if rels_xml else []
+    )
+    relationships_by_id = {rel.get("Id"): rel for rel in document_relationships}
     
     for idx, sect in enumerate(sect_blocks):
         sect_info = _parse_sectpr(sect, rels_xml, idx)
+        for kind, reference_group in (
+            ("header", sect_info["header_refs"]),
+            ("footer", sect_info["footer_refs"]),
+        ):
+            for reference_type, rel_id in reference_group.items():
+                if rel_id is None:
+                    continue
+                rel = relationships_by_id.get(rel_id)
+                if rel is None:
+                    raise ValueError(
+                        f"Section {idx} {kind} reference {reference_type!r} uses "
+                        f"missing relationship {rel_id!r} in {rels_part_name}"
+                    )
+                rel_type = rel.get("Type") or ""
+                if rel.get("TargetMode") == "External" or not rel_type.endswith(f"/{kind}"):
+                    raise ValueError(
+                        f"Section {idx} {kind} reference {reference_type!r} uses "
+                        f"relationship {rel_id!r} with unsupported Type={rel_type!r} "
+                        f"or TargetMode={rel.get('TargetMode')!r}"
+                    )
+                target = rel.get("Target")
+                assert target is not None  # validated by _parse_relationships_xml
+                target_path, package_part = _resolve_internal_relationship_target(
+                    extract_dir,
+                    "word/document.xml",
+                    target,
+                )
+                if not target_path.is_file():
+                    raise ValueError(
+                        f"Section {idx} {kind} relationship {rel_id!r} targets "
+                        f"missing package part {package_part!r}"
+                    )
         result["section_chain"].append(sect_info)
     
     # The last sectPr is typically the "default" section
@@ -686,30 +807,30 @@ def _parse_sectpr(sect_xml: str, rels_xml: Optional[str], section_index: int) ->
     if doc_grid:
         info["doc_grid"] = _canonicalize(doc_grid)
     
-    # Header/footer references
-    for hdr_m in re.finditer(r'<w:headerReference\s+([^>]+)/>', sect_xml):
-        attrs = hdr_m.group(1)
-        type_m = re.search(r'w:type="([^"]+)"', attrs)
-        rid_m = re.search(r'r:id="([^"]+)"', attrs)
-        if type_m and rid_m:
-            hdr_type = type_m.group(1)
-            if hdr_type in info["header_refs"]:
-                info["header_refs"][hdr_type] = rid_m.group(1)
-    
-    for ftr_m in re.finditer(r'<w:footerReference\s+([^>]+)/>', sect_xml):
-        attrs = ftr_m.group(1)
-        type_m = re.search(r'w:type="([^"]+)"', attrs)
-        rid_m = re.search(r'r:id="([^"]+)"', attrs)
-        if type_m and rid_m:
-            ftr_type = type_m.group(1)
-            if ftr_type in info["footer_refs"]:
-                info["footer_refs"][ftr_type] = rid_m.group(1)
+    # Header/footer reference elements are normally self-closing, but paired
+    # empty forms are also legal XML and Word accepts both quote styles.  Only
+    # the opening token carries data, so this deliberately recognizes either
+    # serialization without trying to parse a namespace-less XML fragment.
+    for kind in ("header", "footer"):
+        refs = info[f"{kind}_refs"]
+        for match in re.finditer(rf"<w:{kind}Reference\b([^>]*)>", sect_xml):
+            attrs = match.group(1)
+            reference_type = _qualified_attribute(attrs, "w:type")
+            rel_id = _qualified_attribute(attrs, "r:id")
+            if reference_type in refs and rel_id:
+                refs[reference_type] = rel_id
     
     return info
 
 
 def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
-    """Extract all header and footer parts."""
+    """Extract header/footer parts named by document relationships.
+
+    OPC does not require these parts to be named ``word/header1.xml`` or to
+    live directly under ``word``.  The document relationships are therefore
+    authoritative; filesystem globs can both miss legal custom paths and pick
+    up orphan parts that the document never uses.
+    """
     extract_dir = Path(extract_dir)
     content_type_defaults, content_type_overrides = _load_content_types(extract_dir)
     total_media_bytes = 0
@@ -748,18 +869,56 @@ def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
         part_name: str,
         rels_part_name: str,
         rels_xml: Optional[str],
+        part_xml: str,
     ) -> List[Dict[str, str]]:
+        references = _relationship_references(part_xml, part_name)
         if not rels_xml:
+            if references:
+                missing = sorted({rel_id for rel_id, _attribute in references})
+                raise ValueError(
+                    f"{part_name} references missing relationships {missing}; "
+                    f"{rels_part_name} does not exist"
+                )
             return []
 
+        relationships = _parse_relationships_xml(rels_xml, rels_part_name)
+        relationships_by_id = {rel.get("Id"): rel for rel in relationships}
+        missing = sorted(
+            {
+                rel_id
+                for rel_id, _attribute in references
+                if rel_id not in relationships_by_id
+            }
+        )
+        if missing:
+            raise ValueError(
+                f"{part_name} references relationship IDs absent from "
+                f"{rels_part_name}: {missing}"
+            )
+
+        for rel_id, attribute_name in references:
+            rel = relationships_by_id[rel_id]
+            rel_type = rel.get("Type") or ""
+            if attribute_name in {"r:embed", "r:link"} and not rel_type.endswith("/image"):
+                raise ValueError(
+                    f"Unsupported {attribute_name} relationship {rel_id!r} in {part_name}: "
+                    f"expected an image relationship, got {rel_type!r}"
+                )
+
         media_items: List[Dict[str, str]] = []
-        for rel in _parse_relationships_xml(rels_xml, rels_part_name):
+        for rel in relationships:
             # External image links may point to file://, UNC, or network URLs.
             # Preserve the relationship XML, but never dereference the target.
             if rel.get("TargetMode") == "External":
                 continue
-            if not (rel.get("Type") or "").endswith("/image"):
-                continue
+
+            rel_type = rel.get("Type") or ""
+            if not rel_type.endswith("/image"):
+                raise ValueError(
+                    f"Unsupported internal header/footer relationship in {rels_part_name}: "
+                    f"Id={rel.get('Id')!r}, Type={rel_type!r}. "
+                    "Only internal images and external relationships are supported."
+                )
 
             rel_id = rel.get("Id")
             target = rel.get("Target")
@@ -770,7 +929,10 @@ def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
                 target,
             )
             if not media_path.exists() or not media_path.is_file():
-                continue
+                raise ValueError(
+                    f"Header/footer image relationship {rel_id!r} in {rels_part_name} "
+                    f"targets missing package part {package_part!r}"
+                )
 
             word_root = PurePosixPath("word")
             package_part_path = PurePosixPath(package_part)
@@ -798,24 +960,19 @@ def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
 
         return media_items
 
-    result = {
-        "headers": [],
-        "footers": []
-    }
+    result = {"headers": [], "footers": []}
     header_footer_media = set()
-    
-    word_dir = extract_dir / "word"
-    
-    # Read relationships to map rId to part names
+
+    # Resolve each part from the validated document relationship.  Preserve
+    # one registry entry per relationship ID so every section reference can be
+    # mapped even when a package legally has two IDs for the same part.
     rels_xml = _read_xml_part(extract_dir, "word/_rels/document.xml.rels")
-    rid_to_part = {}
+    document_parts: List[Tuple[str, str, str, Path]] = []
     if rels_xml:
         for rel in _parse_relationships_xml(
             rels_xml,
             "word/_rels/document.xml.rels",
         ):
-            if rel.get("TargetMode") == "External":
-                continue
             rel_type = rel.get("Type") or ""
             if not rel_type.endswith(("/header", "/footer")):
                 continue
@@ -823,69 +980,72 @@ def extract_headers_footers(extract_dir: Path) -> Dict[str, Any]:
             rel_id = rel.get("Id")
             target = rel.get("Target")
             assert rel_id is not None and target is not None  # validated above
-            _, package_part = _resolve_internal_relationship_target(
+            kind = "header" if rel_type.endswith("/header") else "footer"
+            if rel.get("TargetMode") == "External":
+                raise ValueError(
+                    f"Unsupported external {kind} relationship {rel_id!r} in "
+                    "word/_rels/document.xml.rels"
+                )
+            part_path, package_part = _resolve_internal_relationship_target(
                 extract_dir,
                 "word/document.xml",
                 target,
             )
-            rid_to_part[rel_id] = package_part
-    
-    # Collect headers
-    for hdr_path in sorted(word_dir.glob("header*.xml")):
-        part_name = f"word/{hdr_path.name}"
-        xml_content = read_xml_text(hdr_path)
-        rels_part_name = f"word/_rels/{hdr_path.name}.rels"
-        rels_content = _read_xml_part(extract_dir, rels_part_name)
-        media_entries = _extract_media_from_rels(
-            part_name,
-            rels_part_name,
-            rels_content,
-        )
-        for media_entry in media_entries:
-            header_footer_media.add(media_entry["target"])
-        
-        # Find the rId for this part
-        rel_id = None
-        for rid, target_part in rid_to_part.items():
-            if target_part == part_name:
-                rel_id = rid
-                break
-        
-        result["headers"].append({
-            "part_name": part_name,
-            "rel_id": rel_id,
-            "xml": _canonicalize(xml_content),
-            "rels_xml": _canonicalize(rels_content, strip_rsid=False) if rels_content else None,
-            "media": media_entries,
-        })
-    
-    # Collect footers
-    for ftr_path in sorted(word_dir.glob("footer*.xml")):
-        part_name = f"word/{ftr_path.name}"
-        xml_content = read_xml_text(ftr_path)
-        rels_part_name = f"word/_rels/{ftr_path.name}.rels"
-        rels_content = _read_xml_part(extract_dir, rels_part_name)
-        media_entries = _extract_media_from_rels(
-            part_name,
-            rels_part_name,
-            rels_content,
-        )
-        for media_entry in media_entries:
-            header_footer_media.add(media_entry["target"])
-        
-        rel_id = None
-        for rid, target_part in rid_to_part.items():
-            if target_part == part_name:
-                rel_id = rid
-                break
-        
-        result["footers"].append({
-            "part_name": part_name,
-            "rel_id": rel_id,
-            "xml": _canonicalize(xml_content),
-            "rels_xml": _canonicalize(rels_content, strip_rsid=False) if rels_content else None,
-            "media": media_entries,
-        })
+            if not part_path.is_file():
+                raise ValueError(
+                    f"{kind.title()} relationship {rel_id!r} targets missing "
+                    f"package part {package_part!r}"
+                )
+            if PurePosixPath(package_part).suffix.lower() != ".xml":
+                raise ValueError(
+                    f"Unsupported {kind} part name {package_part!r}: expected an XML part"
+                )
+            document_parts.append((kind, rel_id, package_part, part_path))
+
+    kinds_by_part: Dict[str, str] = {}
+    for kind, rel_id, part_name, _part_path in document_parts:
+        prior_kind = kinds_by_part.setdefault(part_name.casefold(), kind)
+        if prior_kind != kind:
+            raise ValueError(
+                f"Package part {part_name!r} is targeted as both a header and footer "
+                f"(including relationship {rel_id!r})"
+            )
+
+    captured_parts: Dict[str, Dict[str, Any]] = {}
+    for kind, rel_id, part_name, part_path in sorted(
+        document_parts,
+        key=lambda item: (item[0], item[2].casefold(), item[1]),
+    ):
+        captured = captured_parts.get(part_name)
+        if captured is None:
+            xml_content = read_xml_text(part_path)
+            rels_part_name = _relationship_part_name(part_name)
+            rels_content = _read_xml_part(extract_dir, rels_part_name)
+            media_entries = _extract_media_from_rels(
+                part_name,
+                rels_part_name,
+                rels_content,
+                xml_content,
+            )
+            for media_entry in media_entries:
+                header_footer_media.add(media_entry["target"])
+            captured = {
+                "part_name": part_name,
+                "xml": _canonicalize(xml_content),
+                "rels_part_name": rels_part_name if rels_content else None,
+                "rels_xml": (
+                    _canonicalize(rels_content, strip_rsid=False)
+                    if rels_content
+                    else None
+                ),
+                "media": media_entries,
+            }
+            captured_parts[part_name] = captured
+
+        entry = dict(captured)
+        entry["media"] = [dict(item) for item in captured["media"]]
+        entry["rel_id"] = rel_id
+        result[f"{kind}s"].append(entry)
 
     result["header_footer_media"] = sorted(header_footer_media)
     
@@ -936,9 +1096,38 @@ def extract_numbering(extract_dir: Path) -> Dict[str, Any]:
 
 
 def extract_fonts(extract_dir: Path) -> Dict[str, Any]:
-    """Extract fontTable.xml which declares fonts used in the document."""
+    """Extract declared fonts while rejecting unsupported embedded font data.
+
+    The Phase 1 bundle intentionally carries only ``fontTable.xml``.  Emitting
+    ``w:embed*`` references without the relationship part and obfuscated font
+    payload would create dangling references in Phase 2, so such a source must
+    fail during capture instead of producing a superficially valid bundle.
+    """
     font_xml = _read_xml_part(extract_dir, "word/fontTable.xml")
-    
+    if font_xml:
+        references = _relationship_references(font_xml, "word/fontTable.xml")
+        embed_elements = re.findall(
+            r"<w:(embedRegular|embedBold|embedItalic|embedBoldItalic)\b",
+            font_xml,
+        )
+        if embed_elements or references:
+            details = sorted(set(embed_elements)) or [name for _rid, name in references]
+            raise ValueError(
+                "Embedded fonts are unsupported: word/fontTable.xml contains "
+                f"relationship-backed font declarations {details}"
+            )
+
+    font_rels_part = "word/_rels/fontTable.xml.rels"
+    font_rels_xml = _read_xml_part(extract_dir, font_rels_part)
+    if font_rels_xml:
+        relationships = _parse_relationships_xml(font_rels_xml, font_rels_part)
+        if relationships:
+            relationship_ids = sorted(rel.get("Id") for rel in relationships)
+            raise ValueError(
+                f"Embedded fonts are unsupported: {font_rels_part} contains "
+                f"relationships {relationship_ids}"
+            )
+
     return {
         "font_table_xml": _canonicalize(font_xml) if font_xml else None,
         "notes": {
