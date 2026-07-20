@@ -127,7 +127,10 @@ _BOILERPLATE_RX = [(re.compile(pat, flags=re.MULTILINE), tag) for pat, tag in BO
 
 _PART_RX = re.compile(r"^\s*PART\s+[123]\b", re.IGNORECASE)
 _ARTICLE_RX = re.compile(r"^\s*\d+\.\d{2}\b")
-_SECTION_ID_RX = re.compile(r"^\s*SECTION\s+\d{2}(?:\s+\d{2}){2,}\b", re.IGNORECASE)
+_SECTION_ID_RX = re.compile(
+    r"^\s*SECTION\s+(?:\d{6,}|\d{2}(?:[ \t\u00a0]+\d{2}){2,})\b",
+    re.IGNORECASE,
+)
 _END_OF_SECTION_RX = re.compile(r"^\s*END\s+OF\s+SECTION\s*", re.IGNORECASE)
 _ALL_CAPS_RX = re.compile(r"^[^a-z]*[A-Z][^a-z]*$")
 _MARKER_RX = [
@@ -527,6 +530,7 @@ def build_phase2_slim_bundle(
             *BODY_HIERARCHY_ROLES,
         ]
 
+    skip_next_section_title = False
     for idx, (start, _e, p_xml) in enumerate(raw_paragraphs):
         raw_text = paragraph_text_from_block(p_xml)
         in_table = _in_any_range(start, table_ranges)
@@ -571,6 +575,40 @@ def build_phase2_slim_bundle(
                 "paragraph_index": idx,
                 "tags": tags
             })
+
+        # A source can contain a section-number/title header even when the
+        # architect template has no semantic style for it.  Such a header has
+        # no valid parent-role fallback: classifying it as PART would cause a
+        # numbered Canadian PART style to insert a spurious list item.  Keep
+        # the original paragraph untouched and outside classification instead.
+        section_match = _SECTION_ID_RX.match(cleaned_text)
+        if skip_next_section_title:
+            skip_next_section_title = False
+            has_csi_marker = bool(
+                _PART_RX.match(cleaned_text)
+                or _ARTICLE_RX.match(cleaned_text)
+                or _END_OF_SECTION_RX.match(cleaned_text)
+                or any(pattern.match(cleaned_text) for pattern, _kind in _MARKER_RX)
+            )
+            if _ALL_CAPS_RX.fullmatch(cleaned_text) and not has_csi_marker:
+                filter_report["paragraphs_removed_entirely"].append({
+                    "paragraph_index": idx,
+                    "tags": ["section_title_no_role"],
+                    "original_text_preview": raw_text[:120],
+                })
+                continue
+        if section_match is not None:
+            remainder = cleaned_text[section_match.end():].strip(
+                " \t\u00a0-\u2010\u2011\u2012\u2013\u2014\u2015:"
+            )
+            skip_next_section_title = not remainder and "SectionTitle" not in available_roles
+            if "SectionID" not in available_roles and "SectionTitle" not in available_roles:
+                filter_report["paragraphs_removed_entirely"].append({
+                    "paragraph_index": idx,
+                    "tags": ["section_header_no_role"],
+                    "original_text_preview": raw_text[:120],
+                })
+                continue
 
         # Skip END OF SECTION lines when no available role can receive them.
         # These are deterministically identifiable but unstyled — sending them

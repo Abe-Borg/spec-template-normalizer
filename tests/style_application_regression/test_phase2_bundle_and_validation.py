@@ -383,6 +383,97 @@ def test_preclassify_markers():
     assert out[8] == "SUBPARAGRAPH_LEVEL_8"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SECTION 012900 - PAYMENT PROCEDURES",
+        "SECTION 01 29 00",
+        "SECTION 01\u00a029\u00a000 - PAYMENT PROCEDURES",
+    ],
+)
+def test_section_header_number_formats_are_preclassified(text):
+    out = preclassify_paragraphs(
+        [{"paragraph_index": 0, "text": text, "in_table": False}],
+        ["SectionID", "SectionTitle", "PART"],
+    )
+
+    assert out == {0: "SectionID"}
+
+
+def test_combined_section_header_without_template_role_is_preserved_unclassified(
+    tmp_path: Path,
+):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:r><w:t>SECTION 012900 - PAYMENT PROCEDURES</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>GENERAL</w:t></w:r></w:p>',
+    )
+
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PART", "ARTICLE", "PARAGRAPH"],
+    )
+
+    assert [p["paragraph_index"] for p in bundle["paragraphs"]] == [1]
+    assert bundle["filter_report"]["paragraphs_removed_entirely"] == [
+        {
+            "paragraph_index": 0,
+            "tags": ["section_header_no_role"],
+            "original_text_preview": "SECTION 012900 - PAYMENT PROCEDURES",
+        }
+    ]
+
+
+def test_separate_section_title_without_template_role_is_preserved_unclassified(
+    tmp_path: Path,
+):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:r><w:t>SECTION 01 29 00</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>PAYMENT PROCEDURES</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>PART 1 GENERAL</w:t></w:r></w:p>',
+    )
+
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PART", "ARTICLE", "PARAGRAPH"],
+    )
+
+    assert bundle["paragraphs"] == []
+    assert bundle["deterministic_classifications"] == [
+        {"paragraph_index": 2, "csi_role": "PART"}
+    ]
+    assert bundle["filter_report"]["paragraphs_removed_entirely"] == [
+        {
+            "paragraph_index": 0,
+            "tags": ["section_header_no_role"],
+            "original_text_preview": "SECTION 01 29 00",
+        },
+        {
+            "paragraph_index": 1,
+            "tags": ["section_title_no_role"],
+            "original_text_preview": "PAYMENT PROCEDURES",
+        },
+    ]
+
+
+def test_section_number_without_title_does_not_hide_following_part(tmp_path: Path):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:r><w:t>SECTION 01 29 00</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>PART 1 GENERAL</w:t></w:r></w:p>',
+    )
+
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PART", "ARTICLE", "PARAGRAPH"],
+    )
+
+    assert bundle["deterministic_classifications"] == [
+        {"paragraph_index": 1, "csi_role": "PART"}
+    ]
+
+
 def test_end_of_section_is_deterministic_not_boilerplate_removed(tmp_path: Path):
     extract_dir = _write_document_xml(
         tmp_path,
