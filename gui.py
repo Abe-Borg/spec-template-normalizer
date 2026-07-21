@@ -6,6 +6,7 @@ import os
 import queue
 import threading
 import traceback
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
@@ -13,6 +14,8 @@ from typing import Iterable, Optional, Tuple
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+from spec_formatter import __version__, secrets, updates
+from spec_formatter.app_paths import default_config_dir
 from spec_formatter.pipeline import (
     CSI_TO_CANADIAN,
     FORMAT_ONLY,
@@ -160,8 +163,15 @@ class App(ctk.CTk):
 
         self.architect_var = ctk.StringVar()
         self.output_var = ctk.StringVar()
-        self.api_key_var = ctk.StringVar(value=os.environ.get("ANTHROPIC_API_KEY", ""))
+        env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        stored_key = secrets.load_api_key()
+        # An explicit ANTHROPIC_API_KEY (rotated / deployment-provided) takes
+        # precedence over a previously remembered key, which may be stale.
+        self.api_key_var = ctk.StringVar(value=env_key or stored_key)
         self.show_key_var = ctk.BooleanVar(value=False)
+        # Pre-check "Remember" only when the shown key came from storage; an env
+        # override is ephemeral and must not silently overwrite the saved key.
+        self.remember_key_var = ctk.BooleanVar(value=bool(stored_key) and not env_key)
         self.reuse_var = ctk.BooleanVar(value=True)
         self.workers_var = ctk.StringVar(value="3")
         self.conversion_mode_var = ctk.StringVar(value=FORMAT_ONLY)
@@ -174,13 +184,24 @@ class App(ctk.CTk):
         self.active_output_dir: Optional[Path] = None
         self.advanced_visible = False
 
+        self._update_state_path = updates.default_state_path()
+        self._update_checking = False
+        self._update_downloading = False
+        self._update_download_cancelled = False
+        self._update_dialog: Optional[ctk.CTkToplevel] = None
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_events)
+        # Silent once-a-day update check, shortly after the window paints.
+        self.after(1500, self._maybe_auto_check_for_updates)
 
     def _build_ui(self) -> None:
         shell = ctk.CTkFrame(self, fg_color="transparent")
         shell.pack(fill="both", expand=True, padx=28, pady=24)
+
+        # Footer first so it reserves the bottom edge below the log box.
+        self._build_footer(shell)
 
         header = ctk.CTkFrame(shell, fg_color="transparent")
         header.pack(fill="x", pady=(0, 16))
@@ -332,6 +353,16 @@ class App(ctk.CTk):
             variable=self.show_key_var,
             command=self._toggle_key,
             width=72,
+            text_color=COLORS["secondary"],
+            font=_font(13),
+            fg_color=COLORS["accent"],
+        ).pack(side="left", padx=(12, 0))
+        ctk.CTkCheckBox(
+            key_row,
+            text="Remember",
+            variable=self.remember_key_var,
+            command=self._on_remember_key_toggled,
+            width=104,
             text_color=COLORS["secondary"],
             font=_font(13),
             fg_color=COLORS["accent"],
@@ -621,6 +652,8 @@ class App(ctk.CTk):
         self.open_button.configure(state="disabled")
         self.status_label.configure(text="Checking files", text_color=COLORS["secondary"])
         self.progress.start()
+        if self.remember_key_var.get():
+            secrets.save_api_key(self.api_key_var.get())
         self.worker = FormatWorker(
             architect_template=Path(architect),
             target_inputs=tuple(self.target_inputs),
@@ -751,6 +784,403 @@ class App(ctk.CTk):
             )
             return
         self.destroy()
+
+    # ------------------------------------------------------------------
+    # API key persistence (OS keyring)
+    # ------------------------------------------------------------------
+
+    def _on_remember_key_toggled(self) -> None:
+        if self.remember_key_var.get():
+            secrets.save_api_key(self.api_key_var.get())
+        else:
+            secrets.clear_api_key()
+
+    # ------------------------------------------------------------------
+    # Footer + self-update flow
+    # ------------------------------------------------------------------
+
+    def _build_footer(self, parent: ctk.CTkFrame) -> None:
+        footer = ctk.CTkFrame(parent, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", pady=(10, 0))
+        ctk.CTkLabel(
+            footer,
+            text=f"v{__version__}",
+            text_color=COLORS["muted"],
+            font=_font(12),
+        ).pack(side="left")
+        self.update_status_label = ctk.CTkLabel(
+            footer,
+            text="",
+            text_color=COLORS["muted"],
+            font=_font(12),
+        )
+        self.update_status_label.pack(side="left", padx=(10, 0))
+        self.check_update_button = ctk.CTkButton(
+            footer,
+            text="Check for Updates",
+            command=self._on_check_for_updates_clicked,
+            width=150,
+            height=28,
+            fg_color=COLORS["input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+            font=_font(13),
+        )
+        self.check_update_button.pack(side="right")
+
+    def _set_update_status(self, text: str, *, color: Optional[str] = None) -> None:
+        self.update_status_label.configure(text=text, text_color=color or COLORS["muted"])
+
+    def _maybe_auto_check_for_updates(self) -> None:
+        # A background convenience check must never break app startup.
+        try:
+            if updates.update_check_disabled():
+                return
+            state = updates.load_state(self._update_state_path)
+            if not updates.should_auto_check(state, now=datetime.now()):
+                return
+            self._start_update_check(manual=False)
+        except Exception:
+            pass
+
+    def _on_check_for_updates_clicked(self) -> None:
+        self._start_update_check(manual=True)
+
+    def _start_update_check(self, *, manual: bool) -> None:
+        if self._update_checking:
+            return
+        self._update_checking = True
+        if manual:
+            self.check_update_button.configure(state="disabled", text="Checking…")
+            self._set_update_status("Checking for updates…")
+        thread = threading.Thread(
+            target=self._update_check_worker, args=(manual,), daemon=True
+        )
+        thread.start()
+
+    def _update_check_worker(self, manual: bool) -> None:
+        result = updates.check_for_update(__version__)
+        # Record the check regardless of outcome so the daily throttle holds.
+        try:
+            state = updates.load_state(self._update_state_path)
+            updates.record_check(state, now=datetime.now())
+            updates.save_state(self._update_state_path, state)
+        except Exception:
+            pass
+        self.after(0, lambda: self._on_update_check_done(result, manual))
+
+    def _on_update_check_done(self, result, manual: bool) -> None:
+        self._update_checking = False
+        self.check_update_button.configure(state="normal", text="Check for Updates")
+        status = result.status
+        if status == updates.STATUS_UPDATE_AVAILABLE and result.info is not None:
+            info = result.info
+            self._set_update_status(
+                f"Update available: v{info.version}", color=COLORS["accent"]
+            )
+            if not manual:
+                state = updates.load_state(self._update_state_path)
+                if updates.version_is_skipped(state, info.version):
+                    return
+            self._show_update_dialog(info)
+        elif status == updates.STATUS_UP_TO_DATE:
+            self._set_update_status("You're up to date.")
+            if manual:
+                messagebox.showinfo(
+                    "No updates",
+                    f"You're running the latest version (v{__version__}).",
+                    parent=self,
+                )
+        elif status == updates.STATUS_DISABLED:
+            self._set_update_status("Update checks are disabled.")
+            if manual:
+                messagebox.showinfo(
+                    "Updates disabled",
+                    f"Update checks are turned off via {updates.ENV_DISABLE}.",
+                    parent=self,
+                )
+        else:  # STATUS_ERROR
+            self._set_update_status("Update check failed.")
+            if manual:
+                messagebox.showwarning(
+                    "Update check failed",
+                    "Could not check for updates:\n\n"
+                    f"{result.error}\n\n"
+                    "You can download the latest version manually from:\n"
+                    f"{updates.releases_page_url()}",
+                    parent=self,
+                )
+
+    def _show_update_dialog(self, info) -> None:
+        if self._update_dialog is not None and self._update_dialog.winfo_exists():
+            self._update_dialog.lift()
+            self._update_dialog.focus_force()
+            return
+
+        win = ctk.CTkToplevel(self)
+        self._update_dialog = win
+        win.title("Update available")
+        win.geometry("560x480")
+        win.minsize(460, 380)
+        win.configure(fg_color=COLORS["bg"])
+        win.transient(self)
+        win.protocol("WM_DELETE_WINDOW", self._close_update_dialog)
+        win.after(150, lambda: self._grab_dialog(win))
+
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24, pady=20)
+
+        ctk.CTkLabel(
+            body,
+            text=f"Version {info.version} is available",
+            text_color=COLORS["text"],
+            font=_font(20, "bold"),
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            body,
+            text=(
+                f"You have v{__version__}. Download and install the update? "
+                "The app will close so the installer can replace it."
+            ),
+            text_color=COLORS["secondary"],
+            font=_font(13),
+            wraplength=500,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 14))
+
+        # Button bar sits at the very bottom.
+        button_bar = ctk.CTkFrame(body, fg_color="transparent")
+        button_bar.pack(side="bottom", fill="x", pady=(14, 0))
+        self._update_download_button = ctk.CTkButton(
+            button_bar,
+            text="Download & Install",
+            command=lambda: self._start_update_download(info),
+            width=170,
+            height=34,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#FFFFFF",
+            font=_font(14, "bold"),
+        )
+        self._update_download_button.pack(side="right")
+        self._update_later_button = ctk.CTkButton(
+            button_bar,
+            text="Later",
+            command=self._close_update_dialog,
+            width=84,
+            height=34,
+            fg_color=COLORS["input"],
+            hover_color=COLORS["border"],
+            border_width=1,
+            border_color=COLORS["border"],
+            font=_font(14),
+        )
+        self._update_later_button.pack(side="right", padx=(0, 8))
+        self._update_skip_button = ctk.CTkButton(
+            button_bar,
+            text="Skip this Version",
+            command=lambda: self._skip_update_version(info),
+            width=150,
+            height=34,
+            fg_color="transparent",
+            hover_color=COLORS["border"],
+            text_color=COLORS["secondary"],
+            font=_font(13),
+        )
+        self._update_skip_button.pack(side="left")
+
+        # Clickable releases link, above the buttons.
+        link = ctk.CTkLabel(
+            body,
+            text="View this release on GitHub",
+            text_color=COLORS["accent"],
+            font=_font(12),
+            cursor="hand2",
+        )
+        link.pack(side="bottom", anchor="w", pady=(10, 0))
+        link.bind("<Button-1>", lambda _event: self._open_releases_page())
+
+        # Progress row: created now, packed only once a download starts.
+        self._update_progress = ctk.CTkProgressBar(
+            body, height=10, progress_color=COLORS["accent"], fg_color=COLORS["border"]
+        )
+        self._update_progress.set(0)
+        self._update_progress_label = ctk.CTkLabel(
+            body, text="", text_color=COLORS["muted"], font=_font(12)
+        )
+
+        ctk.CTkLabel(
+            body,
+            text="What's new",
+            text_color=COLORS["text"],
+            font=_font(14, "bold"),
+        ).pack(anchor="w", pady=(4, 6))
+        notes_box = ctk.CTkTextbox(
+            body,
+            height=150,
+            fg_color=COLORS["card"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["secondary"],
+            font=_font(12),
+        )
+        notes_box.pack(fill="both", expand=True)
+        notes_box.insert("1.0", info.notes or "No release notes were provided.")
+        notes_box.configure(state="disabled")
+
+    def _grab_dialog(self, win: ctk.CTkToplevel) -> None:
+        try:
+            if win.winfo_exists():
+                win.grab_set()
+        except Exception:
+            pass
+
+    def _start_update_download(self, info) -> None:
+        if self._update_downloading:
+            self._set_update_status("A download is already in progress…")
+            return
+        if self.worker is not None and self.worker.is_alive():
+            messagebox.showinfo(
+                "Formatting in progress",
+                "Wait for the active formatting run to finish before updating.",
+                parent=self,
+            )
+            return
+        self._update_downloading = True
+        self._update_download_cancelled = False
+        for button in (
+            self._update_download_button,
+            self._update_later_button,
+            self._update_skip_button,
+        ):
+            button.configure(state="disabled")
+        self._update_progress.set(0)
+        self._update_progress_label.pack(side="bottom", fill="x", pady=(6, 0))
+        self._update_progress.pack(side="bottom", fill="x", pady=(6, 0))
+        self._update_progress_label.configure(text="Starting download…")
+        thread = threading.Thread(
+            target=self._update_download_worker, args=(info,), daemon=True
+        )
+        thread.start()
+
+    def _update_download_worker(self, info) -> None:
+        dest_dir = default_config_dir() / "updates"
+
+        def _progress(done: int, total: int) -> None:
+            self.after(0, lambda: self._on_update_download_progress(done, total))
+
+        try:
+            path = updates.download_installer(info, dest_dir, progress=_progress)
+        except Exception as exc:
+            message = str(exc)
+            self.after(0, lambda: self._on_update_download_error(message))
+            return
+        self.after(0, lambda: self._on_update_download_done(path))
+
+    def _on_update_download_progress(self, done: int, total: int) -> None:
+        if self._update_download_cancelled or self._update_dialog is None:
+            return
+        mb = 1024 * 1024
+        try:
+            if total > 0:
+                self._update_progress.set(min(1.0, done / total))
+                self._update_progress_label.configure(
+                    text=f"Downloading… {done // mb} / {total // mb} MB"
+                )
+            else:
+                self._update_progress_label.configure(text=f"Downloading… {done // mb} MB")
+        except Exception:
+            pass
+
+    def _on_update_download_done(self, path: Path) -> None:
+        self._update_downloading = False
+        # Respect a dialog the user dismissed mid-download: keep the verified
+        # file cached but do not pop a surprise "install & quit" prompt.
+        if self._update_download_cancelled or self._update_dialog is None:
+            self._set_update_status("Update downloaded — install it later.")
+            return
+        self._update_progress.set(1.0)
+        self._update_progress_label.configure(text="Download verified.")
+        if messagebox.askyesno(
+            "Install update",
+            "The update was downloaded and verified. Install it now? "
+            "The app will close so the installer can replace it.",
+            parent=self,
+        ):
+            try:
+                updates.spawn_installer(path)
+            except Exception as exc:
+                messagebox.showerror(
+                    "Could not start installer",
+                    f"The installer could not be launched:\n\n{exc}\n\n"
+                    f"You can run it manually from:\n{path}",
+                    parent=self,
+                )
+                self._reset_update_dialog_buttons()
+                return
+            self._close_update_dialog()
+            self.quit()
+        else:
+            self._reset_update_dialog_buttons()
+            self._set_update_status("Update downloaded (not installed).")
+
+    def _on_update_download_error(self, message: str) -> None:
+        self._update_downloading = False
+        if self._update_download_cancelled or self._update_dialog is None:
+            self._set_update_status("Update download failed.")
+            return
+        self._reset_update_dialog_buttons()
+        messagebox.showerror(
+            "Download failed",
+            f"The update could not be downloaded:\n\n{message}\n\n"
+            "You can download the latest version manually from:\n"
+            f"{updates.releases_page_url()}",
+            parent=self,
+        )
+
+    def _reset_update_dialog_buttons(self) -> None:
+        for button in (
+            self._update_download_button,
+            self._update_later_button,
+            self._update_skip_button,
+        ):
+            try:
+                button.configure(state="normal")
+            except Exception:
+                pass
+        try:
+            self._update_progress.pack_forget()
+            self._update_progress_label.pack_forget()
+        except Exception:
+            pass
+
+    def _skip_update_version(self, info) -> None:
+        state = updates.load_state(self._update_state_path)
+        updates.mark_skipped(state, info.version)
+        updates.save_state(self._update_state_path, state)
+        self._set_update_status(f"Skipped v{info.version}.")
+        self._close_update_dialog()
+
+    def _open_releases_page(self) -> None:
+        webbrowser.open(updates.releases_page_url())
+
+    def _close_update_dialog(self) -> None:
+        if self._update_downloading:
+            # The daemon worker can't be killed, but flag it so a completing
+            # download doesn't pop a stray install prompt after the dialog closes.
+            self._update_download_cancelled = True
+        win = self._update_dialog
+        self._update_dialog = None
+        if win is not None:
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
 
 def main() -> None:
