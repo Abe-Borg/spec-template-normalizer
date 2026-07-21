@@ -17,6 +17,8 @@ dist/
 # PyInstaller
 *.manifest
 *.spec
+# ...but the committed one-folder build spec is tracked.
+!packaging/windows/specification-formatter.spec
 
 # Unit test / coverage reports
 htmlcov/
