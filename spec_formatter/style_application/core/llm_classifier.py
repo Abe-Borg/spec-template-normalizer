@@ -34,12 +34,78 @@ def _build_user_message(slim_bundle: dict, available_roles: list) -> str:
     )
 
 
+def _classification_output_config(available_roles: list) -> dict:
+    """Return the shared Anthropic structured-output contract."""
+
+    return {
+        "effort": "high",
+        "format": {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "classifications": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "paragraph_index": {"type": "integer"},
+                                "csi_role": {
+                                    "type": "string",
+                                    "enum": list(available_roles),
+                                },
+                            },
+                            "required": ["paragraph_index", "csi_role"],
+                        },
+                    },
+                    "notes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["classifications", "notes"],
+            },
+        },
+    }
+
+
 def _parse_classification_response(response_text: str) -> dict:
-    text = response_text.strip()
-    if text.startswith("```"):
-        text = re.sub(r'^```\w*\s*\n?', '', text)
-        text = re.sub(r'\n?```\s*$', '', text)
-    return json.loads(text)
+    text = response_text.lstrip("\ufeff").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as direct_error:
+        # Models occasionally wrap an otherwise valid object in prose, XML-ish
+        # tags, or a Markdown fence.  Recover only when there is exactly one
+        # distinct object containing the expected top-level field; ambiguous
+        # or partial output remains a hard parse failure and is retried.
+        decoder = json.JSONDecoder()
+        candidates: Dict[str, dict] = {}
+        for match in re.finditer(r"\{", text):
+            try:
+                value, _end = decoder.raw_decode(text, match.start())
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, dict) or "classifications" not in value:
+                continue
+            canonical = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            candidates[canonical] = value
+
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        if len(candidates) > 1:
+            raise json.JSONDecodeError(
+                "multiple distinct classification JSON objects",
+                text,
+                0,
+            ) from direct_error
+        raise
 
 
 def _validate_classifications(classifications: dict, available_roles: list, allowed_indices: Set[int]) -> dict:
@@ -177,9 +243,19 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                     model=model,
                     max_tokens=128000,
                     thinking={"type": "adaptive"},
-                    output_config={"effort": "high"},
+                    output_config=_classification_output_config(available_roles),
                     system=PHASE2_MASTER_PROMPT.strip(),
-                    messages=[{"role": "user", "content": user_message}],
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            user_message
+                            if attempt == 0
+                            else user_message
+                            + "\n\nRETRY REQUIREMENT: The prior response was not usable. "
+                            "Return exactly one complete JSON object with no prose, "
+                            "Markdown fence, or text before or after it."
+                        ),
+                    }],
                 ) as stream:
                     response_text = stream.get_final_text()
                 parsed = _parse_classification_response(response_text)
@@ -194,7 +270,12 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                     print(f"  JSON parse error, retrying ({attempt + 1}/{max_retries})...")
                     time.sleep(2 ** attempt)
                 else:
-                    raise ValueError(f"Failed to parse LLM response as JSON after {max_retries + 1} attempts: {e}")
+                    response_length = len(response_text.strip())
+                    raise ValueError(
+                        "Failed to parse LLM response as JSON after "
+                        f"{max_retries + 1} attempts (last response: "
+                        f"{response_length} characters): {e}"
+                    )
             except Exception as e:
                 if attempt < max_retries:
                     wait = 2 ** (attempt + 1)

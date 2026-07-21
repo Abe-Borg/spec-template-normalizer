@@ -231,7 +231,7 @@ def test_style_numbering_contract_does_not_leave_target_numpr_override(tmp_path)
     assert "<w:numPr" not in first_paragraph
 
 
-def test_text_literal_contract_fails_closed_for_automatic_target_numbering(tmp_path):
+def test_text_literal_contract_preserves_direct_automatic_target_numbering(tmp_path):
     extract = _seed_extract(tmp_path, STYLE_WITHOUT_PPR)
     doc_path = extract / "word" / "document.xml"
     doc_path.write_text(
@@ -242,16 +242,144 @@ def test_text_literal_contract_fails_closed_for_automatic_target_numbering(tmp_p
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="requires literal-text numbering"):
-        apply_phase2_classifications(
-            extract,
-            {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
-            {"PARAGRAPH": "Body"},
-            [],
-            role_specs={
-                "PARAGRAPH": {
-                    "style_id": "Body",
-                    "numbering_provenance": "text_literal",
-                }
-            },
-        )
+    log = []
+    report = apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        log,
+        role_specs={
+            "PARAGRAPH": {
+                "style_id": "Body",
+                "numbering_provenance": "text_literal",
+            }
+        },
+    )
+
+    first_paragraph = doc_path.read_text(encoding="utf-8").split("</w:p>", 1)[0]
+    assert '<w:pStyle w:val="Body"/>' in first_paragraph
+    assert '<w:numId w:val="5"/>' in first_paragraph
+    assert report.preserved_automatic_numbering == 1
+    assert any("Preserved source Word numbering" in line for line in log)
+
+
+def test_text_literal_contract_materializes_inherited_target_numbering(tmp_path):
+    source_styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="SourceList"><w:pPr><w:numPr>'
+        '<w:ilvl w:val="0"/><w:numId w:val="5"/></w:numPr></w:pPr></w:style>'
+        '</w:styles>'
+    )
+    imported_styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="SourceList">'
+        '<w:name w:val="Replaced Source List"/></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Body"><w:pPr>'
+        '<w:spacing w:after="240"/></w:pPr></w:style>'
+        '</w:styles>'
+    )
+    extract = _seed_extract(tmp_path, imported_styles)
+    doc_path = extract / "word" / "document.xml"
+    doc_path.write_text(
+        DOC_XML.replace(
+            '<w:spacing w:after="120"/>',
+            '<w:pStyle w:val="SourceList"/><w:spacing w:after="120"/>',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    report = apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+        role_specs={
+            "PARAGRAPH": {
+                "style_id": "Body",
+                "numbering_provenance": "text_literal",
+            }
+        },
+        source_styles_xml=source_styles,
+    )
+
+    first_paragraph = doc_path.read_text(encoding="utf-8").split("</w:p>", 1)[0]
+    assert '<w:pStyle w:val="Body"/>' in first_paragraph
+    assert '<w:numId w:val="5"/>' in first_paragraph
+    assert '<w:ilvl w:val="0"/>' in first_paragraph
+    assert 'w:after="120"' not in first_paragraph
+    assert report.preserved_automatic_numbering == 1
+
+
+def test_text_literal_contract_materializes_merged_partial_numpr(tmp_path):
+    source_styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="SourceList"><w:pPr><w:numPr>'
+        '<w:ilvl w:val="0"/><w:numId w:val="5"/></w:numPr></w:pPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Body"/>'
+        '</w:styles>'
+    )
+    extract = _seed_extract(tmp_path, source_styles)
+    doc_path = extract / "word" / "document.xml"
+    doc_path.write_text(
+        DOC_XML.replace(
+            '<w:spacing w:after="120"/>',
+            '<w:pStyle w:val="SourceList"/><w:numPr>'
+            '<w:ilvl w:val="2"/></w:numPr>',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    report = apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+        role_specs={
+            "PARAGRAPH": {
+                "style_id": "Body",
+                "numbering_provenance": "text_literal",
+            }
+        },
+        source_styles_xml=source_styles,
+    )
+
+    first_paragraph = doc_path.read_text(encoding="utf-8").split("</w:p>", 1)[0]
+    assert '<w:numId w:val="5"/>' in first_paragraph
+    assert '<w:ilvl w:val="2"/>' in first_paragraph
+    assert report.preserved_automatic_numbering == 1
+
+
+def test_text_literal_deep_marker_removes_doubled_automatic_numbering(tmp_path):
+    extract = _seed_extract(tmp_path, STYLE_WITHOUT_PPR)
+    doc_path = extract / "word" / "document.xml"
+    doc_path.write_text(
+        DOC_XML.replace(
+            '<w:spacing w:after="120"/>',
+            '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="5"/></w:numPr>',
+            1,
+        ).replace('<w:t>A</w:t>', '<w:t>1) Deep item</w:t>', 1),
+        encoding="utf-8",
+    )
+
+    report = apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+        role_specs={
+            "PARAGRAPH": {
+                "style_id": "Body",
+                "numbering_provenance": "text_literal",
+            }
+        },
+    )
+
+    first_paragraph = doc_path.read_text(encoding="utf-8").split("</w:p>", 1)[0]
+    assert "1) Deep item" in first_paragraph
+    assert "<w:numPr" not in first_paragraph
+    assert report.preserved_automatic_numbering == 0

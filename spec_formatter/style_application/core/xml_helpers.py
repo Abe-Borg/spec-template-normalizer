@@ -397,7 +397,11 @@ def strip_run_font_formatting(p_xml: str) -> str:
 
 _DIRECT_PPR_OVERRIDE_TAGS = ("jc", "ind", "spacing", "numPr")
 
-def strip_conflicting_direct_ppr(p_xml: str) -> str:
+def strip_conflicting_direct_ppr(
+    p_xml: str,
+    *,
+    preserve_numpr: bool = False,
+) -> str:
     """
     Remove direct paragraph-layout overrides that commonly win over paragraph styles.
 
@@ -405,7 +409,7 @@ def strip_conflicting_direct_ppr(p_xml: str) -> str:
     - <w:jc>
     - <w:ind>
     - <w:spacing>
-    - <w:numPr>
+    - <w:numPr>, unless ``preserve_numpr`` is true
 
     Preserves section properties and other unrelated pPr children.
     """
@@ -413,7 +417,12 @@ def strip_conflicting_direct_ppr(p_xml: str) -> str:
 
     def _strip_from_ppr(match):
         ppr = match.group(0)
-        for tag in _DIRECT_PPR_OVERRIDE_TAGS:
+        tags = (
+            tuple(tag for tag in _DIRECT_PPR_OVERRIDE_TAGS if tag != "numPr")
+            if preserve_numpr
+            else _DIRECT_PPR_OVERRIDE_TAGS
+        )
+        for tag in tags:
             ppr = re.sub(rf'<w:{tag}\b[^>]*/>', '', ppr)
             ppr = re.sub(rf'<w:{tag}\b[^>]*>[\s\S]*?</w:{tag}>', '', ppr, flags=re.S)
         return ppr

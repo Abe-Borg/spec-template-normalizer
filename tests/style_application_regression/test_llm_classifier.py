@@ -4,7 +4,11 @@ import types
 
 import pytest
 
-from spec_formatter.style_application.core.llm_classifier import classify_target_document, _merge_chunk_results
+from spec_formatter.style_application.core.llm_classifier import (
+    _merge_chunk_results,
+    _parse_classification_response,
+    classify_target_document,
+)
 
 
 class _FakeStream:
@@ -64,7 +68,71 @@ def test_classify_calls_llm_for_unresolved(monkeypatch):
         "deterministic_classifications": [],
     }
     classify_target_document(bundle, ["PART"], api_key="x", model="m")
-    assert fake.messages.last_kwargs["output_config"] == {"effort": "high"}
+    output_config = fake.messages.last_kwargs["output_config"]
+    assert output_config["effort"] == "high"
+    assert output_config["format"]["type"] == "json_schema"
+    role_schema = output_config["format"]["schema"]["properties"][
+        "classifications"
+    ]["items"]["properties"]["csi_role"]
+    assert role_schema["enum"] == ["PART"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '```json\n{"classifications": []}\n```',
+        'Here is the requested result:\n{"classifications": []}',
+        '<json>{"classifications": []}</json>',
+    ],
+)
+def test_parse_classification_response_recovers_one_wrapped_object(payload):
+    assert _parse_classification_response(payload) == {"classifications": []}
+
+
+def test_parse_classification_response_rejects_multiple_distinct_objects():
+    with pytest.raises(json.JSONDecodeError, match="multiple distinct"):
+        _parse_classification_response(
+            '{"classifications": []}\n'
+            '{"classifications": [{"paragraph_index": 1, "csi_role": "PART"}]}'
+        )
+
+
+def test_empty_response_retry_uses_stricter_json_instruction(monkeypatch):
+    class SequenceMessages:
+        def __init__(self):
+            self.payloads = [
+                "",
+                'Result: {"classifications": '
+                '[{"paragraph_index": 3, "csi_role": "PART"}]}',
+            ]
+            self.prompts = []
+
+        def stream(self, **kwargs):
+            self.prompts.append(kwargs["messages"][0]["content"])
+            return _FakeStream(self.payloads.pop(0))
+
+    messages = SequenceMessages()
+    fake = types.SimpleNamespace(messages=messages)
+    fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake)
+    monkeypatch.setitem(__import__("sys").modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr(
+        "spec_formatter.style_application.core.llm_classifier.time.sleep",
+        lambda _seconds: None,
+    )
+    bundle = {
+        "paragraphs": [{"paragraph_index": 3, "text": "A"}],
+        "available_roles": ["PART"],
+        "deterministic_classifications": [],
+    }
+
+    result = classify_target_document(bundle, ["PART"], api_key="x", model="m")
+
+    assert result["classifications"] == [
+        {"paragraph_index": 3, "csi_role": "PART"}
+    ]
+    assert len(messages.prompts) == 2
+    assert "RETRY REQUIREMENT" not in messages.prompts[0]
+    assert "RETRY REQUIREMENT" in messages.prompts[1]
 
 
 def test_split_bundle_terminates_when_filter_report_dominates():

@@ -9,6 +9,7 @@ from typing import Callable, Dict, List
 from .classification import PHASE2_MASTER_PROMPT, coerce_to_final_classifications
 from .llm_classifier import (
     _build_user_message,
+    _classification_output_config,
     _merge_chunk_results,
     _parse_classification_response,
     _split_bundle_into_chunks,
@@ -56,7 +57,9 @@ def build_batch_requests(
                         "model": model,
                         "max_tokens": 128000,
                         "thinking": {"type": "adaptive"},
-                        "output_config": {"effort": "high"},
+                        "output_config": _classification_output_config(
+                            available_roles
+                        ),
                         "system": PHASE2_MASTER_PROMPT.strip(),
                         "messages": [{"role": "user", "content": user_message}],
                     },

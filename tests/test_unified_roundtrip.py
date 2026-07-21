@@ -511,6 +511,75 @@ def test_unified_formatter_keeps_valid_output_when_another_target_is_corrupt(
     } == input_hashes
 
 
+def test_format_only_preserves_target_automatic_numbering_for_typed_architect_role(
+    tmp_path: Path,
+) -> None:
+    architect = tmp_path / "typed-numbering-architect.docx"
+    target = tmp_path / "automatic-numbering-target.docx"
+    _write_docx(architect, architect=True)
+    _write_docx(target, architect=False)
+
+    with zipfile.ZipFile(architect) as package:
+        architect_document = package.read("word/document.xml").decode("utf-8")
+    architect_document = re.sub(
+        r'(<w:body><w:p>)<w:pPr><w:numPr>[\s\S]*?</w:numPr></w:pPr>',
+        r"\1",
+        architect_document,
+        count=1,
+    ).replace(
+        "Architect paragraph one",
+        "A. Architect paragraph one",
+        1,
+    )
+    _rewrite_docx_parts(
+        architect,
+        {"word/document.xml": architect_document},
+    )
+
+    with zipfile.ZipFile(target) as package:
+        target_document_before = package.read("word/document.xml")
+    target_sha = _sha256(target)
+
+    run = format_specifications(
+        architect_template=architect,
+        target_specs=[target],
+        output_dir=tmp_path / "formatted",
+        cache_dir=tmp_path / "template-cache",
+        api_key="",
+        max_workers=1,
+        template_model="typed-numbering-format-only-fixture",
+        template_classifier=_deterministic_classifier,
+    )
+
+    assert run.success, "\n".join(run.targets[0].log)
+    result = run.targets[0]
+    assert result.output_path is not None
+    assert _sha256(target) == target_sha
+    assert any("Preserved source Word numbering" in line for line in result.log)
+
+    role_registry = json.loads(
+        (run.template_profile.bundle_dir / "arch_style_registry.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert role_registry["roles"]["PARAGRAPH"]["numbering_provenance"] == "text_literal"
+
+    validate_docx_package(result.output_path)
+    with zipfile.ZipFile(result.output_path) as package:
+        output_document = package.read("word/document.xml")
+        output_document_text = output_document.decode("utf-8")
+        output_numbering = package.read("word/numbering.xml").decode("utf-8")
+
+    assert _xml_text_sequence(output_document) == _xml_text_sequence(
+        target_document_before
+    )
+    first_paragraph = output_document_text.split("</w:p>", 1)[0]
+    assert '<w:pStyle w:val="CSI_Paragraph__ARCH"/>' in first_paragraph
+    assert '<w:numId w:val="17"/>' in first_paragraph
+    assert '<w:ilvl w:val="0"/>' in first_paragraph
+    assert '<w:num w:numId="17">' in output_numbering
+
+
 def test_unified_canadian_mode_converts_typed_csi_markers_end_to_end(
     tmp_path: Path,
 ) -> None:

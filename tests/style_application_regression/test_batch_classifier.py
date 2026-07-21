@@ -24,7 +24,13 @@ def test_build_batch_requests_creates_chunked_custom_ids(monkeypatch):
 
     assert [r["custom_id"] for r in reqs] == ["my-file.docx__chunk0", "my-file.docx__chunk1"]
     assert reqs[0]["params"]["model"] == "m"
-    assert reqs[0]["params"]["output_config"] == {"effort": "high"}
+    output_config = reqs[0]["params"]["output_config"]
+    assert output_config["effort"] == "high"
+    assert output_config["format"]["type"] == "json_schema"
+    role_schema = output_config["format"]["schema"]["properties"][
+        "classifications"
+    ]["items"]["properties"]["csi_role"]
+    assert role_schema["enum"] == ["PART"]
 
 
 def test_build_batch_requests_skips_deterministic_only_files(monkeypatch):

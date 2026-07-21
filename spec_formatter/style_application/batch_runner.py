@@ -32,6 +32,7 @@ from .core.batch_classifier import (
     submit_and_poll,
 )
 from .core.llm_classifier import classify_target_document
+from .core.ooxml_text import read_xml_text
 from .core.registry import (
     PHASE1_MANIFEST_FILENAME,
     build_arch_styles_xml_from_registry,
@@ -414,6 +415,8 @@ def process_single_file(
                 per_file_log,
             )
 
+            source_styles_xml = read_xml_text(extract_dir / "word" / "styles.xml")
+
             used_roles = {
                 item.get("csi_role")
                 for item in application_classifications.get("classifications", [])
@@ -473,6 +476,7 @@ def process_single_file(
                 log=per_file_log,
                 role_specs=role_specs,
                 role_numpr_remap=role_numpr_remap,
+                source_styles_xml=source_styles_xml,
             )
             verify_stability(extract_dir, snap)
             per_file_log.append("Applied classifications, stability verified")
@@ -604,6 +608,10 @@ def _apply_batch_result(
             per_file_log,
         )
 
+        source_styles_xml = read_xml_text(
+            prepared.extract_dir / "word" / "styles.xml"
+        )
+
         used_roles = {
             item.get("csi_role")
             for item in application_classifications.get("classifications", [])
@@ -663,6 +671,7 @@ def _apply_batch_result(
             log=per_file_log,
             role_specs=role_specs,
             role_numpr_remap=role_numpr_remap,
+            source_styles_xml=source_styles_xml,
         )
         verify_stability(prepared.extract_dir, snap)
         per_file_log.append("Applied classifications, stability verified")

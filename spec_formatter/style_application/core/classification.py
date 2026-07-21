@@ -858,10 +858,29 @@ def _inject_direct_numpr(paragraph_xml: str, num_id: int, ilvl: int) -> str:
 
 def _paragraph_uses_automatic_numbering(paragraph_xml: str, styles_xml: str) -> bool:
     analysis_xml = strip_out_of_scope_subtrees(paragraph_xml)
-    if "<w:numPr" in analysis_xml:
-        return True
-    style_id = paragraph_pstyle_from_block(analysis_xml)
-    return bool(style_id and _find_style_numpr_in_chain(styles_xml, style_id))
+    return _effective_numpr(analysis_xml, styles_xml) is not None
+
+
+def _materialize_effective_numpr(
+    paragraph_xml: str,
+    source_styles_xml: str,
+) -> str:
+    """Write the complete effective source numPr before changing pStyle."""
+
+    effective = _effective_numpr(
+        strip_out_of_scope_subtrees(paragraph_xml),
+        source_styles_xml,
+    )
+    if effective is None:
+        return paragraph_xml
+    num_id = str(effective.get("numId") or "")
+    ilvl = str(effective.get("ilvl") or "0")
+    if not re.fullmatch(r"\d+", num_id) or not re.fullmatch(r"\d+", ilvl):
+        raise ValueError(
+            "Target paragraph has invalid effective Word numbering "
+            f"(numId={num_id!r}, ilvl={ilvl!r})"
+        )
+    return _inject_direct_numpr(paragraph_xml, int(num_id), int(ilvl))
 
 
 def _ensure_explicit_numpr_preserving_sectpr(
@@ -895,7 +914,9 @@ def _ensure_explicit_numpr_preserving_sectpr(
 def _has_literal_numbering_marker(paragraph_xml: str) -> bool:
     text = paragraph_text_from_block(paragraph_xml).strip()
     return bool(re.match(
-        r"(?:SECTION\s+\d|PART\s+\d|\d+\.\d{2,}\b|[A-Z]\.\s|\d+\.\s|[a-z]\.\s)",
+        r"(?:SECTION\s+\d|PART\s+\d|\d+\.\d{2,}\b|\.\d+\s|"
+        r"[A-Z]\.\s|\d+\.\s|[a-z]\.\s|\d+\)\s|[a-z]\)\s|"
+        r"\(\d+\)\s|\([a-z]+\)\s|[ivxlcdm]+[.)]\s)",
         text,
         flags=re.IGNORECASE,
     ))
@@ -908,6 +929,7 @@ def apply_phase2_classifications(
     log: List[str],
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
     role_numpr_remap: Optional[Dict[str, Dict[str, Any]]] = None,
+    source_styles_xml: Optional[str] = None,
 ) -> "ApplyReport":
     """
     Apply CSI role classifications to paragraphs by setting pStyle.
@@ -920,6 +942,9 @@ def apply_phase2_classifications(
 
     # Load styles once so we can verify architect style IDs exist in target styles.xml
     styles_xml_text = read_xml_text(extract_dir / "word" / "styles.xml")
+    numbering_source_styles_xml = (
+        source_styles_xml if source_styles_xml is not None else styles_xml_text
+    )
     style_ids_in_styles = set(re.findall(r'w:styleId="([^"]+)"', styles_xml_text))
 
     blocks = list(iter_paragraph_xml_blocks(doc_text))
@@ -970,16 +995,33 @@ def apply_phase2_classifications(
         if provenance in {"style_numpr", "direct_numpr"}:
             pb = strip_conflicting_direct_ppr(pb)
             report.stripped_direct_ppr += 1
-        elif provenance in {"none", "text_literal"}:
-            if (
-                provenance == "text_literal"
-                and _paragraph_uses_automatic_numbering(pb, styles_xml_text)
-                and not _has_literal_numbering_marker(pb)
-            ):
-                raise ValueError(
-                    f"Role {role} requires literal-text numbering, but target paragraph {idx} "
-                    "uses automatic numbering and has no literal marker"
+        elif provenance == "text_literal":
+            target_automatic = _paragraph_uses_automatic_numbering(
+                pb,
+                numbering_source_styles_xml,
+            )
+            if target_automatic and not _has_literal_numbering_marker(pb):
+                # A typed marker belongs to the architect exemplar's text; it
+                # is not part of the reusable paragraph style.  Format-only
+                # application must therefore retain the target's proven Word
+                # numbering instead of deleting it or inventing literal text.
+                pb = _materialize_effective_numpr(
+                    pb,
+                    numbering_source_styles_xml,
                 )
+                if _style_has_replacement_ppr(style_xml):
+                    pb = strip_conflicting_direct_ppr(pb, preserve_numpr=True)
+                    report.stripped_direct_ppr += 1
+                else:
+                    report.preserved_direct_ppr += 1
+                report.preserved_automatic_numbering += 1
+            elif _style_has_replacement_ppr(style_xml):
+                pb = strip_conflicting_direct_ppr(pb)
+                report.stripped_direct_ppr += 1
+            else:
+                pb = _strip_direct_numpr_only(pb)
+                report.preserved_direct_ppr += 1
+        elif provenance == "none":
             if _style_has_replacement_ppr(style_xml):
                 pb = strip_conflicting_direct_ppr(pb)
                 report.stripped_direct_ppr += 1
@@ -1028,6 +1070,12 @@ def apply_phase2_classifications(
         f"{report.stripped_direct_ppr}/{report.preserved_direct_ppr}"
     )
     log.append(f"Stripped run-level font formatting from {report.stripped_run_fonts} paragraphs")
+    if report.preserved_automatic_numbering:
+        log.append(
+            "Preserved source Word numbering for "
+            f"{report.preserved_automatic_numbering} paragraphs whose architect "
+            "role uses typed markers"
+        )
 
     # Enforce the diff contract.
     contract_after = [_normalize_paragraph_for_contract(p) for p in para_blocks]
@@ -1070,6 +1118,7 @@ class ApplyReport:
     missing_style_ids: Set[str] = field(default_factory=set)
     stripped_direct_ppr: int = 0
     preserved_direct_ppr: int = 0
+    preserved_automatic_numbering: int = 0
     stripped_run_fonts: int = 0
 
 
