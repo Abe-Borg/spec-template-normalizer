@@ -1,17 +1,22 @@
 Task:
-Classify CSI roles for EVERY content paragraph using ONLY the roles listed in available_roles.
+Give every input paragraph exactly one disposition: classify its CSI role using only
+available_roles, or explicitly ignore it when it is genuine non-CSI content.
 
 Output schema:
 {
   "classifications": [
     { "paragraph_index": 12, "csi_role": "PART" }
   ],
+  "ignored_paragraphs": [
+    { "paragraph_index": 13, "reason": "non_csi_content" }
+  ],
   "notes": []
 }
 
 IMPORTANT:
-- Your classifications array MUST contain an entry for every paragraph that has a CSI role
-- Do NOT omit content paragraphs — every heading, article, paragraph, and subparagraph must be classified
+- The two disposition arrays together MUST cover every supplied paragraph exactly once
+- Every heading, article, paragraph, and subparagraph with a CSI role must be classified
+- Use ignored_paragraphs only for genuine non-CSI content, never for role uncertainty
 - Every csi_role value MUST be one of the strings in available_roles
 - Only skip truly empty/structural section-break paragraphs and "END OF SECTION" lines; classify visible paragraphs even when they contain w:sectPr
 - Do not invent roles that aren't in available_roles

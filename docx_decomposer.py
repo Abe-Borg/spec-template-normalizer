@@ -77,6 +77,22 @@ def _get_attr(elem: ET.Element, local_name: str) -> Optional[str]:
     return elem.get(f"{{{W_NS}}}{local_name}")
 
 
+def _get_on_off_attr(elem: Optional[ET.Element]) -> Optional[str]:
+    """Return canonical Word on/off semantics, including an empty true tag."""
+
+    if elem is None:
+        return None
+    value = _get_attr(elem, "val")
+    if value is None:
+        return "1"
+    normalized = value.strip().lower()
+    if normalized in {"0", "false", "off", "none"}:
+        return "0"
+    if normalized in {"1", "true", "on"}:
+        return "1"
+    return value
+
+
 # -----------------------------
 # Phase 1 stability snapshot
 # -----------------------------
@@ -364,6 +380,10 @@ _OUT_OF_SCOPE_CONTAINER_NAMES = {
     "w:txbxContent",
     "v:textbox",
     "wps:txbx",
+    # A tracked paragraph-format revision contains the previous pPr.  Those
+    # properties are historical metadata and are never live paragraph state.
+    "w:pPrChange",
+    "w:rPrChange",
 }
 
 
@@ -588,15 +608,26 @@ def _strip_out_of_scope_subtrees(xml_text: str) -> str:
 
 
 def _mask_text_box_subtrees(p_xml: str) -> str:
-    """Hide text-box story XML while preserving every original index.
+    """Hide protected/non-live XML while preserving every original index.
 
     Metadata reads and paragraph-level edits use the masked string to locate
-    only the host paragraph's properties. Splices are then made against the
-    original XML, so the complete ``w:txbxContent`` subtree remains byte exact.
+    only the host paragraph's live properties. Splices are then made against
+    the original XML, so text-box stories and tracked historical ``w:pPr``
+    remain byte exact.
     """
+    ranges: List[Tuple[int, int]] = []
+    for qualified_name in ("w:txbxContent", "w:pPrChange", "w:rPrChange"):
+        ranges.extend(_named_xml_block_ranges(p_xml, qualified_name))
+    merged: List[Tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
     pieces: List[str] = []
     cursor = 0
-    for start, end in _named_xml_block_ranges(p_xml, "w:txbxContent"):
+    for start, end in merged:
         pieces.append(p_xml[cursor:start])
         pieces.append(" " * (end - start))
         cursor = end
@@ -819,12 +850,27 @@ def build_numbering_catalog(numbering_xml_path: Path, used_num_ids: Set[str]) ->
                     item["startOverride"] = _get_attr(start, "val")
                 override_lvl = override.find(_q("lvl"))
                 if override_lvl is not None:
-                    num_fmt = override_lvl.find(_q("numFmt"))
-                    lvl_text = override_lvl.find(_q("lvlText"))
-                    if num_fmt is not None and _get_attr(num_fmt, "val") is not None:
-                        item["numFmt"] = _get_attr(num_fmt, "val")
-                    if lvl_text is not None and _get_attr(lvl_text, "val") is not None:
-                        item["lvlText"] = _get_attr(lvl_text, "val")
+                    for element_name, key in (
+                        ("start", "start"),
+                        ("numFmt", "numFmt"),
+                        ("lvlRestart", "lvlRestart"),
+                        ("pStyle", "pStyle"),
+                        ("lvlText", "lvlText"),
+                        ("suff", "suff"),
+                        ("isLgl", "isLgl"),
+                    ):
+                        element = override_lvl.find(_q(element_name))
+                        value = (
+                            _get_on_off_attr(element)
+                            if element_name == "isLgl"
+                            else (
+                                _get_attr(element, "val")
+                                if element is not None
+                                else None
+                            )
+                        )
+                        if value is not None:
+                            item[key] = value
                 overrides.append(item)
             if overrides:
                 num_overrides[numId] = overrides
@@ -840,13 +886,29 @@ def build_numbering_catalog(numbering_xml_path: Path, used_num_ids: Set[str]) ->
         lvls = []
         for lvl in absn.findall(_q("lvl")):
             ilvl = _get_attr(lvl, "ilvl")
-            numFmt = lvl.find(_q("numFmt"))
-            lvlText = lvl.find(_q("lvlText"))
-            lvls.append({
-                "ilvl": ilvl,
-                "numFmt": _get_attr(numFmt, "val") if numFmt is not None else None,
-                "lvlText": _get_attr(lvlText, "val") if lvlText is not None else None,
-            })
+            level_item: Dict[str, Any] = {"ilvl": ilvl}
+            for element_name, key in (
+                ("start", "start"),
+                ("numFmt", "numFmt"),
+                ("lvlRestart", "lvlRestart"),
+                ("pStyle", "pStyle"),
+                ("lvlText", "lvlText"),
+                ("suff", "suff"),
+                ("isLgl", "isLgl"),
+            ):
+                element = lvl.find(_q(element_name))
+                value = (
+                    _get_on_off_attr(element)
+                    if element_name == "isLgl"
+                    else (
+                        _get_attr(element, "val")
+                        if element is not None
+                        else None
+                    )
+                )
+                if value is not None:
+                    level_item[key] = value
+            lvls.append(level_item)
         abstracts[absId] = {"abstractNumId": absId, "levels": lvls}
 
     nums: Dict[str, Any] = {}
@@ -979,7 +1041,12 @@ def strip_pstyle_from_paragraph(p_xml: str) -> str:
         flags=re.S,
     )
     if empty_ppr:
-        result = result[:empty_ppr.start()] + result[empty_ppr.end():]
+        raw_ppr = result[empty_ppr.start():empty_ppr.end()]
+        if not any(
+            marker in raw_ppr
+            for marker in ("<w:pPrChange", "<w:rPrChange", "<w:txbxContent")
+        ):
+            result = result[:empty_ppr.start()] + result[empty_ppr.end():]
     return result
 
 def ppr_without_pstyle(p_xml: str) -> str:
@@ -994,7 +1061,10 @@ def ppr_without_pstyle(p_xml: str) -> str:
     if not m:
         return ""
     ppr = p_xml[m.start():m.end()]
-    ppr = re.sub(r"<w:pStyle\b[^>]*/\s*>", "", ppr, count=1)
+    masked_ppr = outer_xml[m.start():m.end()]
+    live_pstyle = re.search(r"<w:pStyle\b[^>]*/\s*>", masked_ppr, flags=re.S)
+    if live_pstyle:
+        ppr = ppr[:live_pstyle.start()] + ppr[live_pstyle.end():]
     # If pPr is now empty, return empty string
     inner = re.sub(r"<w:pPr\b[^>]*>([\s\S]*)</w:pPr>", r"\1", ppr, flags=re.S)
     if not inner.strip():
@@ -1027,7 +1097,9 @@ def extract_paragraph_ppr_inner(p_xml: str) -> str:
     m = re.search(r"<w:pPr\b[^>]*>(.*?)</w:pPr>", outer_xml, flags=re.S)
     if not m:
         return ""
-    inner = p_xml[m.start(1):m.end(1)]
+    # Use the index-preserving masked string so tracked historical pPr data is
+    # never promoted into a newly derived live style.
+    inner = outer_xml[m.start(1):m.end(1)]
     inner = re.sub(r"<w:pStyle\b[^>]*/>", "", inner)
     # A visible paragraph may also carry a section break.  It is part of the
     # document structure, not reusable paragraph formatting: copying it into
@@ -2098,7 +2170,9 @@ def _determine_numbering_provenance(
 
     txt = (exemplar.get("text") or "") if isinstance(exemplar, dict) else ""
     marker_patterns = [
-        r"^\s*\d+\.\d{2,}\s+",
+        r"^\s*SECTION\s+\d(?:[\d ]*\d)?(?:\s*[-:])?\s+",
+        r"^\s*PART\s+\d+\b(?:\s*[-:])?\s*",
+        r"^\s*\d+\.\d+\s+",
         r"^\s*[A-Z]\.\s+",
         r"^\s*\d+\.\s+",
         r"^\s*[a-z]\.\s+",
@@ -2107,7 +2181,7 @@ def _determine_numbering_provenance(
         r"^\s*\([A-Za-z]+\)\s+",
         r"^\s*[ivxlcdm]+[.)]\s+",
     ]
-    if any(re.match(pat, txt) for pat in marker_patterns):
+    if any(re.match(pat, txt, flags=re.IGNORECASE) for pat in marker_patterns):
         return "text_literal"
     return "none"
 
@@ -2138,16 +2212,21 @@ def _extract_numbering_pattern_from_numpr(
         if level is None and levels:
             level = levels[0]
         if isinstance(level, dict):
-            if level.get("numFmt"):
-                pattern["numFmt"] = level["numFmt"]
-            if level.get("lvlText"):
-                pattern["lvlText"] = level["lvlText"]
+            for key in (
+                "start", "numFmt", "lvlRestart",
+                "lvlText", "suff", "isLgl",
+            ):
+                if level.get(key) is not None:
+                    pattern[key] = level[key]
 
     if num_id:
         overrides = nums.get(num_id, {}).get("levelOverrides", [])
         override = next((item for item in overrides if item.get("ilvl") == ilvl), None)
         if isinstance(override, dict):
-            for key in ("numFmt", "lvlText", "startOverride"):
+            for key in (
+                "start", "numFmt", "lvlRestart",
+                "lvlText", "suff", "isLgl", "startOverride",
+            ):
                 if override.get(key) is not None:
                     pattern[key] = override[key]
 

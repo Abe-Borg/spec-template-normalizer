@@ -594,7 +594,14 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
                 raise ValueError(f"roles['{role}'].numbering_pattern must be an object when present")
             allowed_pattern_keys = {"numId", "ilvl", "numFmt", "lvlText"}
             if version == 2:
-                allowed_pattern_keys.update({"abstractNumId", "startOverride"})
+                allowed_pattern_keys.update({
+                    "abstractNumId",
+                    "start",
+                    "lvlRestart",
+                    "suff",
+                    "isLgl",
+                    "startOverride",
+                })
             unknown_pattern_keys = set(numbering_pattern) - allowed_pattern_keys
             if unknown_pattern_keys:
                 raise ValueError(

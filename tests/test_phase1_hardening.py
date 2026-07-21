@@ -101,6 +101,42 @@ def test_article_marker_1_01_reports_text_literal(tmp_path: Path):
     assert reg["roles"]["ARTICLE"]["numbering_provenance"] == "text_literal"
 
 
+@pytest.mark.parametrize(
+    ("role", "style_id", "text"),
+    [
+        ("PART", "CSI_Part__ARCH", "PART 1 - GENERAL"),
+        ("ARTICLE", "CSI_Article__ARCH", "1.1 SUMMARY"),
+    ],
+)
+def test_part_and_single_digit_article_markers_are_text_literal(
+    tmp_path: Path,
+    role: str,
+    style_id: str,
+    text: str,
+) -> None:
+    extract_dir = tmp_path / role.lower()
+    (extract_dir / "word").mkdir(parents=True)
+    (extract_dir / "word" / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f'<w:style w:type="paragraph" w:styleId="{style_id}"/>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    (extract_dir / "word" / "document.xml").write_text(
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+        f'<w:p><w:r><w:t>{text}</w:t></w:r></w:p><w:p><w:sectPr/></w:p>'
+        '</w:body></w:document>',
+        encoding="utf-8",
+    )
+    registry = build_style_registry_dict(
+        extract_dir,
+        "test.docx",
+        {"roles": {role: {"styleId": style_id, "exemplar_paragraph_index": 0}}},
+        source_sha256="a" * 64,
+    )
+    assert registry["roles"][role]["numbering_provenance"] == "text_literal"
+
+
 def test_style_registry_warning_uses_pre_apply_bundle(tmp_path: Path):
     extract_dir = tmp_path / "x"
     (extract_dir / "word").mkdir(parents=True)

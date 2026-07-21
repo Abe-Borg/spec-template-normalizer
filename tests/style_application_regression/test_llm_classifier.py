@@ -76,6 +76,12 @@ def test_classify_calls_llm_for_unresolved(monkeypatch):
         "classifications"
     ]["items"]["properties"]["csi_role"]
     assert role_schema["enum"] == ["PART"]
+    ignored_schema = output_config["format"]["schema"]["properties"][
+        "ignored_paragraphs"
+    ]
+    assert ignored_schema["items"]["properties"]["reason"]["enum"] == [
+        "non_csi_content"
+    ]
 
 
 def test_user_message_exposes_only_unresolved_paragraphs():
@@ -202,6 +208,31 @@ def test_validation_retry_names_exact_allowed_indices(monkeypatch):
     ]
     assert "classification index not allowed: 1" in messages.prompts[1]
     assert "and no other indices: [3]" in messages.prompts[1]
+
+
+def test_classify_accepts_explicit_non_csi_disposition(monkeypatch):
+    fake = _FakeClient()
+    fake.messages.payload = json.dumps({
+        "classifications": [],
+        "ignored_paragraphs": [
+            {"paragraph_index": 3, "reason": "non_csi_content"},
+        ],
+        "notes": [],
+    })
+    fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake)
+    monkeypatch.setitem(__import__("sys").modules, "anthropic", fake_anthropic)
+    bundle = {
+        "paragraphs": [{"paragraph_index": 3, "text": "Document control note"}],
+        "available_roles": ["PART"],
+        "deterministic_classifications": [],
+    }
+
+    result = classify_target_document(bundle, ["PART"], api_key="x", model="m")
+
+    assert result["classifications"] == []
+    assert result["ignored_paragraphs"] == [
+        {"paragraph_index": 3, "reason": "non_csi_content"},
+    ]
 
 
 def test_split_bundle_terminates_when_filter_report_dominates():

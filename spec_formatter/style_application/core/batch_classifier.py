@@ -149,7 +149,11 @@ def reassemble_file_classifications(
         if not unresolved_paragraphs:
             output[filename] = coerce_to_final_classifications(
                 slim_bundle,
-                {"classifications": [], "notes": ["LLM skipped: all paragraphs classified deterministically."]},
+                {
+                    "classifications": [],
+                    "ignored_paragraphs": [],
+                    "notes": ["LLM skipped: all paragraphs classified deterministically."],
+                },
                 available_roles,
             )
             continue
@@ -176,10 +180,19 @@ def reassemble_file_classifications(
         llm_only = validated_chunks[0] if len(validated_chunks) == 1 else _merge_chunk_results(validated_chunks)
         final = coerce_to_final_classifications(slim_bundle, llm_only, available_roles)
 
-        total_expected = len(slim_bundle.get("paragraphs", [])) + len(slim_bundle.get("deterministic_classifications", []))
-        classified_count = len(final.get("classifications", []))
-        if total_expected > 0 and classified_count != total_expected:
-            failed_files[filename] = f"coverage incomplete ({classified_count}/{total_expected})"
+        total_expected = (
+            len(slim_bundle.get("paragraphs", []))
+            + len(slim_bundle.get("deterministic_classifications", []))
+            + len(slim_bundle.get("deterministic_ignored_paragraphs", []))
+        )
+        disposition_count = (
+            len(final.get("classifications", []))
+            + len(final.get("ignored_paragraphs", []))
+        )
+        if total_expected > 0 and disposition_count != total_expected:
+            failed_files[filename] = (
+                f"coverage incomplete ({disposition_count}/{total_expected})"
+            )
             continue
 
         output[filename] = final

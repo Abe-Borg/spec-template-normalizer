@@ -120,6 +120,37 @@ class TestEnsureExplicitNumpr:
         result = ensure_explicit_numpr_from_current_style(p, STYLES_WITH_NUMPR)
         assert result == p
 
+    def test_historical_pstyle_and_numpr_are_not_materialized_as_live(self):
+        change = (
+            '<w:pPrChange w:id="7"><w:pPr>'
+            '<w:pStyle w:val="ListBullet"/><w:numPr>'
+            '<w:ilvl w:val="0"/><w:numId w:val="1"/>'
+            '</w:numPr></w:pPr></w:pPrChange>'
+        )
+        p = f'<w:p><w:pPr>{change}</w:pPr><w:r><w:t>Plain</w:t></w:r></w:p>'
+
+        result = ensure_explicit_numpr_from_current_style(p, STYLES_WITH_NUMPR)
+
+        assert result == p
+
+    def test_live_style_materializes_around_byte_stable_historical_numpr(self):
+        change = (
+            '<w:pPrChange w:id="7"><w:pPr><w:numPr>'
+            '<w:ilvl w:val="4"/><w:numId w:val="91"/>'
+            '</w:numPr></w:pPr></w:pPrChange>'
+        )
+        p = (
+            '<w:p><w:pPr><w:pStyle w:val="ListBullet2"/>'
+            f'{change}</w:pPr><w:r><w:t>Item</w:t></w:r></w:p>'
+        )
+
+        result = ensure_explicit_numpr_from_current_style(p, STYLES_WITH_NUMPR)
+
+        assert change in result
+        live_prefix = result.split("<w:pPrChange", 1)[0]
+        assert '<w:numId w:val="1"/>' in live_prefix
+        assert '<w:ilvl w:val="0"/>' in live_prefix
+
 
 # ── materialize_arch_style_block ─────────────────────────────────────────────
 
@@ -366,7 +397,7 @@ class TestBuiltinStyleSkipping:
         )
 
         log = []
-        import_arch_styles_into_target(
+        result = import_arch_styles_into_target(
             target_extract_dir=tmp_path,
             arch_styles_xml=self.ARCH_STYLES_XML_NORMAL_MISSING,
             needed_style_ids=["CSI_Part__ARCH"],
@@ -374,7 +405,8 @@ class TestBuiltinStyleSkipping:
         )
 
         result_xml = (word_dir / "styles.xml").read_text(encoding="utf-8")
-        assert 'w:styleId="CSI_Part__ARCH"' in result_xml
+        assert result.style_id_map["CSI_Part__ARCH"].startswith("SF_")
+        assert f'w:styleId="{result.style_id_map["CSI_Part__ARCH"]}"' in result_xml
         assert any("Normal" in msg and "built-in" in msg.lower() for msg in log), \
             f"Expected log entry about skipping built-in Normal, got: {log}"
 
@@ -404,7 +436,7 @@ class TestBuiltinStyleSkipping:
         (word_dir / "styles.xml").write_text(target_xml, encoding="utf-8")
 
         log = []
-        import_arch_styles_into_target(
+        result = import_arch_styles_into_target(
             target_extract_dir=tmp_path,
             arch_styles_xml=self.ARCH_STYLES_XML_NORMAL_MISSING,
             needed_style_ids=["CSI_Part__ARCH"],
@@ -412,9 +444,12 @@ class TestBuiltinStyleSkipping:
         )
 
         result_xml = (word_dir / "styles.xml").read_text(encoding="utf-8")
-        assert 'w:styleId="CSI_Part__ARCH"' in result_xml
-        assert not any("built-in" in msg.lower() for msg in log), \
-            f"Should not skip Normal when it exists in target, got: {log}"
+        assert result.style_id_map["CSI_Part__ARCH"].startswith("SF_")
+        assert f'w:styleId="{result.style_id_map["CSI_Part__ARCH"]}"' in result_xml
+        # The target-owned Normal style is never overwritten. The CSI style
+        # may continue to reference that built-in when the architect bundle
+        # does not carry its own explicit Normal definition.
+        assert '<w:spacing w:after="200"/>' in result_xml
 
     def test_nonbuiltin_dependency_still_fails_when_missing(self, tmp_path):
         """
@@ -480,7 +515,7 @@ class TestBuiltinStyleSkipping:
         )
 
         log = []
-        import_arch_styles_into_target(
+        result = import_arch_styles_into_target(
             target_extract_dir=tmp_path,
             arch_styles_xml=arch_xml,
             needed_style_ids=["CSI_Article__ARCH"],
@@ -488,9 +523,10 @@ class TestBuiltinStyleSkipping:
         )
 
         result_xml = (word_dir / "styles.xml").read_text(encoding="utf-8")
-        assert 'w:styleId="CSI_Article__ARCH"' in result_xml
+        assert result.style_id_map["CSI_Article__ARCH"].startswith("SF_")
+        assert f'w:styleId="{result.style_id_map["CSI_Article__ARCH"]}"' in result_xml
 
-def test_conflicting_existing_style_is_not_silently_skipped(tmp_path):
+def test_conflicting_existing_style_is_namespaced_without_replacing_target(tmp_path):
     from spec_formatter.style_application.core.style_import import import_arch_styles_into_target
 
     word_dir = tmp_path / "word"
@@ -507,13 +543,15 @@ def test_conflicting_existing_style_is_not_silently_skipped(tmp_path):
         '</w:styles>'
     )
     log = []
-    import_arch_styles_into_target(tmp_path, arch, ["CSI"], log)
+    result = import_arch_styles_into_target(tmp_path, arch, ["CSI"], log)
     out = (word_dir / "styles.xml").read_text(encoding="utf-8")
-    assert "<w:i/>" in out and "<w:b/>" not in out
-    assert any("Replaced conflicting" in m for m in log)
+    assert "<w:i/>" in out and "<w:b/>" in out
+    assert result.style_id_map["CSI"] != "CSI"
+    assert f'w:styleId="{result.style_id_map["CSI"]}"' in out
+    assert any("preserved target style CSI" in m for m in log)
 
 
-def test_equivalent_existing_style_is_left_in_place(tmp_path):
+def test_equivalent_existing_target_style_is_still_kept_target_owned(tmp_path):
     from spec_formatter.style_application.core.style_import import import_arch_styles_into_target
 
     style_block = '<w:style w:type="paragraph" w:styleId="CSI"><w:rPr><w:b/></w:rPr></w:style>'
@@ -525,5 +563,162 @@ def test_equivalent_existing_style_is_left_in_place(tmp_path):
     )
     arch = f'<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{style_block}</w:styles>'
     log = []
-    import_arch_styles_into_target(tmp_path, arch, ["CSI"], log)
-    assert any("already matches" in m for m in log)
+    result = import_arch_styles_into_target(tmp_path, arch, ["CSI"], log)
+    out = (word_dir / "styles.xml").read_text(encoding="utf-8")
+    assert result.style_id_map["CSI"] != "CSI"
+    assert out.count("<w:b/>") == 2
+    assert any("preserved target style CSI" in m for m in log)
+
+
+def test_format_only_body_style_is_self_contained_and_has_no_numbering(tmp_path):
+    from spec_formatter.style_application.core.style_import import (
+        extract_style_block_raw,
+        import_arch_styles_into_target,
+    )
+
+    word_dir = tmp_path / "word"
+    word_dir.mkdir()
+    (word_dir / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Target"><w:name w:val="Target"/></w:style>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    arch = (
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Base">'
+        '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr>'
+        '<w:spacing w:before="240"/></w:pPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Role">'
+        '<w:basedOn w:val="Base"/><w:pPr><w:ind w:left="720"/></w:pPr>'
+        '</w:style></w:styles>'
+    )
+    result = import_arch_styles_into_target(
+        tmp_path,
+        arch,
+        ["Role"],
+        [],
+        format_only_body_style_ids={"Role"},
+    )
+    out = (word_dir / "styles.xml").read_text(encoding="utf-8")
+    block = extract_style_block_raw(out, result.style_id_map["Role"])
+    assert block is not None
+    assert "<w:numPr" not in block
+    assert "<w:basedOn" not in block
+    assert '<w:ind w:left="720"' in block
+    assert '<w:spacing w:before="240"' in block
+
+
+def test_architect_dependency_collision_is_namespaced_and_target_normal_survives(tmp_path):
+    from spec_formatter.style_application.core.style_import import (
+        extract_style_block_raw,
+        import_arch_styles_into_target,
+    )
+
+    word_dir = tmp_path / "word"
+    word_dir.mkdir()
+    (word_dir / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Normal"><w:rPr><w:b/></w:rPr></w:style>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    arch = (
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Normal"><w:rPr><w:i/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Role"><w:basedOn w:val="Normal"/></w:style>'
+        '</w:styles>'
+    )
+    result = import_arch_styles_into_target(tmp_path, arch, ["Role"], [])
+    out = (word_dir / "styles.xml").read_text(encoding="utf-8")
+    target_normal = extract_style_block_raw(out, "Normal")
+    role = extract_style_block_raw(out, result.style_id_map["Role"])
+    assert target_normal is not None and "<w:b/>" in target_normal and "<w:i/>" not in target_normal
+    assert result.style_id_map["Normal"] != "Normal"
+    assert role is not None
+    assert f'<w:basedOn w:val="{result.style_id_map["Normal"]}"' in role
+
+
+def test_nonconflicting_architect_graph_is_always_app_namespaced(tmp_path):
+    from spec_formatter.style_application.core.style_import import (
+        extract_style_block_raw,
+        import_arch_styles_into_target,
+    )
+
+    word_dir = tmp_path / "word"
+    word_dir.mkdir()
+    (word_dir / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="TargetOnly"/>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    arch = (
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Base"><w:rPr><w:b/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Role">'
+        '<w:basedOn w:val="Base"/><w:next w:val="Base"/>'
+        '</w:style></w:styles>'
+    )
+
+    result = import_arch_styles_into_target(tmp_path, arch, ["Role"], [])
+    out = (word_dir / "styles.xml").read_text(encoding="utf-8")
+
+    assert result.style_id_map["Role"].startswith("SF_")
+    assert result.style_id_map["Base"].startswith("SF_")
+    assert extract_style_block_raw(out, "Role") is None
+    assert extract_style_block_raw(out, "Base") is None
+    role = extract_style_block_raw(out, result.style_id_map["Role"])
+    assert role is not None
+    assert f'<w:basedOn w:val="{result.style_id_map["Base"]}"' in role
+    assert f'<w:next w:val="{result.style_id_map["Base"]}"' in role
+
+
+def test_shared_body_and_shell_style_gets_distinct_safe_clones(tmp_path):
+    from spec_formatter.style_application.core.style_import import (
+        extract_style_block_raw,
+        import_arch_styles_into_target,
+    )
+
+    word_dir = tmp_path / "word"
+    word_dir.mkdir()
+    (word_dir / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Normal"/>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    arch = (
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Base"><w:rPr><w:b/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Shared">'
+        '<w:basedOn w:val="Base"/><w:pPr><w:numPr>'
+        '<w:ilvl w:val="2"/><w:numId w:val="9"/>'
+        '</w:numPr><w:spacing w:before="120"/></w:pPr>'
+        '</w:style></w:styles>'
+    )
+
+    result = import_arch_styles_into_target(
+        tmp_path,
+        arch,
+        ["Shared"],
+        [],
+        style_numid_remap={"Shared": {"old_numId": 9, "new_numId": 42}},
+        format_only_body_style_ids={"Shared"},
+        shell_style_ids={"Shared"},
+    )
+    out = (word_dir / "styles.xml").read_text(encoding="utf-8")
+    shell_id = result.style_id_map["Shared"]
+    body_id = result.body_style_id_map["Shared"]
+    shell = extract_style_block_raw(out, shell_id)
+    body = extract_style_block_raw(out, body_id)
+
+    assert shell_id.startswith("SF_") and body_id.startswith("SF_")
+    assert shell_id != body_id
+    assert shell is not None and body is not None
+    assert f'<w:basedOn w:val="{result.style_id_map["Base"]}"' in shell
+    assert '<w:numId w:val="42"/>' in shell
+    assert "<w:basedOn" not in body
+    assert "<w:numPr" not in body
+    assert '<w:spacing w:before="120"' in body
+    assert "<w:b" in body  # inherited run formatting was materialized before detach

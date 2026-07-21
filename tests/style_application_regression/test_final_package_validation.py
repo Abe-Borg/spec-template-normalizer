@@ -320,3 +320,108 @@ def test_preservation_invariant_follows_custom_header_relationship_target(tmp_pa
             new_docx=output,
             arch_template_registry={},
         )
+
+
+def test_format_only_invariant_rejects_body_text_change(tmp_path):
+    source = tmp_path / "source-text.docx"
+    output = tmp_path / "output-text.docx"
+    source_parts = _parts()
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        ">Text<",
+        ">Changed<",
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="target body text changed"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+        )
+
+
+def test_format_only_invariant_rejects_effective_numbering_change(tmp_path):
+    source = tmp_path / "source-numbering.docx"
+    output = tmp_path / "output-numbering.docx"
+    source_parts = _parts()
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        'w:numId w:val="1"',
+        'w:numId w:val="2"',
+    )
+    output_parts["word/numbering.xml"] = source_parts["word/numbering.xml"].replace(
+        "</w:numbering>",
+        '<w:num w:numId="2"><w:abstractNumId w:val="2"/></w:num></w:numbering>',
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="effective target numbering changed"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+        )
+
+
+def test_format_only_invariant_does_not_treat_tracked_numpr_as_live(tmp_path):
+    source = tmp_path / "source-tracked-numbering.docx"
+    output = tmp_path / "output-tracked-numbering.docx"
+    source_parts = _parts()
+    live_properties = (
+        '<w:pStyle w:val="Body"/><w:numPr><w:ilvl w:val="0"/>'
+        '<w:numId w:val="1"/></w:numPr>'
+    )
+    tracked_properties = (
+        '<w:pPrChange w:id="7"><w:pPr>'
+        f'{live_properties}</w:pPr></w:pPrChange>'
+    )
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        live_properties,
+        tracked_properties,
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        tracked_properties,
+        live_properties + tracked_properties,
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="effective target numbering changed"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+        )
+
+
+def test_format_only_invariant_preserves_all_existing_numbering_definitions(tmp_path):
+    source = tmp_path / "source-definitions.docx"
+    output = tmp_path / "output-definitions.docx"
+    source_parts = _parts()
+    source_parts["word/numbering.xml"] = source_parts["word/numbering.xml"].replace(
+        "</w:numbering>",
+        '<w:abstractNum w:abstractNumId="9"><w:lvl w:ilvl="0">'
+        '<w:start w:val="4"/></w:lvl></w:abstractNum></w:numbering>',
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/numbering.xml"] = source_parts["word/numbering.xml"].replace(
+        '<w:start w:val="4"/>',
+        '<w:start w:val="5"/>',
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="numbering definitions changed"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+        )

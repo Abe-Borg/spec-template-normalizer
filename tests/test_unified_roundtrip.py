@@ -415,8 +415,15 @@ def test_unified_formatter_round_trips_without_api(tmp_path: Path) -> None:
     assert TEXTBOX_BLOCK in target_document_before.decode("utf-8")
     assert TEXTBOX_BLOCK in output_document_text
 
-    assert output_document_text.count('w:val="CSI_Paragraph__ARCH"') == 1
-    assert output_document_text.count('w:val="CSI_Subparagraph__ARCH"') == 1
+    applied_style_ids = re.findall(r'<w:pStyle w:val="([^"]+)"', output_document_text)
+    assert sum(
+        style_id.startswith("SF_") and "_BODY_CSI_Paragraph__ARCH_" in style_id
+        for style_id in applied_style_ids
+    ) == 1
+    assert sum(
+        style_id.startswith("SF_") and "_BODY_CSI_Subparagraph__ARCH_" in style_id
+        for style_id in applied_style_ids
+    ) == 1
     assert output_settings.decode("utf-8").startswith('<?xml version="1.0" encoding="UTF-8"?>')
     assert 'w:percent="110"' in output_settings.decode("utf-8")
     assert 'w:name="compatibilityMode"' in output_settings.decode("utf-8")
@@ -494,7 +501,8 @@ def test_unified_formatter_keeps_valid_output_when_another_target_is_corrupt(
     valid_result = results[valid_target.resolve()]
     assert valid_result.success, "\n".join(valid_result.log)
     assert valid_result.error is None
-    assert valid_result.output_path == output_dir.resolve() / "valid-target_FORMATTED.docx"
+    assert run.run_dir is not None
+    assert valid_result.output_path == run.run_dir / "valid-target_FORMATTED.docx"
     assert valid_result.output_path.is_file()
     validate_docx_package(valid_result.output_path)
 
@@ -502,8 +510,8 @@ def test_unified_formatter_keeps_valid_output_when_another_target_is_corrupt(
     assert corrupt_result.success is False
     assert corrupt_result.output_path is None
     assert corrupt_result.error
-    assert not (output_dir / "corrupt-target_FORMATTED.docx").exists()
-    assert list(output_dir.glob("*_FORMATTED.docx")) == [valid_result.output_path]
+    assert not (run.run_dir / "corrupt-target_FORMATTED.docx").exists()
+    assert list(run.run_dir.glob("*_FORMATTED.docx")) == [valid_result.output_path]
 
     assert {
         path: _sha256(path)
@@ -574,7 +582,10 @@ def test_format_only_preserves_target_automatic_numbering_for_typed_architect_ro
         target_document_before
     )
     first_paragraph = output_document_text.split("</w:p>", 1)[0]
-    assert '<w:pStyle w:val="CSI_Paragraph__ARCH"/>' in first_paragraph
+    assert re.search(
+        r'<w:pStyle w:val="SF_[^"]+_BODY_CSI_Paragraph__ARCH_[^"]+"/>',
+        first_paragraph,
+    )
     assert '<w:numId w:val="17"/>' in first_paragraph
     assert '<w:ilvl w:val="0"/>' in first_paragraph
     assert '<w:num w:numId="17">' in output_numbering

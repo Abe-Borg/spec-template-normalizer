@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from spec_formatter.style_application.core.classification import (
+    _numbering_role_candidates,
     build_phase2_slim_bundle,
     preclassify_paragraphs,
     validate_phase2_classification_contract,
@@ -88,8 +89,7 @@ def test_drawing_textbox_host_is_reported_and_preserved_out_of_scope(tmp_path: P
     )
 
     bundle = build_phase2_slim_bundle(extract_dir, available_roles=["PARAGRAPH"])
-    assert [p["paragraph_index"] for p in bundle["paragraphs"]] == [0, 1]
-    assert bundle["paragraphs"][0]["text"] == "Host"
+    assert [p["paragraph_index"] for p in bundle["paragraphs"]] == [1]
     assert bundle["filter_report"]["paragraphs_out_of_scope"] == [
         {
             "paragraph_index": 0,
@@ -263,6 +263,45 @@ def test_style_inherited_numbering_is_resolved_and_matched(tmp_path: Path):
     ]
 
 
+def test_tracked_previous_numpr_and_pstyle_are_not_effective_numbering(
+    tmp_path: Path,
+):
+    change = (
+        '<w:pPrChange w:id="7"><w:pPr>'
+        '<w:pStyle w:val="HistoricalList"/><w:numPr>'
+        '<w:ilvl w:val="2"/><w:numId w:val="8"/>'
+        '</w:numPr></w:pPr></w:pPrChange>'
+    )
+    extract_dir = _write_document_xml(
+        tmp_path,
+        f'<w:p><w:pPr>{change}</w:pPr>'
+        '<w:r><w:t>Ordinary text</w:t></w:r></w:p>',
+    )
+    _write_numbering_parts(
+        extract_dir,
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="HistoricalList"><w:pPr>'
+        '<w:numPr><w:ilvl w:val="2"/><w:numId w:val="8"/></w:numPr>'
+        '</w:pPr></w:style></w:styles>',
+        '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:abstractNum w:abstractNumId="4"><w:lvl w:ilvl="2">'
+        '<w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%3."/>'
+        '</w:lvl></w:abstractNum><w:num w:numId="8">'
+        '<w:abstractNumId w:val="4"/></w:num></w:numbering>',
+    )
+
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PARAGRAPH"],
+    )
+
+    assert bundle["deterministic_classifications"] == []
+    assert bundle["paragraphs"][0]["pStyle"] is None
+    assert bundle["paragraphs"][0]["numPr"] is None
+    assert bundle["paragraphs"][0]["effective_numPr"] is None
+    assert bundle["paragraphs"][0]["numbering_pattern"] is None
+
+
 def test_ambiguous_automatic_numbering_stays_unresolved_for_llm(tmp_path: Path):
     extract_dir = _write_document_xml(
         tmp_path,
@@ -327,6 +366,121 @@ def test_extra_target_start_override_prevents_deterministic_match(tmp_path: Path
     )
     assert bundle["deterministic_classifications"] == []
     assert bundle["paragraphs"][0]["numbering_match_candidates"] == []
+
+
+def test_numbering_role_exact_match_compares_every_portable_semantic():
+    target = {
+        "numId": "7",
+        "abstractNumId": "3",
+        "ilvl": "2",
+        "start": "4",
+        "numFmt": "decimal",
+        "lvlRestart": "1",
+        "pStyle": "TargetLocalStyle",
+        "lvlText": "%3)",
+        "suff": "space",
+        "isLgl": "1",
+        "startOverride": "9",
+    }
+    expected = dict(target)
+    expected.update({
+        "numId": "91",
+        "abstractNumId": "44",
+        "pStyle": "ArchitectLocalStyle",
+    })
+    role_specs = {
+        "SUBPARAGRAPH": {
+            "numbering_provenance": "style_numpr",
+            "numbering_pattern": expected,
+        }
+    }
+
+    assert _numbering_role_candidates(
+        target,
+        role_specs,
+        ["SUBPARAGRAPH"],
+    ) == ["SUBPARAGRAPH"]
+
+    for key, value in (
+        ("start", "5"),
+        ("lvlRestart", "2"),
+        ("suff", "tab"),
+        ("isLgl", "0"),
+        ("startOverride", "10"),
+    ):
+        mismatched = dict(expected)
+        mismatched[key] = value
+        role_specs["SUBPARAGRAPH"]["numbering_pattern"] = mismatched
+        assert _numbering_role_candidates(
+            target,
+            role_specs,
+            ["SUBPARAGRAPH"],
+        ) == []
+
+
+def test_numbering_role_exact_match_distinguishes_absent_portable_semantics():
+    target = {
+        "ilvl": "0",
+        "start": "1",
+        "numFmt": "upperLetter",
+        "lvlText": "%1.",
+    }
+    expected = dict(target)
+    role_specs = {
+        "PARAGRAPH": {
+            "numbering_provenance": "style_numpr",
+            "numbering_pattern": expected,
+        }
+    }
+
+    del expected["start"]
+    assert _numbering_role_candidates(target, role_specs, ["PARAGRAPH"]) == []
+
+    expected["start"] = "1"
+    target_without_start = dict(target)
+    del target_without_start["start"]
+    assert _numbering_role_candidates(
+        target_without_start,
+        role_specs,
+        ["PARAGRAPH"],
+    ) == []
+
+
+def test_counter_near_match_suppresses_contextual_role_fallback(tmp_path: Path):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/>'
+        '</w:numPr></w:pPr><w:r><w:t>Requirement</w:t></w:r></w:p>',
+    )
+    _write_numbering_parts(
+        extract_dir,
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+        '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:abstractNum w:abstractNumId="3"><w:lvl w:ilvl="0">'
+        '<w:start w:val="5"/><w:numFmt w:val="upperLetter"/>'
+        '<w:lvlText w:val="%1."/></w:lvl></w:abstractNum>'
+        '<w:num w:numId="7"><w:abstractNumId w:val="3"/></w:num></w:numbering>',
+    )
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PARAGRAPH"],
+        role_specs={
+            "PARAGRAPH": {
+                "numbering_provenance": "style_numpr",
+                "numbering_pattern": {
+                    "numId": "9",
+                    "ilvl": "0",
+                    "start": "1",
+                    "numFmt": "upperLetter",
+                    "lvlText": "%1.",
+                },
+            }
+        },
+    )
+
+    assert bundle["deterministic_classifications"] == []
+    assert bundle["paragraphs"][0]["numbering_match_candidates"] == []
+    assert bundle["paragraphs"][0]["numbering_role"] is None
 
 
 def test_deep_typed_csi_markers_are_detected_and_preclassified(tmp_path: Path):
@@ -457,6 +611,89 @@ def test_numbered_section_cross_reference_uses_its_list_role():
     ) == {7: "SUBPARAGRAPH"}
 
 
+def test_automatic_numbering_precedes_general_section_title_heuristic(tmp_path: Path):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:r><w:t>SECTION 01 29 00</w:t></w:r></w:p>'
+        '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/>'
+        '<w:numId w:val="7"/></w:numPr></w:pPr>'
+        '<w:r><w:t>GENERAL</w:t></w:r></w:p>',
+    )
+    _write_numbering_parts(
+        extract_dir,
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+        '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:abstractNum w:abstractNumId="3"><w:lvl w:ilvl="0">'
+        '<w:numFmt w:val="decimal"/><w:lvlText w:val="PART %1"/>'
+        '</w:lvl></w:abstractNum><w:num w:numId="7">'
+        '<w:abstractNumId w:val="3"/></w:num></w:numbering>',
+    )
+
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PART"],
+    )
+
+    assert bundle["deterministic_classifications"] == [
+        {"paragraph_index": 1, "csi_role": "PART"},
+    ]
+    assert bundle["deterministic_ignored_paragraphs"] == [
+        {"paragraph_index": 0, "reason": "section_header_no_role"},
+    ]
+
+
+def test_single_digit_article_marker_is_deterministic():
+    assert preclassify_paragraphs(
+        [{
+            "paragraph_index": 4,
+            "text": "1.1 General requirements",
+            "in_table": False,
+        }],
+        ["PART", "ARTICLE", "PARAGRAPH"],
+    ) == {4: "ARTICLE"}
+
+
+def test_automatic_numbering_precedes_uppercase_section_cross_reference():
+    assert preclassify_paragraphs(
+        [{
+            "paragraph_index": 5,
+            "text": "SECTION 012100 ALLOWANCES",
+            "in_table": False,
+            "effective_numPr": {"numId": "2", "ilvl": "5"},
+            "numbering_role": "SUBPARAGRAPH",
+        }],
+        ["SectionID", "SectionTitle", "SUBPARAGRAPH"],
+    ) == {5: "SUBPARAGRAPH"}
+
+
+def test_bundle_keeps_automatic_uppercase_section_cross_reference_in_list(tmp_path: Path):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/>'
+        '<w:numId w:val="7"/></w:numPr></w:pPr>'
+        '<w:r><w:t>SECTION 012100 ALLOWANCES</w:t></w:r></w:p>',
+    )
+    _write_numbering_parts(
+        extract_dir,
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+        '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:abstractNum w:abstractNumId="3"><w:lvl w:ilvl="0">'
+        '<w:numFmt w:val="upperLetter"/><w:lvlText w:val="%1."/>'
+        '</w:lvl></w:abstractNum><w:num w:numId="7">'
+        '<w:abstractNumId w:val="3"/></w:num></w:numbering>',
+    )
+
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PARAGRAPH"],
+    )
+
+    assert bundle["deterministic_classifications"] == [
+        {"paragraph_index": 0, "csi_role": "PARAGRAPH"},
+    ]
+    assert bundle["deterministic_ignored_paragraphs"] == []
+
+
 def test_masterspec_cmt_style_is_preserved_outside_classification(tmp_path: Path):
     extract_dir = _write_document_xml(
         tmp_path,
@@ -475,6 +712,12 @@ def test_masterspec_cmt_style_is_preserved_outside_classification(tmp_path: Path
             "paragraph_index": 0,
             "tags": ["editorial_comment_style"],
             "original_text_preview": "Always retain first three subparagraphs below.",
+        }
+    ]
+    assert bundle["deterministic_ignored_paragraphs"] == [
+        {
+            "paragraph_index": 0,
+            "reason": "editorial_comment_style",
         }
     ]
 
@@ -597,4 +840,104 @@ def test_coerce_rejects_deterministic_override():
                 ]
             },
             ["PART", "ARTICLE"],
+        )
+
+
+def test_explicit_ignored_disposition_completes_unresolved_coverage():
+    bundle = {
+        "paragraphs": [
+            {"paragraph_index": 10},
+            {"paragraph_index": 11},
+        ],
+        "deterministic_classifications": [],
+        "deterministic_ignored_paragraphs": [],
+    }
+
+    out = coerce_to_final_classifications(
+        bundle,
+        {
+            "classifications": [
+                {"paragraph_index": 10, "csi_role": "PART"},
+            ],
+            "ignored_paragraphs": [
+                {"paragraph_index": 11, "reason": "non_csi_content"},
+            ],
+        },
+        ["PART"],
+    )
+
+    assert out["classifications"] == [
+        {"paragraph_index": 10, "csi_role": "PART"},
+    ]
+    assert out["ignored_paragraphs"] == [
+        {"paragraph_index": 11, "reason": "non_csi_content"},
+    ]
+
+
+def test_dispositions_must_be_disjoint_and_complete():
+    bundle = {
+        "paragraphs": [{"paragraph_index": 10}, {"paragraph_index": 11}],
+        "deterministic_classifications": [],
+    }
+    with pytest.raises(ValueError, match="both classified and ignored"):
+        validate_phase2_classification_contract(
+            bundle,
+            {
+                "classifications": [
+                    {"paragraph_index": 10, "csi_role": "PART"},
+                    {"paragraph_index": 11, "csi_role": "PART"},
+                ],
+                "ignored_paragraphs": [
+                    {"paragraph_index": 10, "reason": "non_csi_content"},
+                ],
+            },
+            ["PART"],
+        )
+
+    with pytest.raises(ValueError, match="missing coverage"):
+        validate_phase2_classification_contract(
+            bundle,
+            {
+                "classifications": [],
+                "ignored_paragraphs": [
+                    {"paragraph_index": 10, "reason": "non_csi_content"},
+                ],
+            },
+            ["PART"],
+        )
+
+
+def test_coerce_merges_deterministic_ignored_without_allowing_override():
+    bundle = {
+        "paragraphs": [{"paragraph_index": 11}],
+        "deterministic_classifications": [],
+        "deterministic_ignored_paragraphs": [
+            {"paragraph_index": 10, "reason": "editorial_comment_style"},
+        ],
+    }
+    out = coerce_to_final_classifications(
+        bundle,
+        {
+            "classifications": [
+                {"paragraph_index": 11, "csi_role": "PART"},
+            ],
+            "ignored_paragraphs": [],
+        },
+        ["PART"],
+    )
+    assert out["ignored_paragraphs"] == [
+        {"paragraph_index": 10, "reason": "editorial_comment_style"},
+    ]
+
+    with pytest.raises(ValueError, match="deterministic ignored override"):
+        validate_phase2_final_payload(
+            bundle,
+            {
+                "classifications": [
+                    {"paragraph_index": 10, "csi_role": "PART"},
+                    {"paragraph_index": 11, "csi_role": "PART"},
+                ],
+                "ignored_paragraphs": [],
+            },
+            ["PART"],
         )

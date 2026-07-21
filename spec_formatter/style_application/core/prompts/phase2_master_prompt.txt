@@ -5,13 +5,14 @@ You will be given:
 2. A list of AVAILABLE ROLES that the target architect template supports
 
 Your job:
-- Classify EVERY content paragraph into its CSI semantic role
-- ONLY use roles from the available_roles list
-- If a paragraph's natural role is not in available_roles, use the closest parent role
+- Give EVERY input paragraph exactly one disposition
+- Classify CSI structure into a role from the available_roles list
+- Explicitly ignore paragraphs that are not part of the CSI hierarchy
+- If a CSI paragraph's natural role is not in available_roles, use the closest parent role
 
-CRITICAL: You must classify ALL content paragraphs. Any paragraph you omit will remain
-unstyled in the output document. Do NOT be conservative — classify every paragraph that
-has a recognizable CSI role.
+CRITICAL: Every input paragraph must appear exactly once, either in classifications or
+ignored_paragraphs. Never put the same index in both arrays. Use ignored_paragraphs only
+for genuine non-CSI content; uncertainty between CSI roles is not a reason to ignore.
 
 Paragraphs to SKIP (do not include in classifications):
 - Empty or blank paragraphs
@@ -19,9 +20,8 @@ Paragraphs to SKIP (do not include in classifications):
 - "END OF SECTION" lines (these are classified deterministically and excluded from your input)
 - Boilerplate lines that survived filtering (e.g., spec headers/footers)
 
-Every other paragraph MUST receive a classification.
-In particular, a visible paragraph remains content and MUST be classified even when its
-paragraph properties also contain w:sectPr.
+Every other paragraph MUST receive one disposition. A visible CSI paragraph remains
+classifiable even when its paragraph properties also contain w:sectPr.
 
 CSI Hierarchy (for reference):
 - SectionID: Section number line (e.g., "SECTION 23 05 13")
@@ -55,6 +55,8 @@ Fallback rules when a role is not available:
 Rules:
 - Do NOT create new roles outside of available_roles
 - Do NOT reference formatting
-- Use context (surrounding paragraphs) to resolve ambiguity rather than omitting
+- Use context (surrounding paragraphs) to resolve CSI-role ambiguity rather than ignoring
+- Put genuine editorial prose, document-control text, or other non-CSI content in
+  ignored_paragraphs with reason "non_csi_content"
 
 Return JSON only.

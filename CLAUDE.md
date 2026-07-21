@@ -2,95 +2,164 @@
 
 ## Purpose
 
-This repository is Phase 1 of a two-step DOCX formatting pipeline. It analyzes an architect's specification template and publishes a validated `.phase1` bundle. A separate Phase 2 application validates that complete bundle and applies its style system to another specification.
+This repository is the unified Specification Formatter. It analyzes and caches
+an architect template, classifies one or more target specifications, applies an
+explicit formatting policy, and publishes validated DOCX files plus complete
+run provenance. The `.phase1` bundle remains an internal integrity boundary;
+it is not a separate user workflow or a separate application.
 
-The supported Phase 1 pipeline is observational with respect to the input document:
-
-- Never modify, retag, repackage, or replace the selected DOCX.
-- Never mutate the extracted working snapshot.
-- Never publish a normalized DOCX or extracted package.
-- Derive generated CSI styles into a separate `portable_styles.xml` document.
-- Publish only a complete, validated, checksummed `.phase1` directory.
-
-The source snapshot is the authority for all artifacts created in a run.
+The canonical public entry point is
+`spec_formatter.format_specifications()`. `gui.py` is a thin client of that API.
+Architect and target inputs are immutable; only private snapshots and new
+output files may be changed.
 
 ## Canonical architecture
 
-`gui.py` is a thin client of `phase1_pipeline.run_phase1()`. The headless pipeline owns the business flow:
+`spec_formatter.pipeline.format_specifications()` owns the business flow:
 
 ```text
-source DOCX
-  -> stable private snapshot
-  -> contained, bounded package extraction
-  -> slim paragraph/style/numbering bundle
-  -> LLM role + styled/ignored classification
-  -> instruction and 100% disposition validation
-  -> portable stylesheet derivation (separate output; no retagging)
-  -> bounded environment capture
-  -> registry + audit validation
-  -> private bundle staging
-  -> source-part, cross-artifact, size, and checksum validation
-  -> atomic rename to unique *.phase1 directory
+architect DOCX
+  -> immutable snapshot and bounded package extraction
+  -> styled/ignored role classification and source-derived portable styles
+  -> bounded shell capture (styles, theme/defaults, settings, layout, headers/footers)
+  -> strict checksummed *.phase1 profile
+  -> versioned cache namespace and exact compatibility validation
+
+target DOCX files
+  -> immutable per-target snapshot in a short generated temp path
+  -> bounded extraction and deterministic/AI styled-or-ignored dispositions
+  -> one immutable ApplicationPolicy
+       format_only: target-owned text and numbering
+       csi_to_canadian: fail-closed hierarchy conversion
+  -> collision-safe style import and full architect shell application
+  -> mode-specific content, numbering, structure, and package invariants
+  -> atomic DOCX publication in one timestamped run directory
+
+run
+  -> per-target audit JSON
+  -> redacted run.log
+  -> run.json written after target results and audits
 ```
 
-If any step fails, no final bundle is published. Temporary work and unpublished staging data are cleaned up.
+Targets are independent: one target can fail without discarding other validated
+outputs. A failed target never publishes a partial DOCX. A run directory and
+manifest still record partial or total failure.
 
 ## Repository map
 
 ```text
-phase1_pipeline.py       Canonical headless orchestration and immutable source snapshot
-phase1_bundle.py         Bundle models, audit creation, staging, validation, atomic publication
-docx_decomposer.py       Safe package extraction, slim bundle, semantic checks, portable style derivation
-llm_classifier.py        Anthropic request, bounded retries, targeted coverage patches
-paragraph_rules.py       CSI signals, numbering-aware role inference, classifiable-universe rules
-arch_env_extractor.py    Bounded formatting-environment capture
-phase1_validator.py      Instruction, style registry, template registry, and cross-registry validation
-gui.py                   CustomTkinter client; no pipeline business logic
-master_prompt.txt         Classifier system contract
-run_instruction_prompt.txt
-instructions.json        Example classifier instruction shape
+spec_formatter/pipeline.py
+    canonical public orchestration, profile cache, isolated runs, manifests
+spec_formatter/template_analysis.py
+    namespaced facade over architect analysis and bundle validation
+spec_formatter/style_application/
+    target extraction, shell application, numbering/header import, invariants
+spec_formatter/style_application/core/application_policy.py
+    immutable mode-dependent mutation contract
+spec_formatter/style_application/core/classification.py
+    numbering-aware target dispositions and paragraph application
+spec_formatter/style_application/core/style_import.py
+    effective style materialization and collision-safe import
+phase1_pipeline.py, phase1_bundle.py, docx_decomposer.py
+    architect snapshot, analysis, profile construction, and validation
+gui.py
+    input collection, immutable active-run display, progress, and results
 schemas/
-  phase1_bundle_manifest.v1.schema.json
-  classification_audit.v1.schema.json
-  phase1_instructions.schema.json
-  arch_style_registry.v2.schema.json
-  arch_style_registry.v1.schema.json       Legacy registry schema
-  arch_template_registry.example.json      Reference shape, not a generated artifact
-tests/                    Unit, adversarial, contract, bundle, and pipeline regression tests
+    formal architect-profile contracts
+tests/
+    unit, adversarial, contract, integration, GUI, and round-trip regressions
+output/spec_test_corpus_smoke.py
+    offline realistic-corpus checks against this repository's namespaced engine
 ```
 
-`apply_instructions()` is a legacy developer surface and must not be wired into `gui.py`, `run_phase1()`, or Phase 2. `phase1_smoke_test.py` is the supported offline harness: it injects precomputed instructions into the same immutable `run_phase1()` -> `build_portable_styles_xml()` -> bundle path.
+`phase1_pipeline.run_phase1()` remains a compatibility and internal profile
+builder surface. New integrations must call the unified public API.
+`apply_instructions()` is a legacy developer surface and must not be wired into
+the GUI or target application.
 
 ## Non-negotiable invariants
 
-### 1. One immutable source identity
+### 1. Immutable source identities
 
-`run_phase1()` copies the selected DOCX to a private snapshot, checks size and modification time around the copy, and hashes the snapshot. Extraction, environment capture, registry metadata, audit metadata, and bundle staging all use that snapshot. Do not hash or reopen the user's live path later in the run as an artifact authority.
+Every architect and target is copied to a private snapshot while size,
+modification time, and SHA-256 are checked. All processing uses that snapshot;
+the live input is checked again before target publication. Never mutate an input
+or treat a later live-file read as artifact authority.
 
-### 2. No source paragraph mutation
+### 2. One explicit application policy
 
-The production flow reads `word/document.xml`; it does not insert or replace `<w:pStyle>`. New role styles are built in memory and written to `portable_styles.xml`. `source_styles.xml` remains byte-identical to the source `word/styles.xml`.
+Resolve `conversion_mode` once with `application_policy_for_mode()` and pass the
+same policy through numbering import, style import, paragraph application, and
+validation. Do not recreate mode checks independently in downstream modules.
 
-### 3. Formatting stays local and source-derived
+- `format_only` preserves target body text and target numbering semantics and
+  does not import architect body numbering.
+- `csi_to_canadian` performs only the existing fail-closed supported hierarchy
+  conversion and may import architect numbering for classified roles.
+- Both modes apply the architect's complete shell.
 
-The LLM may select roles, explicit ignored paragraphs, and exemplar indices. It may not specify formatting XML or formatting attributes. `build_portable_styles_xml()` derives paragraph/run properties from the selected source exemplar and preserves source-style inheritance. A direct property seen in one marked run must not be promoted to an entire style unless it is common to the visible text-bearing runs.
+### 3. Explicit disposition coverage
 
-### 4. Explicit classification universe
+Every visible classifiable target paragraph must occur exactly once in one of:
 
-Structurally out-of-scope paragraphs are limited to empty paragraphs, table paragraphs, and empty structural section-break paragraphs. A visible paragraph remains in the classification universe when its paragraph properties contain `w:sectPr`; its section properties must be preserved exactly. Every other candidate index must occur exactly once in one of:
-
-- `apply_pStyle`: styled CSI content
+- `classifications`: styled CSI content
 - `ignored_paragraphs`: non-CSI/editorial content with a non-empty reason
 
-The sets must be disjoint and their union must equal the expected indices. Editor notes and copyright/specifier notices are auditable ignored content, not invisible skips. There is no nearest-neighbor style fallback.
+The sets are disjoint and cover the complete classifiable universe. Empty
+structural paragraphs, table paragraphs, drawings, and text boxes are recorded
+out of scope. Ignored paragraphs receive no paragraph or run edits. Missing,
+duplicate, overlapping, or unknown dispositions fail closed; never restore
+nearest-neighbor fallback.
 
-### 5. Bundle is the API boundary
+### 4. Format-only numbering is target-owned
 
-Phase 2 consumes the entire `.phase1` directory, starting with strict manifest validation. Two loose registries are not a valid Phase 1 handoff. The bundle validator checks required artifacts, exact paths, source identity, sizes, hashes, JSON/XML validity, audit consistency, registry relationships, and unlisted files.
+Snapshot effective target numbering before shell/style changes, including
+numbering inherited through `basedOn`. Materialize target `numPr` when changing
+its style would otherwise lose that inheritance. Detach imported body styles
+from architect numbering and suppress architect numbering on originally
+unnumbered paragraphs. Before publication, prove unchanged body text, unchanged
+effective numbering semantics, and preservation of all original target
+numbering definitions.
 
-### 6. Atomic publication
+Automatic numbering evidence precedes text-only heuristics. An automatically
+numbered paragraph whose stored text is `GENERAL` can be a PART, while an
+automatically numbered requirement beginning `Section ...` is not a SectionID.
 
-Artifacts are copied into a private sibling staging directory, revalidated there, and published by same-filesystem directory rename. New runs use unique names. Existing bundles are not overwritten by default. Never write generated artifacts directly into a final `.phase1` directory.
+### 5. Architect formatting is source-derived and collision-safe
+
+The LLM selects roles/dispositions, not XML formatting. Role styles come from
+validated architect exemplars. Resolve paragraph formatting through the full
+architect `basedOn` chain, and remove a target direct property only when the
+effective architect style supplies that property. Never remove numbering,
+`sectPr`, tracked changes, or protected subtrees as generic formatting cleanup.
+
+Never replace an existing target style ID, including `Normal`. Clone a
+conflicting architect style and its dependencies under deterministic private
+IDs, rewrite `basedOn`/`next`/`link` and imported header/footer references, and
+reject a deterministic namespace collision with different content.
+
+### 6. Profile bundle and cache are strict boundaries
+
+Target application consumes the complete `.phase1` directory after strict
+manifest validation; loose registries are not a valid handoff. Cache profiles
+under a versioned contract namespace and require exact source hash, producer,
+classifier, model, and prompt compatibility. Bump the profile contract when a
+consumer-visible bundle assumption changes.
+
+Architect analysis remains observational: derive generated styles in
+`portable_styles.xml`; preserve byte-exact `source_styles.xml` and optional
+`source_settings.xml`; never retag or publish a normalized architect DOCX.
+
+### 7. Isolated, atomic, auditable publication
+
+Create one `<UTC timestamp>_<mode>_<run-id>` directory per validated invocation,
+before template analysis begins, so template/profile initialization failures
+still publish a failed manifest, run log, and per-target not-started audits.
+Stage each target under a short generated system-temp path, validate the complete
+DOCX, and atomically publish it into that run directory. Then atomically write
+per-target audits, `run.log`, and finally `run.json`. Never put secrets or
+document text in metadata. Existing run directories and flat legacy outputs
+are immutable history.
 
 ## Bundle contract
 
@@ -138,56 +207,81 @@ Role expectations come from text signals and effective Word numbering, including
 
 ## Module responsibilities
 
-### `phase1_pipeline.py`
+### `spec_formatter/pipeline.py`
 
-- `run_phase1()` is the sole supported end-to-end entry point.
-- `_snapshot_source()` establishes the stable input used for the whole run.
-- Reads the two prompt files, invokes classification, requires complete coverage, writes generated artifacts to private work storage, and delegates publication to `phase1_bundle`.
-- Returns `Phase1Result` only after atomic publication.
+- `format_specifications()` is the canonical public entry point.
+- Validates inputs and modes, prepares a compatible cached profile, allocates
+  the isolated run directory, snapshots/dispatches targets, atomically publishes
+  metadata, and returns `FormatRunResult`.
+- `output_dir` is an output root; the returned `output_dir` is a backward-
+  compatible alias of the concrete `run_dir`.
+- Folder expansion excludes the architect only when discovered through a
+  folder. An explicitly supplied architect target must reach validation and
+  fail.
 
-Keep filesystem/UI concerns outside of classifiers and decomposers. Keep GUI progress reporting behind the optional callback.
+Keep UI concerns out of this module and content/classification decisions in the
+target engine. Redact the API key from every error/log/manifest path.
 
-### `phase1_bundle.py`
+### `spec_formatter/style_application/core/application_policy.py`
 
-- `build_classification_audit()` and `validate_classification_audit()` freeze and verify paragraph dispositions.
-- `stage_phase1_bundle()` copies artifacts to private staging, verifies exact source parts and all contracts, writes the manifest, and validates the staged directory.
-- `publish_staged_bundle()` performs the atomic rename.
-- `validate_bundle_directory()` is the consumer-facing integrity gate and should also be used by Phase 2.
+Owns all mode-dependent decisions. Add a policy field rather than scattering a
+new conversion-mode conditional across the pipeline. Its contract version must
+be recorded in `run.json` and changed when policy semantics change.
 
-Do not weaken `reject_unlisted`, required artifact, filename, hash, or source identity checks for convenience.
+### `spec_formatter/style_application/batch_runner.py`
 
-### `docx_decomposer.py`
+- Loads one validated profile and prepares/classifies targets.
+- `_apply_classified_target()` is the shared application path for single and
+  batch flows; do not duplicate environment/numbering/style sequencing.
+- Captures target styles/numbering before shell mutation, applies the selected
+  policy, produces audit/numbering checks, validates, and packages the result.
 
-- `extract_docx()` performs safe, bounded OPC/ZIP extraction.
-- `build_slim_bundle()` reads visible paragraph text, table/section status, direct and effective numbering, source style IDs, and catalogs.
-- `validate_instructions()` performs document-aware shape, semantic, role, exemplar, style, and coverage checks.
-- `build_portable_styles_xml()` derives and inserts generated styles into a separate stylesheet string without writing the extracted source package.
-- `build_style_registry_dict()` emits role metadata, source identity, resolved formatting, and numbering provenance for Phase 2.
+### `spec_formatter/style_application/core/classification.py`
 
-Paragraph indices are tied to the source `document.xml` paragraph sequence. Preserve the visible-text and index semantics when changing XML parsing.
+- Builds the target slim bundle and deterministic CSI/ignore dispositions.
+- Gives effective Word numbering stronger precedence than text-only signals.
+- Validates exact disjoint coverage and rejects deterministic overrides.
+- Applies only styled entries, leaves ignored entries exact, resolves effective
+  architect paragraph properties through `basedOn`, and enforces Format-only
+  text/numbering invariants.
 
-### `llm_classifier.py`
+Paragraph indices are tied to the `word/document.xml` paragraph sequence.
+Preserve that index and visible-text contract when changing XML parsing.
 
-- `classify_document()` performs one primary classifier request and bounded targeted patch requests.
-- API retry is limited to transient connection, rate-limit, and server failures.
-- Invalid credentials, invalid requests, malformed JSON, semantic contradictions, and unresolved coverage fail closed.
-- Current single-pass input limit is an estimated 150,000 tokens.
+### `spec_formatter/style_application/core/style_import.py`
 
-Do not restore positional or nearest-neighbor gap filling. A missing paragraph must receive an explicit supported style or an explicit ignore reason.
+Imports only the requested architect style closure. Materialize effective
+formatting, detach Format-only body styles from architect numbering, namespace
+every target-ID collision deterministically, and rewrite dependency references.
+Return the source-to-final style-ID map to every body/header/footer consumer.
 
-### `arch_env_extractor.py`
+### Target shell, packaging, and invariants
 
-Captures the supported formatting environment: package inventory, document defaults, styles, latent/table styles, theme, compatibility settings, section/page layout, header/footer XML and contained media, numbering, font table, and relationships.
+- `arch_env_applier.py` applies document defaults, theme/settings,
+  compatibility, and canonical section/page layout.
+- `header_footer_importer.py` and `numbering_importer.py` import bounded
+  dependency sets and remap relationships/IDs.
+- `phase2_invariants.py` verifies body, numbering, protected structure,
+  section, header/footer, relationship, and package contracts.
+- `docx_decomposer.py` extracts targets safely; `docx_patch.py` assembles and
+  validates replacements before publication.
 
-This registry is deliberately bounded and normalized; it is not a complete rendering VM or a byte-exact mirror of every package part. `capture_policy` describes normalization. Exact source styles/settings are separate bundle artifacts.
+### Architect profile modules
 
-### `phase1_validator.py`
-
-Owns the formal instruction and registry contracts. Keep its allowed role/style sets synchronized with prompt files and JSON schemas. Cross-registry checks must use the portable stylesheet/environment that Phase 2 will actually consume.
+`phase1_pipeline.py` snapshots and analyzes the architect. `phase1_bundle.py`
+creates and validates the complete bundle. Root `docx_decomposer.py` builds the
+architect slim bundle, derives portable styles without changing the source,
+and emits role metadata. `llm_classifier.py`, `paragraph_rules.py`,
+`arch_env_extractor.py`, and `phase1_validator.py` own architect classification,
+signals, shell capture, and cross-contract validation respectively.
 
 ### `gui.py`
 
-Owns only input collection, background-thread execution, progress/log display, and final status. It calls `run_phase1()` and displays `Phase1Result`. It must not recreate extraction, classification, artifact copying, or validation logic.
+Owns input collection, background execution, immutable active-run display,
+progress/log rendering, and final status. It calls `format_specifications()` and
+displays `FormatRunResult`. Lock every run-affecting control while work is
+active, display all target processor log lines and audit counts, and open the
+actual `run_dir`. Never recreate pipeline business logic in the GUI.
 
 ## Untrusted input and limits
 
@@ -205,7 +299,9 @@ Any new extractor must have adversarial tests for containment, external targets,
 
 ## Environment capture semantics
 
-The template registry stores normalized source-derived XML fragments. Current capture policy does not canonicalize whitespace but does strip volatile rsid attributes and proofing markers. Do not call these fields “raw XML.”
+The template registry stores normalized source-derived XML fragments. Current
+capture policy does not canonicalize whitespace but does strip volatile rsid
+attributes and proofing markers. Do not call these fields "raw XML."
 
 Use these terms consistently:
 
@@ -216,53 +312,100 @@ Use these terms consistently:
 
 The retired names `arch_styles_raw.xml` and `arch_settings_raw.xml` are not bundle artifacts.
 
+## Run artifacts and public results
+
+Each invocation creates:
+
+```text
+<UTC timestamp>_<mode>_<run-id>/
+  *_FORMATTED.docx or *_CANADIAN_FORMATTED.docx
+  target-<sequence>-<source-hash>.audit.json
+  run.log
+  run.json
+```
+
+`run.json` records the run/mode/status/timestamps; application, policy, and
+profile contract versions; output paths; architect path/hash; cache bundle
+identity; model/prompt fingerprints; target/output hashes; audit paths;
+disposition counts; numbering checks; durations; and redacted errors. It must
+not contain API keys or document text.
+
+`FormatRunResult` retains `success`, `succeeded`, `failed`, `output_paths`, and
+the historical `output_dir`, and adds `run_id`, `conversion_mode`,
+`output_root`, `run_dir`, and `manifest_path`. `TargetFormatResult` retains its
+historical fields and adds source/output SHA-256, `audit_path`,
+`audit_summary`, application audit details, and numbering checks. Additive
+fields must keep safe defaults so existing test doubles and callers continue
+to work.
+
 ## Development commands
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests
+python -m pytest -q
 python gui.py
+python output/spec_test_corpus_smoke.py
 ```
 
 Headless usage is through Python:
 
 ```python
 from pathlib import Path
-from phase1_pipeline import run_phase1
+from spec_formatter import format_specifications
 
-result = run_phase1(
-    source_docx=Path("template.docx"),
-    output_root=Path("output"),
+result = format_specifications(
+    architect_template=Path("template.docx"),
+    target_specs=[Path("targets")],
+    output_dir=Path("output"),
     api_key="...",
+    conversion_mode="format_only",
 )
+
+print(result.run_dir, result.manifest_path, result.output_paths)
 ```
 
 ## Change checklist
 
-Before considering a Phase 1 change complete:
+Before considering a formatter change complete:
 
-1. Confirm the source path and extracted snapshot remain unchanged.
-2. Confirm every classifiable paragraph is explicitly styled or ignored once.
-3. Confirm generated style inheritance and numbering provenance match the exemplar.
-4. Confirm exact source style/settings artifacts still match the source ZIP members.
-5. Validate the staged bundle, manifest, hashes, source identity, audit, and registries.
-6. Run focused tests plus the complete test suite.
-7. Test a real architect template and the Phase 2 bundle consumer when the contract changes.
-8. Update prompts, schemas, validators, README, and Phase 2 together for wire-contract changes.
+1. Confirm architect and target sources remain unchanged.
+2. Confirm every classifiable target paragraph is styled or ignored exactly once.
+3. Exercise both application policies; prove Format-only text and numbering are
+   unchanged and Canadian conversion still fails closed.
+4. Confirm generated style inheritance, collision remapping, and header/footer
+   style references resolve correctly without replacing target style IDs.
+5. Validate the complete architect bundle and versioned cache compatibility.
+6. Validate each output package, audit, `run.log`, `run.json`, hashes, and
+   redaction behavior for success, partial failure, and total failure.
+7. Test deep Windows paths and folder discovery containing the architect.
+8. Run focused tests, the complete suite, and the local realistic-corpus smoke.
+9. Render and inspect every page of representative original and output DOCX
+   files when formatting or shell behavior changes.
+10. Update prompts, schemas, validators, README, and this guide together for
+    contract changes.
 
 ## Common mistakes
 
 - Calling `apply_instructions()` from the production pipeline.
 - Treating the extraction directory as an output deliverable.
-- Writing loose artifacts into the selected output root.
+- Treating the selected output root as the concrete run directory.
+- Writing loose formatted files or logs directly into the output root.
+- Reimplementing mode checks outside `ApplicationPolicy`.
+- Importing architect body numbering in Format-only.
+- Treating visible text as stronger evidence than effective Word numbering.
+- Restyling an ignored paragraph or silently dropping it from coverage.
+- Replacing a target style merely because an architect style uses the same ID.
+- Inspecting only a direct style's `pPr` and ignoring its `basedOn` chain.
 - Describing the two registries as the complete handoff.
-- Calling normalized registry fragments “raw” or “complete VM state.”
-- Omitting ignored paragraphs from coverage.
+- Calling normalized registry fragments "raw" or "complete VM state."
 - Filling missing classifications from adjacent paragraphs.
 - Dropping style-only numbering definitions from the slim catalog or registry.
 - Trusting an LLM-provided `basedOn` instead of the exemplar's source style.
 - Following an external relationship or a path that escapes the package.
-- Publishing before all files have been copied and revalidated.
+- Publishing before the DOCX is fully copied and revalidated.
+- Recording secrets or paragraph text in run metadata.
+- Pointing the corpus smoke at a sibling checkout instead of the namespaced
+  implementation in this repository.
 
 ## Platform and license
 

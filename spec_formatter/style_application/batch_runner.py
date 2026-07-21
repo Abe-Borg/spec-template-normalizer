@@ -10,12 +10,13 @@ import time
 import zipfile
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .arch_env_applier import apply_environment_to_target
 from .core.classification import apply_phase2_classifications, build_phase2_slim_bundle
+from .core.application_policy import ApplicationPolicy, application_policy_for_mode
 from .core.csi_to_canadian import (
     CSI_TO_CANADIAN,
     FORMAT_ONLY,
@@ -32,7 +33,7 @@ from .core.batch_classifier import (
     submit_and_poll,
 )
 from .core.llm_classifier import classify_target_document
-from .core.ooxml_text import read_xml_text
+from .core.ooxml_text import read_xml_text, write_xml_text
 from .core.registry import (
     PHASE1_MANIFEST_FILENAME,
     build_arch_styles_xml_from_registry,
@@ -71,6 +72,9 @@ class BatchResult:
     error: Optional[str]
     duration_seconds: float
     conversion_report: Optional[CanadianConversionReport] = None
+    audit_summary: Dict[str, int] = field(default_factory=dict)
+    audit: Dict[str, Any] = field(default_factory=dict)
+    numbering_checks: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -96,9 +100,15 @@ class PreparedFile:
 
 
 def _coverage_counts(bundle: Dict[str, Any], classifications: Dict[str, Any]) -> tuple[int, int, int]:
-    total = len(bundle.get("paragraphs", [])) + len(bundle.get("deterministic_classifications", []))
-    classified = len(classifications.get("classifications", []))
-    return classified, total, len(bundle.get("paragraphs", []))
+    total = (
+        len(bundle.get("paragraphs", []))
+        + len(bundle.get("deterministic_classifications", []))
+        + len(bundle.get("deterministic_ignored_paragraphs", []))
+    )
+    resolved = len(classifications.get("classifications", [])) + len(
+        classifications.get("ignored_paragraphs", [])
+    )
+    return resolved, total, len(bundle.get("paragraphs", []))
 
 
 def _check_numbering_module_needed(arch_styles_xml: str, needed_style_ids: List[str]) -> None:
@@ -238,6 +248,75 @@ def _patch_header_footer_tokens_if_imported(
     return True
 
 
+def _remap_imported_header_footer_style_ids(
+    extract_dir: Path,
+    part_names: List[str],
+    style_id_map: Dict[str, str],
+    log: List[str],
+) -> None:
+    """Point imported header/footer content at collision-safe style clones."""
+
+    replacements = {
+        source: destination
+        for source, destination in style_id_map.items()
+        if source != destination
+    }
+    if not replacements:
+        return
+    changed_parts = 0
+    for part_name in sorted(set(part_names)):
+        path = extract_dir / part_name
+        if not path.is_file() or path.suffix.lower() != ".xml":
+            continue
+        original = read_xml_text(path)
+        updated = re.sub(
+            r'(<w:(?:pStyle|rStyle|tblStyle)\b[^>]*w:val=")([^"]+)(")',
+            lambda match: (
+                match.group(1)
+                + replacements.get(match.group(2), match.group(2))
+                + match.group(3)
+            ),
+            original,
+        )
+        if updated != original:
+            write_xml_text(path, updated)
+            changed_parts += 1
+    if changed_parts:
+        log.append(
+            f"Remapped collision-safe style IDs in {changed_parts} imported header/footer parts"
+        )
+
+
+def _classification_audit(
+    bundle: Dict[str, Any],
+    classifications: Dict[str, Any],
+) -> tuple[Dict[str, int], Dict[str, Any]]:
+    styled = classifications.get("classifications", [])
+    ignored = classifications.get("ignored_paragraphs", [])
+    filter_report = bundle.get("filter_report", {})
+    out_of_scope = filter_report.get("paragraphs_out_of_scope", [])
+    total = (
+        len(bundle.get("paragraphs", []))
+        + len(bundle.get("deterministic_classifications", []))
+        + len(bundle.get("deterministic_ignored_paragraphs", []))
+    )
+    resolved = len(styled) + len(ignored)
+    summary = {
+        "styled": len(styled),
+        "ignored": len(ignored),
+        "out_of_scope": len(out_of_scope),
+        "unresolved": max(0, total - resolved),
+    }
+    audit = {
+        "schema_version": 1,
+        "summary": summary,
+        "classifications": styled,
+        "ignored_paragraphs": ignored,
+        "out_of_scope": out_of_scope,
+    }
+    return summary, audit
+
+
 def _build_and_patch_output(
     docx_path: Path,
     extract_dir: Path,
@@ -289,7 +368,7 @@ def _build_and_patch_output(
         ))
     )
     with tempfile.NamedTemporaryFile(
-        prefix=f".{output_path.stem}.",
+        prefix=".sf-",
         suffix=".tmp.docx",
         dir=output_dir,
         delete=False,
@@ -310,12 +389,186 @@ def _build_and_patch_output(
             new_document_xml=replacements["word/document.xml"],
             new_docx=temp_output_path,
             arch_template_registry=arch_template_registry,
+            conversion_mode=conversion_mode,
         )
         os.replace(temp_output_path, output_path)
     except Exception:
         temp_output_path.unlink(missing_ok=True)
         raise
     return output_path
+
+
+def _apply_classified_target(
+    *,
+    docx_path: Path,
+    extract_dir: Path,
+    bundle: Dict[str, Any],
+    classifications: Dict[str, Any],
+    arch_registry: Dict[str, str],
+    env_registry: Dict[str, Any],
+    arch_styles_xml: str,
+    output_dir: Path,
+    log: List[str],
+    source_tokens: Optional[Dict[str, str]],
+    arch_root: Optional[Path],
+    role_specs: Optional[Dict[str, Dict[str, Any]]],
+    conversion_mode: str,
+) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
+    """Apply one validated classification payload through the shared engine."""
+
+    policy: ApplicationPolicy = application_policy_for_mode(conversion_mode)
+    classifications_path = extract_dir / "phase2_classifications.json"
+    classifications_path.write_text(json.dumps(classifications, indent=2), encoding="utf-8")
+    log.append(f"Classifications saved: {classifications_path}")
+
+    # Capture the target's style and list catalogs before any architect
+    # environment or numbering parts are imported.
+    source_styles_xml = read_xml_text(extract_dir / "word" / "styles.xml")
+    source_numbering_path = extract_dir / "word" / "numbering.xml"
+    source_numbering_xml = (
+        read_xml_text(source_numbering_path) if source_numbering_path.is_file() else ""
+    )
+
+    target_tokens = extract_target_tokens(extract_dir, classifications)
+    application_classifications = classifications
+    conversion_report: Optional[CanadianConversionReport] = None
+
+    if policy.convert_to_canadian:
+        log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
+        conversion_report = apply_csi_to_canadian(
+            extract_dir,
+            classifications,
+            role_specs,
+            log,
+            architect_numbering_xml=(
+                env_registry.get("numbering", {}).get("numbering_xml") or ""
+            ),
+        )
+        application_classifications = classifications_for_canadian_application(
+            classifications,
+            conversion_report,
+        )
+
+    env_result = apply_environment_to_target(
+        target_extract_dir=extract_dir,
+        registry=env_registry,
+        log=log,
+        registry_dir=arch_root,
+    )
+    log.append("Applied environment")
+    _patch_header_footer_tokens_if_imported(
+        extract_dir,
+        env_result,
+        source_tokens,
+        target_tokens,
+        log,
+    )
+
+    used_roles = {
+        item.get("csi_role")
+        for item in application_classifications.get("classifications", [])
+        if isinstance(item, dict) and isinstance(item.get("csi_role"), str)
+    }
+    body_style_ids = {arch_registry[r] for r in used_roles if r in arch_registry}
+    hf_manifest = env_result.get("header_footer_import", {})
+    hf_style_ids = set(hf_manifest.get("style_ids", set()))
+    hf_direct_num_ids = set(hf_manifest.get("direct_num_ids", set()))
+    needed_style_ids = sorted(body_style_ids | hf_style_ids)
+
+    style_numid_remap: Dict[str, Dict[str, int]] = {}
+    role_numpr_remap: Dict[str, Dict[str, Any]] = {}
+    num_id_remap: Dict[int, int] = {}
+    numbering_style_ids = needed_style_ids if policy.import_body_numbering else sorted(hf_style_ids)
+    numbering_roles = sorted(used_roles) if policy.import_body_numbering else []
+    if HAS_NUMBERING_IMPORTER:
+        numbering_contract = import_numbering(
+            target_extract_dir=extract_dir,
+            arch_template_registry=env_registry,
+            arch_styles_xml=arch_styles_xml,
+            style_ids_to_import=numbering_style_ids,
+            log=log,
+            role_specs=role_specs,
+            roles_to_apply=numbering_roles,
+            additional_num_ids=sorted(hf_direct_num_ids),
+            return_contract=True,
+        )
+        style_numid_remap = numbering_contract["style_numid_remap"]
+        role_numpr_remap = numbering_contract["role_numpr_remap"]
+        num_id_remap = numbering_contract["num_id_remap"]
+    else:
+        _check_numbering_module_needed(arch_styles_xml, numbering_style_ids)
+        if hf_direct_num_ids:
+            raise ImportError("numbering_importer is required by architect headers/footers")
+
+    remap_header_footer_numids(
+        extract_dir,
+        list(hf_manifest.get("part_names", set())),
+        num_id_remap,
+        log,
+    )
+
+    style_result = import_arch_styles_into_target(
+        target_extract_dir=extract_dir,
+        arch_styles_xml=arch_styles_xml,
+        needed_style_ids=needed_style_ids,
+        log=log,
+        style_numid_remap=style_numid_remap,
+        format_only_body_style_ids=(body_style_ids if policy.preserve_target_numbering else None),
+        shell_style_ids=hf_style_ids,
+        namespace_seed=hashlib.sha256(arch_styles_xml.encode("utf-8")).hexdigest(),
+    )
+    applied_arch_registry = {
+        role: style_result.body_style_id_map.get(style_id, style_id)
+        for role, style_id in arch_registry.items()
+    }
+    _remap_imported_header_footer_style_ids(
+        extract_dir,
+        list(hf_manifest.get("part_names", set())),
+        style_result.style_id_map,
+        log,
+    )
+    log.append(f"Imported {len(needed_style_ids)} requested styles collision-safely")
+
+    snap = snapshot_stability(extract_dir)
+    apply_report = apply_phase2_classifications(
+        extract_dir=extract_dir,
+        classifications=application_classifications,
+        arch_style_registry=applied_arch_registry,
+        log=log,
+        role_specs=role_specs,
+        role_numpr_remap=role_numpr_remap,
+        source_styles_xml=source_styles_xml,
+        source_numbering_xml=source_numbering_xml,
+        policy=policy,
+    )
+    verify_stability(extract_dir, snap)
+    log.append("Applied classifications, stability verified")
+
+    output_path = _build_and_patch_output(
+        docx_path,
+        extract_dir,
+        env_result,
+        output_dir,
+        arch_template_registry=env_registry,
+        conversion_mode=policy.conversion_mode,
+    )
+
+    classified, total, unresolved = _coverage_counts(bundle, classifications)
+    class_coverage = (classified / total * 100) if total > 0 else 100.0
+    expected_targetable = apply_report.requested - len(apply_report.skipped_sectpr)
+    app_coverage = (
+        (apply_report.modified / expected_targetable * 100)
+        if expected_targetable > 0
+        else 100.0
+    )
+    log.append(f"Output: {output_path}")
+    log.append(f"Classification coverage: {classified}/{total} ({class_coverage:.1f}%)")
+    log.append(
+        f"Application coverage: {apply_report.modified}/{expected_targetable} ({app_coverage:.1f}%)"
+    )
+    audit_summary, audit = _classification_audit(bundle, classifications)
+    numbering_checks = dict(getattr(apply_report, "numbering_checks", {}) or {})
+    return output_path, conversion_report, audit_summary, audit, numbering_checks
 
 
 def process_single_file(
@@ -337,12 +590,15 @@ def process_single_file(
     filename = docx_path.name
     output_path: Optional[Path] = None
     conversion_report: Optional[CanadianConversionReport] = None
+    audit_summary: Dict[str, int] = {}
+    audit: Dict[str, Any] = {}
+    numbering_checks: Dict[str, Any] = {}
 
     try:
         conversion_mode = validate_conversion_mode(conversion_mode)
         with tempfile.TemporaryDirectory(prefix="phase2_") as tmp_root:
             digest = hashlib.sha256(str(docx_path.resolve()).encode("utf-8")).hexdigest()[:8]
-            extract_dir_name = f"{docx_path.stem}_{digest}_extracted"
+            extract_dir_name = f"work_{digest}"
 
             per_file_log.append("Extracting DOCX...")
             decomposer = DocxDecomposer(str(docx_path))
@@ -376,128 +632,26 @@ def process_single_file(
                 model=model,
             )
 
-            classifications_path = extract_dir / "phase2_classifications.json"
-            classifications_path.write_text(json.dumps(classifications, indent=2), encoding="utf-8")
-            per_file_log.append(f"Classifications saved: {classifications_path}")
-
-            target_tokens = extract_target_tokens(extract_dir, classifications)
-            application_classifications = classifications
-
-            if conversion_mode == CSI_TO_CANADIAN:
-                per_file_log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
-                conversion_report = apply_csi_to_canadian(
-                    extract_dir,
-                    classifications,
-                    role_specs,
-                    per_file_log,
-                    architect_numbering_xml=(
-                        env_registry.get("numbering", {}).get("numbering_xml") or ""
-                    ),
-                )
-                application_classifications = classifications_for_canadian_application(
-                    classifications,
-                    conversion_report,
-                )
-
-            env_result = apply_environment_to_target(
-                target_extract_dir=extract_dir,
-                registry=env_registry,
-                log=per_file_log,
-                registry_dir=arch_root,
-            )
-            per_file_log.append("Applied environment")
-
-            _patch_header_footer_tokens_if_imported(
-                extract_dir,
-                env_result,
-                source_tokens,
-                target_tokens,
-                per_file_log,
-            )
-
-            source_styles_xml = read_xml_text(extract_dir / "word" / "styles.xml")
-
-            used_roles = {
-                item.get("csi_role")
-                for item in application_classifications.get("classifications", [])
-                if isinstance(item, dict) and isinstance(item.get("csi_role"), str)
-            }
-            hf_style_ids = env_result.get("header_footer_import", {}).get("style_ids", set())
-            hf_direct_num_ids = env_result.get("header_footer_import", {}).get("direct_num_ids", set())
-            needed_style_ids = sorted(
-                {arch_registry[r] for r in used_roles if r in arch_registry}
-                | set(hf_style_ids)
-            )
-
-            style_numid_remap = {}
-            role_numpr_remap = {}
-            num_id_remap = {}
-            if HAS_NUMBERING_IMPORTER:
-                numbering_contract = import_numbering(
-                    target_extract_dir=extract_dir,
-                    arch_template_registry=env_registry,
-                    arch_styles_xml=arch_styles_xml,
-                    style_ids_to_import=needed_style_ids,
-                    log=per_file_log,
-                    role_specs=role_specs,
-                    roles_to_apply=sorted(used_roles),
-                    additional_num_ids=sorted(hf_direct_num_ids),
-                    return_contract=True,
-                )
-                style_numid_remap = numbering_contract["style_numid_remap"]
-                role_numpr_remap = numbering_contract["role_numpr_remap"]
-                num_id_remap = numbering_contract["num_id_remap"]
-            else:
-                _check_numbering_module_needed(arch_styles_xml, needed_style_ids)
-                if hf_direct_num_ids:
-                    raise ImportError("numbering_importer is required by architect headers/footers")
-
-            remap_header_footer_numids(
-                extract_dir,
-                list(env_result.get("header_footer_import", {}).get("part_names", set())),
-                num_id_remap,
-                per_file_log,
-            )
-
-            import_arch_styles_into_target(
-                target_extract_dir=extract_dir,
-                arch_styles_xml=arch_styles_xml,
-                needed_style_ids=needed_style_ids,
-                log=per_file_log,
-                style_numid_remap=style_numid_remap,
-            )
-            per_file_log.append(f"Imported {len(needed_style_ids)} styles")
-
-            snap = snapshot_stability(extract_dir)
-            apply_report = apply_phase2_classifications(
+            (
+                output_path,
+                conversion_report,
+                audit_summary,
+                audit,
+                numbering_checks,
+            ) = _apply_classified_target(
+                docx_path=docx_path,
                 extract_dir=extract_dir,
-                classifications=application_classifications,
-                arch_style_registry=arch_registry,
+                bundle=bundle,
+                classifications=classifications,
+                arch_registry=arch_registry,
+                env_registry=env_registry,
+                arch_styles_xml=arch_styles_xml,
+                output_dir=output_dir,
                 log=per_file_log,
+                source_tokens=source_tokens,
+                arch_root=arch_root,
                 role_specs=role_specs,
-                role_numpr_remap=role_numpr_remap,
-                source_styles_xml=source_styles_xml,
-            )
-            verify_stability(extract_dir, snap)
-            per_file_log.append("Applied classifications, stability verified")
-
-            output_path = _build_and_patch_output(
-                docx_path,
-                extract_dir,
-                env_result,
-                output_dir,
-                arch_template_registry=env_registry,
                 conversion_mode=conversion_mode,
-            )
-
-            classified, total, unresolved = _coverage_counts(bundle, classifications)
-            class_coverage = (classified / total * 100) if total > 0 else 100.0
-            expected_targetable = apply_report.requested - len(apply_report.skipped_sectpr)
-            app_coverage = (apply_report.modified / expected_targetable * 100) if expected_targetable > 0 else 100.0
-            per_file_log.append(f"Output: {output_path}")
-            per_file_log.append(f"Classification coverage: {classified}/{total} ({class_coverage:.1f}%)")
-            per_file_log.append(
-                f"Application coverage: {apply_report.modified}/{expected_targetable} ({app_coverage:.1f}%)"
             )
 
         return BatchResult(
@@ -508,6 +662,9 @@ def process_single_file(
             error=None,
             duration_seconds=time.monotonic() - start,
             conversion_report=conversion_report,
+            audit_summary=audit_summary,
+            audit=audit,
+            numbering_checks=numbering_checks,
         )
     except Exception as exc:
         per_file_log.append(f"FAILED: {exc}")
@@ -519,6 +676,9 @@ def process_single_file(
             error=str(exc),
             duration_seconds=time.monotonic() - start,
             conversion_report=conversion_report,
+            audit_summary=audit_summary,
+            audit=audit,
+            numbering_checks=numbering_checks,
         )
 
 
@@ -530,7 +690,7 @@ def _prepare_file_for_batch(
 ) -> PreparedFile:
     per_file_log: List[str] = []
     digest = hashlib.sha256(str(docx_path.resolve()).encode("utf-8")).hexdigest()[:8]
-    extract_dir_name = f"{docx_path.stem}_{digest}_extracted"
+    extract_dir_name = f"work_{digest}"
 
     per_file_log.append("Extracting DOCX...")
     decomposer = DocxDecomposer(str(docx_path))
@@ -567,132 +727,32 @@ def _apply_batch_result(
     output_path: Optional[Path] = None
     conversion_report: Optional[CanadianConversionReport] = None
     filename = prepared.docx_path.name
+    audit_summary: Dict[str, int] = {}
+    audit: Dict[str, Any] = {}
+    numbering_checks: Dict[str, Any] = {}
 
     try:
         conversion_mode = validate_conversion_mode(conversion_mode)
-        classifications_path = prepared.extract_dir / "phase2_classifications.json"
-        classifications_path.write_text(json.dumps(classifications, indent=2), encoding="utf-8")
-        per_file_log.append(f"Classifications saved: {classifications_path}")
-
-        target_tokens = extract_target_tokens(prepared.extract_dir, classifications)
-        application_classifications = classifications
-
-        if conversion_mode == CSI_TO_CANADIAN:
-            per_file_log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
-            conversion_report = apply_csi_to_canadian(
-                prepared.extract_dir,
-                classifications,
-                role_specs,
-                per_file_log,
-                architect_numbering_xml=(
-                    env_registry.get("numbering", {}).get("numbering_xml") or ""
-                ),
-            )
-            application_classifications = classifications_for_canadian_application(
-                classifications,
-                conversion_report,
-            )
-
-        env_result = apply_environment_to_target(
-            target_extract_dir=prepared.extract_dir,
-            registry=env_registry,
-            log=per_file_log,
-            registry_dir=arch_root,
-        )
-        per_file_log.append("Applied environment")
-        _patch_header_footer_tokens_if_imported(
-            prepared.extract_dir,
-            env_result,
-            source_tokens,
-            target_tokens,
-            per_file_log,
-        )
-
-        source_styles_xml = read_xml_text(
-            prepared.extract_dir / "word" / "styles.xml"
-        )
-
-        used_roles = {
-            item.get("csi_role")
-            for item in application_classifications.get("classifications", [])
-            if isinstance(item, dict) and isinstance(item.get("csi_role"), str)
-        }
-        hf_style_ids = env_result.get("header_footer_import", {}).get("style_ids", set())
-        hf_direct_num_ids = env_result.get("header_footer_import", {}).get("direct_num_ids", set())
-        needed_style_ids = sorted(
-            {arch_registry[r] for r in used_roles if r in arch_registry}
-            | set(hf_style_ids)
-        )
-
-        style_numid_remap = {}
-        role_numpr_remap = {}
-        num_id_remap = {}
-        if HAS_NUMBERING_IMPORTER:
-            numbering_contract = import_numbering(
-                target_extract_dir=prepared.extract_dir,
-                arch_template_registry=env_registry,
-                arch_styles_xml=arch_styles_xml,
-                style_ids_to_import=needed_style_ids,
-                log=per_file_log,
-                role_specs=role_specs,
-                roles_to_apply=sorted(used_roles),
-                additional_num_ids=sorted(hf_direct_num_ids),
-                return_contract=True,
-            )
-            style_numid_remap = numbering_contract["style_numid_remap"]
-            role_numpr_remap = numbering_contract["role_numpr_remap"]
-            num_id_remap = numbering_contract["num_id_remap"]
-        else:
-            _check_numbering_module_needed(arch_styles_xml, needed_style_ids)
-            if hf_direct_num_ids:
-                raise ImportError("numbering_importer is required by architect headers/footers")
-
-        remap_header_footer_numids(
-            prepared.extract_dir,
-            list(env_result.get("header_footer_import", {}).get("part_names", set())),
-            num_id_remap,
-            per_file_log,
-        )
-
-        import_arch_styles_into_target(
-            target_extract_dir=prepared.extract_dir,
-            arch_styles_xml=arch_styles_xml,
-            needed_style_ids=needed_style_ids,
-            log=per_file_log,
-            style_numid_remap=style_numid_remap,
-        )
-        per_file_log.append(f"Imported {len(needed_style_ids)} styles")
-
-        snap = snapshot_stability(prepared.extract_dir)
-        apply_report = apply_phase2_classifications(
+        (
+            output_path,
+            conversion_report,
+            audit_summary,
+            audit,
+            numbering_checks,
+        ) = _apply_classified_target(
+            docx_path=prepared.docx_path,
             extract_dir=prepared.extract_dir,
-            classifications=application_classifications,
-            arch_style_registry=arch_registry,
+            bundle=prepared.bundle,
+            classifications=classifications,
+            arch_registry=arch_registry,
+            env_registry=env_registry,
+            arch_styles_xml=arch_styles_xml,
+            output_dir=output_dir,
             log=per_file_log,
+            source_tokens=source_tokens,
+            arch_root=arch_root,
             role_specs=role_specs,
-            role_numpr_remap=role_numpr_remap,
-            source_styles_xml=source_styles_xml,
-        )
-        verify_stability(prepared.extract_dir, snap)
-        per_file_log.append("Applied classifications, stability verified")
-
-        output_path = _build_and_patch_output(
-            prepared.docx_path,
-            prepared.extract_dir,
-            env_result,
-            output_dir,
-            arch_template_registry=env_registry,
             conversion_mode=conversion_mode,
-        )
-
-        classified, total, unresolved = _coverage_counts(prepared.bundle, classifications)
-        class_coverage = (classified / total * 100) if total > 0 else 100.0
-        expected_targetable = apply_report.requested - len(apply_report.skipped_sectpr)
-        app_coverage = (apply_report.modified / expected_targetable * 100) if expected_targetable > 0 else 100.0
-        per_file_log.append(f"Output: {output_path}")
-        per_file_log.append(f"Classification coverage: {classified}/{total} ({class_coverage:.1f}%)")
-        per_file_log.append(
-            f"Application coverage: {apply_report.modified}/{expected_targetable} ({app_coverage:.1f}%)"
         )
 
         return BatchResult(
@@ -703,6 +763,9 @@ def _apply_batch_result(
             error=None,
             duration_seconds=time.monotonic() - start,
             conversion_report=conversion_report,
+            audit_summary=audit_summary,
+            audit=audit,
+            numbering_checks=numbering_checks,
         )
     except Exception as exc:
         per_file_log.append(f"FAILED: {exc}")
@@ -714,6 +777,9 @@ def _apply_batch_result(
             error=str(exc),
             duration_seconds=time.monotonic() - start,
             conversion_report=conversion_report,
+            audit_summary=audit_summary,
+            audit=audit,
+            numbering_checks=numbering_checks,
         )
 
 

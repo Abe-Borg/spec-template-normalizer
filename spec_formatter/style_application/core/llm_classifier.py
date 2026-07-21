@@ -45,9 +45,10 @@ def _retry_requirement(error: Exception, allowed_indices: Set[int]) -> str:
     return (
         "\n\nRETRY REQUIREMENT: The prior response failed validation: "
         f"{error}. Return exactly one complete JSON object with no prose, "
-        "Markdown fence, or text before or after it. The classifications array "
-        "must contain exactly one entry for each of these paragraph_index values "
-        f"and no other indices: {json.dumps(sorted(allowed_indices))}."
+        "Markdown fence, or text before or after it. Across classifications and "
+        "ignored_paragraphs, return exactly one disposition for each of these "
+        "paragraph_index values and no other indices: "
+        f"{json.dumps(sorted(allowed_indices))}."
     )
 
 
@@ -77,12 +78,27 @@ def _classification_output_config(available_roles: list) -> dict:
                             "required": ["paragraph_index", "csi_role"],
                         },
                     },
+                    "ignored_paragraphs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "paragraph_index": {"type": "integer"},
+                                "reason": {
+                                    "type": "string",
+                                    "enum": ["non_csi_content"],
+                                },
+                            },
+                            "required": ["paragraph_index", "reason"],
+                        },
+                    },
                     "notes": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
                 },
-                "required": ["classifications", "notes"],
+                "required": ["classifications", "ignored_paragraphs", "notes"],
             },
         },
     }
@@ -151,11 +167,42 @@ def _validate_classifications(classifications: dict, available_roles: list, allo
         seen_indices.add(idx)
         validated.append({"paragraph_index": idx, "csi_role": role})
 
+    raw_ignored = classifications.get("ignored_paragraphs", [])
+    if not isinstance(raw_ignored, list):
+        raise ValueError("LLM response 'ignored_paragraphs' must be an array")
+    validated_ignored = []
+    for item in raw_ignored:
+        if not isinstance(item, dict):
+            raise ValueError("all ignored paragraph entries must be objects")
+        idx = item.get("paragraph_index")
+        reason = item.get("reason")
+        if not isinstance(idx, int):
+            raise ValueError(f"invalid ignored paragraph_index: {idx!r}")
+        if idx in seen_indices:
+            raise ValueError(
+                f"duplicate/conflicting disposition for paragraph_index={idx}"
+            )
+        if idx not in allowed_indices:
+            raise ValueError(f"ignored index not allowed: {idx}")
+        if reason != "non_csi_content":
+            raise ValueError(
+                f"invalid ignored reason for paragraph_index={idx}: {reason!r}"
+            )
+        seen_indices.add(idx)
+        validated_ignored.append({
+            "paragraph_index": idx,
+            "reason": reason,
+        })
+
     missing = sorted(allowed_indices - seen_indices)
     if missing:
         raise ValueError(f"missing coverage for paragraph indices: {missing[:20]}")
 
-    return {"classifications": validated, "notes": classifications.get("notes", [])}
+    return {
+        "classifications": validated,
+        "ignored_paragraphs": validated_ignored,
+        "notes": classifications.get("notes", []),
+    }
 
 
 def _split_bundle_into_chunks(slim_bundle: dict, max_chars: int = _MAX_BUNDLE_CHARS) -> List[dict]:
@@ -200,7 +247,7 @@ def _split_bundle_into_chunks(slim_bundle: dict, max_chars: int = _MAX_BUNDLE_CH
 
 
 def _merge_chunk_results(chunk_results: List[dict]) -> dict:
-    seen: Dict[int, str] = {}
+    seen: Dict[int, tuple[str, str]] = {}
     conflicts: List[Dict[str, Any]] = []
     all_notes: List[Any] = []
 
@@ -210,18 +257,49 @@ def _merge_chunk_results(chunk_results: List[dict]) -> dict:
             role = item.get("csi_role")
             if idx is None or role is None:
                 continue
+            disposition = ("classified", role)
             prior = seen.get(idx)
-            if prior is not None and prior != role:
-                conflicts.append({"paragraph_index": idx, "existing_role": prior, "conflicting_role": role})
-            seen[idx] = role
+            if prior is not None and prior != disposition:
+                conflicts.append({
+                    "paragraph_index": idx,
+                    "existing": prior,
+                    "conflicting": disposition,
+                })
+            seen[idx] = disposition
+        for item in result.get("ignored_paragraphs", []):
+            idx = item.get("paragraph_index")
+            reason = item.get("reason")
+            if idx is None or reason is None:
+                continue
+            disposition = ("ignored", reason)
+            prior = seen.get(idx)
+            if prior is not None and prior != disposition:
+                conflicts.append({
+                    "paragraph_index": idx,
+                    "existing": prior,
+                    "conflicting": disposition,
+                })
+            seen[idx] = disposition
         all_notes.extend(result.get("notes", []))
 
     if conflicts:
-        examples = ", ".join([f"{c['paragraph_index']}:{c['existing_role']}|{c['conflicting_role']}" for c in conflicts[:10]])
+        examples = ", ".join(
+            f"{c['paragraph_index']}:{c['existing']}|{c['conflicting']}"
+            for c in conflicts[:10]
+        )
         raise ValueError(f"Chunk merge conflicts detected ({len(conflicts)} total): {examples}")
 
     return {
-        "classifications": [{"paragraph_index": idx, "csi_role": role} for idx, role in sorted(seen.items())],
+        "classifications": [
+            {"paragraph_index": idx, "csi_role": value}
+            for idx, (kind, value) in sorted(seen.items())
+            if kind == "classified"
+        ],
+        "ignored_paragraphs": [
+            {"paragraph_index": idx, "reason": value}
+            for idx, (kind, value) in sorted(seen.items())
+            if kind == "ignored"
+        ],
         "notes": all_notes,
     }
 
@@ -231,12 +309,19 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
     if not unresolved_paragraphs:
         deterministic_only = coerce_to_final_classifications(
             slim_bundle,
-            {"classifications": [], "notes": ["LLM skipped: all paragraphs classified deterministically."]},
+            {
+                "classifications": [],
+                "ignored_paragraphs": [],
+                "notes": ["LLM skipped: all paragraphs classified deterministically."],
+            },
             available_roles,
         )
-        total_expected = len(deterministic_only.get("classifications", []))
-        print("LLM skipped: all paragraphs classified deterministically.")
-        print(f"Classification coverage: {total_expected}/{total_expected} (100.0%)")
+        total_expected = (
+            len(deterministic_only.get("classifications", []))
+            + len(deterministic_only.get("ignored_paragraphs", []))
+        )
+        print("LLM skipped: all paragraphs resolved deterministically.")
+        print(f"Disposition coverage: {total_expected}/{total_expected} (100.0%)")
         return deterministic_only
 
     import anthropic
@@ -323,13 +408,20 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
     llm_only = chunk_results[0] if len(chunk_results) == 1 else _merge_chunk_results(chunk_results)
     result = coerce_to_final_classifications(slim_bundle, llm_only, available_roles)
 
-    total_expected = len(slim_bundle.get("paragraphs", [])) + len(slim_bundle.get("deterministic_classifications", []))
-    classified_count = len(result.get("classifications", []))
-    if total_expected > 0 and classified_count != total_expected:
+    total_expected = (
+        len(slim_bundle.get("paragraphs", []))
+        + len(slim_bundle.get("deterministic_classifications", []))
+        + len(slim_bundle.get("deterministic_ignored_paragraphs", []))
+    )
+    disposition_count = (
+        len(result.get("classifications", []))
+        + len(result.get("ignored_paragraphs", []))
+    )
+    if total_expected > 0 and disposition_count != total_expected:
         raise ValueError(
-            f"Classification coverage incomplete: {classified_count}/{total_expected}. "
-            "All classifiable paragraphs must be classified."
+            f"Disposition coverage incomplete: {disposition_count}/{total_expected}. "
+            "All classifiable paragraphs must be classified or explicitly ignored."
         )
 
-    print(f"Classification coverage: {classified_count}/{total_expected} (100.0%)")
+    print(f"Disposition coverage: {disposition_count}/{total_expected} (100.0%)")
     return result

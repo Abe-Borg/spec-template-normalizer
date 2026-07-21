@@ -138,6 +138,36 @@ def test_text_box_properties_are_isolated_from_host_paragraph():
     assert strip_pstyle_from_paragraph(styled) == host
 
 
+def test_tracked_previous_paragraph_properties_are_not_live_or_edited():
+    change = (
+        '<w:pPrChange w:id="7"><w:pPr>'
+        '<w:pStyle w:val="HistoricalList"/><w:numPr>'
+        '<w:ilvl w:val="3"/><w:numId w:val="91"/>'
+        '</w:numPr></w:pPr></w:pPrChange>'
+    )
+    paragraph = (
+        f'<w:p><w:pPr>{change}</w:pPr>'
+        '<w:r><w:t>Visible text</w:t></w:r></w:p>'
+    )
+
+    assert paragraph_pstyle_from_block(paragraph) is None
+    assert paragraph_numpr_from_block(paragraph) == {
+        "numId": None,
+        "ilvl": None,
+    }
+    assert "HistoricalList" not in extract_paragraph_ppr_inner(paragraph)
+    assert change in ppr_without_pstyle(paragraph)
+    assert strip_pstyle_from_paragraph(paragraph) == paragraph
+
+    styled = apply_pstyle_to_paragraph_block(paragraph, "CurrentBody")
+
+    assert change in styled
+    assert styled.startswith(
+        '<w:p><w:pPr><w:pStyle w:val="CurrentBody"/><w:pPrChange'
+    )
+    assert strip_pstyle_from_paragraph(styled) == paragraph
+
+
 def test_token_oversized_document_fails_before_api_call():
     bundle = {"paragraphs": [{"paragraph_index": 0, "text": "x" * 700_000}]}
     with pytest.raises(ValueError, match="safe single-pass limit"):

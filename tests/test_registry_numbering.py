@@ -15,8 +15,13 @@ def test_direct_numpr_provenance(tmp_path: Path):
     )
     (extract_dir / "word" / "numbering.xml").write_text(
         '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        '<w:abstractNum w:abstractNumId="10"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>'
-        '<w:num w:numId="9"><w:abstractNumId w:val="10"/></w:num>'
+        '<w:abstractNum w:abstractNumId="10"><w:lvl w:ilvl="0">'
+        '<w:start w:val="2"/><w:numFmt w:val="decimal"/>'
+        '<w:lvlRestart w:val="1"/><w:lvlText w:val="%1."/>'
+        '<w:suff w:val="space"/><w:isLgl/>'
+        '</w:lvl></w:abstractNum><w:num w:numId="9">'
+        '<w:abstractNumId w:val="10"/><w:lvlOverride w:ilvl="0">'
+        '<w:startOverride w:val="5"/></w:lvlOverride></w:num>'
         '</w:numbering>', encoding="utf-8"
     )
     (extract_dir / "word" / "document.xml").write_text(
@@ -33,4 +38,15 @@ def test_direct_numpr_provenance(tmp_path: Path):
     )
     assert reg["version"] == 2
     assert reg["roles"]["ARTICLE"]["numbering_provenance"] == "direct_numpr"
-    assert reg["roles"]["ARTICLE"]["numbering_pattern"]["numFmt"] == "decimal"
+    assert reg["roles"]["ARTICLE"]["numbering_pattern"] == {
+        "numId": "9",
+        "ilvl": "0",
+        "abstractNumId": "10",
+        "start": "2",
+        "numFmt": "decimal",
+        "lvlRestart": "1",
+        "lvlText": "%1.",
+        "suff": "space",
+        "isLgl": "1",
+        "startOverride": "5",
+    }

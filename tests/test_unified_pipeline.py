@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +13,8 @@ from spec_formatter import pipeline
 from spec_formatter.style_application.batch_runner import BatchResult, SharedConfig
 from spec_formatter.style_application.core.csi_to_canadian import (
     CanadianConversionReport,
+    ConversionIssue,
+    MarkerEdit,
 )
 
 
@@ -102,7 +107,8 @@ def _fake_dependencies(
     def processor(**kwargs) -> BatchResult:
         source = Path(kwargs["docx_path"])
         calls["processor"].append(source)
-        if source.name == failing_target:
+        source_bytes = source.read_bytes()
+        if failing_target and source_bytes.startswith(Path(failing_target).stem.encode()):
             return BatchResult(
                 filename=source.name,
                 success=False,
@@ -110,19 +116,44 @@ def _fake_dependencies(
                 log=["simulated target failure"],
                 error="simulated target failure",
                 duration_seconds=0.01,
+                audit_summary={
+                    "styled": 0,
+                    "ignored": 0,
+                    "out_of_scope": 0,
+                    "unresolved": 1,
+                },
+                numbering_checks={"preserved": False},
             )
 
         staging_dir = Path(kwargs["output_dir"])
         staging_dir.mkdir(parents=True, exist_ok=True)
         staged_output = staging_dir / f"{source.stem}_PHASE2_FORMATTED.docx"
-        staged_output.write_bytes(b"formatted:" + source.read_bytes())
+        staged_output.write_bytes(b"formatted:" + source_bytes)
         return BatchResult(
             filename=source.name,
             success=True,
             output_path=staged_output,
-            log=["formatted offline"],
+            log=["Applied classifications, stability verified"],
             error=None,
             duration_seconds=0.02,
+            audit_summary={
+                "styled": 1,
+                "ignored": 2,
+                "out_of_scope": 3,
+                "unresolved": 0,
+            },
+            audit={
+                "schema_version": 1,
+                "paragraph_indices": [0],
+                "out_of_scope": [
+                    {
+                        "paragraph_index": 2,
+                        "reason": "table",
+                        "original_text_preview": "never persist paragraph text",
+                    }
+                ],
+            },
+            numbering_checks={"preserved": True, "checked": 1},
         )
 
     return calls, analyzer, config_loader, processor
@@ -182,15 +213,25 @@ def test_one_call_analyzes_template_once_for_multiple_targets_and_preserves_inpu
     assert result.template_profile.reused is False
     assert len(calls["analyzer"]) == 1
     assert len(calls["config_loader"]) == 1
-    assert {path.name for path in calls["processor"]} == {
-        "mechanical.docx",
-        "electrical.docx",
-    }
+    assert {path.name for path in calls["processor"]} == {"source.docx"}
+    assert len({path.parent for path in calls["processor"]}) == 2
+    assert all(
+        os.path.commonpath([path, Path(tempfile.gettempdir())])
+        == str(Path(tempfile.gettempdir()))
+        for path in calls["processor"]
+    )
     assert {path.name for path in result.output_paths} == {
         "mechanical_FORMATTED.docx",
         "electrical_FORMATTED.docx",
     }
     assert all(path.is_file() for path in result.output_paths)
+    assert result.output_root == (tmp_path / "formatted").resolve()
+    assert result.output_dir == result.run_dir
+    assert result.run_dir is not None and result.run_dir.parent == result.output_root
+    assert result.manifest_path == result.run_dir / "run.json"
+    assert result.manifest_path.is_file()
+    assert (result.run_dir / "run.log").is_file()
+    assert all(item.audit_path and item.audit_path.is_file() for item in result.targets)
     assert {path: path.read_bytes() for path in originals} == originals
 
 
@@ -229,12 +270,225 @@ def test_validated_template_profile_is_reused_on_a_later_run(
     assert first.template_profile.reused is False
     assert second.template_profile.reused is True
     assert first.template_profile.bundle_dir == second.template_profile.bundle_dir
+    assert first.template_profile.bundle_dir.parent == (
+        cache_dir.resolve() / pipeline._PROFILE_CACHE_NAMESPACE
+    )
+    assert first.run_dir != second.run_dir
+    assert first.run_dir is not None and second.run_dir is not None
+    assert first.run_dir.parent == second.run_dir.parent == (tmp_path / "formatted").resolve()
     assert len(calls["analyzer"]) == 1
     assert len(calls["config_loader"]) == 2
     assert len(calls["processor"]) == 2
     assert "Reusing the validated architect template analysis." in progress_messages
     assert architect.read_bytes() == b"stable-architect"
     assert target.read_bytes() == b"stable-target"
+
+
+def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    api_key = "never-persist-this-secret"
+
+    result = pipeline.format_specifications(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        api_key=api_key,
+        cache_dir=tmp_path / "profile-cache",
+        _template_analyzer=analyzer,
+        _config_loader=config_loader,
+        _target_processor=processor,
+    )
+
+    assert result.manifest_path is not None
+    manifest_text = result.manifest_path.read_text(encoding="utf-8")
+    run_log_text = (result.run_dir / "run.log").read_text(encoding="utf-8")
+    assert api_key not in manifest_text
+    assert api_key not in run_log_text
+    manifest = json.loads(manifest_text)
+    assert manifest["run_id"] == result.run_id
+    assert manifest["conversion_mode"] == pipeline.FORMAT_ONLY
+    assert manifest["paths"]["output_root"] == str(result.output_root)
+    assert manifest["paths"]["run_dir"] == str(result.run_dir)
+    assert manifest["architect_template"]["sha256"] == hashlib.sha256(
+        b"architect-original"
+    ).hexdigest()
+    assert manifest["summary"] == {
+        "targets": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "dispositions": {
+            "styled": 1,
+            "ignored": 2,
+            "out_of_scope": 3,
+            "unresolved": 0,
+        },
+    }
+    target_result = result.targets[0]
+    assert target_result.source_sha256 == hashlib.sha256(b"target-original").hexdigest()
+    assert target_result.output_sha256 == hashlib.sha256(
+        b"formatted:target-original"
+    ).hexdigest()
+    assert target_result.audit_path is not None
+    audit = json.loads(target_result.audit_path.read_text(encoding="utf-8"))
+    assert audit["disposition_counts"] == target_result.audit_summary
+    assert audit["application_audit"]["paragraph_indices"] == [0]
+    assert "original_text_preview" not in manifest_text
+    assert "never persist paragraph text" not in target_result.audit_path.read_text(
+        encoding="utf-8"
+    )
+    assert audit["numbering_checks"] == {"checked": 1, "preserved": True}
+    assert "Applied classifications, stability verified" in run_log_text
+
+
+def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+    api_key = "never-persist-this-secret"
+    report = CanadianConversionReport(
+        paragraphs_examined=1,
+        paragraphs_converted=1,
+        literal_markers_removed=1,
+        automatic_numbering_retargeted=0,
+        unnumbered_paragraphs_numbered=0,
+        edits=(
+            MarkerEdit(
+                paragraph_index=4,
+                role="PART",
+                source_kind="literal",
+                target_kind="automatic",
+                source_marker="PART 9 - CONFIDENTIAL",
+                target_marker="Part 9",
+            ),
+        ),
+        warnings=(
+            ConversionIssue(
+                paragraph_index=4,
+                code="marker_warning",
+                message="TOP SECRET PARAGRAPH",
+                text_preview="TOP SECRET PARAGRAPH",
+            ),
+        ),
+    )
+
+    def processor(**kwargs) -> BatchResult:
+        return BatchResult(
+            filename=Path(kwargs["docx_path"]).name,
+            success=False,
+            output_path=None,
+            log=[
+                "Classifying target",
+                f'<w:p><w:r><w:t>SECRET DOC TEXT {api_key}</w:t></w:r></w:p>',
+            ],
+            error=f"paragraph_xml=<w:p>SECRET DOC TEXT {api_key}</w:p>",
+            duration_seconds=0.01,
+            conversion_report=report,
+            audit={
+                "ignored_paragraphs": [
+                    {
+                        "paragraph_index": 4,
+                        "reason": "TOP SECRET PARAGRAPH",
+                        "original_text_preview": "TOP SECRET PARAGRAPH",
+                    }
+                ],
+            },
+            numbering_checks={"policy": "format_only", "checked": 1},
+        )
+
+    result = pipeline.format_specifications(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        api_key=api_key,
+        cache_dir=tmp_path / "profile-cache",
+        _template_analyzer=analyzer,
+        _config_loader=config_loader,
+        _target_processor=processor,
+    )
+
+    assert result.failed == 1
+    assert result.manifest_path is not None
+    assert result.targets[0].audit_path is not None
+    artifact_texts = [
+        result.manifest_path.read_text(encoding="utf-8"),
+        (result.run_dir / "run.log").read_text(encoding="utf-8"),
+        result.targets[0].audit_path.read_text(encoding="utf-8"),
+    ]
+    for artifact_text in artifact_texts:
+        assert api_key not in artifact_text
+        assert "SECRET DOC TEXT" not in artifact_text
+        assert "TOP SECRET PARAGRAPH" not in artifact_text
+        assert "PART 9 - CONFIDENTIAL" not in artifact_text
+
+    audit = json.loads(artifact_texts[-1])
+    assert audit["application_audit"]["ignored_paragraphs"] == [
+        {"paragraph_index": 4, "reason": "unspecified"}
+    ]
+    assert audit["conversion_report"]["warnings"] == [
+        {"paragraph_index": 4, "code": "marker_warning"}
+    ]
+    assert audit["conversion_report"]["edits"] == [
+        {
+            "paragraph_index": 4,
+            "role": "PART",
+            "source_kind": "literal",
+            "target_kind": "automatic",
+        }
+    ]
+    assert "[document content omitted]" in artifact_texts[1]
+
+
+def test_run_text_sanitizer_rejects_unstructured_model_authored_details() -> None:
+    confidential = "deterministic override got confidential sprinkler layout"
+
+    sanitized = pipeline._sanitize_run_text(confidential, ())
+
+    assert confidential not in sanitized
+    assert sanitized.startswith("[untrusted detail omitted; sha256=")
+    assert pipeline._sanitize_run_text(
+        "Applied classifications, stability verified",
+        (),
+        allow_operational=True,
+    ) == "Applied classifications, stability verified"
+
+
+def test_pre_contract_cache_entry_is_ignored_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"stable-architect")
+    target = _write_input(tmp_path / "target.docx", b"stable-target")
+    cache_dir = tmp_path / "profile-cache"
+    source_hash = pipeline.template_analysis.sha256_file(architect)
+    old_bundle = cache_dir / f"architect--{source_hash[:12]}--old.phase1"
+    old_bundle.mkdir(parents=True)
+    (old_bundle / "source.sha256").write_text(source_hash, encoding="ascii")
+    calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        cache_dir=cache_dir,
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    assert result.template_profile.reused is False
+    assert len(calls["analyzer"]) == 1
+    assert result.template_profile.bundle_dir.parent == (
+        cache_dir.resolve() / pipeline._PROFILE_CACHE_NAMESPACE
+    )
+    assert old_bundle.is_dir()
 
 
 def test_tampered_cached_template_profile_is_rejected_and_freshly_analyzed(
@@ -352,32 +606,29 @@ def test_input_preflight_fails_before_analyzer_or_other_pipeline_work(
     assert architect.read_bytes() == b"architect-original"
 
 
-def test_output_plan_cannot_overwrite_the_architect_input(
+def test_isolated_run_output_cannot_overwrite_the_architect_input(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     architect = _write_input(
         tmp_path / "mechanical_FORMATTED.docx",
         b"architect-original",
     )
     target = _write_input(tmp_path / "mechanical.docx", b"target-original")
-    calls: list[str] = []
+    calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
 
-    def unexpected_dependency(*args, **kwargs):
-        calls.append("called")
-        raise AssertionError("pipeline work started despite an unsafe output plan")
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path,
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
 
-    with pytest.raises(ValueError, match="would overwrite an input file"):
-        pipeline.format_specifications(
-            architect,
-            [target],
-            tmp_path,
-            api_key="offline-test-key",
-            _template_analyzer=unexpected_dependency,
-            _config_loader=unexpected_dependency,
-            _target_processor=unexpected_dependency,
-        )
-
-    assert calls == []
+    assert result.success
+    assert result.output_paths[0] != architect
+    assert result.output_paths[0].parent == result.run_dir
     assert architect.read_bytes() == b"architect-original"
     assert target.read_bytes() == b"target-original"
 
@@ -488,6 +739,28 @@ def test_same_stem_targets_receive_distinct_traceable_output_names(
     assert electrical.read_bytes() == b"electrical-section"
 
 
+def test_long_windows_output_components_are_truncated_and_hashed(tmp_path: Path) -> None:
+    stem = "section-" + ("x" * 242)
+    target = tmp_path / f"{stem}.docx"
+
+    first = pipeline._plan_output_paths(
+        [target],
+        tmp_path / "formatted",
+        pipeline.FORMAT_ONLY,
+    )[target]
+    second = pipeline._plan_output_paths(
+        [target],
+        tmp_path / "formatted",
+        pipeline.FORMAT_ONLY,
+    )[target]
+
+    assert first.name == second.name
+    assert first.name.endswith("_FORMATTED.docx")
+    assert pipeline._utf16_code_units(first.name) <= 240
+    assert stem not in first.name
+    assert "__" in first.stem
+
+
 def test_folder_discovery_excludes_lock_files_and_current_or_legacy_outputs(
     tmp_path: Path,
 ) -> None:
@@ -503,6 +776,42 @@ def test_folder_discovery_excludes_lock_files_and_current_or_legacy_outputs(
     discovered = pipeline.collect_target_specs([specs, target])
 
     assert discovered == (target.resolve(),)
+
+
+def test_folder_discovery_excludes_architect_but_explicit_selection_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specs = tmp_path / "specs"
+    architect = _write_input(specs / "architect.docx", b"architect-original")
+    target = _write_input(specs / "target.docx", b"target-original")
+    calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+
+    result = _run_with_fakes(
+        architect,
+        [specs],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    assert result.success
+    assert [item.source_path for item in result.targets] == [target.resolve()]
+    with pytest.raises(
+        ValueError,
+        match="architect template cannot also be a target",
+    ):
+        pipeline.format_specifications(
+            architect,
+            [specs, architect],
+            tmp_path / "formatted-explicit",
+            api_key="offline-test-key",
+            cache_dir=tmp_path / "profile-cache-explicit",
+            _template_analyzer=analyzer,
+            _config_loader=config_loader,
+            _target_processor=processor,
+        )
 
 
 def test_canadian_mode_reaches_target_processor_and_uses_distinct_output_name(
@@ -562,6 +871,47 @@ def test_invalid_conversion_mode_fails_before_analysis_or_filesystem_writes(
 
     assert calls == []
     assert not (tmp_path / "formatted").exists()
+
+
+def test_template_initialization_failure_still_publishes_failed_run_artifacts(
+    tmp_path: Path,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    api_key = "never-persist-this-secret"
+
+    def failing_analyzer(**_kwargs):
+        raise RuntimeError(
+            f"template text=<w:t>CONFIDENTIAL BODY {api_key}</w:t>"
+        )
+
+    with pytest.raises(RuntimeError) as caught:
+        pipeline.format_specifications(
+            architect,
+            [target],
+            tmp_path / "formatted",
+            api_key=api_key,
+            cache_dir=tmp_path / "profile-cache",
+            _template_analyzer=failing_analyzer,
+        )
+
+    run_dir = caught.value.run_dir
+    manifest_path = caught.value.manifest_path
+    assert run_dir.parent == (tmp_path / "formatted").resolve()
+    assert manifest_path == run_dir / "run.json"
+    assert (run_dir / "run.log").is_file()
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    audit_path = next(run_dir.glob("target-*.audit.json"))
+    combined = manifest_text + (run_dir / "run.log").read_text(
+        encoding="utf-8"
+    ) + audit_path.read_text(encoding="utf-8")
+    assert api_key not in combined
+    assert "CONFIDENTIAL BODY" not in combined
+    manifest = json.loads(manifest_text)
+    assert manifest["status"] == "failed"
+    assert manifest["failure_phase"] == "initialization"
+    assert manifest["summary"]["failed"] == 1
+    assert manifest["targets"][0]["audit_path"] == str(audit_path)
 
 
 def test_publication_failure_preserves_processor_log_and_conversion_report(

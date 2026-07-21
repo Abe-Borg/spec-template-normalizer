@@ -17,6 +17,14 @@ OUT_OF_SCOPE_SUBTREE_NAMES = (
     "w:txbxContent",
     "v:textbox",
     "wps:txbx",
+    # This subtree stores the *previous* paragraph properties for a tracked
+    # formatting revision.  Its pStyle/numPr are historical metadata, not the
+    # live properties of the paragraph, and must be ignored by readers and
+    # preserved byte-for-byte by paragraph edits.
+    "w:pPrChange",
+    # Historical run properties are likewise metadata, not live direct
+    # formatting. They must never be stripped while applying a paragraph style.
+    "w:rPrChange",
 )
 
 
@@ -145,7 +153,7 @@ def _remove_element_blocks(xml_text: str, qualified_names: Iterable[str]) -> str
 
 
 def strip_out_of_scope_subtrees(xml_text: str) -> str:
-    """Remove drawing/text-box subtrees for host-paragraph analysis only."""
+    """Remove non-live/protected subtrees for host-paragraph analysis only."""
     return _remove_element_blocks(xml_text, OUT_OF_SCOPE_SUBTREE_NAMES)
 
 
@@ -256,23 +264,27 @@ def paragraph_text_from_block(p_xml: str) -> str:
     return joined
 
 def paragraph_contains_sectpr(p_xml: str) -> bool:
-    return next(iter_element_xml_blocks(p_xml, "w:sectPr"), None) is not None
+    live_xml = strip_out_of_scope_subtrees(p_xml)
+    return next(iter_element_xml_blocks(live_xml, "w:sectPr"), None) is not None
 
 def paragraph_pstyle_from_block(p_xml: str) -> Optional[str]:
-    m = re.search(r"<w:pStyle\b[^>]*w:val=\"([^\"]+)\"", p_xml)
+    live_xml = strip_out_of_scope_subtrees(p_xml)
+    m = re.search(r"<w:pStyle\b[^>]*w:val=\"([^\"]+)\"", live_xml)
     return m.group(1) if m else None
 
 def paragraph_numpr_from_block(p_xml: str) -> Dict[str, Optional[str]]:
     numId = None
     ilvl = None
-    m1 = re.search(r"<w:numId\b[^>]*w:val=\"([^\"]+)\"", p_xml)
-    m2 = re.search(r"<w:ilvl\b[^>]*w:val=\"([^\"]+)\"", p_xml)
+    live_xml = strip_out_of_scope_subtrees(p_xml)
+    m1 = re.search(r"<w:numId\b[^>]*w:val=\"([^\"]+)\"", live_xml)
+    m2 = re.search(r"<w:ilvl\b[^>]*w:val=\"([^\"]+)\"", live_xml)
     if m1: numId = m1.group(1)
     if m2: ilvl = m2.group(1)
     return {"numId": numId, "ilvl": ilvl}
 
 def paragraph_ppr_hints_from_block(p_xml: str) -> Dict[str, Any]:
     # lightweight hints (alignment + ind + spacing)
+    p_xml = strip_out_of_scope_subtrees(p_xml)
     hints: Dict[str, Any] = {}
     m = re.search(r"<w:jc\b[^>]*w:val=\"([^\"]+)\"", p_xml)
     if m:
@@ -334,6 +346,64 @@ def apply_pstyle_to_paragraph_block(p_xml: str, styleId: str) -> str:
     )
     return _restore_out_of_scope_subtrees(p_xml, preserved)
 
+def strip_direct_run_properties(
+    p_xml: str,
+    properties: Iterable[str],
+) -> str:
+    """Remove selected direct ``w:rPr`` children from visible runs only.
+
+    Paragraph-style application may remove a direct run property only when
+    the effective replacement style supplies that same property.  Callers
+    therefore pass the exact local OOXML names resolved from the architect
+    style (for example ``rFonts``, ``sz``, ``szCs``, or ``lang``).
+    """
+
+    property_names = set(properties)
+    for name in property_names:
+        if not re.fullmatch(r"[A-Za-z_][\w.-]*", name):
+            raise ValueError(f"Invalid direct run property name: {name!r}")
+    if not property_names:
+        return p_xml
+
+    p_xml, preserved = _protect_out_of_scope_subtrees(p_xml)
+
+    def strip_properties_from_rpr(rpr_text: str) -> str:
+        result = rpr_text
+        for name in sorted(property_names):
+            result = re.sub(rf'<w:{name}\b[^>]*/>', '', result)
+            result = re.sub(
+                rf'<w:{name}\b[^>]*>[\s\S]*?</w:{name}>',
+                '',
+                result,
+                flags=re.S,
+            )
+
+        inner = re.sub(
+            r'<w:rPr\b[^>]*>([\s\S]*)</w:rPr>',
+            r'\1',
+            result,
+            flags=re.S,
+        )
+        return '' if not inner.strip() else result
+
+    def process_run(run_match: re.Match[str]) -> str:
+        return re.sub(
+            r'<w:rPr\b[^>]*>[\s\S]*?</w:rPr>',
+            lambda match: strip_properties_from_rpr(match.group(0)),
+            run_match.group(0),
+            count=1,
+            flags=re.S,
+        )
+
+    result = re.sub(
+        r'<w:r\b[^>]*>[\s\S]*?</w:r>',
+        process_run,
+        p_xml,
+        flags=re.S,
+    )
+    return _restore_out_of_scope_subtrees(result, preserved)
+
+
 def strip_run_font_formatting(p_xml: str) -> str:
     """
     Strip font-related formatting from all runs in a paragraph.
@@ -352,48 +422,7 @@ def strip_run_font_formatting(p_xml: str) -> str:
     - Character styles (<w:rStyle>)
     - Everything else
     """
-    p_xml, preserved = _protect_out_of_scope_subtrees(p_xml)
-
-    def strip_font_from_rpr_text(rpr_text: str) -> str:
-        """Process a raw rPr string."""
-        result = rpr_text
-        # Strip rFonts (self-closing or with content)
-        result = re.sub(r'<w:rFonts\b[^>]*/>', '', result)
-        result = re.sub(r'<w:rFonts\b[^>]*>[\s\S]*?</w:rFonts>', '', result, flags=re.S)
-        # Strip sz (font size)
-        result = re.sub(r'<w:sz\b[^>]*/>', '', result)
-        # Strip szCs (complex script font size)
-        result = re.sub(r'<w:szCs\b[^>]*/>', '', result)
-
-        # Check if empty - remove entirely if so
-        inner = re.sub(r'<w:rPr\b[^>]*>([\s\S]*)</w:rPr>', r'\1', result, flags=re.S)
-        if not inner.strip():
-            return ''
-        return result
-
-    def process_run(run_match):
-        """Process a single <w:r>...</w:r> block."""
-        run_block = run_match.group(0)
-
-        # Find and replace rPr inside this run
-        run_block = re.sub(
-            r'<w:rPr\b[^>]*>[\s\S]*?</w:rPr>',
-            lambda m: strip_font_from_rpr_text(m.group(0)),
-            run_block,
-            count=1,
-            flags=re.S
-        )
-        return run_block
-
-    # Process each run in the paragraph
-    result = re.sub(
-        r'<w:r\b[^>]*>[\s\S]*?</w:r>',
-        process_run,
-        p_xml,
-        flags=re.S
-    )
-
-    return _restore_out_of_scope_subtrees(result, preserved)
+    return strip_direct_run_properties(p_xml, {"rFonts", "sz", "szCs"})
 
 _DIRECT_PPR_OVERRIDE_TAGS = ("jc", "ind", "spacing", "numPr")
 

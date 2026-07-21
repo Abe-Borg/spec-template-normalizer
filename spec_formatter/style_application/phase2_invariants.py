@@ -4,7 +4,7 @@ import posixpath
 import zipfile
 from collections import Counter
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import TYPE_CHECKING, List, Dict, Any, Optional
 from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
@@ -13,7 +13,18 @@ from .core.ooxml_text import decode_xml_bytes, prepare_xml_text_for_utf8
 from .core.section_mapping import choose_section_sources
 from .core.sectpr_tools import extract_all_sectpr_blocks, iter_document_sectpr_blocks
 from .core.style_import import WORD_BUILTIN_STYLE_IDS
-from .core.xml_helpers import iter_element_xml_blocks
+from .core.classification import (
+    _build_numbering_catalog,
+    _effective_numbering_semantics,
+)
+from .core.xml_helpers import (
+    iter_element_xml_blocks,
+    iter_paragraph_xml_blocks,
+    paragraph_text_from_block,
+)
+
+if TYPE_CHECKING:
+    from .core.application_policy import ApplicationPolicy
 
 
 _OOXML_TRASH_ITEM_RE = re.compile(r"\[trash\]/[0-9A-Fa-f]{4}\.dat\Z")
@@ -30,6 +41,175 @@ def _sha256(b: bytes) -> str:
 def _read_docx_part(docx: Path, internal_path: str) -> bytes:
     with zipfile.ZipFile(docx, "r") as z:
         return z.read(internal_path)
+
+
+def _read_optional_docx_part(docx: Path, internal_path: str) -> bytes | None:
+    with zipfile.ZipFile(docx, "r") as z:
+        try:
+            return z.read(internal_path)
+        except KeyError:
+            return None
+
+
+def _resolve_application_policy(
+    policy: Optional["ApplicationPolicy"],
+    conversion_mode: Optional[str],
+) -> "ApplicationPolicy":
+    from .core.application_policy import application_policy_for_mode
+
+    if policy is None:
+        return application_policy_for_mode(conversion_mode or "format_only")
+    if conversion_mode is not None and policy.conversion_mode != conversion_mode:
+        raise ValueError(
+            "application policy conversion_mode does not match explicit "
+            f"conversion_mode ({policy.conversion_mode!r} != {conversion_mode!r})"
+        )
+    return policy
+
+
+def _element_semantic_signature(element: ET.Element) -> tuple:
+    """Namespace-prefix-independent signature for an OOXML element tree."""
+
+    text = element.text or ""
+    if not text.strip():
+        text = ""
+    return (
+        element.tag,
+        tuple(sorted(element.attrib.items())),
+        text,
+        tuple(_element_semantic_signature(child) for child in element),
+    )
+
+
+def _numbering_definition_signatures(numbering_xml: str) -> Counter:
+    if not numbering_xml.strip():
+        return Counter()
+    root = ET.fromstring(numbering_xml)
+    return Counter(_element_semantic_signature(child) for child in root)
+
+
+def _verify_format_only_body_invariants(
+    src_docx: Path,
+    before_document_xml: str,
+    after_document_xml: str,
+    new_docx: Path | None,
+) -> None:
+    """Fail closed if Format-only changes target content or numbering semantics."""
+
+    source_blocks = [block for _s, _e, block in iter_paragraph_xml_blocks(before_document_xml)]
+    output_blocks = [block for _s, _e, block in iter_paragraph_xml_blocks(after_document_xml)]
+    if len(source_blocks) != len(output_blocks):
+        raise RuntimeError(
+            "FORMAT_ONLY INVARIANT FAIL: target body paragraph count changed "
+            f"({len(source_blocks)} -> {len(output_blocks)})"
+        )
+
+    source_text = [paragraph_text_from_block(block) for block in source_blocks]
+    output_text = [paragraph_text_from_block(block) for block in output_blocks]
+    if source_text != output_text:
+        changed = next(
+            idx
+            for idx, (before, after) in enumerate(zip(source_text, output_text))
+            if before != after
+        )
+        raise RuntimeError(
+            "FORMAT_ONLY INVARIANT FAIL: target body text changed at paragraph "
+            f"index {changed}"
+        )
+
+    source_styles_bytes = _read_optional_docx_part(src_docx, "word/styles.xml")
+    source_numbering_bytes = _read_optional_docx_part(src_docx, "word/numbering.xml")
+    source_styles = (
+        decode_xml_bytes(source_styles_bytes, part_name="word/styles.xml (source)")
+        if source_styles_bytes is not None
+        else ""
+    )
+    source_numbering = (
+        decode_xml_bytes(source_numbering_bytes, part_name="word/numbering.xml (source)")
+        if source_numbering_bytes is not None
+        else ""
+    )
+
+    if new_docx is not None:
+        output_styles_bytes = _read_optional_docx_part(new_docx, "word/styles.xml")
+        output_numbering_bytes = _read_optional_docx_part(new_docx, "word/numbering.xml")
+        output_styles = (
+            decode_xml_bytes(output_styles_bytes, part_name="word/styles.xml (output)")
+            if output_styles_bytes is not None
+            else ""
+        )
+        output_numbering = (
+            decode_xml_bytes(output_numbering_bytes, part_name="word/numbering.xml (output)")
+            if output_numbering_bytes is not None
+            else ""
+        )
+    else:
+        # Callers that validate an in-memory document before packaging cannot
+        # have changed package-level styles/numbering yet.
+        output_styles = source_styles
+        output_numbering = source_numbering
+
+    source_catalog = _build_numbering_catalog(source_numbering)
+    output_catalog = _build_numbering_catalog(output_numbering)
+    source_semantics = [
+        _effective_numbering_semantics(block, source_styles, source_catalog)
+        for block in source_blocks
+    ]
+    output_semantics = [
+        _effective_numbering_semantics(block, output_styles, output_catalog)
+        for block in output_blocks
+    ]
+    if source_semantics != output_semantics:
+        changed = next(
+            idx
+            for idx, (before, after) in enumerate(
+                zip(source_semantics, output_semantics)
+            )
+            if before != after
+        )
+        raise RuntimeError(
+            "FORMAT_ONLY INVARIANT FAIL: effective target numbering changed at "
+            f"paragraph index {changed}"
+        )
+
+    # Numbering import may append definitions needed by architect headers and
+    # footers, but every pre-existing target definition must remain exact.
+    source_definitions = _numbering_definition_signatures(source_numbering)
+    output_definitions = _numbering_definition_signatures(output_numbering)
+    missing_or_changed = source_definitions - output_definitions
+    if missing_or_changed:
+        raise RuntimeError(
+            "FORMAT_ONLY INVARIANT FAIL: existing target numbering definitions changed"
+        )
+
+    # These structures are outside paragraph styling scope and must remain
+    # byte-stable within document.xml even though the global shell may reflow.
+    for qualified_name in (
+        "w:tbl",
+        "w:drawing",
+        "w:pict",
+        "w:object",
+        "w:txbxContent",
+    ):
+        before_blocks = [
+            block
+            for _start, _end, block in iter_element_xml_blocks(
+                before_document_xml,
+                qualified_name,
+            )
+        ]
+        after_blocks = [
+            block
+            for _start, _end, block in iter_element_xml_blocks(
+                after_document_xml,
+                qualified_name,
+            )
+        ]
+        if before_blocks != after_blocks:
+            raise RuntimeError(
+                "FORMAT_ONLY INVARIANT FAIL: out-of-scope document structure "
+                f"changed ({qualified_name})"
+            )
 
 def _extract_all_sectpr_blocks(document_xml: str) -> List[str]:
     return extract_all_sectpr_blocks(document_xml)
@@ -544,6 +724,8 @@ def verify_phase2_invariants(
     new_document_xml: bytes,
     new_docx: Path | None = None,
     arch_template_registry: Dict[str, Any] | None = None,
+    policy: Optional["ApplicationPolicy"] = None,
+    conversion_mode: Optional[str] = None,
 ) -> None:
     """
     Verify Phase 2 invariants:
@@ -561,6 +743,15 @@ def verify_phase2_invariants(
         part_name="word/document.xml (source)",
     )
     after_doc = decode_xml_bytes(new_document_xml, part_name="word/document.xml (output)")
+
+    application_policy = _resolve_application_policy(policy, conversion_mode)
+    if application_policy.preserve_target_numbering:
+        _verify_format_only_body_invariants(
+            src_docx,
+            before_doc,
+            after_doc,
+            new_docx,
+        )
 
     before_records = _sectpr_records(before_doc)
     after_records = _sectpr_records(after_doc)

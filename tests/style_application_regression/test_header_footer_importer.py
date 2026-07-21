@@ -85,7 +85,11 @@ def test_import_headers_footers_replaces_parts_and_refs(tmp_path):
                     "header_refs": {"default": "rId10"},
                     "footer_refs": {"default": "rId11"},
                 }
-            ]
+            ],
+            "default_section": {
+                "header_refs": {"default": "rId10"},
+                "footer_refs": {"default": "rId11"},
+            },
         },
     }
 

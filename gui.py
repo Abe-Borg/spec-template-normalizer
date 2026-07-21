@@ -6,6 +6,8 @@ import os
 import queue
 import threading
 import traceback
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
@@ -97,6 +99,88 @@ def conversion_report_log_lines(item: object) -> tuple[str, ...]:
     return tuple(lines)
 
 
+@dataclass(frozen=True)
+class ActiveRunSummary:
+    """Values captured for a run, excluding the API key by design."""
+
+    architect_template: Path
+    target_inputs: tuple[Path, ...]
+    output_root: Path
+    conversion_mode: str
+    reuse_template_analysis: bool
+    max_workers: int
+
+
+def output_mode_label(conversion_mode: str) -> str:
+    """Return the user-facing label for a pipeline conversion mode."""
+
+    if conversion_mode == CSI_TO_CANADIAN:
+        return "Canadian CSC PageFormat conversion"
+    return "Format only"
+
+
+def active_run_summary_text(summary: ActiveRunSummary, *, active: bool = True) -> str:
+    """Render a stable, non-secret snapshot of the values used by the worker."""
+
+    heading = "ACTIVE RUN (inputs locked)" if active else "LAST RUN"
+    analysis = (
+        "reuse matching profile"
+        if summary.reuse_template_analysis
+        else "reanalyze template"
+    )
+    return (
+        f"{heading}\n"
+        f"{output_mode_label(summary.conversion_mode)} | "
+        f"{len(summary.target_inputs)} target selection(s) | "
+        f"{summary.max_workers} worker(s) | {analysis}\n"
+        f"Template: {summary.architect_template}\n"
+        f"Output root: {summary.output_root}"
+    )
+
+
+def result_run_directory(result: object) -> Optional[Path]:
+    """Return the concrete run directory, with backward-compatible fallbacks."""
+
+    for attribute in ("run_dir", "output_dir", "output_root"):
+        value = getattr(result, attribute, None)
+        if value:
+            return Path(value)
+    return None
+
+
+def target_result_log_lines(item: object) -> tuple[str, ...]:
+    """Return every processor log line plus any available audit diagnostics."""
+
+    lines: list[str] = []
+    raw_log = getattr(item, "log", ()) or ()
+    if isinstance(raw_log, str):
+        raw_log = (raw_log,)
+    for entry in raw_log:
+        text = str(entry)
+        split = text.splitlines()
+        lines.extend(split if split else ("",))
+
+    source_path = Path(getattr(item, "source_path", "target.docx"))
+    audit_summary = getattr(item, "audit_summary", None)
+    if isinstance(audit_summary, Mapping) and audit_summary:
+        preferred_keys = ("styled", "ignored", "out_of_scope", "unresolved")
+        ordered_keys = [key for key in preferred_keys if key in audit_summary]
+        ordered_keys.extend(
+            sorted(
+                (key for key in audit_summary if key not in preferred_keys),
+                key=str,
+            )
+        )
+        counts = ", ".join(f"{key}={audit_summary[key]}" for key in ordered_keys)
+        lines.append(f"{source_path.name}: audit counts: {counts}")
+
+    audit_path = getattr(item, "audit_path", None)
+    if audit_path:
+        lines.append(f"{source_path.name}: audit: {audit_path}")
+    lines.extend(conversion_report_log_lines(item))
+    return tuple(lines)
+
+
 class FormatWorker(threading.Thread):
     """Run the unified pipeline without blocking Tk's event loop."""
 
@@ -145,6 +229,8 @@ class FormatWorker(threading.Thread):
                     {
                         "message": str(exc),
                         "traceback": traceback.format_exc(),
+                        "run_dir": getattr(exc, "run_dir", None),
+                        "manifest_path": getattr(exc, "manifest_path", None),
                     },
                 )
             )
@@ -166,12 +252,16 @@ class App(ctk.CTk):
         self.workers_var = ctk.StringVar(value="3")
         self.conversion_mode_var = ctk.StringVar(value=FORMAT_ONLY)
         self.mode_controls: list[ctk.CTkRadioButton] = []
+        self.run_affecting_controls: list[object] = []
+        self._locked_run_control_states: list[tuple[object, str]] = []
         self.target_inputs: list[Path] = []
         self.output_is_automatic = False
         self.events: queue.Queue = queue.Queue()
         self.worker: Optional[FormatWorker] = None
         self.last_result: Optional[FormatRunResult] = None
+        self.failed_run_dir: Optional[Path] = None
         self.active_output_dir: Optional[Path] = None
+        self.active_run_summary: Optional[ActiveRunSummary] = None
         self.advanced_visible = False
 
         self._build_ui()
@@ -207,7 +297,7 @@ class App(ctk.CTk):
         card.pack(fill="x")
 
         self._section_label(card, "1   Architect template")
-        self._path_row(
+        self.architect_entry, self.architect_button = self._path_row(
             card,
             self.architect_var,
             "Select the architect's .docx template",
@@ -218,7 +308,7 @@ class App(ctk.CTk):
         self._section_label(card, "2   Target specifications", top=18)
         target_toolbar = ctk.CTkFrame(card, fg_color="transparent")
         target_toolbar.pack(fill="x", padx=22)
-        ctk.CTkButton(
+        self.add_files_button = ctk.CTkButton(
             target_toolbar,
             text="Add Files",
             command=self._add_target_files,
@@ -229,8 +319,9 @@ class App(ctk.CTk):
             hover_color=COLORS["border"],
             border_width=1,
             border_color=COLORS["border"],
-        ).pack(side="left")
-        ctk.CTkButton(
+        )
+        self.add_files_button.pack(side="left")
+        self.add_folder_button = ctk.CTkButton(
             target_toolbar,
             text="Add Folder",
             command=self._add_target_folder,
@@ -241,8 +332,9 @@ class App(ctk.CTk):
             hover_color=COLORS["border"],
             border_width=1,
             border_color=COLORS["border"],
-        ).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(
+        )
+        self.add_folder_button.pack(side="left", padx=(8, 0))
+        self.clear_targets_button = ctk.CTkButton(
             target_toolbar,
             text="Clear",
             command=self._clear_targets,
@@ -252,7 +344,15 @@ class App(ctk.CTk):
             fg_color="transparent",
             hover_color=COLORS["border"],
             text_color=COLORS["secondary"],
-        ).pack(side="right")
+        )
+        self.clear_targets_button.pack(side="right")
+        self.run_affecting_controls.extend(
+            (
+                self.add_files_button,
+                self.add_folder_button,
+                self.clear_targets_button,
+            )
+        )
 
         self.target_box = ctk.CTkTextbox(
             card,
@@ -287,6 +387,7 @@ class App(ctk.CTk):
             )
             control.pack(side="left", padx=(0, 28))
             self.mode_controls.append(control)
+            self.run_affecting_controls.append(control)
         ctk.CTkLabel(
             card,
             text=(
@@ -303,7 +404,7 @@ class App(ctk.CTk):
         ).pack(anchor="w", padx=22, pady=(7, 0))
 
         self._section_label(card, "4   Output folder", top=18)
-        self._path_row(
+        self.output_entry, self.output_button = self._path_row(
             card,
             self.output_var,
             "Formatted Specs",
@@ -326,7 +427,8 @@ class App(ctk.CTk):
             font=_font(14),
         )
         self.api_entry.pack(side="left", fill="x", expand=True)
-        ctk.CTkCheckBox(
+        self.run_affecting_controls.append(self.api_entry)
+        self.show_key_checkbox = ctk.CTkCheckBox(
             key_row,
             text="Show",
             variable=self.show_key_var,
@@ -335,7 +437,8 @@ class App(ctk.CTk):
             text_color=COLORS["secondary"],
             font=_font(13),
             fg_color=COLORS["accent"],
-        ).pack(side="left", padx=(12, 0))
+        )
+        self.show_key_checkbox.pack(side="left", padx=(12, 0))
 
         advanced_button = ctk.CTkButton(
             card,
@@ -352,14 +455,16 @@ class App(ctk.CTk):
         self.advanced_button = advanced_button
 
         self.advanced_frame = ctk.CTkFrame(card, fg_color=COLORS["input"])
-        ctk.CTkCheckBox(
+        self.reuse_checkbox = ctk.CTkCheckBox(
             self.advanced_frame,
             text="Reuse analysis when the architect template has not changed",
             variable=self.reuse_var,
             text_color=COLORS["secondary"],
             font=_font(13),
             fg_color=COLORS["accent"],
-        ).pack(side="left", padx=14, pady=12)
+        )
+        self.reuse_checkbox.pack(side="left", padx=14, pady=12)
+        self.run_affecting_controls.append(self.reuse_checkbox)
         workers = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
         workers.pack(side="right", padx=14, pady=8)
         ctk.CTkLabel(
@@ -368,7 +473,7 @@ class App(ctk.CTk):
             text_color=COLORS["secondary"],
             font=_font(13),
         ).pack(side="left", padx=(0, 8))
-        ctk.CTkOptionMenu(
+        self.workers_menu = ctk.CTkOptionMenu(
             workers,
             values=["1", "2", "3", "4", "5", "6"],
             variable=self.workers_var,
@@ -378,7 +483,9 @@ class App(ctk.CTk):
             button_color=COLORS["accent"],
             button_hover_color=COLORS["accent_hover"],
             font=_font(13),
-        ).pack(side="left")
+        )
+        self.workers_menu.pack(side="left")
+        self.run_affecting_controls.append(self.workers_menu)
 
         action_row = ctk.CTkFrame(card, fg_color="transparent")
         self.action_row = action_row
@@ -408,6 +515,17 @@ class App(ctk.CTk):
             font=_font(14),
         )
         self.open_button.pack(side="left", padx=(10, 0))
+
+        self.active_run_label = ctk.CTkLabel(
+            card,
+            text="No run has started.",
+            wraplength=870,
+            justify="left",
+            anchor="w",
+            text_color=COLORS["muted"],
+            font=_font(12),
+        )
+        self.active_run_label.pack(fill="x", padx=22, pady=(0, 18))
 
         status_row = ctk.CTkFrame(shell, fg_color="transparent")
         status_row.pack(fill="x", pady=(15, 7))
@@ -456,7 +574,7 @@ class App(ctk.CTk):
         placeholder: str,
         command,
         button_text: str,
-    ) -> None:
+    ) -> tuple[ctk.CTkEntry, ctk.CTkButton]:
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", padx=22)
         entry = ctk.CTkEntry(
@@ -476,7 +594,7 @@ class App(ctk.CTk):
                 "<KeyPress>",
                 lambda _event: setattr(self, "output_is_automatic", False),
             )
-        ctk.CTkButton(
+        button = ctk.CTkButton(
             row,
             text=button_text,
             command=command,
@@ -487,7 +605,10 @@ class App(ctk.CTk):
             border_width=1,
             border_color=COLORS["border"],
             font=_font(14),
-        ).pack(side="left", padx=(10, 0))
+        )
+        button.pack(side="left", padx=(10, 0))
+        self.run_affecting_controls.extend((entry, button))
+        return entry, button
 
     def _choose_architect(self) -> None:
         selected = filedialog.askopenfilename(
@@ -590,6 +711,39 @@ class App(ctk.CTk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
+    def _lock_run_controls(self) -> None:
+        """Disable run inputs while remembering their exact prior states."""
+
+        if self._locked_run_control_states:
+            return
+        for control in self.run_affecting_controls:
+            try:
+                previous_state = str(control.cget("state"))
+            except Exception:
+                previous_state = "normal"
+            self._locked_run_control_states.append((control, previous_state))
+            control.configure(state="disabled")
+
+    def _unlock_run_controls(self) -> None:
+        """Restore the states captured by :meth:`_lock_run_controls`."""
+
+        states = self._locked_run_control_states
+        self._locked_run_control_states = []
+        for control, previous_state in states:
+            try:
+                control.configure(state=previous_state)
+            except Exception:
+                # A control can disappear only while the window is being torn down.
+                continue
+
+    def _show_run_summary(self, *, active: bool) -> None:
+        if self.active_run_summary is None:
+            return
+        self.active_run_label.configure(
+            text=active_run_summary_text(self.active_run_summary, active=active),
+            text_color=COLORS["secondary"] if active else COLORS["muted"],
+        )
+
     def _start(self) -> None:
         if self.worker is not None and self.worker.is_alive():
             return
@@ -605,30 +759,41 @@ class App(ctk.CTk):
             messagebox.showerror("Missing output folder", "Choose an output folder.")
             return
 
-        self.last_result = None
-        self.active_output_dir = Path(output)
-        self._clear_log()
         conversion_mode = self.conversion_mode_var.get()
-        mode_label = (
-            "Canadian CSC PageFormat conversion"
-            if conversion_mode == CSI_TO_CANADIAN
-            else "Format only"
+        active_run = ActiveRunSummary(
+            architect_template=Path(architect),
+            target_inputs=tuple(self.target_inputs),
+            output_root=Path(output),
+            conversion_mode=conversion_mode,
+            reuse_template_analysis=self.reuse_var.get(),
+            max_workers=int(self.workers_var.get()),
         )
+        api_key = self.api_key_var.get()
+        self.last_result = None
+        self.failed_run_dir = None
+        self.active_output_dir = active_run.output_root
+        self.active_run_summary = active_run
+        self._clear_log()
+        mode_label = output_mode_label(conversion_mode)
         self._append_log(f"Starting specification processing. Output mode: {mode_label}")
+        self._append_log(
+            f"Run inputs locked: {len(active_run.target_inputs)} target selection(s), "
+            f"{active_run.max_workers} worker(s), output root {active_run.output_root}"
+        )
+        self._show_run_summary(active=True)
         self.run_button.configure(state="disabled", text="PROCESSING...")
-        for control in self.mode_controls:
-            control.configure(state="disabled")
+        self._lock_run_controls()
         self.open_button.configure(state="disabled")
         self.status_label.configure(text="Checking files", text_color=COLORS["secondary"])
         self.progress.start()
         self.worker = FormatWorker(
-            architect_template=Path(architect),
-            target_inputs=tuple(self.target_inputs),
-            output_dir=Path(output),
-            api_key=self.api_key_var.get(),
-            reuse_template_analysis=self.reuse_var.get(),
-            max_workers=int(self.workers_var.get()),
-            conversion_mode=conversion_mode,
+            architect_template=active_run.architect_template,
+            target_inputs=active_run.target_inputs,
+            output_dir=active_run.output_root,
+            api_key=api_key,
+            reuse_template_analysis=active_run.reuse_template_analysis,
+            max_workers=active_run.max_workers,
+            conversion_mode=active_run.conversion_mode,
             events=self.events,
         )
         self.worker.start()
@@ -652,12 +817,13 @@ class App(ctk.CTk):
         self.progress.stop()
         self.progress.set(0)
         self.run_button.configure(state="normal", text="FORMAT SPECS")
-        for control in self.mode_controls:
-            control.configure(state="normal")
+        self._unlock_run_controls()
+        self._show_run_summary(active=False)
 
     def _handle_complete(self, result: FormatRunResult) -> None:
         self._finish_busy_state()
         self.last_result = result
+        run_dir = result_run_directory(result) or self.active_output_dir
         status, summary = summarize_batch_results(result.targets)
         color = {
             "success": COLORS["success"],
@@ -665,17 +831,24 @@ class App(ctk.CTk):
             "failed": COLORS["error"],
         }.get(status, COLORS["muted"])
         self.status_label.configure(text=summary, text_color=color)
+        run_id = getattr(result, "run_id", None)
+        if run_id:
+            self._append_log(f"Run ID: {run_id}")
+        if run_dir is not None:
+            self._append_log(f"Run folder: {run_dir}")
+        manifest_path = getattr(result, "manifest_path", None)
+        if manifest_path:
+            self._append_log(f"Run manifest: {manifest_path}")
         for item in result.targets:
+            for line in target_result_log_lines(item):
+                self._append_log(line)
             if item.success and item.output_path is not None:
                 self._append_log(f"Output: {item.output_path}")
             else:
                 self._append_log(f"Failed: {item.source_path.name} — {item.error}")
-            for line in conversion_report_log_lines(item):
-                self._append_log(line)
-        self.open_button.configure(state="normal")
-        log_path = self._save_log(result.output_dir)
-        if log_path is not None:
-            self._append_log(f"Log saved: {log_path}")
+        self.open_button.configure(state="normal" if run_dir is not None else "disabled")
+        if run_dir is not None:
+            self._append_log(f"Persisted run log: {run_dir / 'run.log'}")
         self.active_output_dir = None
         if status == "success":
             messagebox.showinfo("Formatting complete", summary, parent=self)
@@ -693,47 +866,23 @@ class App(ctk.CTk):
         message = payload.get("message") or "Formatting failed."
         self.status_label.configure(text="Formatting failed", text_color=COLORS["error"])
         self._append_log(message)
-        output_dir = self.active_output_dir
-        if output_dir is not None:
-            diagnostic = self._save_diagnostic(
-                output_dir,
-                payload.get("traceback", ""),
-            )
-            if diagnostic is not None:
-                self._append_log(f"Diagnostic log saved: {diagnostic}")
-            self._save_log(output_dir)
+        run_dir = payload.get("run_dir")
+        self.failed_run_dir = Path(run_dir) if run_dir else None
+        if self.failed_run_dir is not None:
+            self._append_log(f"Run folder: {self.failed_run_dir}")
+            manifest_path = payload.get("manifest_path")
+            if manifest_path:
+                self._append_log(f"Run manifest: {manifest_path}")
+            self.open_button.configure(state="normal")
         self.active_output_dir = None
         messagebox.showerror("Formatting failed", message, parent=self)
 
-    def _save_diagnostic(self, output_dir: Path, traceback_text: str) -> Optional[Path]:
-        if not traceback_text:
-            return None
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = output_dir / f"spec_formatter_diagnostic_{stamp}.log"
-            path.write_text(traceback_text.rstrip() + "\n", encoding="utf-8")
-            return path
-        except OSError:
-            return None
-
-    def _save_log(self, output_dir: Path) -> Optional[Path]:
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            log_path = output_dir / f"spec_formatter_{stamp}.log"
-            content = self.log_box.get("1.0", "end").rstrip() + "\n"
-            log_path.write_text(content, encoding="utf-8")
-            return log_path
-        except OSError:
-            return None
-
     def _open_output(self) -> None:
-        output = (
-            self.last_result.output_dir
-            if self.last_result is not None
-            else Path(self.output_var.get().strip())
-        )
+        output = result_run_directory(self.last_result) if self.last_result is not None else None
+        if output is None:
+            output = self.failed_run_dir
+        if output is None:
+            output = Path(self.output_var.get().strip())
         if not output.is_dir():
             messagebox.showerror("Output folder unavailable", f"Folder not found: {output}")
             return

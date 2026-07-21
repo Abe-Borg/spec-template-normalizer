@@ -485,8 +485,15 @@ def test_generated_phase1_bundle_round_trips_through_phase2_without_api(tmp_path
     assert TEXTBOX_BLOCK in target_document_before.decode("utf-8")
     assert TEXTBOX_BLOCK in output_document_text
 
-    assert output_document_text.count('w:val="CSI_Paragraph__ARCH"') == 1
-    assert output_document_text.count('w:val="CSI_Subparagraph__ARCH"') == 1
+    applied_style_ids = re.findall(r'<w:pStyle w:val="([^"]+)"', output_document_text)
+    assert sum(
+        style_id.startswith("SF_") and "_BODY_CSI_Paragraph__ARCH_" in style_id
+        for style_id in applied_style_ids
+    ) == 1
+    assert sum(
+        style_id.startswith("SF_") and "_BODY_CSI_Subparagraph__ARCH_" in style_id
+        for style_id in applied_style_ids
+    ) == 1
     assert output_settings.decode("utf-8").startswith('<?xml version="1.0" encoding="UTF-8"?>')
     assert 'w:percent="110"' in output_settings.decode("utf-8")
     assert 'w:name="compatibilityMode"' in output_settings.decode("utf-8")

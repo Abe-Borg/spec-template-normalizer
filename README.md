@@ -11,20 +11,28 @@ The original template and target files are never modified.
 1. Analyzes the architect's `.docx` template and captures its CSI paragraph
    styles, numbering, fonts, headers, footers, settings, and page layout.
 2. Validates and caches that template analysis by the template's SHA-256 hash,
-   engine version, prompt hashes, and classifier model.
-3. Classifies each target spec's in-scope paragraphs.
-4. Optionally converts conventional CSI numbering (`1.01 / A. / 1. / a. /
-   1) / a) / (1) / (a)`)
-   to the Canadian numeric hierarchy demonstrated by the architect template.
-5. Applies the architect's formatting while preserving technical wording,
-   tables, drawings, text boxes, and unmanaged document structure.
-6. Validates each complete DOCX package before publishing it.
+   engine version, prompt hashes, classifier model, and profile-contract
+   version.
+3. Classifies each visible target paragraph as a CSI role or an explicit,
+   auditable ignore disposition; empty structural paragraphs and table content
+   are recorded out of scope.
+4. Applies one explicit mode policy:
+   - **Format only** keeps the target's text, list ownership, markers, levels,
+     counters, and restart semantics.
+   - **Canadian CSC PageFormat** converts supported CSI hierarchy to the
+     architect's demonstrated automatic numbering.
+5. Applies the architect's complete document shell: source-derived CSI
+   formatting, theme/defaults, compatibility settings, page layout, and
+   default/even/first headers and footers.
+6. Validates content, numbering, protected structure, and the complete DOCX
+   package before publishing it.
 
 The internal template profile remains a checksummed integrity boundary, but it
 is not part of the user workflow. If the architect template has not changed,
 the app safely reuses its validated analysis from the operating system's
-per-user application cache; the selected output folder contains only formatted
-documents and run logs.
+per-user application cache. A profile is reused only from the current cache
+contract namespace; changing that contract invalidates older cached profiles
+without deleting them.
 
 ## Install
 
@@ -54,15 +62,53 @@ In the single window:
 5. Enter the Anthropic API key when needed.
 6. Click **Format Specs**.
 
-Format-only outputs are named `<target>_FORMATTED.docx`; Canadian outputs are
-named `<target>_CANADIAN_FORMATTED.docx`, so the two modes cannot silently
-replace each other. When selected targets from different folders share the
-same filename, the app adds a stable source suffix so neither output can
-overwrite the other. A timestamped activity log is saved beside the formatted
-documents.
+Each run creates an isolated directory below the selected output root:
+
+```text
+<UTC timestamp>_<mode>_<run-id>/
+  <target>_FORMATTED.docx              # Format only
+  <target>_CANADIAN_FORMATTED.docx     # Canadian mode
+  target-<sequence>-<source-hash>.audit.json
+  run.log
+  run.json
+```
+
+When selected targets from different folders share a filename, the app adds a
+stable source suffix so neither output can overwrite the other. Failed reruns
+therefore cannot make an older output appear current. `run.json` records the
+mode, application/profile contract versions, template and target hashes, model
+and prompt fingerprints, cache identity, output hashes, disposition counts,
+numbering checks, durations, and errors. API keys and document text are never
+written to run metadata.
 
 Folder discovery ignores Word lock files, current `_FORMATTED.docx` outputs,
-and legacy `_PHASE2_FORMATTED.docx` outputs.
+and legacy `_PHASE2_FORMATTED.docx` outputs. If the architect is present in a
+selected folder it is excluded from discovery; explicitly selecting the
+architect as a target remains an error.
+
+## Format-only mode
+
+Format-only treats target content and numbering as authoritative. Before any
+architect parts are applied, the engine snapshots each paragraph's effective
+numbering, including numbering inherited through a paragraph style. Imported
+body-role styles are detached from architect numbering, inherited target
+`numPr` is materialized where needed, and existing target numbering definitions
+remain intact. Publication fails if body text or effective list semantics
+change.
+
+Only paragraphs with validated CSI roles receive paragraph/run formatting.
+Non-CSI and editorial content is returned as `ignored_paragraphs` with a reason
+and its paragraph XML is left untouched. Tables, drawings, and text boxes are
+outside body restyling. The architect shell is document-global, so ignored or
+out-of-scope content can still reflow under the architect's page geometry,
+theme, and defaults.
+
+Architect styles are always imported into deterministic private `SF_*`
+namespaces. Existing target style IDs, including built-ins such as `Normal`,
+are never overwritten, and every imported dependency reference is rewritten to
+the private namespace. Direct target paragraph and run properties are removed
+only when the effective architect style supplies the same property through its
+full `basedOn` chain.
 
 ## Canadian CSC PageFormat mode
 
@@ -140,11 +186,23 @@ result = format_specifications(
 
 for target in result.targets:
     print(target.source_path, target.success, target.output_path or target.error)
+
+print(result.run_id, result.conversion_mode)
+print(result.output_root, result.run_dir, result.manifest_path)
 ```
 
 Target inputs may be individual DOCX paths or folders. Folder expansion is
 non-recursive. Multi-file runs are independent: one corrupt target is reported
 as a failure without discarding valid outputs from other targets.
+`output_dir` is the output **root**; `result.output_dir` remains a
+backward-compatible alias of the concrete `result.run_dir`.
+
+`FormatRunResult` exposes `run_id`, `conversion_mode`, `output_root`, `run_dir`,
+`manifest_path`, `targets`, `success`, `succeeded`, `failed`, and
+`output_paths`. Each `TargetFormatResult` includes source/output hashes,
+`audit_path`, disposition counts, numbering checks, processor log lines,
+duration, conversion report, and any error in addition to the historical
+source/success/output fields.
 
 ## Internal architecture
 
@@ -159,11 +217,12 @@ architect template DOCX
 
 target specification DOCX files
     -> bounded extraction
-    -> deterministic/AI paragraph classification
-    -> optional fail-closed CSI-to-Canadian hierarchy conversion
-    -> environment, numbering, style, header/footer, and layout application
-    -> stability and complete-package validation
-    -> atomic publication as *_FORMATTED.docx or *_CANADIAN_FORMATTED.docx
+    -> deterministic/AI styled-or-ignored paragraph dispositions
+    -> immutable application policy selected at the orchestration boundary
+    -> target-owned numbering preservation OR fail-closed Canadian conversion
+    -> collision-safe styles and complete architect shell application
+    -> mode-specific content, numbering, stability, and package validation
+    -> atomic publication into an isolated, manifested run directory
 ```
 
 The architect-template engine remains available through
@@ -181,6 +240,11 @@ Those artifacts include the role/style and template-environment registries,
 the complete classification audit, and byte-exact source styles and settings
 alongside portable source-derived styles. Strict validation rejects missing,
 altered, or unlisted profile files.
+
+Profiles live under a versioned cache namespace (`contract-v<version>`). A
+cache hit also requires the exact source hash, producer version, classifier
+identity, and prompt hashes, so a wire-contract change cannot silently reuse an
+older profile.
 
 Formal JSON contracts remain in `schemas/`. The template-environment registry
 is a bounded, normalized representation; use its exact `source_styles.xml` and
@@ -209,14 +273,19 @@ section-break paragraphs remain classifiable and retain their `sectPr`.
   estimated 150,000 tokens.
 - Architect and target inputs are read-only; outputs are separate files.
 - Template profiles are reused only after manifest, size, checksum, source hash,
-  and producer-version validation.
+  producer-version, prompt/model fingerprint, and cache-contract validation.
 - Tables and drawing/text-box content are excluded from paragraph restyling.
-- Formatting is applied through validated architect styles and numbering
-  definitions; unknown roles are not guessed.
+- Explicit ignored paragraphs receive no paragraph/run edits; unresolved or
+  overlapping dispositions fail closed.
+- Imported architect styles never replace an existing target style ID.
+- Format-only verifies unchanged body text and effective target numbering and
+  preserves every pre-existing target numbering definition.
 - Canadian conversion edits only recognized leading numbering markers in
   classified paragraphs and verifies that substantive text and protected OOXML
   remain unchanged.
-- Each output is fully validated before it replaces an earlier formatted output.
+- Short generated temporary paths avoid carrying user-controlled deep paths
+  into Windows staging.
+- Every output is fully validated before atomic publication into its run folder.
 
 ## Tests
 
@@ -229,7 +298,14 @@ The suite includes the original template-analysis coverage, the vendored
 style-application regression suite under its new namespace, unified workflow
 and cache tests, and offline end-to-end DOCX round trips that verify styles,
 numbering, settings, headers/footers, page layout, tables, text boxes, source
-immutability, partial-failure isolation, and package validity.
+immutability, ignored dispositions, mode separation, partial-failure isolation,
+run provenance, long paths, and package validity.
+
+`tests/test_sanitized_format_only_corpus.py` builds a tracked, non-proprietary
+154-paragraph reproduction of the supplied acceptance case and runs it through
+the public unified application. It verifies all 121 inherited automatic list
+items, the 19 critical markers, `GENERAL` as `PART`, byte-stable ignored XML,
+and the architect shell without any sibling-repository dependency.
 
 ## Copyright Notice
 

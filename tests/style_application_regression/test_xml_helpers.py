@@ -3,6 +3,7 @@
 import pytest
 from spec_formatter.style_application.core.xml_helpers import (
     apply_pstyle_to_paragraph_block,
+    strip_direct_run_properties,
     strip_run_font_formatting,
     iter_paragraph_xml_blocks,
     paragraph_text_from_block,
@@ -37,6 +38,22 @@ class TestApplyPstyle:
         p = '<w:p><w:r><w:t>Hello</w:t></w:r></w:p>'
         result = apply_pstyle_to_paragraph_block(p, "MyStyle")
         assert '<w:pPr><w:pStyle w:val="MyStyle"/></w:pPr>' in result
+
+    def test_historical_pstyle_is_preserved_and_new_live_style_is_inserted(self):
+        change = (
+            '<w:pPrChange w:id="7"><w:pPr>'
+            '<w:pStyle w:val="HistoricalList"/>'
+            '</w:pPr></w:pPrChange>'
+        )
+        p = f'<w:p><w:pPr>{change}</w:pPr><w:r><w:t>Hello</w:t></w:r></w:p>'
+
+        result = apply_pstyle_to_paragraph_block(p, "MyStyle")
+
+        assert change in result
+        assert result.startswith(
+            '<w:p><w:pPr><w:pStyle w:val="MyStyle"/>'
+            '<w:pPrChange'
+        )
 
     def test_visible_sectpr_paragraph_is_styled_without_changing_sectpr(self):
         sectpr = '<w:sectPr><w:pgSz/></w:sectPr>'
@@ -78,6 +95,39 @@ class TestStripRunFontFormatting:
         p = '<w:p><w:r><w:rPr><w:b/><w:i/></w:rPr><w:t>BI</w:t></w:r></w:p>'
         result = strip_run_font_formatting(p)
         assert result == p
+
+    def test_selected_properties_include_language_without_touching_size(self):
+        p = (
+            '<w:p><w:r><w:rPr>'
+            '<w:rFonts w:ascii="Target"/><w:sz w:val="20"/>'
+            '<w:szCs w:val="20"/><w:lang w:val="fr-CA"/><w:b/>'
+            '</w:rPr><w:t>Text</w:t></w:r></w:p>'
+        )
+
+        result = strip_direct_run_properties(p, {"rFonts", "lang"})
+
+        assert "<w:rFonts" not in result
+        assert "<w:lang" not in result
+        assert '<w:sz w:val="20"/>' in result
+        assert '<w:szCs w:val="20"/>' in result
+        assert "<w:b/>" in result
+
+    def test_historical_run_properties_are_byte_stable(self):
+        historical = (
+            '<w:rPrChange w:id="4"><w:rPr><w:rFonts w:ascii="Historical"/>'
+            '<w:lang w:val="de-DE"/></w:rPr></w:rPrChange>'
+        )
+        p = (
+            '<w:p><w:r><w:rPr><w:rFonts w:ascii="Live"/>'
+            f'<w:lang w:val="fr-CA"/>{historical}</w:rPr><w:t>Text</w:t></w:r></w:p>'
+        )
+
+        result = strip_direct_run_properties(p, {"rFonts", "lang"})
+
+        assert historical in result
+        live_prefix = result.split("<w:rPrChange", 1)[0]
+        assert "<w:rFonts" not in live_prefix
+        assert "<w:lang" not in live_prefix
 
 
 class TestStripConflictingDirectPpr:
@@ -262,6 +312,23 @@ class TestParagraphPstyleFromBlock:
         p = '<w:p><w:r><w:t>Normal</w:t></w:r></w:p>'
         assert paragraph_pstyle_from_block(p) is None
 
+    def test_tracked_previous_pstyle_is_not_live(self):
+        p = (
+            '<w:p><w:pPr><w:pPrChange w:id="7"><w:pPr>'
+            '<w:pStyle w:val="HistoricalList"/>'
+            '</w:pPr></w:pPrChange></w:pPr><w:r><w:t>Normal</w:t></w:r></w:p>'
+        )
+        assert paragraph_pstyle_from_block(p) is None
+
+    def test_live_pstyle_wins_over_tracked_previous_pstyle(self):
+        p = (
+            '<w:p><w:pPr><w:pStyle w:val="CurrentBody"/>'
+            '<w:pPrChange w:id="7"><w:pPr>'
+            '<w:pStyle w:val="HistoricalList"/>'
+            '</w:pPr></w:pPrChange></w:pPr></w:p>'
+        )
+        assert paragraph_pstyle_from_block(p) == "CurrentBody"
+
 
 # ── paragraph_numpr_from_block ───────────────────────────────────────────────
 
@@ -277,3 +344,20 @@ class TestParagraphNumprFromBlock:
         result = paragraph_numpr_from_block(p)
         assert result["numId"] is None
         assert result["ilvl"] is None
+
+    def test_tracked_previous_numpr_is_not_live(self):
+        p = (
+            '<w:p><w:pPr><w:pPrChange w:id="7"><w:pPr><w:numPr>'
+            '<w:ilvl w:val="4"/><w:numId w:val="91"/>'
+            '</w:numPr></w:pPr></w:pPrChange></w:pPr></w:p>'
+        )
+        assert paragraph_numpr_from_block(p) == {"numId": None, "ilvl": None}
+
+    def test_live_numpr_wins_over_tracked_previous_numpr(self):
+        p = (
+            '<w:p><w:pPr><w:numPr><w:ilvl w:val="1"/>'
+            '<w:numId w:val="5"/></w:numPr><w:pPrChange w:id="7"><w:pPr>'
+            '<w:numPr><w:ilvl w:val="4"/><w:numId w:val="91"/></w:numPr>'
+            '</w:pPr></w:pPrChange></w:pPr></w:p>'
+        )
+        assert paragraph_numpr_from_block(p) == {"numId": "5", "ilvl": "1"}

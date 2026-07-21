@@ -61,6 +61,10 @@
             "numId": { "type": "string" },
             "ilvl": { "type": "string" },
             "abstractNumId": { "type": "string" },
+            "start": { "type": "string" },
+            "lvlRestart": { "type": "string" },
+            "suff": { "type": "string" },
+            "isLgl": { "type": "string" },
             "startOverride": { "type": "string" },
             "numFmt": { "type": "string" },
             "lvlText": { "type": "string" }

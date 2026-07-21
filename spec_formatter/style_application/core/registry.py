@@ -521,7 +521,8 @@ def validate_phase1_bundle_directory(
         "warning", "numbering_provenance", "numbering_pattern",
     }
     allowed_pattern_keys = {
-        "numId", "ilvl", "abstractNumId", "startOverride", "numFmt", "lvlText",
+        "numId", "ilvl", "abstractNumId", "start", "lvlRestart", "suff",
+        "isLgl", "startOverride", "numFmt", "lvlText",
     }
     for role, spec in roles.items():
         if not isinstance(spec, dict):
