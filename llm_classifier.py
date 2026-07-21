@@ -17,10 +17,15 @@ from paragraph_rules import (
     is_classifiable_paragraph,
     infer_expected_roles,
 )
-from spec_formatter.role_contract import ROLE_TO_ARCH_STYLE, ROLE_TO_STYLE_NAME
+from spec_formatter.role_contract import (
+    ROLE_ORDER,
+    ROLE_TO_ARCH_STYLE,
+    ROLE_TO_STYLE_NAME,
+)
 
 
 MAX_SINGLE_PASS_INPUT_TOKENS = 150_000
+DEFAULT_RESPONSE_ATTEMPTS = 2
 
 
 def estimate_tokens(text: str) -> int:
@@ -39,12 +44,115 @@ def _strip_code_fences(text: str) -> str:
     return text.strip()
 
 
+def _role_spec_schema() -> dict:
+    """Return the structured-output schema shared by every role entry."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "styleId": {"type": "string"},
+            "exemplar_paragraph_index": {"type": "integer"},
+        },
+        "required": ["styleId", "exemplar_paragraph_index"],
+    }
+
+
+def _instruction_response_schema() -> dict:
+    """Return the Anthropic JSON schema for a complete Phase 1 response.
+
+    The runtime validators remain authoritative for document-aware constraints.
+    This API-facing subset prevents malformed JSON and rejects unknown fields
+    before a response reaches the local parser.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "create_styles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "styleId": {
+                            "type": "string",
+                            "enum": [ROLE_TO_ARCH_STYLE[role] for role in ROLE_ORDER],
+                        },
+                        "name": {"type": "string"},
+                        "type": {"type": "string", "enum": ["paragraph"]},
+                        "derive_from_paragraph_index": {"type": "integer"},
+                        "basedOn": {"type": ["string", "null"]},
+                        "role": {"type": "string"},
+                    },
+                    "required": ["styleId", "derive_from_paragraph_index"],
+                },
+            },
+            "apply_pStyle": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "paragraph_index": {"type": "integer"},
+                        "styleId": {"type": "string"},
+                    },
+                    "required": ["paragraph_index", "styleId"],
+                },
+            },
+            "ignored_paragraphs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "paragraph_index": {"type": "integer"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["paragraph_index", "reason"],
+                },
+            },
+            "roles": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    role: _role_spec_schema()
+                    for role in ROLE_ORDER
+                },
+            },
+            "notes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "create_styles",
+            "apply_pStyle",
+            "ignored_paragraphs",
+            "roles",
+            "notes",
+        ],
+    }
+
+
+def _patch_response_schema() -> dict:
+    """Return the structured-output schema for a targeted coverage patch."""
+    full_schema = _instruction_response_schema()
+    properties = full_schema["properties"]
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "apply_pStyle": properties["apply_pStyle"],
+            "ignored_paragraphs": properties["ignored_paragraphs"],
+        },
+        "required": ["apply_pStyle", "ignored_paragraphs"],
+    }
+
+
 def _call_api(
     client: Any,
     system: str,
     user_message: str,
     model: str,
     max_tokens: int = 128000,
+    response_schema: Optional[dict] = None,
 ) -> str:
     """Single API call with retry logic. Returns raw response text."""
     import anthropic
@@ -56,11 +164,38 @@ def _call_api(
                 model=model,
                 max_tokens=max_tokens,
                 thinking={"type": "adaptive"},
-                output_config={"effort": "high"},
+                output_config={
+                    "effort": "high",
+                    "format": {
+                        "type": "json_schema",
+                        "schema": (
+                            response_schema
+                            if response_schema is not None
+                            else _instruction_response_schema()
+                        ),
+                    },
+                },
                 system=system,
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
-                return stream.get_final_text()
+                raw = stream.get_final_text()
+                stop_reason = stream.get_final_message().stop_reason
+                if stop_reason == "max_tokens":
+                    raise ValueError(
+                        "LLM response reached the output-token limit before "
+                        "completing its JSON (stop_reason=max_tokens)"
+                    )
+                if stop_reason == "refusal":
+                    raise ValueError(
+                        "LLM refused the template-classification request "
+                        "(stop_reason=refusal)"
+                    )
+                if stop_reason not in (None, "end_turn"):
+                    raise ValueError(
+                        "LLM response ended unexpectedly "
+                        f"(stop_reason={stop_reason})"
+                    )
+                return raw
         except (anthropic.APIConnectionError, anthropic.RateLimitError) as e:
             last_error = e
             if attempt < 2:
@@ -98,11 +233,69 @@ def _parse_response(raw: str) -> dict:
         )
     except (json.JSONDecodeError, ValueError) as e:
         raise ValueError(
-            f"LLM response is not valid JSON: {e}\n\nRaw response (first 2000 chars):\n{raw[:2000]}"
+            f"LLM response is not valid JSON: {e} "
+            f"(response length: {len(cleaned)} characters)"
         ) from e
     if not isinstance(parsed, dict):
         raise ValueError("LLM response must be a JSON object")
     return parsed
+
+
+def _retry_requirement(error: Exception) -> str:
+    """Build a concise correction appended after an unusable JSON response."""
+    detail = str(error).splitlines()[0]
+    return (
+        "\n\nRETRY REQUIREMENT: The prior response could not be parsed: "
+        f"{detail}. Regenerate the entire response as exactly one complete JSON "
+        "object. Do not return prose, Markdown fences, or partial JSON."
+    )
+
+
+def _request_json_response(
+    client: Any,
+    system: str,
+    user_message: str,
+    model: str,
+    *,
+    response_schema: dict,
+    max_attempts: int,
+) -> dict:
+    """Request and strictly parse JSON, regenerating malformed output once."""
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("max_response_attempts must be a positive integer")
+
+    last_error: Optional[ValueError] = None
+    for attempt in range(max_attempts):
+        prompt = (
+            user_message
+            if attempt == 0
+            else user_message + _retry_requirement(
+                last_error or ValueError("prior response was not usable")
+            )
+        )
+        raw = _call_api(
+            client,
+            system,
+            prompt,
+            model,
+            response_schema=response_schema,
+        )
+        try:
+            return _parse_response(raw)
+        except ValueError as exc:
+            last_error = exc
+            if attempt + 1 < max_attempts:
+                print(
+                    "JSON parse error; regenerating complete response "
+                    f"({attempt + 2}/{max_attempts})..."
+                )
+
+    assert last_error is not None  # max_attempts is validated above
+    detail = str(last_error).splitlines()[0]
+    suffix = "attempt" if max_attempts == 1 else "attempts"
+    raise ValueError(
+        f"LLM response is not valid JSON after {max_attempts} {suffix}: {detail}"
+    ) from last_error
 
 
 def _normalize_known_exclusions(instructions: dict, slim_bundle: dict) -> int:
@@ -559,6 +752,7 @@ def classify_document(
     api_key: str,
     model: str = "claude-opus-4-8",
     max_patch_attempts: int = 3,
+    max_response_attempts: int = DEFAULT_RESPONSE_ATTEMPTS,
 ) -> dict:
     """
     Classify all paragraphs in a slim bundle using the Anthropic API.
@@ -580,6 +774,8 @@ def classify_document(
         api_key: Anthropic API key.
         model: Model ID to use.
         max_patch_attempts: Max number of targeted patch calls (default 3).
+        max_response_attempts: Total attempts allowed for each JSON response
+            before malformed output fails the run (default 2).
 
     Returns:
         Parsed instructions dict (same schema as instructions.json).
@@ -614,8 +810,14 @@ def classify_document(
     )
     user_message = f"{run_instruction}\n\nSlim bundle:\n{bundle_json}"
 
-    raw = _call_api(client, master_prompt, user_message, model)
-    instructions = _parse_response(raw)
+    instructions = _request_json_response(
+        client,
+        master_prompt,
+        user_message,
+        model,
+        response_schema=_instruction_response_schema(),
+        max_attempts=max_response_attempts,
+    )
 
     normalized_exclusions = _normalize_known_exclusions(instructions, slim_bundle)
     if normalized_exclusions:
@@ -662,8 +864,14 @@ def classify_document(
             )
 
             patch_prompt = _build_patch_prompt(slim_bundle, instructions, missing)
-            patch_raw = _call_api(client, master_prompt, patch_prompt, model)
-            patch_result = _parse_response(patch_raw)
+            patch_result = _request_json_response(
+                client,
+                master_prompt,
+                patch_prompt,
+                model,
+                response_schema=_patch_response_schema(),
+                max_attempts=max_response_attempts,
+            )
             _validate_patch_result(patch_result, missing, instructions)
 
             # Merge patch results into instructions

@@ -88,6 +88,22 @@ def _body_instructions(styled_indices) -> dict:
     }
 
 
+_MISSING_COMMA_INITIAL_RESPONSE = """{
+  "create_styles": [],
+  "apply_pStyle": [
+    {"paragraph_index": 0, "styleId": "Body"}
+  ]
+  "ignored_paragraphs": [],
+  "roles": {
+    "PARAGRAPH": {
+      "styleId": "Body",
+      "exemplar_paragraph_index": 0
+    }
+  },
+  "notes": []
+}"""
+
+
 def test_parse_response_rejects_duplicate_keys() -> None:
     with pytest.raises(ValueError, match="duplicate JSON key: 'roles'"):
         _parse_response('{"roles": {}, "roles": {}}')
@@ -243,7 +259,9 @@ def test_targeted_patch_merges_styled_and_ignored_paragraphs(monkeypatch) -> Non
     ]
     prompts = []
 
-    def fake_call(_client, _system, user_message, _model, max_tokens=128000):
+    def fake_call(
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+    ):
         prompts.append(user_message)
         return responses.pop(0)
 
@@ -260,6 +278,136 @@ def test_targeted_patch_merges_styled_and_ignored_paragraphs(monkeypatch) -> Non
     ]
     assert "Classify ONLY the following paragraph indices: [1, 2]" in prompts[1]
     assert "never guess from a neighboring style" in prompts[1]
+
+
+def test_classifier_regenerates_after_missing_comma_in_initial_response(
+    monkeypatch,
+) -> None:
+    _install_fake_anthropic(monkeypatch)
+    responses = [
+        _MISSING_COMMA_INITIAL_RESPONSE,
+        json.dumps(_body_instructions([0])),
+    ]
+    prompts = []
+
+    def fake_call(
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+    ):
+        prompts.append(user_message)
+        return responses.pop(0)
+
+    monkeypatch.setattr(llm_classifier, "_call_api", fake_call)
+    monkeypatch.setattr(llm_classifier.time, "sleep", lambda _seconds: None)
+
+    result = classify_document(
+        _plain_bundle(1),
+        "master",
+        "run",
+        "fake-key",
+        max_patch_attempts=0,
+        max_response_attempts=2,
+    )
+
+    assert result == _body_instructions([0])
+    assert len(prompts) == 2
+    assert prompts[1].startswith(prompts[0])
+    assert "RETRY REQUIREMENT" in prompts[1]
+
+
+def test_classifier_bounds_repeated_malformed_initial_responses(monkeypatch) -> None:
+    _install_fake_anthropic(monkeypatch)
+    prompts = []
+
+    def fake_call(
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+    ):
+        prompts.append(user_message)
+        return _MISSING_COMMA_INITIAL_RESPONSE
+
+    monkeypatch.setattr(llm_classifier, "_call_api", fake_call)
+    monkeypatch.setattr(llm_classifier.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(ValueError) as exc_info:
+        classify_document(
+            _plain_bundle(1),
+            "master",
+            "run",
+            "fake-key",
+            max_patch_attempts=0,
+            max_response_attempts=2,
+        )
+
+    message = str(exc_info.value)
+    assert len(prompts) == 2
+    assert "after 2" in message
+    assert "attempt" in message
+    assert "Raw response" not in message
+    assert len(message) < 500
+
+
+def test_classifier_regenerates_malformed_targeted_patch_then_merges(
+    monkeypatch,
+) -> None:
+    _install_fake_anthropic(monkeypatch)
+    responses = [
+        json.dumps(_body_instructions([0])),
+        """{
+  "apply_pStyle": [
+    {"paragraph_index": 1, "styleId": "Body"}
+  ]
+  "ignored_paragraphs": []
+}""",
+        json.dumps(
+            {
+                "apply_pStyle": [
+                    {"paragraph_index": 1, "styleId": "Body"},
+                ],
+                "ignored_paragraphs": [],
+            }
+        ),
+    ]
+    prompts = []
+    schemas = []
+
+    def fake_call(
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+    ):
+        prompts.append(user_message)
+        schemas.append(response_schema)
+        return responses.pop(0)
+
+    monkeypatch.setattr(llm_classifier, "_call_api", fake_call)
+    monkeypatch.setattr(llm_classifier.time, "sleep", lambda _seconds: None)
+
+    result = classify_document(
+        _plain_bundle(2),
+        "master",
+        "run",
+        "fake-key",
+        max_patch_attempts=1,
+        max_response_attempts=2,
+    )
+
+    assert result["apply_pStyle"] == [
+        {"paragraph_index": 0, "styleId": "Body"},
+        {"paragraph_index": 1, "styleId": "Body"},
+    ]
+    assert result["ignored_paragraphs"] == []
+    assert len(prompts) == 3
+    assert "Classify ONLY the following paragraph indices: [1]" in prompts[1]
+    assert prompts[2].startswith(prompts[1])
+    assert "RETRY REQUIREMENT" in prompts[2]
+    assert set(schemas[0]["properties"]) == {
+        "create_styles",
+        "apply_pStyle",
+        "ignored_paragraphs",
+        "roles",
+        "notes",
+    }
+    assert all(
+        set(schema["properties"]) == {"apply_pStyle", "ignored_paragraphs"}
+        for schema in schemas[1:]
+    )
 
 
 @pytest.mark.parametrize(
@@ -300,7 +448,9 @@ def test_incomplete_patches_fail_closed_without_nearest_neighbor_fill(monkeypatc
     ]
     prompts = []
 
-    def fake_call(_client, _system, user_message, _model, max_tokens=128000):
+    def fake_call(
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+    ):
         prompts.append(user_message)
         return responses.pop(0)
 
@@ -330,6 +480,9 @@ def test_call_api_retries_connection_and_rate_limit_errors(monkeypatch) -> None:
         def get_final_text(self):
             return "success"
 
+        def get_final_message(self):
+            return types.SimpleNamespace(stop_reason="end_turn")
+
     class Messages:
         def __init__(self):
             self.outcomes = [
@@ -349,6 +502,91 @@ def test_call_api_retries_connection_and_rate_limit_errors(monkeypatch) -> None:
 
     assert _call_api(client, "system", "user", "model") == "success"
     assert sleeps == [2, 4]
+
+
+def test_call_api_requests_phase1_json_schema(monkeypatch) -> None:
+    _install_fake_anthropic(monkeypatch)
+    captured = {}
+
+    class FinalStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_final_text(self):
+            return "success"
+
+        def get_final_message(self):
+            return types.SimpleNamespace(stop_reason="end_turn")
+
+    class Messages:
+        def stream(self, **kwargs):
+            captured.update(kwargs)
+            return FinalStream()
+
+    client = types.SimpleNamespace(messages=Messages())
+
+    assert _call_api(client, "system", "user", "model") == "success"
+    output_config = captured["output_config"]
+    assert output_config["effort"] == "high"
+    assert output_config["format"]["type"] == "json_schema"
+    schema = output_config["format"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == {
+        "create_styles",
+        "apply_pStyle",
+        "ignored_paragraphs",
+        "roles",
+        "notes",
+    }
+    assert set(schema["required"]) == set(schema["properties"])
+    assert set(schema["properties"]["roles"]["properties"]) == set(
+        llm_classifier.ROLE_ORDER
+    )
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "match"),
+    [
+        ("max_tokens", "output-token limit.*stop_reason=max_tokens"),
+        ("refusal", "refused.*stop_reason=refusal"),
+    ],
+)
+def test_call_api_reports_non_json_stop_reasons_without_retry(
+    monkeypatch,
+    stop_reason: str,
+    match: str,
+) -> None:
+    _install_fake_anthropic(monkeypatch)
+    calls = 0
+
+    class FinalStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_final_text(self):
+            return "not a complete structured response"
+
+        def get_final_message(self):
+            return types.SimpleNamespace(stop_reason=stop_reason)
+
+    class Messages:
+        def stream(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return FinalStream()
+
+    client = types.SimpleNamespace(messages=Messages())
+
+    with pytest.raises(ValueError, match=match):
+        _call_api(client, "system", "user", "model")
+    assert calls == 1
 
 
 def test_call_api_does_not_retry_nontransient_status(monkeypatch) -> None:
@@ -377,7 +615,9 @@ def test_more_than_500_small_paragraphs_reach_classifier(monkeypatch) -> None:
     instructions = _body_instructions(range(501))
     calls = []
 
-    def fake_call(_client, _system, user_message, _model, max_tokens=128000):
+    def fake_call(
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+    ):
         calls.append(user_message)
         return json.dumps(instructions)
 
