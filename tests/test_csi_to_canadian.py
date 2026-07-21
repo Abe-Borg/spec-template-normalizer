@@ -361,6 +361,55 @@ def test_automatic_csi_numbering_is_retargeted_without_text_edits():
     assert plan.report.edits[0].source_kind == "automatic"
 
 
+def test_automatic_deep_role_uses_closest_available_architect_fallback():
+    styles = "".join(
+        f'<w:style w:type="paragraph" w:styleId="PR{offset}"><w:pPr><w:numPr>'
+        f'<w:ilvl w:val="{level}"/><w:numId w:val="2"/>'
+        '</w:numPr></w:pPr></w:style>'
+        for offset, level in enumerate(range(4, 9), start=1)
+    )
+    source = _document(
+        *(
+            _paragraph(f"Level {level}", f'<w:pStyle w:val="PR{offset}"/>')
+            for offset, level in enumerate(range(4, 9), start=1)
+        )
+    )
+    numbering = (
+        f'<w:numbering xmlns:w="{W_NS}"><w:abstractNum w:abstractNumId="1">'
+        '<w:lvl w:ilvl="4"><w:start w:val="1"/><w:numFmt w:val="upperLetter"/>'
+        '<w:lvlText w:val="%5."/></w:lvl>'
+        '<w:lvl w:ilvl="5"><w:start w:val="1"/><w:numFmt w:val="decimal"/>'
+        '<w:lvlText w:val="%6."/></w:lvl>'
+        '<w:lvl w:ilvl="6"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/>'
+        '<w:lvlText w:val="%7."/></w:lvl>'
+        '<w:lvl w:ilvl="7"><w:start w:val="1"/><w:numFmt w:val="decimal"/>'
+        '<w:lvlText w:val="%8)"/></w:lvl>'
+        '<w:lvl w:ilvl="8"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/>'
+        '<w:lvlText w:val="%9)"/></w:lvl>'
+        '</w:abstractNum><w:num w:numId="2"><w:abstractNumId w:val="1"/>'
+        '</w:num></w:numbering>'
+    )
+    roles = (
+        "PARAGRAPH",
+        "SUBPARAGRAPH",
+        "SUBSUBPARAGRAPH",
+        "SUBPARAGRAPH_LEVEL_5",
+        # The source is semantically level 6, but the architect only has level 5.
+        "SUBPARAGRAPH_LEVEL_5",
+    )
+
+    plan = plan_csi_to_canadian(
+        source,
+        _styles(styles),
+        _classifications(*roles),
+        _canadian_role_specs(*dict.fromkeys(roles)),
+        numbering_xml=numbering,
+    )
+
+    assert plan.document_xml == source
+    assert [edit.role for edit in plan.report.edits] == list(roles)
+
+
 def test_sparse_masterspec_part_and_article_numbering_is_retargeted():
     styles = (
         '<w:style w:type="paragraph" w:styleId="PRT"><w:pPr><w:numPr>'

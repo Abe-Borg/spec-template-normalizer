@@ -23,6 +23,7 @@ from spec_formatter.numbering_roles import (
 from spec_formatter.role_contract import (
     BODY_HIERARCHY_ROLES,
     NUMBERED_BODY_ROLES,
+    ROLE_FALLBACKS,
     ROLE_LEVEL,
     ROLE_PARENT,
 )
@@ -648,6 +649,7 @@ def _validate_automatic_source(
     item: _SourceEvidence,
     numbering_root: Optional[ET.Element],
     numbering_catalog: Dict[str, Any],
+    available_roles: set[str],
 ) -> None:
     if numbering_root is None or item.automatic_numpr is None:
         raise ValueError(
@@ -670,10 +672,23 @@ def _validate_automatic_source(
         inferred = role_from_numbering_signature(
             pattern.get("numFmt"), pattern.get("lvlText"), pattern.get("ilvl")
         )
-    if inferred != item.role:
+    resolved = next(
+        (
+            candidate
+            for candidate in ROLE_FALLBACKS.get(inferred, (inferred,))
+            if candidate in available_roles
+        ),
+        None,
+    ) if inferred is not None else None
+    if resolved != item.role:
         raise ValueError(
             f"Paragraph {item.paragraph_index} is classified as {item.role}, but its "
-            f"automatic numbering signature resolves to {inferred or 'no safe role'}."
+            f"automatic numbering signature resolves to {inferred or 'no safe role'}"
+            + (
+                f" (available-role fallback: {resolved})."
+                if resolved is not None and resolved != inferred
+                else "."
+            )
         )
     level, override = _find_numbering_level(numbering_root, num_id, ilvl)
     _validate_numbering_start(
@@ -1056,7 +1071,12 @@ def plan_csi_to_canadian(
     for item in evidence:
         if item.source_kind != "automatic":
             continue
-        _validate_automatic_source(item, numbering_root, numbering_catalog)
+        _validate_automatic_source(
+            item,
+            numbering_root,
+            numbering_catalog,
+            set(role_specs),
+        )
         assert item.automatic_numpr is not None
         automatic_ids.setdefault(item.role, set()).add(item.automatic_numpr["numId"])
         automatic_by_index[item.paragraph_index] = item

@@ -27,10 +27,27 @@ _CHUNK_OVERLAP = 20
 
 
 def _build_user_message(slim_bundle: dict, available_roles: list) -> str:
+    # Only unresolved paragraphs belong in the model request.  The complete
+    # bundle also contains deterministic classifications and filtered paragraph
+    # indices for local audit/reassembly; exposing those indices invites the
+    # model to echo entries that validation correctly rejects.
+    prompt_bundle = {"paragraphs": slim_bundle.get("paragraphs", [])}
+    if "_chunk_info" in slim_bundle:
+        prompt_bundle["_chunk_info"] = slim_bundle["_chunk_info"]
     return (
         PHASE2_RUN_INSTRUCTION.strip()
         + "\n\navailable_roles: " + json.dumps(available_roles)
-        + "\n\n" + json.dumps(slim_bundle, indent=2)
+        + "\n\n" + json.dumps(prompt_bundle, indent=2)
+    )
+
+
+def _retry_requirement(error: Exception, allowed_indices: Set[int]) -> str:
+    return (
+        "\n\nRETRY REQUIREMENT: The prior response failed validation: "
+        f"{error}. Return exactly one complete JSON object with no prose, "
+        "Markdown fence, or text before or after it. The classifications array "
+        "must contain exactly one entry for each of these paragraph_index values "
+        f"and no other indices: {json.dumps(sorted(allowed_indices))}."
     )
 
 
@@ -146,7 +163,7 @@ def _split_bundle_into_chunks(slim_bundle: dict, max_chars: int = _MAX_BUNDLE_CH
     roles = slim_bundle.get("available_roles", [])
     filter_report = slim_bundle.get("filter_report", {})
 
-    full_json = json.dumps(slim_bundle)
+    full_json = json.dumps({"paragraphs": paragraphs})
     if len(full_json) <= max_chars and len(paragraphs) <= 300:
         return [slim_bundle]
 
@@ -234,6 +251,13 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
 
         user_message = _build_user_message(chunk, available_roles)
         max_retries = 2
+        allowed_indices = {
+            p.get("paragraph_index")
+            for p in chunk.get("paragraphs", [])
+            if isinstance(p, dict) and isinstance(p.get("paragraph_index"), int)
+        }
+        retry_error: Exception | None = None
+        response_text = ""
 
         for attempt in range(max_retries + 1):
             try:
@@ -250,22 +274,18 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                         "content": (
                             user_message
                             if attempt == 0
-                            else user_message
-                            + "\n\nRETRY REQUIREMENT: The prior response was not usable. "
-                            "Return exactly one complete JSON object with no prose, "
-                            "Markdown fence, or text before or after it."
+                            else user_message + _retry_requirement(
+                                retry_error or ValueError("prior response was not usable"),
+                                allowed_indices,
+                            )
                         ),
                     }],
                 ) as stream:
                     response_text = stream.get_final_text()
                 parsed = _parse_classification_response(response_text)
-                allowed_indices = {
-                    p.get("paragraph_index")
-                    for p in chunk.get("paragraphs", [])
-                    if isinstance(p, dict) and isinstance(p.get("paragraph_index"), int)
-                }
                 return _validate_classifications(parsed, available_roles, allowed_indices)
             except json.JSONDecodeError as e:
+                retry_error = e
                 if attempt < max_retries:
                     print(f"  JSON parse error, retrying ({attempt + 1}/{max_retries})...")
                     time.sleep(2 ** attempt)
@@ -277,9 +297,10 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                         f"{response_length} characters): {e}"
                     )
             except Exception as e:
+                retry_error = e
                 if attempt < max_retries:
                     wait = 2 ** (attempt + 1)
-                    print(f"  API error: {e}, retrying in {wait}s ({attempt + 1}/{max_retries})...")
+                    print(f"  Classification attempt failed: {e}, retrying in {wait}s ({attempt + 1}/{max_retries})...")
                     time.sleep(wait)
                 else:
                     raise RuntimeError(f"LLM classification failed after {max_retries + 1} attempts: {e}")

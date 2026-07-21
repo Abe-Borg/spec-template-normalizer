@@ -133,6 +133,7 @@ _SECTION_ID_RX = re.compile(
 )
 _END_OF_SECTION_RX = re.compile(r"^\s*END\s+OF\s+SECTION\s*", re.IGNORECASE)
 _ALL_CAPS_RX = re.compile(r"^[^a-z]*[A-Z][^a-z]*$")
+_EDITORIAL_COMMENT_STYLE_IDS = frozenset({"CMT"})
 _MARKER_RX = [
     (re.compile(r"^\s*[A-Z]\.\s+"), "upper_alpha"),
     (re.compile(r"^\s*\d+\.\s+"), "number"),
@@ -142,6 +143,20 @@ _MARKER_RX = [
     (re.compile(r"^\s*\(\d+\)\s+"), "deep_level_7"),
     (re.compile(r"^\s*\([a-z]\)\s+"), "deep_level_8"),
 ]
+
+
+def _match_section_header(text: str) -> Optional[re.Match[str]]:
+    """Match a section header without consuming sentence-form cross-references."""
+
+    match = _SECTION_ID_RX.match(text)
+    if match is None:
+        return None
+    remainder = text[match.end():].strip(
+        " \t\u00a0-\u2010\u2011\u2012\u2013\u2014\u2015:"
+    )
+    if remainder and not _ALL_CAPS_RX.fullmatch(remainder):
+        return None
+    return match
 
 
 def _table_ranges(document_xml_text: str) -> List[Tuple[int, int]]:
@@ -403,7 +418,7 @@ def _deterministic_role_for_paragraph(paragraph: Dict[str, Any], prev_text: str 
     text = paragraph.get("text", "")
     if not text or paragraph.get("in_table"):
         return None
-    if _SECTION_ID_RX.match(text):
+    if _match_section_header(text):
         return "SectionID"
     if _END_OF_SECTION_RX.match(text):
         return "END_OF_SECTION"
@@ -411,7 +426,7 @@ def _deterministic_role_for_paragraph(paragraph: Dict[str, Any], prev_text: str 
         return "PART"
     if _ARTICLE_RX.match(text):
         return "ARTICLE"
-    if prev_text and _SECTION_ID_RX.match(prev_text) and _ALL_CAPS_RX.match(text):
+    if prev_text and _match_section_header(prev_text) and _ALL_CAPS_RX.match(text):
         return "SectionTitle"
 
     # Automatic numbering is deterministic only when its effective rendered
@@ -543,6 +558,7 @@ def build_phase2_slim_bundle(
             continue
         contains_drawing_or_textbox = _contains_drawing_or_textbox(p_xml)
         analysis_xml = strip_out_of_scope_subtrees(p_xml)
+        pstyle = paragraph_pstyle_from_block(analysis_xml)
         if contains_drawing_or_textbox:
             filter_report["paragraphs_out_of_scope"].append({
                 "paragraph_index": idx,
@@ -576,12 +592,29 @@ def build_phase2_slim_bundle(
                 "tags": tags
             })
 
+        # MasterSpec uses the dedicated CMT paragraph style for editorial
+        # instructions that are intentionally preserved in the document but
+        # must not receive an architect content style.  Text-pattern filtering
+        # catches many of these notes, but not open-ended guidance such as
+        # "Always retain..." or explanatory paragraphs containing URLs.
+        if pstyle in _EDITORIAL_COMMENT_STYLE_IDS:
+            filter_report["paragraphs_removed_entirely"].append({
+                "paragraph_index": idx,
+                "tags": ["editorial_comment_style"],
+                "original_text_preview": raw_text[:120],
+            })
+            continue
+
         # A source can contain a section-number/title header even when the
         # architect template has no semantic style for it.  Such a header has
         # no valid parent-role fallback: classifying it as PART would cause a
         # numbered Canadian PART style to insert a spurious list item.  Keep
         # the original paragraph untouched and outside classification instead.
-        section_match = _SECTION_ID_RX.match(cleaned_text)
+        # A real combined section header is conventionally uppercase.
+        # Sentence-form cross-references such as
+        # `Section 012100 "Allowances" for ...` are numbered content and must
+        # remain in the classification bundle.
+        section_match = _match_section_header(cleaned_text)
         if skip_next_section_title:
             skip_next_section_title = False
             has_csi_marker = bool(
@@ -639,7 +672,6 @@ def build_phase2_slim_bundle(
             )
             if contextual_numbering_role not in available_roles:
                 contextual_numbering_role = None
-        pstyle = paragraph_pstyle_from_block(analysis_xml)
         ppr_hints = paragraph_ppr_hints_from_block(analysis_xml)
         rpr_hints = _extract_rpr_hints(analysis_xml)
         marker_type = _detect_marker_type(cleaned_text, effective_numpr or numpr)

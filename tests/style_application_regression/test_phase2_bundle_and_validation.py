@@ -424,6 +424,61 @@ def test_combined_section_header_without_template_role_is_preserved_unclassified
     ]
 
 
+def test_sentence_form_section_cross_reference_remains_classifiable(tmp_path: Path):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:r><w:t>Section 012100 "Allowances" for procedural requirements.'
+        '</w:t></w:r></w:p>',
+    )
+
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PART", "ARTICLE", "PARAGRAPH"],
+    )
+
+    assert [p["paragraph_index"] for p in bundle["paragraphs"]] == [0]
+    assert bundle["filter_report"]["paragraphs_removed_entirely"] == []
+
+
+def test_numbered_section_cross_reference_uses_its_list_role():
+    paragraphs = [
+        {
+            "paragraph_index": 7,
+            "text": 'Section 012100 "Allowances" for procedural requirements.',
+            "in_table": False,
+            "effective_numPr": {"numId": "2", "ilvl": "5"},
+            "numbering_role": "SUBPARAGRAPH",
+        }
+    ]
+
+    assert preclassify_paragraphs(
+        paragraphs,
+        ["PART", "ARTICLE", "PARAGRAPH", "SUBPARAGRAPH"],
+    ) == {7: "SUBPARAGRAPH"}
+
+
+def test_masterspec_cmt_style_is_preserved_outside_classification(tmp_path: Path):
+    extract_dir = _write_document_xml(
+        tmp_path,
+        '<w:p><w:pPr><w:pStyle w:val="CMT"/></w:pPr>'
+        '<w:r><w:t>Always retain first three subparagraphs below.</w:t></w:r></w:p>',
+    )
+
+    bundle = build_phase2_slim_bundle(
+        extract_dir,
+        available_roles=["PART", "ARTICLE", "PARAGRAPH"],
+    )
+
+    assert bundle["paragraphs"] == []
+    assert bundle["filter_report"]["paragraphs_removed_entirely"] == [
+        {
+            "paragraph_index": 0,
+            "tags": ["editorial_comment_style"],
+            "original_text_preview": "Always retain first three subparagraphs below.",
+        }
+    ]
+
+
 def test_separate_section_title_without_template_role_is_preserved_unclassified(
     tmp_path: Path,
 ):

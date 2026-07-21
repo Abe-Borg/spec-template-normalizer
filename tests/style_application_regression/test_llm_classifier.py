@@ -5,6 +5,7 @@ import types
 import pytest
 
 from spec_formatter.style_application.core.llm_classifier import (
+    _build_user_message,
     _merge_chunk_results,
     _parse_classification_response,
     classify_target_document,
@@ -77,6 +78,25 @@ def test_classify_calls_llm_for_unresolved(monkeypatch):
     assert role_schema["enum"] == ["PART"]
 
 
+def test_user_message_exposes_only_unresolved_paragraphs():
+    bundle = {
+        "paragraphs": [{"paragraph_index": 3, "text": "A"}],
+        "deterministic_classifications": [
+            {"paragraph_index": 1, "csi_role": "PART"}
+        ],
+        "filter_report": {
+            "paragraphs_removed_entirely": [{"paragraph_index": 2}],
+        },
+    }
+
+    content = _build_user_message(bundle, ["PART"])
+    prompt_bundle = json.loads(content[content.rfind("\n\n{") + 2:])
+
+    assert prompt_bundle == {
+        "paragraphs": [{"paragraph_index": 3, "text": "A"}],
+    }
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -133,6 +153,55 @@ def test_empty_response_retry_uses_stricter_json_instruction(monkeypatch):
     assert len(messages.prompts) == 2
     assert "RETRY REQUIREMENT" not in messages.prompts[0]
     assert "RETRY REQUIREMENT" in messages.prompts[1]
+
+
+def test_validation_retry_names_exact_allowed_indices(monkeypatch):
+    class SequenceMessages:
+        def __init__(self):
+            self.payloads = [
+                json.dumps({
+                    "classifications": [
+                        {"paragraph_index": 1, "csi_role": "PART"},
+                    ],
+                    "notes": [],
+                }),
+                json.dumps({
+                    "classifications": [
+                        {"paragraph_index": 3, "csi_role": "PART"},
+                    ],
+                    "notes": [],
+                }),
+            ]
+            self.prompts = []
+
+        def stream(self, **kwargs):
+            self.prompts.append(kwargs["messages"][0]["content"])
+            return _FakeStream(self.payloads.pop(0))
+
+    messages = SequenceMessages()
+    fake = types.SimpleNamespace(messages=messages)
+    fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake)
+    monkeypatch.setitem(__import__("sys").modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr(
+        "spec_formatter.style_application.core.llm_classifier.time.sleep",
+        lambda _seconds: None,
+    )
+    bundle = {
+        "paragraphs": [{"paragraph_index": 3, "text": "A"}],
+        "available_roles": ["PART"],
+        "deterministic_classifications": [
+            {"paragraph_index": 1, "csi_role": "PART"}
+        ],
+    }
+
+    result = classify_target_document(bundle, ["PART"], api_key="x", model="m")
+
+    assert result["classifications"] == [
+        {"paragraph_index": 1, "csi_role": "PART"},
+        {"paragraph_index": 3, "csi_role": "PART"},
+    ]
+    assert "classification index not allowed: 1" in messages.prompts[1]
+    assert "and no other indices: [3]" in messages.prompts[1]
 
 
 def test_split_bundle_terminates_when_filter_report_dominates():
