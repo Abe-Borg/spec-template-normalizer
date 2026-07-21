@@ -6,6 +6,12 @@ application engine can be imported without importing the template engine.
 
 from typing import Any
 
+# Single source of truth for the app version. The frozen Windows build reports
+# this value, the in-app updater compares it against the release manifest, and
+# packaging/windows/check_release_version.py guards it against the git tag.
+# Bump this (only) when cutting a release; see docs/RELEASE_WINDOWS.md.
+__version__ = "1.0.0"
+
 __all__ = [
     "CSI_TO_CANADIAN",
     "FORMAT_ONLY",

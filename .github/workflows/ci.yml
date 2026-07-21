@@ -1,0 +1,66 @@
+# Test CI for Specification Formatter.
+#
+# Two jobs:
+#   * updater  (ubuntu)  -- runs the hermetic updater tests (tests/test_updates.py).
+#                           No network, no clock, no display -- a fast, always-green
+#                           gate that proves spec_formatter/updates.py and the
+#                           packaging scripts round-trip correctly. Also runs on
+#                           Python 3.9 to enforce the source floor.
+#   * suite    (windows) -- runs the full test suite on the primary GUI platform
+#                           (Windows, per CLAUDE.md), which is where tkinter and the
+#                           frozen app actually run.
+name: CI
+
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  updater:
+    name: Updater tests (hermetic)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+      - name: Run hermetic updater tests
+        run: python -m pytest tests/test_updates.py -q
+
+  suite:
+    name: Full test suite (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.11"
+      - name: Install dev deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Run test suite
+        shell: pwsh
+        run: python -m pytest tests -q

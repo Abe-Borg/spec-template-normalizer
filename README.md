@@ -26,7 +26,26 @@ the app safely reuses its validated analysis from the operating system's
 per-user application cache; the selected output folder contains only formatted
 documents and run logs.
 
-## Install
+## Download for Windows
+
+Most users do not need Python. Download the latest **SpecificationFormatterSetup.exe**
+from the [Releases page](https://github.com/abe-borg/spec-template-normalizer/releases/latest)
+and run it. It installs per-user (no admin prompt) with a Start-menu shortcut.
+
+The app is **not code-signed**, so the first time you run the installer Windows
+SmartScreen shows *"Windows protected your PC."* Choose **More info → Run
+anyway**. (The download is still integrity-checked: the in-app updater verifies
+every update's SHA-256 before running it.)
+
+### Updates
+
+The app checks for updates once a day on launch and via the **Check for Updates**
+button in the footer. When a newer version exists it shows what's new and lets
+you **Download & Install** (the app closes so the installer can replace it),
+**Skip this Version**, or decide **Later**. Update checks can be turned off with
+the `SPEC_FORMATTER_DISABLE_UPDATE_CHECK` environment variable.
+
+## Install from source (developers)
 
 Python 3.10 or newer is required.
 
@@ -37,7 +56,10 @@ python -m venv venv
 
 An Anthropic API key is required when a new architect template must be analyzed
 or when a target contains paragraphs that cannot be classified locally. The key
-is used only for the active run and is not saved by the application.
+is used for the active run. Tick **Remember** next to the key field to save it to
+the Windows Credential Manager (via `keyring`) so it is pre-filled on the next
+launch; leave it unticked and the key is held only in memory. The field is also
+pre-filled from the `ANTHROPIC_API_KEY` environment variable when set.
 
 ## Run the app
 
@@ -109,17 +131,22 @@ This mode converts numbering hierarchy and presentation only. It does **not**
 reorder articles, replace US codes or standards, convert units, change spelling
 or terminology, revise technical requirements, or certify NMS compliance.
 
-## Build one Windows executable
+## Build the Windows installer
 
-Install the build dependencies, then run the included build script:
+The distributable Windows app is a PyInstaller **one-folder** build wrapped by an
+Inno Setup installer. On Windows, from the repo root:
 
 ```powershell
-.\venv\Scripts\python.exe -m pip install -r requirements-build.txt
-.\build_app.ps1
+.\venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-build.txt
+.\venv\Scripts\pyinstaller.exe packaging\windows\specification-formatter.spec --noconfirm --clean
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.0.0 packaging\windows\installer.iss
 ```
 
-The single-file application is written to
-`dist\SpecificationFormatter.exe`.
+The app folder is written to `dist\SpecificationFormatter\` and the installer to
+`dist\installer\SpecificationFormatterSetup.exe`. Releases are normally built and
+published automatically by `.github/workflows/release.yml` on a `vX.Y.Z` tag — see
+[docs/RELEASE_WINDOWS.md](docs/RELEASE_WINDOWS.md) for the full runbook. The
+legacy `build_app.ps1` one-file script is retained for quick local smoke builds.
 
 ## Headless API
 
