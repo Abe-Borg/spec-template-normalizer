@@ -21,6 +21,7 @@ from .core.csi_to_canadian import (
     FORMAT_ONLY,
     CanadianConversionReport,
     apply_csi_to_canadian,
+    classifications_for_canadian_application,
     validate_conversion_mode,
 )
 from .core.token_utils import extract_target_tokens
@@ -379,6 +380,7 @@ def process_single_file(
             per_file_log.append(f"Classifications saved: {classifications_path}")
 
             target_tokens = extract_target_tokens(extract_dir, classifications)
+            application_classifications = classifications
 
             if conversion_mode == CSI_TO_CANADIAN:
                 per_file_log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
@@ -390,6 +392,10 @@ def process_single_file(
                     architect_numbering_xml=(
                         env_registry.get("numbering", {}).get("numbering_xml") or ""
                     ),
+                )
+                application_classifications = classifications_for_canadian_application(
+                    classifications,
+                    conversion_report,
                 )
 
             env_result = apply_environment_to_target(
@@ -410,7 +416,7 @@ def process_single_file(
 
             used_roles = {
                 item.get("csi_role")
-                for item in classifications.get("classifications", [])
+                for item in application_classifications.get("classifications", [])
                 if isinstance(item, dict) and isinstance(item.get("csi_role"), str)
             }
             hf_style_ids = env_result.get("header_footer_import", {}).get("style_ids", set())
@@ -462,7 +468,7 @@ def process_single_file(
             snap = snapshot_stability(extract_dir)
             apply_report = apply_phase2_classifications(
                 extract_dir=extract_dir,
-                classifications=classifications,
+                classifications=application_classifications,
                 arch_style_registry=arch_registry,
                 log=per_file_log,
                 role_specs=role_specs,
@@ -565,6 +571,7 @@ def _apply_batch_result(
         per_file_log.append(f"Classifications saved: {classifications_path}")
 
         target_tokens = extract_target_tokens(prepared.extract_dir, classifications)
+        application_classifications = classifications
 
         if conversion_mode == CSI_TO_CANADIAN:
             per_file_log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
@@ -576,6 +583,10 @@ def _apply_batch_result(
                 architect_numbering_xml=(
                     env_registry.get("numbering", {}).get("numbering_xml") or ""
                 ),
+            )
+            application_classifications = classifications_for_canadian_application(
+                classifications,
+                conversion_report,
             )
 
         env_result = apply_environment_to_target(
@@ -595,7 +606,7 @@ def _apply_batch_result(
 
         used_roles = {
             item.get("csi_role")
-            for item in classifications.get("classifications", [])
+            for item in application_classifications.get("classifications", [])
             if isinstance(item, dict) and isinstance(item.get("csi_role"), str)
         }
         hf_style_ids = env_result.get("header_footer_import", {}).get("style_ids", set())
@@ -647,7 +658,7 @@ def _apply_batch_result(
         snap = snapshot_stability(prepared.extract_dir)
         apply_report = apply_phase2_classifications(
             extract_dir=prepared.extract_dir,
-            classifications=classifications,
+            classifications=application_classifications,
             arch_style_registry=arch_registry,
             log=per_file_log,
             role_specs=role_specs,

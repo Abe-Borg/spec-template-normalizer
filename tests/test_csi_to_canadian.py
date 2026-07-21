@@ -8,12 +8,17 @@ from spec_formatter.style_application.core.csi_to_canadian import (
     CSI_TO_CANADIAN,
     FORMAT_ONLY,
     apply_csi_to_canadian,
+    classifications_for_canadian_application,
     plan_csi_to_canadian,
     validate_conversion_mode,
 )
 from spec_formatter.numbering_roles import role_from_numbering_signature
+from spec_formatter.style_application.core.classification import (
+    apply_phase2_classifications,
+)
 from spec_formatter.style_application.core.xml_helpers import (
     iter_paragraph_xml_blocks,
+    paragraph_pstyle_from_block,
     paragraph_text_from_block,
 )
 
@@ -450,6 +455,43 @@ def test_typed_canadian_marker_requires_word_tab_and_canonical_counter():
         )
 
 
+def test_spaced_canadian_articles_convert_when_part_sequence_proves_them():
+    roles = ("PART", "ARTICLE", "ARTICLE")
+    source = _document(
+        _paragraph("PART 1 GENERAL"),
+        _paragraph("1.1 SUMMARY"),
+        _paragraph("1.2 REFERENCES"),
+    )
+
+    plan = plan_csi_to_canadian(
+        source,
+        _styles(),
+        _classifications(*roles),
+        _canadian_role_specs(*dict.fromkeys(roles)),
+    )
+
+    assert _texts(plan.document_xml)[:3] == ["GENERAL", "SUMMARY", "REFERENCES"]
+    assert [edit.source_kind for edit in plan.report.edits] == [
+        "literal",
+        "already_canadian",
+        "already_canadian",
+    ]
+
+
+def test_spaced_decimal_measurement_is_not_accepted_as_canadian_article():
+    roles = ("PART", "ARTICLE")
+    with pytest.raises(ValueError, match="ambiguous decimal text"):
+        plan_csi_to_canadian(
+            _document(
+                _paragraph("PART 1 GENERAL"),
+                _paragraph("1.1 mm thick"),
+            ),
+            _styles(),
+            _classifications(*roles),
+            _canadian_role_specs(*roles),
+        )
+
+
 def test_deep_numbering_signatures_are_not_deterministically_misclassified():
     assert role_from_numbering_signature("decimal", "%1.%2", "1") == "ARTICLE"
     assert role_from_numbering_signature("decimal", "%1.%2.%3", "2") is None
@@ -486,18 +528,66 @@ def test_noncanonical_typed_sequences_fail_closed(paragraphs, roles, message):
         )
 
 
-def test_unnumbered_classification_is_not_inserted_into_known_sequence():
-    with pytest.raises(ValueError, match="neither a recognized typed marker"):
-        plan_csi_to_canadian(
-            _document(
-                _paragraph("A. First"),
-                _paragraph("Unproven list item"),
-                _paragraph("B. Second"),
-            ),
-            _styles(),
-            _classifications("PARAGRAPH", "PARAGRAPH", "PARAGRAPH"),
-            _canadian_role_specs("PARAGRAPH"),
-        )
+def test_unnumbered_classification_is_not_inserted_into_known_sequence(tmp_path: Path):
+    classifications = _classifications("PARAGRAPH", "PARAGRAPH", "PARAGRAPH")
+    plan = plan_csi_to_canadian(
+        _document(
+            _paragraph("A. First"),
+            _paragraph("Unproven list item"),
+            _paragraph("B. Second"),
+        ),
+        _styles(),
+        classifications,
+        _canadian_role_specs("PARAGRAPH"),
+    )
+
+    assert _texts(plan.document_xml)[:3] == [
+        "First",
+        "Unproven list item",
+        "Second",
+    ]
+    assert len(plan.report.warnings) == 1
+    assert plan.report.warnings[0].paragraph_index == 1
+    assert plan.report.warnings[0].code == "unproven_numbered_role_preserved"
+
+    application = classifications_for_canadian_application(
+        classifications,
+        plan.report,
+    )
+    assert [
+        item["paragraph_index"] for item in application["classifications"]
+    ] == [0, 2]
+    assert len(classifications["classifications"]) == 3
+
+    extract = tmp_path / "extract"
+    (extract / "word").mkdir(parents=True)
+    (extract / "word" / "document.xml").write_text(
+        plan.document_xml,
+        encoding="utf-8",
+    )
+    style = (
+        '<w:style w:type="paragraph" w:styleId="CanadianParagraph">'
+        '<w:pPr><w:numPr><w:ilvl w:val="2"/><w:numId w:val="9"/>'
+        '</w:numPr></w:pPr></w:style>'
+    )
+    (extract / "word" / "styles.xml").write_text(
+        _styles(style),
+        encoding="utf-8",
+    )
+    apply_report = apply_phase2_classifications(
+        extract,
+        application,
+        {"PARAGRAPH": "CanadianParagraph"},
+        [],
+        role_specs=_canadian_role_specs("PARAGRAPH"),
+    )
+
+    applied_xml = (extract / "word" / "document.xml").read_text(encoding="utf-8")
+    applied_blocks = list(iter_paragraph_xml_blocks(applied_xml))
+    assert apply_report.modified == 2
+    assert paragraph_pstyle_from_block(applied_blocks[0][2]) == "CanadianParagraph"
+    assert paragraph_pstyle_from_block(applied_blocks[1][2]) is None
+    assert paragraph_pstyle_from_block(applied_blocks[2][2]) == "CanadianParagraph"
 
 
 def test_automatic_start_override_and_list_instance_change_fail_closed():

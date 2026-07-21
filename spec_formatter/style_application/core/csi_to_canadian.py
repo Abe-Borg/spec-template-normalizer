@@ -48,6 +48,7 @@ FORMAT_ONLY = "format_only"
 CSI_TO_CANADIAN = "csi_to_canadian"
 VALID_CONVERSION_MODES = frozenset({FORMAT_ONLY, CSI_TO_CANADIAN})
 NUMBERED_ROLES = NUMBERED_BODY_ROLES
+PRESERVED_UNNUMBERED_ROLE = "unproven_numbered_role_preserved"
 
 
 def validate_conversion_mode(value: object) -> str:
@@ -121,6 +122,38 @@ class CanadianConversionReport:
 class ConversionPlan:
     document_xml: str
     report: CanadianConversionReport
+
+
+def classifications_for_canadian_application(
+    classifications: Dict[str, Any],
+    report: CanadianConversionReport,
+) -> Dict[str, Any]:
+    """Exclude markerless numbered guesses before architect styles are applied.
+
+    The classifier still retains complete coverage for its audit and for
+    format-only mode.  Canadian conversion, however, must not let a semantic
+    LLM guess apply an automatically numbered architect style to source prose
+    that has no typed or automatic numbering evidence.
+    """
+
+    preserved = {
+        issue.paragraph_index
+        for issue in report.warnings
+        if issue.code == PRESERVED_UNNUMBERED_ROLE
+    }
+    if not preserved:
+        return classifications
+
+    filtered = dict(classifications)
+    filtered["classifications"] = [
+        item
+        for item in classifications.get("classifications", [])
+        if not (
+            isinstance(item, dict)
+            and item.get("paragraph_index") in preserved
+        )
+    ]
+    return filtered
 
 
 @dataclass(frozen=True)
@@ -246,6 +279,13 @@ def _detect_any_literal_marker(text: str) -> Optional[str]:
         if match is not None:
             return match.group(0).strip()
     return None
+
+
+def _has_heading_like_article_body(body_text: str) -> bool:
+    """Require a heading-like word before accepting a spaced ``1.1`` marker."""
+
+    first_letter = next((char for char in body_text if char.isalpha()), "")
+    return bool(first_letter and first_letter.isupper())
 
 
 def _validate_canadian_role_contract(
@@ -830,7 +870,56 @@ def plan_csi_to_canadian(
             raise ValueError(f"Duplicate Canadian conversion classification for paragraph {index}")
         role_by_index[index] = role
 
-    roles_in_target = set(role_by_index.values())
+    blocks = list(iter_paragraph_xml_blocks(document_xml))
+    warnings: list[ConversionIssue] = []
+
+    # The Phase 2 classifier intentionally gives every content paragraph a
+    # semantic role.  In Canadian mode, a numbered role is actionable only
+    # when the source also proves that the paragraph is a list item.  Preserve
+    # markerless guesses unchanged and keep them out of the later numbered
+    # style application; otherwise the architect style itself would silently
+    # create numbering that was not present in the source.
+    numbered_candidates = set(NUMBERED_ROLES)
+    part_spec = role_specs.get("PART")
+    if isinstance(part_spec, dict) and part_spec.get(
+        "numbering_provenance"
+    ) in {"style_numpr", "direct_numpr"}:
+        numbered_candidates.add("PART")
+
+    preserved_indices: set[int] = set()
+    for index, role in sorted(role_by_index.items()):
+        if role not in numbered_candidates:
+            continue
+        if index >= len(blocks):
+            raise ValueError(f"Canadian conversion paragraph index is out of range: {index}")
+        paragraph = blocks[index][2]
+        text = paragraph_text_from_block(paragraph)
+        literal = _detect_literal_marker(text, role)
+        any_literal = _detect_any_literal_marker(text)
+        automatic = _effective_numpr(
+            strip_out_of_scope_subtrees(paragraph),
+            styles_xml,
+        ) is not None
+        if literal is None and any_literal is None and not automatic:
+            preserved_indices.add(index)
+            warnings.append(
+                ConversionIssue(
+                    index,
+                    PRESERVED_UNNUMBERED_ROLE,
+                    f"Classified as numbered role {role}, but the source has neither "
+                    "a recognized typed marker nor Word automatic numbering. The "
+                    "paragraph was preserved unchanged and excluded from numbered "
+                    "architect style application.",
+                    text.strip()[:120],
+                )
+            )
+
+    effective_role_by_index = {
+        index: role
+        for index, role in role_by_index.items()
+        if index not in preserved_indices
+    }
+    roles_in_target = set(effective_role_by_index.values())
     used_numbered_roles = sorted(roles_in_target & NUMBERED_ROLES)
     for role in used_numbered_roles:
         _validate_canadian_role_contract(role, role_specs.get(role))
@@ -838,7 +927,6 @@ def plan_csi_to_canadian(
         _validate_complete_article_hierarchy(role_specs, roles_in_target)
 
     roles_to_convert = set(used_numbered_roles)
-    part_spec = role_specs.get("PART")
     if "PART" in roles_in_target and isinstance(part_spec, dict) and part_spec.get(
         "numbering_provenance"
     ) in {"style_numpr", "direct_numpr"}:
@@ -862,15 +950,13 @@ def plan_csi_to_canadian(
         else None
     )
 
-    blocks = list(iter_paragraph_xml_blocks(document_xml))
     replacements: Dict[int, str] = {}
     evidence: list[_SourceEvidence] = []
     edits: list[MarkerEdit] = []
-    warnings: list[ConversionIssue] = []
     literal_removed = 0
     automatic_retargeted = 0
 
-    for index, role in sorted(role_by_index.items()):
+    for index, role in sorted(effective_role_by_index.items()):
         if role not in roles_to_convert:
             continue
         if index >= len(blocks):
@@ -905,14 +991,25 @@ def plan_csi_to_canadian(
                     f"Paragraph {index} uses a line break after typed marker "
                     f"{literal.marker!r}; only a normal space or Word list tab is safe."
                 )
-            if (
-                literal.family in {"csc_article", "csc_dot_decimal"}
-                and delimiter != "tab"
-            ):
+            # A two-component article marker such as ``1.1`` is proven later
+            # against its active PART and contiguous article sequence.  The
+            # single-component ``.1`` family remains ambiguous with decimal
+            # values and therefore still requires an actual Word list tab.
+            if literal.family == "csc_dot_decimal" and delimiter != "tab":
                 raise ValueError(
                     f"Paragraph {index} begins with ambiguous decimal text "
                     f"{literal.marker!r}. A typed Canadian marker is converted only "
                     "when followed by a structural Word tab."
+                )
+            if (
+                literal.family == "csc_article"
+                and delimiter != "tab"
+                and not _has_heading_like_article_body(literal.body_text)
+            ):
+                raise ValueError(
+                    f"Paragraph {index} begins with ambiguous decimal text "
+                    f"{literal.marker!r}. A spaced Canadian article marker must "
+                    "be followed by heading-like text or a structural Word tab."
                 )
             evidence.append(
                 _SourceEvidence(index, role, "literal", literal, None, None)
@@ -1016,7 +1113,9 @@ def plan_csi_to_canadian(
     ET.fromstring(prepare_xml_text_for_utf8(converted_document).encode("utf-8"))
 
     report = CanadianConversionReport(
-        paragraphs_examined=sum(1 for role in role_by_index.values() if role in roles_to_convert),
+        paragraphs_examined=sum(
+            1 for role in effective_role_by_index.values() if role in roles_to_convert
+        ),
         paragraphs_converted=len(edits),
         literal_markers_removed=literal_removed,
         automatic_numbering_retargeted=automatic_retargeted,
@@ -1073,6 +1172,7 @@ __all__ = [
     "ConversionIssue",
     "MarkerEdit",
     "apply_csi_to_canadian",
+    "classifications_for_canadian_application",
     "plan_csi_to_canadian",
     "validate_conversion_mode",
 ]

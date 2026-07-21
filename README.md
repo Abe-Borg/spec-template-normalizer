@@ -83,14 +83,19 @@ are also rejected as ambiguous.
 
 The first implementation deliberately supports the sequence it can prove:
 source counters must start at 1, be contiguous, and appear under their expected
-parent level. Gaps, unnumbered list items, custom starts/restarts, or automatic
-source list-instance changes stop that target without publishing a partial
-conversion. Every paragraph sharing a converted automatic source list must
+parent level. Counter gaps, custom starts/restarts, or automatic source
+list-instance changes stop that target without publishing a partial conversion.
+Every paragraph sharing a converted automatic source list must
 participate in the conversion; a filtered table or boilerplate list item is
 rejected because omitting it would shift later counters. A typed Canadian
 decimal such as `.1` is treated as a marker only when Word stores a structural
 list tab after it; this prevents a leading value such as `.125 mm` from being
-deleted. For targets containing ARTICLE headings,
+deleted. A two-component article such as `1.1 SUMMARY` may use a normal space
+when its heading-like text, active PART, and contiguous counter prove the
+hierarchy. A markerless paragraph that the classifier assigns to a numbered
+role is instead preserved unchanged, omitted from numbered style application,
+and reported as a warning; the converter does not invent a list item. For
+targets containing ARTICLE headings,
 the target must contain a preceding classified PART heading, and the current
 engine requires the architect's PART, ARTICLE, and used subordinate roles to be
 levels of one coherent automatic multilevel Word list. That is an application
