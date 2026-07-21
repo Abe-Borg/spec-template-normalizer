@@ -163,12 +163,15 @@ class App(ctk.CTk):
 
         self.architect_var = ctk.StringVar()
         self.output_var = ctk.StringVar()
+        env_key = os.environ.get("ANTHROPIC_API_KEY", "")
         stored_key = secrets.load_api_key()
-        self.api_key_var = ctk.StringVar(
-            value=stored_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        )
+        # An explicit ANTHROPIC_API_KEY (rotated / deployment-provided) takes
+        # precedence over a previously remembered key, which may be stale.
+        self.api_key_var = ctk.StringVar(value=env_key or stored_key)
         self.show_key_var = ctk.BooleanVar(value=False)
-        self.remember_key_var = ctk.BooleanVar(value=bool(stored_key))
+        # Pre-check "Remember" only when the shown key came from storage; an env
+        # override is ephemeral and must not silently overwrite the saved key.
+        self.remember_key_var = ctk.BooleanVar(value=bool(stored_key) and not env_key)
         self.reuse_var = ctk.BooleanVar(value=True)
         self.workers_var = ctk.StringVar(value="3")
         self.conversion_mode_var = ctk.StringVar(value=FORMAT_ONLY)
