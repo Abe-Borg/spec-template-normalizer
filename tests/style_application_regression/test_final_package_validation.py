@@ -64,6 +64,69 @@ def test_valid_package_passes_final_validation(tmp_path):
     validate_docx_package(docx)
 
 
+def test_valid_package_allows_standard_ooxml_trash_items(tmp_path):
+    docx = tmp_path / "valid-with-trash.docx"
+    parts = _parts()
+    parts["[trash]/0000.dat"] = b"discarded package data"
+    parts["[trash]/00aF.dat"] = b"more discarded package data"
+    _write_docx(docx, parts)
+
+    validate_docx_package(docx)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "[trash]/00000.dat",
+        "[trash]/000g.dat",
+        "[trash]/nested/0000.dat",
+        "word/[trash]/0000.dat",
+    ],
+)
+def test_final_validation_does_not_exempt_malformed_trash_item_names(tmp_path, name):
+    docx = tmp_path / "invalid-trash-name.docx"
+    parts = _parts()
+    parts[name] = b"untyped package data"
+    _write_docx(docx, parts)
+
+    with pytest.raises(RuntimeError, match="has no content type"):
+        validate_docx_package(docx)
+
+
+def test_output_build_preserves_standard_ooxml_trash_items(tmp_path):
+    source = tmp_path / "source-with-trash.docx"
+    parts = _parts()
+    trash_parts = {
+        "[trash]/0000.dat": b"discarded package data 0",
+        "[trash]/0001.dat": b"discarded package data 1",
+    }
+    parts.update(trash_parts)
+    _write_docx(source, parts)
+
+    extract = tmp_path / "extract"
+    (extract / "word").mkdir(parents=True)
+    (extract / "word" / "document.xml").write_text(
+        parts["word/document.xml"],
+        encoding="utf-8",
+    )
+    (extract / "word" / "styles.xml").write_text(
+        parts["word/styles.xml"],
+        encoding="utf-8",
+    )
+
+    output = _build_and_patch_output(
+        source,
+        extract,
+        {"header_footer_import": {}},
+        tmp_path / "out",
+        arch_template_registry={},
+    )
+
+    with zipfile.ZipFile(output) as zf:
+        for name, data in trash_parts.items():
+            assert zf.read(name) == data
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

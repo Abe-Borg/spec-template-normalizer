@@ -15,6 +15,15 @@ from .core.sectpr_tools import extract_all_sectpr_blocks, iter_document_sectpr_b
 from .core.style_import import WORD_BUILTIN_STYLE_IDS
 from .core.xml_helpers import iter_element_xml_blocks
 
+
+_OOXML_TRASH_ITEM_RE = re.compile(r"\[trash\]/[0-9A-Fa-f]{4}\.dat\Z")
+
+
+def _is_ooxml_trash_item(name: str) -> bool:
+    """Return whether a ZIP member uses the OOXML trash-item naming scheme."""
+    return bool(_OOXML_TRASH_ITEM_RE.fullmatch(name))
+
+
 def _sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
@@ -239,7 +248,14 @@ def validate_docx_package(docx_path: Path) -> None:
                             errors.append(f"content-type Override targets missing part: {part}")
 
                 for name in sorted(name_set):
-                    if name.endswith("/") or name == "[Content_Types].xml":
+                    # OOXML trash items are discarded physical ZIP items, not
+                    # package parts. ISO/IEC 29500 requires the exact
+                    # ``[trash]/HHHH.dat`` form to have no content type.
+                    if (
+                        name.endswith("/")
+                        or name == "[Content_Types].xml"
+                        or _is_ooxml_trash_item(name)
+                    ):
                         continue
                     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
                     if name.casefold() not in overrides and ext not in defaults:
