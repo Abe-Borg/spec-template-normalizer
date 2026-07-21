@@ -25,7 +25,11 @@ from docx_decomposer import (
     extract_docx,
     validate_instructions,
 )
-from llm_classifier import classify_document, compute_coverage
+from llm_classifier import (
+    _normalize_instruction_roles,
+    classify_document,
+    compute_coverage,
+)
 from paragraph_rules import is_classifiable_paragraph
 from phase1_bundle import (
     BundleArtifacts,
@@ -158,12 +162,14 @@ def run_phase1(
         _emit(progress, "Reading paragraph, style, and numbering structure...")
         slim_bundle = build_slim_bundle(extract_dir)
         _emit(progress, f"Classifying {len(slim_bundle.get('paragraphs', []))} paragraphs...")
-        instructions = classify(
-            slim_bundle=slim_bundle,
-            master_prompt=master_prompt,
-            run_instruction=run_instruction,
-            api_key=api_key,
-            model=model,
+        instructions = _normalize_instruction_roles(
+            classify(
+                slim_bundle=slim_bundle,
+                master_prompt=master_prompt,
+                run_instruction=run_instruction,
+                api_key=api_key,
+                model=model,
+            )
         )
         validate_instructions(instructions, slim_bundle=slim_bundle)
         coverage, handled, classifiable = compute_coverage(slim_bundle, instructions)

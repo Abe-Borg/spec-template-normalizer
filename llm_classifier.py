@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from paragraph_rules import (
     is_classifiable_paragraph,
@@ -27,6 +27,12 @@ from spec_formatter.role_contract import (
 MAX_SINGLE_PASS_INPUT_TOKENS = 150_000
 DEFAULT_RESPONSE_ATTEMPTS = 2
 
+_STRUCTURED_OUTPUT_COMPILATION_ERRORS = frozenset(
+    {
+        "grammar compilation timed out",
+        "schema is too complex for compilation",
+    }
+)
 
 def estimate_tokens(text: str) -> int:
     """Rough token estimate (1 token ≈ 4 chars)."""
@@ -62,7 +68,10 @@ def _instruction_response_schema() -> dict:
 
     The runtime validators remain authoritative for document-aware constraints.
     This API-facing subset prevents malformed JSON and rejects unknown fields
-    before a response reaches the local parser.
+    before a response reaches the local parser.  ``roles`` deliberately uses
+    an array on the wire: twelve optional properties in the canonical mapping
+    create an exponentially larger constrained-output grammar.  The array is
+    converted back to the canonical mapping before local validation.
     """
     return {
         "type": "object",
@@ -82,9 +91,14 @@ def _instruction_response_schema() -> dict:
                         "type": {"type": "string", "enum": ["paragraph"]},
                         "derive_from_paragraph_index": {"type": "integer"},
                         "basedOn": {"type": ["string", "null"]},
-                        "role": {"type": "string"},
                     },
-                    "required": ["styleId", "derive_from_paragraph_index"],
+                    "required": [
+                        "styleId",
+                        "name",
+                        "type",
+                        "derive_from_paragraph_index",
+                        "basedOn",
+                    ],
                 },
             },
             "apply_pStyle": {
@@ -112,11 +126,19 @@ def _instruction_response_schema() -> dict:
                 },
             },
             "roles": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    role: _role_spec_schema()
-                    for role in ROLE_ORDER
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "role": {"type": "string", "enum": list(ROLE_ORDER)},
+                        **_role_spec_schema()["properties"],
+                    },
+                    "required": [
+                        "role",
+                        "styleId",
+                        "exemplar_paragraph_index",
+                    ],
                 },
             },
             "notes": {"type": "array", "items": {"type": "string"}},
@@ -129,6 +151,42 @@ def _instruction_response_schema() -> dict:
             "notes",
         ],
     }
+
+
+def _normalize_instruction_roles(instructions: dict) -> dict:
+    """Convert the compact API wire representation to the runtime contract."""
+    roles = instructions.get("roles")
+    if isinstance(roles, dict):
+        # Backward compatibility for prompt-only responses and injected test
+        # classifiers that already return the canonical runtime representation.
+        return instructions
+    if not isinstance(roles, list):
+        raise ValueError("LLM response roles must be an array or object")
+
+    normalized = {}
+    expected_fields = {"role", "styleId", "exemplar_paragraph_index"}
+    for position, item in enumerate(roles):
+        if not isinstance(item, dict) or set(item) != expected_fields:
+            raise ValueError(
+                f"LLM response roles[{position}] must contain exactly "
+                "role, styleId, and exemplar_paragraph_index"
+            )
+        role = item["role"]
+        if role not in ROLE_ORDER:
+            raise ValueError(f"LLM response roles[{position}] has an unknown role")
+        if role in normalized:
+            raise ValueError(f"LLM response contains duplicate role: {role!r}")
+        normalized[role] = {
+            "styleId": item["styleId"],
+            "exemplar_paragraph_index": item["exemplar_paragraph_index"],
+        }
+
+    instructions["roles"] = {
+        role: normalized[role]
+        for role in ROLE_ORDER
+        if role in normalized
+    }
+    return instructions
 
 
 def _patch_response_schema() -> dict:
@@ -146,6 +204,26 @@ def _patch_response_schema() -> dict:
     }
 
 
+def _is_structured_output_compilation_error(error: Exception) -> bool:
+    """Return whether a 400 specifically reports grammar compilation failure."""
+    if getattr(error, "status_code", None) != 400:
+        return False
+
+    message = ""
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        error_detail = body.get("error")
+        if isinstance(error_detail, dict):
+            body_message = error_detail.get("message")
+            if isinstance(body_message, str):
+                message = body_message
+    if not message:
+        message = str(error)
+
+    normalized = message.strip().casefold()
+    return any(marker in normalized for marker in _STRUCTURED_OUTPUT_COMPILATION_ERRORS)
+
+
 def _call_api(
     client: Any,
     system: str,
@@ -153,28 +231,48 @@ def _call_api(
     model: str,
     max_tokens: int = 128000,
     response_schema: Optional[dict] = None,
+    response_format_state: Optional[Dict[str, bool]] = None,
 ) -> str:
-    """Single API call with retry logic. Returns raw response text."""
+    """Single API call with retry logic. Returns raw response text.
+
+    A provider-side structured-output compiler failure is a special case: the
+    same request is retried once without ``output_config.format``.  Prompt
+    constraints, bounded JSON regeneration, and local document-aware validators
+    remain in force.  Other client errors are still non-retryable.
+    """
     import anthropic
 
     last_error: Optional[Exception] = None
-    for attempt in range(3):  # initial + 2 retries
+    format_state = (
+        response_format_state
+        if response_format_state is not None
+        else {"enabled": True}
+    )
+    active_schema: Optional[dict] = None
+    if format_state.get("enabled", True):
+        active_schema = (
+            response_schema
+            if response_schema is not None
+            else _instruction_response_schema()
+        )
+
+    # Compiler fallback does not consume a transport retry. A schema can fail
+    # after earlier transient attempts, and the prompt-only request must still
+    # get one chance to run.
+    attempt = 0
+    while attempt < 3:  # initial + 2 transient retries
         try:
+            output_config = {"effort": "high"}
+            if active_schema is not None:
+                output_config["format"] = {
+                    "type": "json_schema",
+                    "schema": active_schema,
+                }
             with client.messages.stream(
                 model=model,
                 max_tokens=max_tokens,
                 thinking={"type": "adaptive"},
-                output_config={
-                    "effort": "high",
-                    "format": {
-                        "type": "json_schema",
-                        "schema": (
-                            response_schema
-                            if response_schema is not None
-                            else _instruction_response_schema()
-                        ),
-                    },
-                },
+                output_config=output_config,
                 system=system,
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
@@ -200,7 +298,17 @@ def _call_api(
             last_error = e
             if attempt < 2:
                 time.sleep(2 ** (attempt + 1))
+            attempt += 1
         except anthropic.APIStatusError as e:
+            if active_schema is not None and _is_structured_output_compilation_error(e):
+                last_error = e
+                active_schema = None
+                format_state["enabled"] = False
+                print(
+                    "Structured-output grammar compilation failed; "
+                    "retrying with prompt-enforced JSON."
+                )
+                continue
             # Invalid credentials/requests will not heal on retry. Retry only
             # transient server failures.
             if getattr(e, "status_code", 0) < 500:
@@ -208,6 +316,7 @@ def _call_api(
             last_error = e
             if attempt < 2:
                 time.sleep(2 ** (attempt + 1))
+            attempt += 1
     raise last_error  # type: ignore[misc]
 
 
@@ -245,7 +354,7 @@ def _retry_requirement(error: Exception) -> str:
     """Build a concise correction appended after an unusable JSON response."""
     detail = str(error).splitlines()[0]
     return (
-        "\n\nRETRY REQUIREMENT: The prior response could not be parsed: "
+        "\n\nRETRY REQUIREMENT: The prior response could not be used: "
         f"{detail}. Regenerate the entire response as exactly one complete JSON "
         "object. Do not return prose, Markdown fences, or partial JSON."
     )
@@ -259,12 +368,14 @@ def _request_json_response(
     *,
     response_schema: dict,
     max_attempts: int,
+    response_transform: Optional[Callable[[dict], dict]] = None,
 ) -> dict:
-    """Request and strictly parse JSON, regenerating malformed output once."""
+    """Request and validate JSON, regenerating unusable output when allowed."""
     if type(max_attempts) is not int or max_attempts < 1:
         raise ValueError("max_response_attempts must be a positive integer")
 
     last_error: Optional[ValueError] = None
+    response_format_state = {"enabled": True}
     for attempt in range(max_attempts):
         prompt = (
             user_message
@@ -279,14 +390,20 @@ def _request_json_response(
             prompt,
             model,
             response_schema=response_schema,
+            response_format_state=response_format_state,
         )
         try:
-            return _parse_response(raw)
+            parsed = _parse_response(raw)
+            return (
+                response_transform(parsed)
+                if response_transform is not None
+                else parsed
+            )
         except ValueError as exc:
             last_error = exc
             if attempt + 1 < max_attempts:
                 print(
-                    "JSON parse error; regenerating complete response "
+                    "JSON response validation failed; regenerating complete response "
                     f"({attempt + 2}/{max_attempts})..."
                 )
 
@@ -294,7 +411,7 @@ def _request_json_response(
     detail = str(last_error).splitlines()[0]
     suffix = "attempt" if max_attempts == 1 else "attempts"
     raise ValueError(
-        f"LLM response is not valid JSON after {max_attempts} {suffix}: {detail}"
+        f"LLM response was not usable after {max_attempts} {suffix}: {detail}"
     ) from last_error
 
 
@@ -817,6 +934,7 @@ def classify_document(
         model,
         response_schema=_instruction_response_schema(),
         max_attempts=max_response_attempts,
+        response_transform=_normalize_instruction_roles,
     )
 
     normalized_exclusions = _normalize_known_exclusions(instructions, slim_bundle)

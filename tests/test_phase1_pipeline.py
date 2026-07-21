@@ -123,6 +123,18 @@ def _end_of_section_instructions() -> dict:
     }
 
 
+def _end_of_section_wire_instructions() -> dict:
+    instructions = _end_of_section_instructions()
+    instructions["roles"] = [
+        {
+            "role": "END_OF_SECTION",
+            "styleId": "CSI_EndOfSection__ARCH",
+            "exemplar_paragraph_index": 0,
+        }
+    ]
+    return instructions
+
+
 def test_injected_classifier_runs_pipeline_and_publishes_valid_bundle(tmp_path: Path) -> None:
     source = tmp_path / "architect.docx"
     output_root = tmp_path / "output"
@@ -134,7 +146,7 @@ def test_injected_classifier_runs_pipeline_and_publishes_valid_bundle(tmp_path: 
 
     def deterministic_classifier(**kwargs):
         classifier_calls.append(kwargs)
-        return _end_of_section_instructions()
+        return _end_of_section_wire_instructions()
 
     result = run_phase1(
         source,

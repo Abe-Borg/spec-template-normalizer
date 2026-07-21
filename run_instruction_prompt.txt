@@ -11,7 +11,8 @@ Using the slim bundle, normalize CSI semantics by ensuring consistent paragraph 
   into SUBSUBPARAGRAPH
 - End-of-section markers
 
-You MUST also output a "roles" mapping (role → {styleId, exemplar_paragraph_index}) as described in the master prompt.
+You MUST also output the "roles" array that represents the deterministic
+role → {styleId, exemplar_paragraph_index} mapping described in the master prompt.
 
 IMPORTANT: Account for all classifiable paragraphs (all non-skipped, non-table content paragraphs).
 Use apply_pStyle for CSI content and ignored_paragraphs for genuinely non-CSI content, with a specific reason.

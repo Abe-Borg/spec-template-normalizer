@@ -9,10 +9,12 @@ import pytest
 import llm_classifier
 from llm_classifier import (
     _call_api,
+    _normalize_instruction_roles,
     _normalize_known_exclusions,
     _parse_response,
     _repair_missing_roles,
     _repair_strong_signal_mismatches,
+    _request_json_response,
     _validate_patch_result,
     classify_document,
 )
@@ -28,9 +30,10 @@ def _install_fake_anthropic(monkeypatch):
         pass
 
     class APIStatusError(Exception):
-        def __init__(self, message: str, status_code: int):
+        def __init__(self, message: str, status_code: int, body=None):
             super().__init__(message)
             self.status_code = status_code
+            self.body = body
 
     module.APIConnectionError = APIConnectionError
     module.RateLimitError = RateLimitError
@@ -260,7 +263,8 @@ def test_targeted_patch_merges_styled_and_ignored_paragraphs(monkeypatch) -> Non
     prompts = []
 
     def fake_call(
-        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
+        response_format_state=None,
     ):
         prompts.append(user_message)
         return responses.pop(0)
@@ -291,7 +295,8 @@ def test_classifier_regenerates_after_missing_comma_in_initial_response(
     prompts = []
 
     def fake_call(
-        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
+        response_format_state=None,
     ):
         prompts.append(user_message)
         return responses.pop(0)
@@ -319,7 +324,8 @@ def test_classifier_bounds_repeated_malformed_initial_responses(monkeypatch) -> 
     prompts = []
 
     def fake_call(
-        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
+        response_format_state=None,
     ):
         prompts.append(user_message)
         return _MISSING_COMMA_INITIAL_RESPONSE
@@ -370,7 +376,8 @@ def test_classifier_regenerates_malformed_targeted_patch_then_merges(
     schemas = []
 
     def fake_call(
-        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
+        response_format_state=None,
     ):
         prompts.append(user_message)
         schemas.append(response_schema)
@@ -449,7 +456,8 @@ def test_incomplete_patches_fail_closed_without_nearest_neighbor_fill(monkeypatc
     prompts = []
 
     def fake_call(
-        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
+        response_format_state=None,
     ):
         prompts.append(user_message)
         return responses.pop(0)
@@ -543,9 +551,260 @@ def test_call_api_requests_phase1_json_schema(monkeypatch) -> None:
         "notes",
     }
     assert set(schema["required"]) == set(schema["properties"])
-    assert set(schema["properties"]["roles"]["properties"]) == set(
+    roles_schema = schema["properties"]["roles"]
+    assert roles_schema["type"] == "array"
+    role_item = roles_schema["items"]
+    assert set(role_item["properties"]) == {
+        "role",
+        "styleId",
+        "exemplar_paragraph_index",
+    }
+    assert set(role_item["required"]) == set(role_item["properties"])
+    assert role_item["properties"]["role"]["enum"] == list(
         llm_classifier.ROLE_ORDER
     )
+
+    create_item = schema["properties"]["create_styles"]["items"]
+    assert set(create_item["required"]) == set(create_item["properties"])
+    assert "role" not in create_item["properties"]
+
+
+def test_normalize_instruction_roles_converts_wire_array_to_mapping() -> None:
+    instructions = {
+        "roles": [
+            {
+                "role": "PART",
+                "styleId": "PartStyle",
+                "exemplar_paragraph_index": 4,
+            },
+            {
+                "role": "ARTICLE",
+                "styleId": "ArticleStyle",
+                "exemplar_paragraph_index": 8,
+            },
+        ]
+    }
+
+    result = _normalize_instruction_roles(instructions)
+
+    assert result["roles"] == {
+        "PART": {
+            "styleId": "PartStyle",
+            "exemplar_paragraph_index": 4,
+        },
+        "ARTICLE": {
+            "styleId": "ArticleStyle",
+            "exemplar_paragraph_index": 8,
+        },
+    }
+
+
+def test_normalize_instruction_roles_rejects_duplicate_wire_roles() -> None:
+    role = {
+        "role": "PART",
+        "styleId": "PartStyle",
+        "exemplar_paragraph_index": 4,
+    }
+
+    with pytest.raises(ValueError, match="duplicate role"):
+        _normalize_instruction_roles({"roles": [role, role.copy()]})
+
+
+def test_classifier_normalizes_wire_roles_before_runtime_validation(
+    monkeypatch,
+) -> None:
+    _install_fake_anthropic(monkeypatch)
+    wire_response = _body_instructions([0])
+    wire_response["roles"] = [
+        {
+            "role": "PARAGRAPH",
+            "styleId": "Body",
+            "exemplar_paragraph_index": 0,
+        }
+    ]
+    prompts = []
+
+    def fake_call(
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
+        response_format_state=None,
+    ):
+        prompts.append(user_message)
+        return json.dumps(wire_response)
+
+    monkeypatch.setattr(llm_classifier, "_call_api", fake_call)
+
+    result = classify_document(
+        _plain_bundle(1),
+        "master",
+        "run",
+        "fake-key",
+        max_patch_attempts=0,
+    )
+
+    assert result["roles"] == {
+        "PARAGRAPH": {
+            "styleId": "Body",
+            "exemplar_paragraph_index": 0,
+        }
+    }
+    assert "Slim bundle:" in prompts[0]
+
+
+def test_classifier_regenerates_duplicate_wire_roles_before_validation(
+    monkeypatch,
+) -> None:
+    duplicate_response = _body_instructions([0])
+    duplicate_role = {
+        "role": "PARAGRAPH",
+        "styleId": "Body",
+        "exemplar_paragraph_index": 0,
+    }
+    duplicate_response["roles"] = [duplicate_role, duplicate_role.copy()]
+
+    valid_response = _body_instructions([0])
+    valid_response["roles"] = [duplicate_role]
+    responses = [json.dumps(duplicate_response), json.dumps(valid_response)]
+    prompts = []
+    states = []
+
+    def fake_call(
+        _client, _system, user_message, _model, max_tokens=128000,
+        response_schema=None, response_format_state=None,
+    ):
+        prompts.append(user_message)
+        states.append(response_format_state)
+        return responses.pop(0)
+
+    monkeypatch.setattr(llm_classifier, "_call_api", fake_call)
+
+    result = _request_json_response(
+        object(),
+        "master",
+        "run",
+        "model",
+        response_schema=llm_classifier._instruction_response_schema(),
+        max_attempts=2,
+        response_transform=_normalize_instruction_roles,
+    )
+
+    assert result["roles"] == {
+        "PARAGRAPH": {
+            "styleId": "Body",
+            "exemplar_paragraph_index": 0,
+        }
+    }
+    assert states[0] is states[1]
+    assert "duplicate role" in prompts[1]
+
+
+@pytest.mark.parametrize(
+    "provider_message",
+    [
+        "Grammar compilation timed out",
+        "Schema is too complex for compilation",
+    ],
+)
+def test_call_api_falls_back_without_schema_for_compiler_400(
+    monkeypatch,
+    provider_message: str,
+) -> None:
+    anthropic = _install_fake_anthropic(monkeypatch)
+    calls = []
+
+    class FinalStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_final_text(self):
+            return "success"
+
+        def get_final_message(self):
+            return types.SimpleNamespace(stop_reason="end_turn")
+
+    class Messages:
+        def stream(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise anthropic.APIStatusError(
+                    "structured output compiler failed",
+                    status_code=400,
+                    body={"error": {"message": provider_message}},
+                )
+            return FinalStream()
+
+    sleeps = []
+    client = types.SimpleNamespace(messages=Messages())
+    monkeypatch.setattr(llm_classifier.time, "sleep", sleeps.append)
+
+    assert _call_api(client, "system", "user", "model") == "success"
+    assert "format" in calls[0]["output_config"]
+    assert calls[1]["output_config"] == {"effort": "high"}
+    assert sleeps == []
+
+
+def test_compiler_fallback_stays_disabled_during_json_regeneration(
+    monkeypatch,
+) -> None:
+    anthropic = _install_fake_anthropic(monkeypatch)
+    calls = []
+
+    class FinalStream:
+        def __init__(self, text: str):
+            self.text = text
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_final_text(self):
+            return self.text
+
+        def get_final_message(self):
+            return types.SimpleNamespace(stop_reason="end_turn")
+
+    class Messages:
+        def stream(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise anthropic.APIStatusError(
+                    "structured output compiler failed",
+                    status_code=400,
+                    body={
+                        "error": {"message": "Grammar compilation timed out"}
+                    },
+                )
+            if len(calls) == 2:
+                return FinalStream('{"value":')
+            return FinalStream('{"value": 1}')
+
+    sleeps = []
+    client = types.SimpleNamespace(messages=Messages())
+    monkeypatch.setattr(llm_classifier.time, "sleep", sleeps.append)
+
+    result = _request_json_response(
+        client,
+        "system",
+        "user",
+        "model",
+        response_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+        },
+        max_attempts=2,
+    )
+
+    assert result == {"value": 1}
+    assert "format" in calls[0]["output_config"]
+    assert calls[1]["output_config"] == {"effort": "high"}
+    assert calls[2]["output_config"] == {"effort": "high"}
+    assert sleeps == []
 
 
 @pytest.mark.parametrize(
@@ -616,7 +875,8 @@ def test_more_than_500_small_paragraphs_reach_classifier(monkeypatch) -> None:
     calls = []
 
     def fake_call(
-        _client, _system, user_message, _model, max_tokens=128000, response_schema=None
+        _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
+        response_format_state=None,
     ):
         calls.append(user_message)
         return json.dumps(instructions)
