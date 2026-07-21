@@ -28,6 +28,27 @@ def _pageformat_catalog(*, through_level: int = 5) -> dict:
     }
 
 
+def _sparse_masterspec_catalog(
+    *,
+    part_text: str = "PART %1 -",
+    article_text: str = "%1.%4",
+) -> dict:
+    return {
+        "nums": {"2": {"numId": "2", "abstractNumId": "1"}},
+        "abstracts": {
+            "1": {
+                "abstractNumId": "1",
+                "levels": [
+                    {"ilvl": "0", "numFmt": "decimal", "lvlText": part_text},
+                    {"ilvl": "1", "numFmt": "lowerLetter", "lvlText": "%2."},
+                    {"ilvl": "2", "numFmt": "lowerRoman", "lvlText": "%3."},
+                    {"ilvl": "3", "numFmt": "decimal", "lvlText": article_text},
+                ],
+            }
+        },
+    }
+
+
 def test_context_proves_sixth_pageformat_level_without_global_guessing():
     catalog = _pageformat_catalog()
 
@@ -48,6 +69,46 @@ def test_context_proves_sixth_pageformat_level_without_global_guessing():
         },
     }
     assert role_from_numbering_catalog(unrelated, "1", "5") is None
+
+
+def test_context_proves_sparse_masterspec_article_without_global_guessing():
+    catalog = _sparse_masterspec_catalog()
+
+    assert role_from_numbering_signature("decimal", "%1.%4", "3") is None
+    assert role_from_numbering_catalog(catalog, "2", "3") == "ARTICLE"
+
+    assert (
+        role_from_numbering_catalog(
+            _sparse_masterspec_catalog(part_text="%1."),
+            "2",
+            "3",
+        )
+        is None
+    )
+    assert (
+        role_from_numbering_catalog(
+            _sparse_masterspec_catalog(article_text="%1.%3"),
+            "2",
+            "3",
+        )
+        is None
+    )
+    assert (
+        role_from_numbering_catalog(
+            _sparse_masterspec_catalog(article_text="%2.%4"),
+            "2",
+            "3",
+        )
+        is None
+    )
+    assert (
+        role_from_numbering_catalog(
+            _sparse_masterspec_catalog(article_text="%1.%2.%4"),
+            "2",
+            "3",
+        )
+        is None
+    )
 
 
 def test_distinctive_csi_deep_signatures_map_through_word_limit():
@@ -119,4 +180,3 @@ def test_phase1_repairs_and_validates_missing_sixth_level_role():
     ]
 
     validate_instructions(instructions, slim_bundle=bundle)
-

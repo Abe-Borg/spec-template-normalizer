@@ -141,6 +141,25 @@ def role_from_numbering_catalog(
         return direct
 
     level_zero = _level_from_catalog(numbering_catalog, num_id, 0)
+
+    # MasterSpec commonly reserves physical Word levels 1 and 2 for utility
+    # styles, then places ARTICLE at ilvl=3.  Its rendered marker still proves
+    # the semantic relationship: level 0 is ``PART %1 -`` and the article
+    # combines that PART counter with its own counter (``%1.%4``).  Keep this
+    # contextual so a standalone deep ``%1.%4`` list is not promoted merely
+    # from its local signature.
+    sparse_part_anchor = _is_decimal_pattern(
+        level_zero,
+        r"\s*PART\s+%1\s*[-\u2010-\u2015:]?\s*",
+        flags=re.IGNORECASE,
+    )
+    sparse_article = _is_decimal_pattern(
+        current,
+        rf"\s*%1\s*\.\s*%{level_number + 1}\s*",
+    )
+    if level_number >= 2 and sparse_part_anchor and sparse_article:
+        return "ARTICLE"
+
     level_one = _level_from_catalog(numbering_catalog, num_id, 1)
     level_two = _level_from_catalog(numbering_catalog, num_id, 2)
     part_anchor = _is_decimal_pattern(

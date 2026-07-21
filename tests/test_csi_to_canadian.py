@@ -60,6 +60,28 @@ def _source_numbering(*num_ids: str, override: str = "") -> str:
     return f'<w:numbering xmlns:w="{W_NS}">{abstracts}{nums}</w:numbering>'
 
 
+def _sparse_masterspec_numbering() -> str:
+    return (
+        f'<w:numbering xmlns:w="{W_NS}">'
+        '<w:abstractNum w:abstractNumId="1">'
+        '<w:lvl w:ilvl="0"><w:start w:val="1"/>'
+        '<w:numFmt w:val="decimal"/><w:lvlText w:val="PART %1 -"/></w:lvl>'
+        '<w:lvl w:ilvl="1"><w:start w:val="1"/>'
+        '<w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2."/></w:lvl>'
+        '<w:lvl w:ilvl="2"><w:start w:val="1"/>'
+        '<w:numFmt w:val="lowerRoman"/><w:lvlText w:val="%3."/></w:lvl>'
+        '<w:lvl w:ilvl="3"><w:start w:val="1"/>'
+        '<w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%4"/></w:lvl>'
+        '<w:lvl w:ilvl="4"><w:start w:val="1"/>'
+        '<w:numFmt w:val="upperLetter"/><w:lvlText w:val="%5."/></w:lvl>'
+        '<w:lvl w:ilvl="5"><w:start w:val="1"/>'
+        '<w:numFmt w:val="decimal"/><w:lvlText w:val="%6."/></w:lvl>'
+        '</w:abstractNum>'
+        '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>'
+        '</w:numbering>'
+    )
+
+
 def _architect_numbering(
     *,
     start: str = "1",
@@ -339,6 +361,62 @@ def test_automatic_csi_numbering_is_retargeted_without_text_edits():
     assert plan.report.edits[0].source_kind == "automatic"
 
 
+def test_sparse_masterspec_part_and_article_numbering_is_retargeted():
+    styles = (
+        '<w:style w:type="paragraph" w:styleId="PRT"><w:pPr><w:numPr>'
+        '<w:ilvl w:val="0"/><w:numId w:val="2"/>'
+        '</w:numPr></w:pPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="ART"><w:pPr><w:numPr>'
+        '<w:ilvl w:val="3"/><w:numId w:val="2"/>'
+        '</w:numPr></w:pPr></w:style>'
+    )
+    source = _document(
+        _paragraph("GENERAL", '<w:pStyle w:val="PRT"/>'),
+        _paragraph("SUMMARY", '<w:pStyle w:val="ART"/>'),
+    )
+
+    plan = plan_csi_to_canadian(
+        source,
+        _styles(styles),
+        _classifications("PART", "ARTICLE"),
+        _canadian_role_specs("PART", "ARTICLE"),
+        numbering_xml=_sparse_masterspec_numbering(),
+    )
+
+    assert plan.document_xml == source
+    assert plan.report.automatic_numbering_retargeted == 2
+    assert [edit.role for edit in plan.report.edits] == ["PART", "ARTICLE"]
+
+
+def test_automatic_list_body_abbreviation_is_not_treated_as_a_typed_marker():
+    styles = (
+        '<w:style w:type="paragraph" w:styleId="PR1"><w:pPr><w:numPr>'
+        '<w:ilvl w:val="4"/><w:numId w:val="2"/>'
+        '</w:numPr></w:pPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="PR2"><w:pPr><w:numPr>'
+        '<w:ilvl w:val="5"/><w:numId w:val="2"/>'
+        '</w:numPr></w:pPr></w:style>'
+    )
+    source = _document(
+        _paragraph("N.C.: Normally closed.", '<w:pStyle w:val="PR1"/>'),
+        _paragraph("Requirement", '<w:pStyle w:val="PR1"/>'),
+        _paragraph("N.C.: Normally closed.", '<w:pStyle w:val="PR2"/>'),
+    )
+
+    plan = plan_csi_to_canadian(
+        source,
+        _styles(styles),
+        _classifications("PARAGRAPH", "PARAGRAPH", "SUBPARAGRAPH"),
+        _canadian_role_specs("PARAGRAPH", "SUBPARAGRAPH"),
+        numbering_xml=_sparse_masterspec_numbering(),
+    )
+
+    assert plan.document_xml == source
+    assert plan.report.automatic_numbering_retargeted == 3
+    assert plan.report.literal_markers_removed == 0
+    assert plan.report.warnings == ()
+
+
 def test_mixed_automatic_and_literal_numbering_fails_closed():
     source = _document(
         _paragraph(
@@ -367,11 +445,25 @@ def test_incompatible_marker_role_and_non_canadian_template_fail_closed():
 
     with pytest.raises(ValueError, match="incompatible marker"):
         plan_csi_to_canadian(
-            _document(_paragraph("A.B. designation is unchanged technical text")),
+            _document(_paragraph("N. Wrong level")),
             _styles(),
-            _classifications("PARAGRAPH"),
-            _canadian_role_specs("PARAGRAPH"),
+            _classifications("SUBPARAGRAPH"),
+            _canadian_role_specs("SUBPARAGRAPH"),
         )
+
+    technical_text = _document(
+        _paragraph("A.B. designation is unchanged technical text")
+    )
+    technical_plan = plan_csi_to_canadian(
+        technical_text,
+        _styles(),
+        _classifications("PARAGRAPH"),
+        _canadian_role_specs("PARAGRAPH"),
+    )
+    assert technical_plan.document_xml == technical_text
+    assert [issue.code for issue in technical_plan.report.warnings] == [
+        "unproven_numbered_role_preserved"
+    ]
 
     american = _canadian_role_specs("PARAGRAPH")
     american["PARAGRAPH"]["numbering_pattern"].update(
@@ -384,6 +476,33 @@ def test_incompatible_marker_role_and_non_canadian_template_fail_closed():
             _classifications("PARAGRAPH"),
             american,
         )
+
+
+@pytest.mark.parametrize(
+    ("text", "role"),
+    [
+        ("N.C.: Normally closed.", "PARAGRAPH"),
+        ("N.C.: Normally closed.", "SUBPARAGRAPH"),
+    ],
+)
+def test_leading_abbreviation_is_not_treated_as_a_typed_marker(text, role):
+    source = _document(_paragraph(text))
+    classifications = _classifications(role)
+
+    plan = plan_csi_to_canadian(
+        source,
+        _styles(),
+        classifications,
+        _canadian_role_specs(role),
+    )
+
+    assert plan.document_xml == source
+    assert plan.report.paragraphs_converted == 0
+    assert plan.report.warnings[0].code == "unproven_numbered_role_preserved"
+    assert classifications_for_canadian_application(
+        classifications,
+        plan.report,
+    )["classifications"] == []
 
 
 def test_unclassified_marker_like_text_and_section_properties_are_byte_exact():

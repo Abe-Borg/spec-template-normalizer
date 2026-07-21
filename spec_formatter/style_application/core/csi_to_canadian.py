@@ -213,13 +213,13 @@ _RAW_ROLE_MARKERS = {
     "SUBPARAGRAPH_LEVEL_8": re.compile(r"^\s*(?P<marker>\([a-z]\)|\.\d+)"),
 }
 _ANY_MARKERS = (
-    re.compile(r"^\s*\d{1,2}\.\d{1,3}"),
-    re.compile(r"^\s*\.\d+"),
-    re.compile(r"^\s*\(\d+\)"),
-    re.compile(r"^\s*\([a-z]\)"),
-    re.compile(r"^\s*[A-Z][.)]"),
-    re.compile(r"^\s*[a-z][.)]"),
-    re.compile(r"^\s*\d+[.)]"),
+    re.compile(r"^\s*\d{1,2}\.\d{1,3}(?=\s|$)"),
+    re.compile(r"^\s*\.\d+(?=\s|$)"),
+    re.compile(r"^\s*\(\d+\)(?=\s|$)"),
+    re.compile(r"^\s*\([a-z]\)(?=\s|$)"),
+    re.compile(r"^\s*[A-Z][.)](?=\s|$)"),
+    re.compile(r"^\s*[a-z][.)](?=\s|$)"),
+    re.compile(r"^\s*\d+[.)](?=\s|$)"),
 )
 _TEXT_NODE_RX = re.compile(
     r"(?P<open><w:t\b[^>]*>)(?P<text>[\s\S]*?)(?P<close></w:t>)"
