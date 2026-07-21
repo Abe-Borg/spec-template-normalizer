@@ -4,7 +4,7 @@ import posixpath
 import zipfile
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Dict, Any, Optional
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, Set
 from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
@@ -18,9 +18,11 @@ from .core.classification import (
     _effective_numbering_semantics,
 )
 from .core.xml_helpers import (
+    iter_direct_child_xml_blocks,
     iter_element_xml_blocks,
     iter_paragraph_xml_blocks,
     paragraph_text_from_block,
+    strip_direct_run_properties,
 )
 
 if TYPE_CHECKING:
@@ -28,6 +30,8 @@ if TYPE_CHECKING:
 
 
 _OOXML_TRASH_ITEM_RE = re.compile(r"\[trash\]/[0-9A-Fa-f]{4}\.dat\Z")
+_XML_LOCAL_NAME_RE = re.compile(r"[A-Za-z_][\w.-]*\Z")
+_PROTECTED_DIRECT_RPR_PROPERTIES = frozenset({"rStyle", "rPrChange"})
 
 
 def _is_ooxml_trash_item(name: str) -> bool:
@@ -623,35 +627,195 @@ def validate_docx_package(docx_path: Path) -> None:
         )
 
 
-def _normalize_rpr_for_comparison(rpr_block: str) -> str:
+def _normalized_rpr_state(
+    paragraph_xml: str,
+    allowed_properties: Set[str],
+) -> tuple[List[str], List[str]]:
+    """Return normalized all-rPr and per-live-run rPr signatures.
+
+    The application edit primitive removes only contracted properties from
+    live runs while preserving tracked history, drawings, text boxes, and
+    other protected subtrees. The first signature list binds every rPr to its
+    structural path, so current, historical, paragraph-mark, and nested rPr
+    cannot trade places. The second includes an empty sentinel for every outer
+    run, catching run-count changes even when every run is unformatted.
     """
-    Normalize an rPr block for comparison by stripping font-related elements.
-    
-    We allow changes to:
-    - <w:rFonts .../> (font family)
-    - <w:sz .../> (font size)  
-    - <w:szCs .../> (complex script font size)
-    
-    Everything else (bold, italic, color, etc.) must remain unchanged.
-    """
-    result = rpr_block
-    # Strip rFonts
-    result = re.sub(r'<w:rFonts\b[^>]*/>', '', result)
-    result = re.sub(r'<w:rFonts\b[^>]*>[\s\S]*?</w:rFonts>', '', result, flags=re.S)
-    # Strip sz
-    result = re.sub(r'<w:sz\b[^>]*/>', '', result)
-    # Strip szCs
-    result = re.sub(r'<w:szCs\b[^>]*/>', '', result)
-    return result
+
+    normalized_xml = strip_direct_run_properties(
+        paragraph_xml,
+        allowed_properties,
+    )
+    all_rpr_blocks = _rpr_context_signatures(normalized_xml)
+
+    run_signatures: List[str] = []
+    for _start, _end, run_xml in iter_element_xml_blocks(normalized_xml, "w:r"):
+        position, block = _direct_run_rpr(run_xml)
+        run_signatures.append(
+            "" if position is None else f"child[{position}]\n{block}"
+        )
+
+    return all_rpr_blocks, run_signatures
 
 
-def _extract_and_normalize_rpr_blocks(document_xml: str) -> List[str]:
-    """
-    Extract all rPr blocks from document.xml and normalize them.
-    This allows us to check that non-font formatting is preserved.
-    """
-    rpr_blocks = re.findall(r"<w:rPr\b[\s\S]*?</w:rPr>", document_xml)
-    return [_normalize_rpr_for_comparison(b) for b in rpr_blocks]
+def _rpr_context_signatures(paragraph_xml: str) -> List[str]:
+    """Bind each rPr block to a stable element/sibling path in its paragraph."""
+
+    signatures: List[str] = []
+
+    def walk(element_xml: str, path: tuple[tuple[str, int], ...]) -> None:
+        sibling_counts: Counter[str] = Counter()
+        for _start, _end, qualified_name, child_xml in iter_direct_child_xml_blocks(
+            element_xml
+        ):
+            sibling_index = sibling_counts[qualified_name]
+            sibling_counts[qualified_name] += 1
+            child_path = path + ((qualified_name, sibling_index),)
+            if qualified_name == "w:rPr":
+                rendered_path = "/".join(
+                    f"{name}[{index}]" for name, index in child_path
+                )
+                signatures.append(f"{rendered_path}\n{child_xml}")
+            walk(child_xml, child_path)
+
+    walk(paragraph_xml, (("w:p", 0),))
+    return signatures
+
+
+def _direct_run_rpr(run_xml: str) -> tuple[Optional[int], str]:
+    for position, (
+        _start,
+        _end,
+        qualified_name,
+        block,
+    ) in enumerate(iter_direct_child_xml_blocks(run_xml)):
+        if qualified_name == "w:rPr":
+            return position, block
+    return None, ""
+
+
+def _direct_rpr_children_by_run(
+    paragraph_xml: str,
+) -> List[tuple[Optional[int], List[tuple[str, str]]]]:
+    """Return each run's rPr position and exact ordered direct children."""
+
+    signatures: List[tuple[Optional[int], List[tuple[str, str]]]] = []
+    for _start, _end, run_xml in iter_element_xml_blocks(paragraph_xml, "w:r"):
+        rpr_position, rpr_block = _direct_run_rpr(run_xml)
+        children: List[tuple[str, str]] = []
+        if rpr_block:
+            children.extend(
+                (qualified_name, block)
+                for _child_start, _child_end, qualified_name, block in (
+                    iter_direct_child_xml_blocks(rpr_block)
+                )
+            )
+        signatures.append((rpr_position, children))
+    return signatures
+
+
+def _verify_contracted_rpr_deletions_only(
+    before_paragraph: str,
+    after_paragraph: str,
+    allowed_properties: Set[str],
+    paragraph_index: int,
+) -> None:
+    """Reject additions, changes, or movement of contracted properties."""
+
+    if not allowed_properties:
+        return
+    before_runs = _direct_rpr_children_by_run(before_paragraph)
+    after_runs = _direct_rpr_children_by_run(after_paragraph)
+
+    def can_delete(qualified_name: str) -> bool:
+        return (
+            qualified_name.startswith("w:")
+            and qualified_name[2:] in allowed_properties
+        )
+
+    for run_index in range(max(len(before_runs), len(after_runs))):
+        before_position, before_children = (
+            before_runs[run_index]
+            if run_index < len(before_runs)
+            else (None, [])
+        )
+        after_position, after_children = (
+            after_runs[run_index]
+            if run_index < len(after_runs)
+            else (None, [])
+        )
+        has_contracted_child = any(
+            can_delete(qualified_name)
+            for qualified_name, _block in before_children + after_children
+        )
+        if (
+            after_position is not None
+            and after_position != before_position
+            and has_contracted_child
+        ):
+            raise RuntimeError(
+                "INVARIANT FAIL: contracted run formatting was added, changed, "
+                f"reordered, or moved in paragraph {paragraph_index}, run {run_index}"
+            )
+
+        before_index = 0
+        for after_child in after_children:
+            while (
+                before_index < len(before_children)
+                and before_children[before_index] != after_child
+                and can_delete(before_children[before_index][0])
+            ):
+                before_index += 1
+            if (
+                before_index >= len(before_children)
+                or before_children[before_index] != after_child
+            ):
+                if can_delete(after_child[0]):
+                    raise RuntimeError(
+                        "INVARIANT FAIL: contracted run formatting was added, "
+                        f"changed, reordered, or moved in paragraph {paragraph_index}, "
+                        f"run {run_index}.\nBlock: {after_child[1][:200]}"
+                    )
+                # A change to an uncontracted child is diagnosed by the exact
+                # normalized-state comparison below; do not mislabel it as a
+                # contracted-property violation here.
+                break
+            before_index += 1
+
+
+def _validate_rpr_property_contract(
+    contract: Dict[int, Set[str]],
+    paragraph_count: int,
+) -> Dict[int, Set[str]]:
+    normalized: Dict[int, Set[str]] = {}
+    for paragraph_index, raw_properties in contract.items():
+        if type(paragraph_index) is not int or not (
+            0 <= paragraph_index < paragraph_count
+        ):
+            raise ValueError(
+                "Run-property contract contains an invalid paragraph index: "
+                f"{paragraph_index!r}"
+            )
+        if not isinstance(raw_properties, (set, frozenset, list, tuple)):
+            raise ValueError(
+                "Run-property contract values must be property collections"
+            )
+        properties: Set[str] = set()
+        for property_name in raw_properties:
+            if not isinstance(property_name, str) or not (
+                _XML_LOCAL_NAME_RE.fullmatch(property_name)
+            ):
+                raise ValueError(
+                    "Run-property contract contains an invalid property name: "
+                    f"{property_name!r}"
+                )
+            if property_name in _PROTECTED_DIRECT_RPR_PROPERTIES:
+                raise ValueError(
+                    "Run-property contract cannot authorize protected property: "
+                    f"{property_name!r}"
+                )
+            properties.add(property_name)
+        normalized[paragraph_index] = properties
+    return normalized
 
 
 def _verify_target_header_footer_preserved(src_docx: Path, new_docx: Path) -> None:
@@ -726,16 +890,15 @@ def verify_phase2_invariants(
     arch_template_registry: Dict[str, Any] | None = None,
     policy: Optional["ApplicationPolicy"] = None,
     conversion_mode: Optional[str] = None,
+    allowed_rpr_properties_by_paragraph: Optional[Dict[int, Set[str]]] = None,
 ) -> None:
     """
     Verify Phase 2 invariants:
     1. sectPr non-layout semantics unchanged (managed layout tags may change)
     2. If architect header/footer data is present, output header/footer parts match architect set
        and sectPr references resolve to valid document rels IDs
-    3. Run properties unchanged EXCEPT for font-related elements (rFonts, sz, szCs)
-    
-    The font exception allows us to strip hardcoded fonts from MasterSpec docs
-    so that style-level fonts take effect.
+    3. Direct run properties may be removed only when the effective replacement
+       style supplies that property. An omitted contract authorizes no removal.
     """
     # 1) sectPr non-layout semantics unchanged
     before_doc = decode_xml_bytes(
@@ -922,38 +1085,64 @@ def verify_phase2_invariants(
                                 f"{target!r}, expected {expected[(kind, ref_type)]!r}"
                             )
 
-    # 3) no run-level formatting edits EXCEPT font-related (rFonts, sz, szCs)
-    # We normalize rPr blocks by stripping font elements, then compare
-    before_rpr_normalized = _extract_and_normalize_rpr_blocks(before_doc)
-    after_rpr_normalized = _extract_and_normalize_rpr_blocks(after_doc)
-    
-    # Note: The number of rPr blocks might change if we remove empty ones,
-    # so we compare the non-empty normalized blocks
-    before_rpr_filtered = [b for b in before_rpr_normalized if b.strip() and b.strip() != '<w:rPr></w:rPr>']
-    after_rpr_filtered = [b for b in after_rpr_normalized if b.strip() and b.strip() != '<w:rPr></w:rPr>']
-    
-    # Instead of strict equality (which fails if rPr blocks are removed),
-    # we check that no NON-FONT formatting was changed.
-    # This is a relaxed check - we're mainly guarding against accidental changes.
-    
-    # Verify that no non-font formatting was lost.
-    # We can't do a strict count comparison because stripping fonts can remove
-    # entire rPr blocks (when rFonts/sz/szCs were the only children).
-    # Instead, check that every non-empty normalized "before" block still appears
-    # somewhere in the "after" set. This catches accidental bold/italic/color changes.
-    before_set = {}
-    for b in before_rpr_filtered:
-        before_set[b] = before_set.get(b, 0) + 1
+    # 3) Direct run formatting may be removed only under the mutation contract
+    # produced during style application. Compare paragraph-by-paragraph so a
+    # permitted removal in one paragraph cannot mask an unrelated loss in
+    # another. Missing plumbing fails closed: an omitted contract allows no
+    # run-property removal.
+    before_paragraphs = [
+        block for _start, _end, block in iter_paragraph_xml_blocks(before_doc)
+    ]
+    after_paragraphs = [
+        block for _start, _end, block in iter_paragraph_xml_blocks(after_doc)
+    ]
+    if len(before_paragraphs) != len(after_paragraphs):
+        raise RuntimeError(
+            "INVARIANT FAIL: paragraph count changed during run-property verification"
+        )
+    raw_rpr_contract = (
+        {}
+        if allowed_rpr_properties_by_paragraph is None
+        else allowed_rpr_properties_by_paragraph
+    )
+    rpr_contract = _validate_rpr_property_contract(
+        raw_rpr_contract,
+        len(before_paragraphs),
+    )
 
-    after_set = {}
-    for a in after_rpr_filtered:
-        after_set[a] = after_set.get(a, 0) + 1
+    for paragraph_index, (before_paragraph, after_paragraph) in enumerate(
+        zip(before_paragraphs, after_paragraphs)
+    ):
+        allowed_properties = rpr_contract.get(paragraph_index, set())
+        _verify_contracted_rpr_deletions_only(
+            before_paragraph,
+            after_paragraph,
+            allowed_properties,
+            paragraph_index,
+        )
+        before_blocks, before_runs = _normalized_rpr_state(
+            before_paragraph,
+            allowed_properties,
+        )
+        after_blocks, after_runs = _normalized_rpr_state(
+            after_paragraph,
+            allowed_properties,
+        )
+        if before_blocks == after_blocks and before_runs == after_runs:
+            continue
 
-    for block, count in before_set.items():
-        after_count = after_set.get(block, 0)
-        if after_count < count:
-            raise RuntimeError(
-                f"INVARIANT FAIL: non-font run formatting was lost. "
-                f"A normalized rPr block appeared {count}x before but {after_count}x after.\n"
-                f"Block: {block[:200]}"
-            )
+        before_set = Counter(before_blocks)
+        after_set = Counter(after_blocks)
+        for block, count in before_set.items():
+            after_count = after_set.get(block, 0)
+            if after_count < count:
+                raise RuntimeError(
+                    "INVARIANT FAIL: non-font run formatting was lost. "
+                    f"A normalized rPr block appeared {count}x before but "
+                    f"{after_count}x after in paragraph {paragraph_index}.\n"
+                    f"Block: {block[:200]}"
+                )
+        raise RuntimeError(
+            "INVARIANT FAIL: uncontracted run formatting was added, changed, "
+            f"removed, or moved between runs in paragraph {paragraph_index}"
+        )

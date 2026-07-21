@@ -425,3 +425,340 @@ def test_format_only_invariant_preserves_all_existing_numbering_definitions(tmp_
             new_docx=output,
             conversion_mode="format_only",
         )
+
+
+def test_final_invariant_allows_only_contracted_non_font_run_property_removal(
+    tmp_path,
+):
+    source = tmp_path / "source-run-formatting.docx"
+    output = tmp_path / "output-run-formatting.docx"
+    source_parts = _parts()
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        '<w:r><w:rPr><w:b w:val="0"/><w:color w:val="556677"/>'
+        '</w:rPr><w:t>Text</w:t></w:r>',
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        '<w:b w:val="0"/>',
+        "",
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    verify_phase2_invariants(
+        source,
+        output_parts["word/document.xml"].encode("utf-8"),
+        new_docx=output,
+        conversion_mode="format_only",
+        allowed_rpr_properties_by_paragraph={0: {"b"}},
+    )
+
+    with pytest.raises(RuntimeError, match="non-font run formatting was lost"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            allowed_rpr_properties_by_paragraph={0: {"lang"}},
+        )
+
+
+def test_final_invariant_sees_live_formatting_after_nested_rpr_change(tmp_path):
+    source = tmp_path / "source-nested-rpr-change.docx"
+    output = tmp_path / "output-nested-rpr-change.docx"
+    source_parts = _parts()
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        '<w:r><w:rPr><w:rPrChange w:id="7"><w:rPr><w:b/></w:rPr>'
+        '</w:rPrChange><w:color w:val="556677"/></w:rPr>'
+        '<w:t>Text</w:t></w:r>',
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        '<w:color w:val="556677"/>',
+        "",
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="non-font run formatting was lost"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            allowed_rpr_properties_by_paragraph={0: {"lang"}},
+        )
+
+
+def test_final_invariant_rejects_formatting_moved_between_runs(tmp_path):
+    source = tmp_path / "source-run-relocation.docx"
+    output = tmp_path / "output-run-relocation.docx"
+    source_parts = _parts()
+    source_runs = (
+        '<w:r><w:rPr><w:color w:val="556677"/></w:rPr>'
+        '<w:t>Text</w:t></w:r><w:r><w:t>Two</w:t></w:r>'
+    )
+    output_runs = (
+        '<w:r><w:t>Text</w:t></w:r><w:r><w:rPr>'
+        '<w:color w:val="556677"/></w:rPr><w:t>Two</w:t></w:r>'
+    )
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        source_runs,
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        source_runs,
+        output_runs,
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="run formatting was lost"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            allowed_rpr_properties_by_paragraph={},
+        )
+
+
+def test_final_invariant_omitted_contract_rejects_font_removal(tmp_path):
+    source = tmp_path / "source-uncontracted-font.docx"
+    output = tmp_path / "output-uncontracted-font.docx"
+    source_parts = _parts()
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        '<w:r><w:rPr><w:rFonts w:ascii="Arial"/></w:rPr>'
+        '<w:t>Text</w:t></w:r>',
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        '<w:rPr><w:rFonts w:ascii="Arial"/></w:rPr>',
+        "",
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="non-font run formatting was lost"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+        )
+
+
+def test_final_invariant_rejects_tracked_run_property_loss(tmp_path):
+    source = tmp_path / "source-tracked-run-formatting.docx"
+    output = tmp_path / "output-tracked-run-formatting.docx"
+    source_parts = _parts()
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        '<w:r><w:rPr><w:rPrChange w:id="7"><w:rPr>'
+        '<w:rFonts w:ascii="Historical"/></w:rPr></w:rPrChange></w:rPr>'
+        '<w:t>Text</w:t></w:r>',
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        '<w:rFonts w:ascii="Historical"/>',
+        "",
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="non-font run formatting was lost"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+        )
+
+
+def test_final_invariant_rejects_contracted_property_value_change(tmp_path):
+    source = tmp_path / "source-contracted-value.docx"
+    output = tmp_path / "output-contracted-value.docx"
+    source_parts = _parts()
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        '<w:r><w:rPr><w:b w:val="0"/></w:rPr><w:t>Text</w:t></w:r>',
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        '<w:b w:val="0"/>',
+        "<w:b/>",
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="contracted run formatting was added"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            allowed_rpr_properties_by_paragraph={0: {"b"}},
+        )
+
+
+def test_final_invariant_rejects_contracted_property_moved_to_another_run(tmp_path):
+    source = tmp_path / "source-contracted-move.docx"
+    output = tmp_path / "output-contracted-move.docx"
+    source_parts = _parts()
+    source_runs = (
+        '<w:r><w:rPr><w:b/></w:rPr><w:t>Text</w:t></w:r>'
+        '<w:r><w:t>Two</w:t></w:r>'
+    )
+    output_runs = (
+        '<w:r><w:t>Text</w:t></w:r>'
+        '<w:r><w:rPr><w:b/></w:rPr><w:t>Two</w:t></w:r>'
+    )
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        source_runs,
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        source_runs,
+        output_runs,
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="contracted run formatting was added"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            allowed_rpr_properties_by_paragraph={0: {"b"}},
+        )
+
+
+def test_final_invariant_rejects_rpr_change_moved_between_runs(tmp_path):
+    source = tmp_path / "source-tracked-move.docx"
+    output = tmp_path / "output-tracked-move.docx"
+    source_parts = _parts()
+    tracked_rpr = (
+        '<w:rPr><w:rPrChange w:id="7"><w:rPr><w:i/></w:rPr>'
+        '</w:rPrChange></w:rPr>'
+    )
+    source_runs = (
+        f'<w:r>{tracked_rpr}<w:t>Text</w:t></w:r>'
+        '<w:r><w:t>Two</w:t></w:r>'
+    )
+    output_runs = (
+        '<w:r><w:t>Text</w:t></w:r>'
+        f'<w:r>{tracked_rpr}<w:t>Two</w:t></w:r>'
+    )
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        source_runs,
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        source_runs,
+        output_runs,
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="run formatting was lost"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            allowed_rpr_properties_by_paragraph={},
+        )
+
+
+def test_final_invariant_binds_paragraph_mark_rpr_to_live_context(tmp_path):
+    source = tmp_path / "source-paragraph-mark.docx"
+    output = tmp_path / "output-paragraph-mark.docx"
+    source_parts = _parts()
+    paragraph_mark_rpr = "<w:rPr><w:b/></w:rPr>"
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "</w:numPr></w:pPr>",
+        f"</w:numPr>{paragraph_mark_rpr}</w:pPr>",
+    )
+    output_parts = dict(source_parts)
+    tracked_paragraph_mark = (
+        '<w:pPrChange w:id="8"><w:pPr>'
+        f'{paragraph_mark_rpr}</w:pPr></w:pPrChange>'
+    )
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        paragraph_mark_rpr,
+        tracked_paragraph_mark,
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="run formatting was lost"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            allowed_rpr_properties_by_paragraph={},
+        )
+
+
+def test_final_invariant_rejects_retained_contracted_child_reordering(tmp_path):
+    source = tmp_path / "source-contracted-order.docx"
+    output = tmp_path / "output-contracted-order.docx"
+    source_parts = _parts()
+    source_rpr = '<w:rPr><w:b/><w:color w:val="556677"/></w:rPr>'
+    output_rpr = '<w:rPr><w:color w:val="556677"/><w:b/></w:rPr>'
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        f'<w:r>{source_rpr}<w:t>Text</w:t></w:r>',
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        source_rpr,
+        output_rpr,
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="contracted run formatting was added"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            allowed_rpr_properties_by_paragraph={0: {"b"}},
+        )
+
+
+def test_final_invariant_rejects_rpr_moved_after_run_text(tmp_path):
+    source = tmp_path / "source-rpr-position.docx"
+    output = tmp_path / "output-rpr-position.docx"
+    source_parts = _parts()
+    source_run = '<w:r><w:rPr><w:b/></w:rPr><w:t>Text</w:t></w:r>'
+    output_run = '<w:r><w:t>Text</w:t><w:rPr><w:b/></w:rPr></w:r>'
+    source_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        "<w:r><w:t>Text</w:t></w:r>",
+        source_run,
+    )
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        source_run,
+        output_run,
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    with pytest.raises(RuntimeError, match="contracted run formatting was added"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            allowed_rpr_properties_by_paragraph={0: {"b"}},
+        )

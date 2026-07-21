@@ -1362,44 +1362,53 @@ def _resolve_application_policy(
     return policy
 
 
+def _style_replacement_properties(
+    styles_xml_text: str,
+    style_id: str,
+    property_container: str,
+) -> Set[str]:
+    """Return WML properties supplied anywhere in a style's basedOn chain."""
+
+    try:
+        styles_root = ET.fromstring(styles_xml_text)
+    except ET.ParseError as exc:
+        raise ValueError(
+            "Could not parse styles.xml while resolving replacement properties"
+        ) from exc
+    style_map = {
+        style_element.attrib.get(_wq("styleId")): style_element
+        for style_element in styles_root.findall(_wq("style"))
+        if style_element.attrib.get(_wq("styleId"))
+    }
+    properties: Set[str] = set()
+    visited: Set[str] = set()
+    current = style_id
+    while current and current not in visited:
+        visited.add(current)
+        style_element = style_map.get(current)
+        if style_element is None:
+            break
+        container = style_element.find(_wq(property_container))
+        if container is not None:
+            word_namespace = _wq("")
+            properties.update(
+                child.tag[len(word_namespace):]
+                for child in container
+                if isinstance(child.tag, str)
+                and child.tag.startswith(word_namespace)
+            )
+        based_on = style_element.find(_wq("basedOn"))
+        current = _wval(based_on) or ""
+    return properties
+
+
 def _style_replacement_ppr_properties(
     styles_xml_text: str,
     style_id: str,
 ) -> Set[str]:
     """Return paragraph properties supplied anywhere in a style's basedOn chain."""
 
-    style_map = _build_style_xml_map(styles_xml_text)
-    properties: Set[str] = set()
-    visited: Set[str] = set()
-    current = style_id
-    while current and current not in visited:
-        visited.add(current)
-        block = style_map.get(current, "")
-        if not block:
-            break
-        try:
-            wrapped = ET.fromstring(
-                '<root xmlns:w="http://schemas.openxmlformats.org/'
-                f'wordprocessingml/2006/main">{block}</root>'
-            )
-        except ET.ParseError as exc:
-            raise ValueError(
-                f"Could not parse imported style {current!r} while resolving pPr"
-            ) from exc
-        style_element = next(iter(wrapped), None)
-        ppr = style_element.find(_wq("pPr")) if style_element is not None else None
-        if ppr is not None:
-            properties.update(
-                child.tag.rsplit("}", 1)[-1]
-                for child in ppr
-                if isinstance(child.tag, str)
-            )
-        based_on = re.search(
-            r'<w:basedOn\b[^>]*w:val="([^"]+)"',
-            block,
-        )
-        current = based_on.group(1) if based_on else ""
-    return properties
+    return _style_replacement_properties(styles_xml_text, style_id, "pPr")
 
 
 _PROTECTED_DIRECT_RPR_PROPERTIES = frozenset({"rStyle", "rPrChange"})
@@ -1411,38 +1420,11 @@ def _style_replacement_rpr_properties(
 ) -> Set[str]:
     """Return run properties supplied by the effective replacement style."""
 
-    style_map = _build_style_xml_map(styles_xml_text)
-    properties: Set[str] = set()
-    visited: Set[str] = set()
-    current = style_id
-    while current and current not in visited:
-        visited.add(current)
-        block = style_map.get(current, "")
-        if not block:
-            break
-        try:
-            wrapped = ET.fromstring(
-                '<root xmlns:w="http://schemas.openxmlformats.org/'
-                f'wordprocessingml/2006/main">{block}</root>'
-            )
-        except ET.ParseError as exc:
-            raise ValueError(
-                f"Could not parse imported style {current!r} while resolving rPr"
-            ) from exc
-        style_element = next(iter(wrapped), None)
-        rpr = style_element.find(_wq("rPr")) if style_element is not None else None
-        if rpr is not None:
-            properties.update(
-                child.tag.rsplit("}", 1)[-1]
-                for child in rpr
-                if isinstance(child.tag, str)
-            )
-        based_on = re.search(
-            r'<w:basedOn\b[^>]*w:val="([^"]+)"',
-            block,
-        )
-        current = based_on.group(1) if based_on else ""
-    return properties - _PROTECTED_DIRECT_RPR_PROPERTIES
+    return _style_replacement_properties(
+        styles_xml_text,
+        style_id,
+        "rPr",
+    ) - _PROTECTED_DIRECT_RPR_PROPERTIES
 
 
 def _strip_direct_ppr_properties(
@@ -1632,6 +1614,16 @@ def apply_phase2_classifications(
             ) | {"numPr"}
         else:
             allowed_ppr_by_index[idx] = {"numPr", "jc", "ind", "spacing"}
+
+    # Final package verification runs after the edited XML has been repacked.
+    # Carry the same bounded run-property contract forward so that verifier can
+    # distinguish intended style-supplied formatting replacement from an
+    # unrelated loss of direct formatting.
+    report.allowed_rpr_properties_by_paragraph = {
+        idx: set(properties)
+        for idx, properties in enumerate(allowed_rpr_by_index)
+        if properties
+    }
 
     # Contract normalization is per paragraph: Format-only may remove only
     # properties actually supplied by that paragraph's effective architect
@@ -1893,6 +1885,9 @@ class ApplyReport:
     stripped_run_fonts: int = 0
     ignored: int = 0
     numbering_checks: Dict[str, Any] = field(default_factory=dict)
+    allowed_rpr_properties_by_paragraph: Dict[int, Set[str]] = field(
+        default_factory=dict
+    )
 
 
 def _build_style_xml_map(styles_xml_text: str) -> Dict[str, str]:

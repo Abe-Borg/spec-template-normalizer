@@ -324,6 +324,7 @@ def _build_and_patch_output(
     output_dir: Path,
     arch_template_registry: Optional[Dict[str, Any]] = None,
     conversion_mode: str = FORMAT_ONLY,
+    allowed_rpr_properties_by_paragraph: Optional[Dict[int, set[str]]] = None,
 ) -> Path:
     conversion_mode = validate_conversion_mode(conversion_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -390,6 +391,9 @@ def _build_and_patch_output(
             new_docx=temp_output_path,
             arch_template_registry=arch_template_registry,
             conversion_mode=conversion_mode,
+            allowed_rpr_properties_by_paragraph=(
+                allowed_rpr_properties_by_paragraph
+            ),
         )
         os.replace(temp_output_path, output_path)
     except Exception:
@@ -551,6 +555,9 @@ def _apply_classified_target(
         output_dir,
         arch_template_registry=env_registry,
         conversion_mode=policy.conversion_mode,
+        allowed_rpr_properties_by_paragraph=(
+            apply_report.allowed_rpr_properties_by_paragraph
+        ),
     )
 
     classified, total, unresolved = _coverage_counts(bundle, classifications)

@@ -8,6 +8,7 @@ from spec_formatter.style_application.core.classification import (
     _build_numbering_catalog,
     _effective_numbering_semantics,
 )
+from spec_formatter.style_application.core import classification as classification_module
 from spec_formatter.style_application.core.ooxml_text import decode_xml_bytes
 from spec_formatter.style_application.core.xml_helpers import (
     iter_paragraph_xml_blocks,
@@ -150,6 +151,23 @@ def test_sanitized_154_paragraph_format_only_regression(tmp_path: Path) -> None:
         for index in source_ignored_indices
     )
 
+    # The architect PARAGRAPH style supplies bold. The formatter may therefore
+    # remove only the conflicting direct bold override from styled level-4
+    # paragraphs; their unrelated direct color must survive.
+    style_replaced_indices = {
+        index for index, level in NUMBERED_LEVEL_BY_INDEX.items() if level == 4
+    }
+    assert all(
+        '<w:b w:val="0"/>' in source_paragraphs[index]
+        for index in style_replaced_indices
+    )
+    assert all(
+        '<w:b w:val="0"/>' not in output_paragraphs[index]
+        and '<w:color w:val="556677"/>' in output_paragraphs[index]
+        for index in style_replaced_indices
+    )
+    assert "<w:b" in output_styles
+
     # The target list stays authoritative while the selected architect shell
     # replaces the target page size and header/footer relationships.
     assert '<w:pgSz w:w="10000" w:h="15000"/>' in output_document
@@ -158,3 +176,46 @@ def test_sanitized_154_paragraph_format_only_regression(tmp_path: Path) -> None:
         names = set(package.namelist())
     assert "word/header9.xml" not in names
     assert {"word/header1.xml", "word/header2.xml", "word/header3.xml"} <= names
+
+
+def test_final_verifier_rejects_uncontracted_run_property_loss(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    architect = tmp_path / "sanitized-architect.docx"
+    target = tmp_path / "sanitized-target.docx"
+    write_sanitized_format_only_pair(architect, target)
+
+    real_strip = classification_module.strip_direct_run_properties
+
+    def overbroad_strip(paragraph_xml, properties):
+        # Fault injection: make both application and its immediate normalized
+        # contract believe color is replaceable. Final verification receives
+        # the real style-derived manifest and must still reject the extra loss.
+        return real_strip(paragraph_xml, set(properties) | {"color"})
+
+    monkeypatch.setattr(
+        classification_module,
+        "strip_direct_run_properties",
+        overbroad_strip,
+    )
+
+    run = format_specifications(
+        architect_template=architect,
+        target_specs=[target],
+        output_dir=tmp_path / "formatted",
+        cache_dir=tmp_path / "template-cache",
+        api_key="",
+        max_workers=1,
+        conversion_mode=FORMAT_ONLY,
+        template_model="sanitized-format-only-corpus",
+        template_classifier=sanitized_template_classifier,
+    )
+
+    assert not run.success
+    assert run.failed == 1
+    result = run.targets[0]
+    assert result.output_path is None
+    assert result.error is not None
+    assert "non-font run formatting was lost" in result.error
+    assert "paragraph 3" in result.error

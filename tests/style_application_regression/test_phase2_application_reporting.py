@@ -330,6 +330,37 @@ def test_direct_run_properties_are_removed_only_when_effective_style_replaces_th
     assert report.stripped_run_fonts == 1
 
 
+def test_extension_run_property_does_not_authorize_word_property_removal(tmp_path):
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">'
+        '<w:style w:type="paragraph" w:styleId="Body"><w:rPr><w14:shadow/>'
+        '</w:rPr></w:style></w:styles>'
+    )
+    extract = _seed_extract(tmp_path, styles)
+    doc_path = extract / "word" / "document.xml"
+    doc_path.write_text(
+        DOC_XML.replace(
+            '<w:r><w:t>A</w:t></w:r>',
+            '<w:r><w:rPr><w:shadow/></w:rPr><w:t>A</w:t></w:r>',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    report = apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+    )
+
+    first_paragraph = doc_path.read_text(encoding="utf-8").split("</w:p>", 1)[0]
+    assert "<w:shadow/>" in first_paragraph
+    assert report.allowed_rpr_properties_by_paragraph == {}
+
+
 def test_direct_fonts_sizes_and_language_survive_when_style_replaces_none(tmp_path):
     extract = _seed_extract(tmp_path, STYLE_WITHOUT_PPR)
     doc_path = extract / "word" / "document.xml"

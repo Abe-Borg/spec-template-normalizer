@@ -165,26 +165,33 @@ def _sanitized_text(paragraph_index: int) -> str:
 def _target_document_xml() -> str:
     paragraphs: list[str] = []
     for paragraph_index in range(154):
+        level = NUMBERED_LEVEL_BY_INDEX.get(paragraph_index)
         if paragraph_index == 0:
             style_id = "SID"
         elif paragraph_index == 153:
             style_id = "EOS"
         else:
-            level = NUMBERED_LEVEL_BY_INDEX.get(paragraph_index)
             style_id = TARGET_STYLE_BY_LEVEL[level] if level is not None else "CMT"
 
-        # Direct formatting on ignored paragraphs makes byte-stability visible
-        # to the regression instead of testing only plain runs.
-        ignored_run_properties = (
-            '<w:rPr><w:b/><w:color w:val="445566"/></w:rPr>'
-            if style_id == "CMT"
-            else ""
-        )
+        # Direct formatting on ignored paragraphs makes byte-stability visible.
+        # Level-4 paragraphs reproduce the production regression: their direct
+        # "not bold" override must be removed because the architect PARAGRAPH
+        # style supplies bold, while the unrelated color remains direct.
+        if style_id == "CMT":
+            direct_run_properties = (
+                '<w:rPr><w:b/><w:color w:val="445566"/></w:rPr>'
+            )
+        elif level == 4:
+            direct_run_properties = (
+                '<w:rPr><w:b w:val="0"/><w:color w:val="556677"/></w:rPr>'
+            )
+        else:
+            direct_run_properties = ""
         paragraphs.append(
             '<w:p><w:pPr>'
             f'<w:pStyle w:val="{style_id}"/>'
             '</w:pPr><w:r>'
-            f'{ignored_run_properties}<w:t>{_sanitized_text(paragraph_index)}</w:t>'
+            f'{direct_run_properties}<w:t>{_sanitized_text(paragraph_index)}</w:t>'
             '</w:r></w:p>'
         )
     return (
@@ -201,11 +208,12 @@ def _architect_document_xml() -> str:
         '<w:p><w:r><w:t>SANITIZED ARCHITECT SHELL</w:t></w:r></w:p>',
     ]
     for level, role in ROLE_BY_LEVEL.items():
+        run_properties = '<w:rPr><w:b/></w:rPr>' if role == "PARAGRAPH" else ""
         role_paragraphs.append(
             '<w:p><w:pPr><w:numPr>'
             f'<w:ilvl w:val="{level}"/><w:numId w:val="5"/>'
             '</w:numPr></w:pPr><w:r>'
-            f'<w:t>Sanitized architect exemplar for {role}</w:t>'
+            f'{run_properties}<w:t>Sanitized architect exemplar for {role}</w:t>'
             '</w:r></w:p>'
         )
     return (

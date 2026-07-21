@@ -122,6 +122,118 @@ def iter_element_xml_blocks(
         raise ValueError(f"Malformed XML: unclosed <{qualified_name}> element")
 
 
+def iter_direct_child_xml_blocks(
+    element_xml_text: str,
+) -> Generator[Tuple[int, int, str, str], None, None]:
+    """Yield direct child element blocks without serializing the XML.
+
+    Each item is ``(start, end, qualified_name, raw_block)``.  Nested elements,
+    comments, CDATA, and processing instructions are scanned structurally so a
+    matching descendant cannot be mistaken for a direct property child.
+    """
+
+    def next_markup(start: int) -> Tuple[int, str, Optional[str], bool, bool]:
+        if element_xml_text.startswith("<!--", start):
+            marker = element_xml_text.find("-->", start + 4)
+            if marker < 0:
+                raise ValueError("Malformed XML: unterminated comment")
+            return marker + 3, "misc", None, False, False
+        if element_xml_text.startswith("<![CDATA[", start):
+            marker = element_xml_text.find("]]>", start + 9)
+            if marker < 0:
+                raise ValueError("Malformed XML: unterminated CDATA")
+            return marker + 3, "misc", None, False, False
+        if element_xml_text.startswith("<?", start):
+            marker = element_xml_text.find("?>", start + 2)
+            if marker < 0:
+                raise ValueError("Malformed XML: unterminated processing instruction")
+            return marker + 2, "misc", None, False, False
+
+        quote: Optional[str] = None
+        tag_end = start + 1
+        while tag_end < len(element_xml_text):
+            char = element_xml_text[tag_end]
+            if quote is not None:
+                if char == quote:
+                    quote = None
+            elif char in {'"', "'"}:
+                quote = char
+            elif char == ">":
+                break
+            tag_end += 1
+        if tag_end >= len(element_xml_text):
+            raise ValueError(f"Malformed XML: unterminated tag at character {start}")
+
+        end = tag_end + 1
+        token = element_xml_text[start:end]
+        name_match = re.match(
+            r"<\s*(?P<close>/)?\s*(?P<name>[A-Za-z_][\w.:-]*)(?=\s|/?>)",
+            token,
+        )
+        if name_match is None:
+            return end, "misc", None, False, False
+        is_close = bool(name_match.group("close"))
+        is_self_closing = not is_close and bool(re.search(r"/\s*>$", token))
+        return end, "tag", name_match.group("name"), is_close, is_self_closing
+
+    cursor = 0
+    root_name: Optional[str] = None
+    while root_name is None:
+        start = element_xml_text.find("<", cursor)
+        if start < 0:
+            raise ValueError("Malformed XML: element block has no opening tag")
+        end, kind, name, is_close, is_self_closing = next_markup(start)
+        cursor = end
+        if kind == "misc":
+            continue
+        if is_close or name is None:
+            raise ValueError("Malformed XML: element block starts with a close tag")
+        root_name = name
+        if is_self_closing:
+            return
+
+    depth = 0
+    child_start: Optional[int] = None
+    child_name: Optional[str] = None
+    while True:
+        start = element_xml_text.find("<", cursor)
+        if start < 0:
+            break
+        end, kind, name, is_close, is_self_closing = next_markup(start)
+        cursor = end
+        if kind == "misc" or name is None:
+            continue
+        if is_close:
+            if depth == 0:
+                if name != root_name:
+                    raise ValueError(
+                        f"Malformed XML: expected </{root_name}>, found </{name}>"
+                    )
+                return
+            depth -= 1
+            if depth == 0 and child_start is not None and child_name is not None:
+                yield (
+                    child_start,
+                    end,
+                    child_name,
+                    element_xml_text[child_start:end],
+                )
+                child_start = None
+                child_name = None
+            continue
+
+        if depth == 0:
+            if is_self_closing:
+                yield start, end, name, element_xml_text[start:end]
+                continue
+            child_start = start
+            child_name = name
+        if not is_self_closing:
+            depth += 1
+
+    raise ValueError(f"Malformed XML: unclosed <{root_name}> element")
+
+
 def iter_paragraph_xml_blocks(document_xml_text: str) -> Generator[Tuple[int, int, str], None, None]:
     """Yield stable, non-overlapping top-level ``w:p`` blocks."""
     yield from iter_element_xml_blocks(document_xml_text, "w:p")
@@ -368,15 +480,24 @@ def strip_direct_run_properties(
     p_xml, preserved = _protect_out_of_scope_subtrees(p_xml)
 
     def strip_properties_from_rpr(rpr_text: str) -> str:
-        result = rpr_text
-        for name in sorted(property_names):
-            result = re.sub(rf'<w:{name}\b[^>]*/>', '', result)
-            result = re.sub(
-                rf'<w:{name}\b[^>]*>[\s\S]*?</w:{name}>',
-                '',
-                result,
-                flags=re.S,
+        ranges = [
+            (start, end)
+            for start, end, qualified_name, _block in iter_direct_child_xml_blocks(
+                rpr_text
             )
+            if qualified_name.startswith("w:")
+            and qualified_name[2:] in property_names
+        ]
+        if ranges:
+            pieces: List[str] = []
+            last = 0
+            for start, end in ranges:
+                pieces.append(rpr_text[last:start])
+                last = end
+            pieces.append(rpr_text[last:])
+            result = "".join(pieces)
+        else:
+            result = rpr_text
 
         inner = re.sub(
             r'<w:rPr\b[^>]*>([\s\S]*)</w:rPr>',

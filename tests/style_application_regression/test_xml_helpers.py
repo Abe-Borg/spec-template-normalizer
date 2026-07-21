@@ -129,6 +129,18 @@ class TestStripRunFontFormatting:
         assert "<w:rFonts" not in live_prefix
         assert "<w:lang" not in live_prefix
 
+    def test_selected_property_removal_does_not_touch_nested_descendant(self):
+        nested = '<w14:textFill><w:color w:val="Nested"/></w14:textFill>'
+        p = (
+            '<w:p><w:r><w:rPr><w:color w:val="Direct"/>'
+            f'{nested}</w:rPr><w:t>Text</w:t></w:r></w:p>'
+        )
+
+        result = strip_direct_run_properties(p, {"color"})
+
+        assert '<w:color w:val="Direct"/>' not in result
+        assert nested in result
+
 
 class TestStripConflictingDirectPpr:
     def test_removes_jc_ind_spacing_and_numpr(self):
