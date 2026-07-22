@@ -47,12 +47,57 @@ ERROR = 40
 _LEVEL_TO_NAME = {DEBUG: "DEBUG", INFO: "INFO", WARNING: "WARNING", ERROR: "ERROR"}
 _NAME_TO_LEVEL = {name: value for value, name in _LEVEL_TO_NAME.items()}
 
-# The one character class we trust to reach disk in a string field.  Identical
-# in spirit to ``pipeline._normalize_audit_details``: identifiers, numbers,
-# dotted/pathy tokens and a few symbols -- but never whitespace, which is the
-# cheapest tell that a value is a sentence from a document rather than a code.
+# The one character class we trust to reach disk in a string field VALUE.
+# Identical in spirit to ``pipeline._normalize_audit_details``: identifiers,
+# numbers, dotted/pathy tokens and a few symbols -- but never whitespace, which
+# is the cheapest tell that a value is a sentence from a document rather than a
+# code.  A charset alone is not enough (a single confidential token or an API
+# key is charset-clean), so strings are additionally gated on their KEY below.
 _SAFE_STRING_RX = re.compile(r"[A-Za-z0-9_.:/#@+\-]{1,160}")
 _NAME_RX = re.compile(r"[a-z][a-z0-9_]{0,47}")
+
+# Field KEYS must be code-authored lowercase identifiers.  This is stricter
+# than the value charset on purpose: a diagnostics key is always a fixed name
+# chosen in source, never derived from a document or a secret, so an API key
+# (which carries ``-`` and uppercase) or a document token can never appear as a
+# key -- closing the fact that JSON object keys bypass value redaction.
+_FIELD_KEY_RX = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+# Only these keys may carry a string VALUE.  Every string a diagnostics event
+# legitimately records is an enum-like structural token (a mode, a policy, a
+# model id, an exception class name, a style/role id).  Numbers and bools are
+# always allowed under any valid key; strings under any other key are dropped.
+# This mirrors ``_normalize_audit_details``'s ``safe_string_keys`` whitelist so
+# the diagnostics channel is no weaker than the audit channel it sits beside,
+# and it defeats paragraph-tokenisation exfiltration (``{"w0": "ACME", ...}``).
+_STRING_VALUE_KEYS = frozenset(
+    {
+        "category",
+        "code",
+        "component",
+        "conversion_mode",
+        "csi_role",
+        "disposition",
+        "event",
+        "kind",
+        "level",
+        "method",
+        "mode",
+        "model",
+        "numbering_provenance",
+        "policy",
+        "provenance",
+        "reason",
+        "role",
+        "source_kind",
+        "status",
+        "style_id",
+        "target_kind",
+    }
+)
+# The error class name recorded by timers is lower-cased before storage, so
+# ``error_type`` carries a string too.
+_STRING_VALUE_KEYS = _STRING_VALUE_KEYS | {"error_type"}
 
 _MAX_FIELD_KEYS = 64
 _MAX_LIST_ITEMS = 256
@@ -91,30 +136,46 @@ def _key_may_carry_document_text(key: str) -> bool:
     )
 
 
-def _sanitize_value(value: Any, *, depth: int) -> Any:
+def _valid_field_key(key: Any) -> bool:
+    """A diagnostics field key must be a code-authored lowercase identifier."""
+
+    return (
+        isinstance(key, str)
+        and _FIELD_KEY_RX.fullmatch(key) is not None
+        and not _key_may_carry_document_text(key)
+    )
+
+
+def _sanitize_value(value: Any, *, key: str, depth: int) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
-        return value if _SAFE_STRING_RX.fullmatch(value) else _DROP
+        # A charset-clean string is only kept under a whitelisted enum-like
+        # key.  This is what stops a document paragraph being smuggled out one
+        # whitespace-free token at a time, and it keeps a lone secret-shaped
+        # token from surviving under an arbitrary field name.
+        if key in _STRING_VALUE_KEYS and _SAFE_STRING_RX.fullmatch(value):
+            return value
+        return _DROP
     if depth >= _MAX_DEPTH:
         return _DROP
     if isinstance(value, Mapping):
         nested: Dict[str, Any] = {}
         for raw_key, raw_value in value.items():
-            if not isinstance(raw_key, str) or _key_may_carry_document_text(raw_key):
+            if not _valid_field_key(raw_key):
                 continue
-            if not _NAME_RX.fullmatch(raw_key) and not _SAFE_STRING_RX.fullmatch(raw_key):
-                continue
-            cleaned = _sanitize_value(raw_value, depth=depth + 1)
+            cleaned = _sanitize_value(raw_value, key=raw_key, depth=depth + 1)
             if cleaned is not _DROP:
                 nested[raw_key] = cleaned
             if len(nested) >= _MAX_FIELD_KEYS:
                 break
         return nested
     if isinstance(value, (list, tuple)):
+        # List elements inherit the containing key, so a list of strings is
+        # kept only when that key is itself whitelisted for strings.
         items: List[Any] = []
         for element in value:
-            cleaned = _sanitize_value(element, depth=depth + 1)
+            cleaned = _sanitize_value(element, key=key, depth=depth + 1)
             if cleaned is not _DROP:
                 items.append(cleaned)
             if len(items) >= _MAX_LIST_ITEMS:
@@ -124,23 +185,24 @@ def _sanitize_value(value: Any, *, depth: int) -> Any:
 
 
 def sanitize_fields(fields: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Return only the provably safe scalar/identifier subset of *fields*.
+    """Return only the provably safe subset of *fields*.
 
-    Unsafe values are omitted entirely.  This is intentionally strict: a
-    diagnostics field exists to be aggregated, so anything that is not a
-    number, bool, ``None`` or an identifier-shaped string has no business in
-    it and is far more likely to be leaked document text than a useful datum.
+    Unsafe entries are omitted entirely.  This is intentionally strict: a
+    diagnostics field exists to be aggregated.  Keys must be code-authored
+    lowercase identifiers (so a secret or document token can never appear as a
+    key, which would otherwise bypass value redaction), numbers/bools/``None``
+    are always allowed, and strings are allowed only under a whitelist of
+    enum-like keys.  Everything else is far more likely to be leaked document
+    text than a useful datum, so it is dropped.
     """
 
     if not isinstance(fields, Mapping):
         return {}
     safe: Dict[str, Any] = {}
     for key, value in fields.items():
-        if not isinstance(key, str) or _key_may_carry_document_text(key):
+        if not _valid_field_key(key):
             continue
-        if not _NAME_RX.fullmatch(key) and not _SAFE_STRING_RX.fullmatch(key):
-            continue
-        cleaned = _sanitize_value(value, depth=1)
+        cleaned = _sanitize_value(value, key=key, depth=1)
         if cleaned is not _DROP:
             safe[key] = cleaned
         if len(safe) >= _MAX_FIELD_KEYS:

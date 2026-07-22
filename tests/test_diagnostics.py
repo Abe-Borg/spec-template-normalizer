@@ -52,12 +52,61 @@ def test_sanitize_fields_drops_prose_and_document_text_shaped_values() -> None:
 def test_sanitize_fields_recurses_and_bounds_depth() -> None:
     cleaned = diag.sanitize_fields(
         {
+            # Nested scalars survive; a doc-text key is dropped; a string under
+            # a non-whitelisted key ("b") is dropped even though it is clean.
             "nested": {"a": 1, "content": "drop-me", "b": "safe"},
+            # Numbers survive in a list; strings do not, because the containing
+            # key "items" is not whitelisted for string values.
             "items": [1, 2, "with space", "safe_token", {"x": 3}],
         }
     )
-    assert cleaned["nested"] == {"a": 1, "b": "safe"}
-    assert cleaned["items"] == [1, 2, "safe_token", {"x": 3}]
+    assert cleaned["nested"] == {"a": 1}
+    assert cleaned["items"] == [1, 2, {"x": 3}]
+
+
+def test_sanitize_fields_keeps_strings_only_under_whitelisted_keys() -> None:
+    cleaned = diag.sanitize_fields(
+        {
+            "mode": "format_only",  # whitelisted -> kept
+            "model": "claude-sonnet-5",  # whitelisted -> kept
+            "detail": "csi_to_canadian",  # clean token, non-whitelisted -> dropped
+        }
+    )
+    assert cleaned == {"mode": "format_only", "model": "claude-sonnet-5"}
+
+
+def test_sanitize_fields_rejects_secret_shaped_and_document_token_keys() -> None:
+    api_key = "sk-ant-api03-" + "A1b2C3d4" * 12  # charset-clean, > _NAME limits
+    cleaned = diag.sanitize_fields(
+        {
+            # Regression for the confirmed leak: an API key (or any document
+            # token) used as a KEY must never survive, because JSON object keys
+            # bypass value redaction downstream.
+            "num_id_remaps": {api_key: 2, "CONFIDENTIAL": 4, "valid_child": 7},
+            api_key: 1,
+            "Uppercase": 3,  # keys must be lowercase identifiers
+        }
+    )
+    assert cleaned == {"num_id_remaps": {"valid_child": 7}}
+
+
+def test_sanitize_fields_blocks_paragraph_tokenisation_exfiltration() -> None:
+    # A hostile processor tries to smuggle a confidential heading out one
+    # whitespace-free token at a time, across arbitrary keys and a list.
+    cleaned = diag.sanitize_fields(
+        {
+            "w0": "ACME",
+            "w1": "MERGER",
+            "w2": "PRICING",
+            "tokens": ["ACME", "MERGER", "PRICING"],
+            "modified": 12,
+        }
+    )
+    # No token survives anywhere: the arbitrary word keys are gone and the list
+    # collapses to empty, so nothing of the heading can be reconstructed.
+    assert cleaned == {"modified": 12, "tokens": []}
+    assert "ACME" not in str(cleaned)
+    assert "MERGER" not in str(cleaned)
 
 
 def test_recorder_respects_min_level() -> None:

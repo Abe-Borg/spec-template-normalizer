@@ -592,6 +592,88 @@ def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
     assert "[document content omitted]" in artifact_texts[1]
 
 
+def test_diagnostics_channel_resists_key_and_token_exfiltration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+    api_key = "sk-ant-api03-" + "Z9y8X7w6" * 12
+
+    def processor(**kwargs) -> BatchResult:
+        source = Path(kwargs["docx_path"])
+        staging_dir = Path(kwargs["output_dir"])
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staged_output = staging_dir / f"{source.stem}_PHASE2_FORMATTED.docx"
+        staged_output.write_bytes(b"formatted:" + source.read_bytes())
+        return BatchResult(
+            filename=source.name,
+            success=True,
+            output_path=staged_output,
+            log=["Applied classifications, stability verified"],
+            error=None,
+            duration_seconds=0.02,
+            audit_summary={"styled": 1, "ignored": 0, "out_of_scope": 0, "unresolved": 0},
+            # A hostile processor tries every diagnostics smuggling channel:
+            # a secret as a dict KEY, a document token as a KEY, and a heading
+            # tokenised across arbitrary keys and a list.
+            diagnostics=[
+                {
+                    "level": "info",
+                    "component": "target",
+                    "event": "apply_classifications",
+                    "fields": {
+                        "modified": 3,
+                        "num_id_remaps": {api_key: 2, "CONFIDENTIAL": 4},
+                        api_key: 1,
+                        "w0": "ACME",
+                        "w1": "MERGER",
+                        "leak_list": ["TOPSECRET", "PROJECT"],
+                    },
+                }
+            ],
+        )
+
+    result = pipeline.format_specifications(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        api_key=api_key,
+        cache_dir=tmp_path / "profile-cache",
+        diagnostics_level="debug",
+        _template_analyzer=analyzer,
+        _config_loader=config_loader,
+        _target_processor=processor,
+    )
+
+    artifact_texts = [
+        result.manifest_path.read_text(encoding="utf-8"),
+        (result.run_dir / "run.log").read_text(encoding="utf-8"),
+        result.targets[0].audit_path.read_text(encoding="utf-8"),
+        result.diagnostics_path.read_text(encoding="utf-8"),
+    ]
+    for artifact_text in artifact_texts:
+        assert api_key not in artifact_text
+        assert "CONFIDENTIAL" not in artifact_text
+        assert "ACME" not in artifact_text
+        assert "MERGER" not in artifact_text
+        assert "TOPSECRET" not in artifact_text
+    # The one legitimate structural datum still comes through.
+    diag_events = [
+        json.loads(line)
+        for line in artifact_texts[3].splitlines()
+        if line.strip()
+    ]
+    apply_events = [e for e in diag_events if e["event"] == "apply_classifications"]
+    assert apply_events
+    fields = apply_events[0]["fields"]
+    assert fields["modified"] == 3
+    # Any container that held smuggled data was emptied, not merely value-scrubbed.
+    assert fields.get("num_id_remaps", {}) == {}
+    assert fields.get("leak_list", []) == []
+
+
 def test_run_text_sanitizer_rejects_unstructured_model_authored_details() -> None:
     confidential = "deterministic override got confidential sprinkler layout"
 
