@@ -345,6 +345,135 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
     assert "Applied classifications, stability verified" in run_log_text
 
 
+def test_run_publishes_structured_diagnostics_alongside_the_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+
+    result = pipeline.format_specifications(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        api_key="offline-test-key",
+        cache_dir=tmp_path / "profile-cache",
+        diagnostics_level="debug",
+        _template_analyzer=analyzer,
+        _config_loader=config_loader,
+        _target_processor=processor,
+    )
+
+    # A diagnostics stream is published next to run.json and surfaced on the result.
+    assert result.diagnostics_path == result.run_dir / "diagnostics.jsonl"
+    assert result.diagnostics_path.is_file()
+    events = [
+        json.loads(line)
+        for line in result.diagnostics_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert events, "expected at least one diagnostics event"
+    for event in events:
+        assert set(("seq", "ts", "level", "component", "event", "fields")) <= set(event)
+    by_event = {event["event"]: event for event in events}
+    assert "run_start" in by_event
+    assert by_event["run_start"]["fields"]["targets"] == 1
+    assert "run_complete" in by_event
+    assert by_event["run_complete"]["fields"] == {
+        "targets": 1,
+        "succeeded": 1,
+        "failed": 0,
+    }
+    # Sequence numbers are strictly increasing.
+    assert [event["seq"] for event in events] == sorted(event["seq"] for event in events)
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    diagnostics = manifest["diagnostics"]
+    assert diagnostics["level"] == "DEBUG"
+    assert diagnostics["log"] == "diagnostics.jsonl"
+    assert diagnostics["event_count"] == len(events)
+    assert diagnostics["errors"] == 0
+    assert "phase_durations_ms" in diagnostics
+    assert manifest["paths"]["diagnostics_log"] == str(result.diagnostics_path)
+    # The additive block must not perturb the exact-equality summary contract.
+    assert manifest["summary"] == {
+        "targets": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "dispositions": {"styled": 1, "ignored": 2, "out_of_scope": 3, "unresolved": 0},
+    }
+
+
+def test_diagnostics_level_honours_environment_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    monkeypatch.setenv("SPEC_FORMATTER_DIAGNOSTICS_LEVEL", "warning")
+
+    result = pipeline.format_specifications(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        api_key="offline-test-key",
+        cache_dir=tmp_path / "profile-cache",
+        diagnostics_level="info",
+        _template_analyzer=analyzer,
+        _config_loader=config_loader,
+        _target_processor=processor,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    # The environment override wins over the call argument, so quieter INFO
+    # phase events are filtered out of the persisted stream.
+    assert manifest["diagnostics"]["level"] == "WARNING"
+    diag_lines = [
+        line
+        for line in result.diagnostics_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert diag_lines == []
+
+
+def test_initialization_failure_still_publishes_a_diagnostics_stream(
+    tmp_path: Path,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    api_key = "never-persist-this-secret"
+
+    def failing_analyzer(**_kwargs):
+        raise RuntimeError(f"template text=<w:t>CONFIDENTIAL {api_key}</w:t>")
+
+    with pytest.raises(RuntimeError) as caught:
+        pipeline.format_specifications(
+            architect,
+            [target],
+            tmp_path / "formatted",
+            api_key=api_key,
+            cache_dir=tmp_path / "profile-cache",
+            _template_analyzer=failing_analyzer,
+        )
+
+    run_dir = caught.value.run_dir
+    diagnostics_path = run_dir / "diagnostics.jsonl"
+    assert diagnostics_path.is_file()
+    text = diagnostics_path.read_text(encoding="utf-8")
+    assert api_key not in text
+    assert "CONFIDENTIAL" not in text
+    events = [json.loads(line) for line in text.splitlines() if line.strip()]
+    by_event = {event["event"]: event for event in events}
+    assert "init_failed" in by_event
+    # Only the exception type name is recorded, never its (leaky) message.
+    assert by_event["init_failed"]["fields"]["error_type"] == "runtimeerror"
+    manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert manifest["diagnostics"]["errors"] >= 1
+    assert manifest["paths"]["diagnostics_log"] == str(diagnostics_path)
+
+
 def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -401,6 +530,20 @@ def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
                 ],
             },
             numbering_checks={"policy": "format_only", "checked": 1},
+            # A hostile processor tries to smuggle secrets/document text through
+            # the structured diagnostics channel; both write paths must scrub it.
+            diagnostics=[
+                {
+                    "level": "info",
+                    "component": "target",
+                    "event": "apply_classifications",
+                    "fields": {
+                        "modified": 3,
+                        "leaked_secret": f"SECRET DOC TEXT {api_key}",
+                        "preview": "TOP SECRET PARAGRAPH",
+                    },
+                }
+            ],
         )
 
     result = pipeline.format_specifications(
@@ -417,18 +560,21 @@ def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
     assert result.failed == 1
     assert result.manifest_path is not None
     assert result.targets[0].audit_path is not None
+    assert result.diagnostics_path is not None and result.diagnostics_path.is_file()
     artifact_texts = [
         result.manifest_path.read_text(encoding="utf-8"),
         (result.run_dir / "run.log").read_text(encoding="utf-8"),
         result.targets[0].audit_path.read_text(encoding="utf-8"),
+        result.diagnostics_path.read_text(encoding="utf-8"),
     ]
     for artifact_text in artifact_texts:
         assert api_key not in artifact_text
         assert "SECRET DOC TEXT" not in artifact_text
         assert "TOP SECRET PARAGRAPH" not in artifact_text
         assert "PART 9 - CONFIDENTIAL" not in artifact_text
+        assert "leaked_secret" not in artifact_text
 
-    audit = json.loads(artifact_texts[-1])
+    audit = json.loads(artifact_texts[2])
     assert audit["application_audit"]["ignored_paragraphs"] == [
         {"paragraph_index": 4, "reason": "unspecified"}
     ]

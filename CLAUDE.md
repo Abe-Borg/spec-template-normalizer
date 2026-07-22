@@ -38,6 +38,7 @@ target DOCX files
 run
   -> per-target audit JSON
   -> redacted run.log
+  -> structured diagnostics.jsonl (phase timings and counts)
   -> run.json written after target results and audits
 ```
 
@@ -50,6 +51,8 @@ manifest still record partial or total failure.
 ```text
 spec_formatter/pipeline.py
     canonical public orchestration, profile cache, isolated runs, manifests
+spec_formatter/diagnostics.py
+    thread-safe, redaction-safe structured diagnostics recorder and rollup
 spec_formatter/template_analysis.py
     namespaced facade over architect analysis and bundle validation
 spec_formatter/style_application/
@@ -154,11 +157,12 @@ Architect analysis remains observational: derive generated styles in
 
 Create one `<UTC timestamp>_<mode>_<run-id>` directory per validated invocation,
 before template analysis begins, so template/profile initialization failures
-still publish a failed manifest, run log, and per-target not-started audits.
-Stage each target under a short generated system-temp path, validate the complete
-DOCX, and atomically publish it into that run directory. Then atomically write
-per-target audits, `run.log`, and finally `run.json`. Never put secrets or
-document text in metadata. Existing run directories and flat legacy outputs
+still publish a failed manifest, run log, diagnostics stream, and per-target
+not-started audits. Stage each target under a short generated system-temp path,
+validate the complete DOCX, and atomically publish it into that run directory.
+Then atomically write per-target audits, `run.log`, `diagnostics.jsonl`, and
+finally `run.json`. Never put secrets or document text in any of these,
+including diagnostics fields. Existing run directories and flat legacy outputs
 are immutable history.
 
 ## Bundle contract
@@ -321,22 +325,42 @@ Each invocation creates:
   *_FORMATTED.docx or *_CANADIAN_FORMATTED.docx
   target-<sequence>-<source-hash>.audit.json
   run.log
+  diagnostics.jsonl
   run.json
 ```
 
 `run.json` records the run/mode/status/timestamps; application, policy, and
 profile contract versions; output paths; architect path/hash; cache bundle
 identity; model/prompt fingerprints; target/output hashes; audit paths;
-disposition counts; numbering checks; durations; and redacted errors. It must
-not contain API keys or document text.
+disposition counts; numbering checks; durations; a top-level `diagnostics`
+rollup; and redacted errors. It must not contain API keys or document text.
+
+`diagnostics.jsonl` is the structured detailed-diagnostics stream that
+complements the human-readable `run.log`: one JSON object per phase event with
+`seq`, `ts`, `level` (`DEBUG`/`INFO`/`WARNING`/`ERROR`), `component`, `event`,
+optional `target`, and a `fields` object of counts/timings (per-phase
+`duration_ms`, styles imported, numbering remaps, paragraphs modified, and so
+on). It is written after per-target audits and `run.log` but before `run.json`.
+`spec_formatter/diagnostics.py` owns the recorder. Every field is reduced to
+JSON scalars and short identifier-shaped strings by `sanitize_fields`, so a
+value that could carry document text (anything with whitespace or a
+document-text key such as `text`/`preview`/`content`) is dropped, never
+truncated; the pipeline additionally redacts secrets from every serialized
+event. Verbosity is chosen with `format_specifications(diagnostics_level=...)`
+or the `SPEC_FORMATTER_DIAGNOSTICS_LEVEL` environment variable, which overrides
+the argument. The `diagnostics` block in `run.json` and the per-target
+`diagnostics` array in each `audit.json` obey the same boundary. Do not route
+free error text, document text, or model-authored strings into a diagnostics
+field; emit numbers, bools, and validated identifiers only.
 
 `FormatRunResult` retains `success`, `succeeded`, `failed`, `output_paths`, and
 the historical `output_dir`, and adds `run_id`, `conversion_mode`,
-`output_root`, `run_dir`, and `manifest_path`. `TargetFormatResult` retains its
-historical fields and adds source/output SHA-256, `audit_path`,
-`audit_summary`, application audit details, and numbering checks. Additive
-fields must keep safe defaults so existing test doubles and callers continue
-to work.
+`output_root`, `run_dir`, `manifest_path`, and `diagnostics_path`.
+`TargetFormatResult` retains its historical fields and adds source/output
+SHA-256, `audit_path`, `audit_summary`, application audit details, numbering
+checks, and structured `diagnostics` events. `BatchResult` likewise carries a
+`diagnostics` list of engine phase events. Additive fields must keep safe
+defaults so existing test doubles and callers continue to work.
 
 ## Development commands
 
@@ -375,8 +399,9 @@ Before considering a formatter change complete:
 4. Confirm generated style inheritance, collision remapping, and header/footer
    style references resolve correctly without replacing target style IDs.
 5. Validate the complete architect bundle and versioned cache compatibility.
-6. Validate each output package, audit, `run.log`, `run.json`, hashes, and
-   redaction behavior for success, partial failure, and total failure.
+6. Validate each output package, audit, `run.log`, `diagnostics.jsonl`,
+   `run.json`, hashes, and redaction behavior for success, partial failure, and
+   total failure.
 7. Test deep Windows paths and folder discovery containing the architect.
 8. Run focused tests, the complete suite, and the local realistic-corpus smoke.
 9. Render and inspect every page of representative original and output DOCX

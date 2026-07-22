@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from .. import diagnostics as diag
 from .arch_env_applier import apply_environment_to_target
 from .core.classification import apply_phase2_classifications, build_phase2_slim_bundle
 from .core.application_policy import ApplicationPolicy, application_policy_for_mode
@@ -75,6 +76,9 @@ class BatchResult:
     audit_summary: Dict[str, int] = field(default_factory=dict)
     audit: Dict[str, Any] = field(default_factory=dict)
     numbering_checks: Dict[str, Any] = field(default_factory=dict)
+    # Structured, redaction-safe phase-timing/count events for this target.
+    # Carries no free text; the pipeline folds it into the run diagnostics.
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -417,10 +421,19 @@ def _apply_classified_target(
     arch_root: Optional[Path],
     role_specs: Optional[Dict[str, Dict[str, Any]]],
     conversion_mode: str,
+    diagnostics: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
     """Apply one validated classification payload through the shared engine."""
 
+    # A throwaway sink keeps callers that do not collect diagnostics working
+    # without scattering ``if diagnostics is not None`` across every phase.
+    diag_events: List[Dict[str, Any]] = diagnostics if diagnostics is not None else []
+
     policy: ApplicationPolicy = application_policy_for_mode(conversion_mode)
+    diag.emit(diag_events, "INFO", "target", "policy",
+              conversion_mode=policy.conversion_mode,
+              import_body_numbering=bool(policy.import_body_numbering),
+              preserve_target_numbering=bool(policy.preserve_target_numbering))
     classifications_path = extract_dir / "phase2_classifications.json"
     classifications_path.write_text(json.dumps(classifications, indent=2), encoding="utf-8")
     log.append(f"Classifications saved: {classifications_path}")
@@ -439,26 +452,45 @@ def _apply_classified_target(
 
     if policy.convert_to_canadian:
         log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
-        conversion_report = apply_csi_to_canadian(
-            extract_dir,
-            classifications,
-            role_specs,
-            log,
-            architect_numbering_xml=(
-                env_registry.get("numbering", {}).get("numbering_xml") or ""
-            ),
-        )
+        with diag.timed(diag_events, "target", "csi_to_canadian") as phase:
+            conversion_report = apply_csi_to_canadian(
+                extract_dir,
+                classifications,
+                role_specs,
+                log,
+                architect_numbering_xml=(
+                    env_registry.get("numbering", {}).get("numbering_xml") or ""
+                ),
+            )
+            phase.set(
+                paragraphs_examined=conversion_report.paragraphs_examined,
+                paragraphs_converted=conversion_report.paragraphs_converted,
+                literal_markers_removed=conversion_report.literal_markers_removed,
+                automatic_numbering_retargeted=(
+                    conversion_report.automatic_numbering_retargeted
+                ),
+                unnumbered_paragraphs_numbered=(
+                    conversion_report.unnumbered_paragraphs_numbered
+                ),
+                warnings=len(conversion_report.warnings),
+            )
         application_classifications = classifications_for_canadian_application(
             classifications,
             conversion_report,
         )
 
-    env_result = apply_environment_to_target(
-        target_extract_dir=extract_dir,
-        registry=env_registry,
-        log=log,
-        registry_dir=arch_root,
-    )
+    with diag.timed(diag_events, "target", "apply_environment") as phase:
+        env_result = apply_environment_to_target(
+            target_extract_dir=extract_dir,
+            registry=env_registry,
+            log=log,
+            registry_dir=arch_root,
+        )
+        _hf_import = env_result.get("header_footer_import", {}) if isinstance(env_result, dict) else {}
+        phase.set(
+            header_footer_parts=len(_hf_import.get("part_names", set()) or set()),
+            header_footer_media=len(_hf_import.get("media_names", set()) or set()),
+        )
     log.append("Applied environment")
     _patch_header_footer_tokens_if_imported(
         extract_dir,
@@ -484,25 +516,34 @@ def _apply_classified_target(
     num_id_remap: Dict[int, int] = {}
     numbering_style_ids = needed_style_ids if policy.import_body_numbering else sorted(hf_style_ids)
     numbering_roles = sorted(used_roles) if policy.import_body_numbering else []
-    if HAS_NUMBERING_IMPORTER:
-        numbering_contract = import_numbering(
-            target_extract_dir=extract_dir,
-            arch_template_registry=env_registry,
-            arch_styles_xml=arch_styles_xml,
-            style_ids_to_import=numbering_style_ids,
-            log=log,
-            role_specs=role_specs,
-            roles_to_apply=numbering_roles,
-            additional_num_ids=sorted(hf_direct_num_ids),
-            return_contract=True,
+    with diag.timed(diag_events, "target", "numbering_import") as phase:
+        if HAS_NUMBERING_IMPORTER:
+            numbering_contract = import_numbering(
+                target_extract_dir=extract_dir,
+                arch_template_registry=env_registry,
+                arch_styles_xml=arch_styles_xml,
+                style_ids_to_import=numbering_style_ids,
+                log=log,
+                role_specs=role_specs,
+                roles_to_apply=numbering_roles,
+                additional_num_ids=sorted(hf_direct_num_ids),
+                return_contract=True,
+            )
+            style_numid_remap = numbering_contract["style_numid_remap"]
+            role_numpr_remap = numbering_contract["role_numpr_remap"]
+            num_id_remap = numbering_contract["num_id_remap"]
+        else:
+            _check_numbering_module_needed(arch_styles_xml, numbering_style_ids)
+            if hf_direct_num_ids:
+                raise ImportError("numbering_importer is required by architect headers/footers")
+        phase.set(
+            importer_available=bool(HAS_NUMBERING_IMPORTER),
+            styles_considered=len(numbering_style_ids),
+            roles_considered=len(numbering_roles),
+            num_id_remaps=len(num_id_remap),
+            style_numid_remaps=len(style_numid_remap),
+            role_numpr_remaps=len(role_numpr_remap),
         )
-        style_numid_remap = numbering_contract["style_numid_remap"]
-        role_numpr_remap = numbering_contract["role_numpr_remap"]
-        num_id_remap = numbering_contract["num_id_remap"]
-    else:
-        _check_numbering_module_needed(arch_styles_xml, numbering_style_ids)
-        if hf_direct_num_ids:
-            raise ImportError("numbering_importer is required by architect headers/footers")
 
     remap_header_footer_numids(
         extract_dir,
@@ -511,16 +552,25 @@ def _apply_classified_target(
         log,
     )
 
-    style_result = import_arch_styles_into_target(
-        target_extract_dir=extract_dir,
-        arch_styles_xml=arch_styles_xml,
-        needed_style_ids=needed_style_ids,
-        log=log,
-        style_numid_remap=style_numid_remap,
-        format_only_body_style_ids=(body_style_ids if policy.preserve_target_numbering else None),
-        shell_style_ids=hf_style_ids,
-        namespace_seed=hashlib.sha256(arch_styles_xml.encode("utf-8")).hexdigest(),
-    )
+    with diag.timed(diag_events, "target", "style_import") as phase:
+        style_result = import_arch_styles_into_target(
+            target_extract_dir=extract_dir,
+            arch_styles_xml=arch_styles_xml,
+            needed_style_ids=needed_style_ids,
+            log=log,
+            style_numid_remap=style_numid_remap,
+            format_only_body_style_ids=(body_style_ids if policy.preserve_target_numbering else None),
+            shell_style_ids=hf_style_ids,
+            namespace_seed=hashlib.sha256(arch_styles_xml.encode("utf-8")).hexdigest(),
+        )
+        phase.set(
+            requested_styles=len(needed_style_ids),
+            body_style_ids=len(body_style_ids),
+            header_footer_style_ids=len(hf_style_ids),
+            namespaced_collisions=sum(
+                1 for src, dst in style_result.style_id_map.items() if src != dst
+            ),
+        )
     applied_arch_registry = {
         role: style_result.body_style_id_map.get(style_id, style_id)
         for role, style_id in arch_registry.items()
@@ -534,31 +584,47 @@ def _apply_classified_target(
     log.append(f"Imported {len(needed_style_ids)} requested styles collision-safely")
 
     snap = snapshot_stability(extract_dir)
-    apply_report = apply_phase2_classifications(
-        extract_dir=extract_dir,
-        classifications=application_classifications,
-        arch_style_registry=applied_arch_registry,
-        log=log,
-        role_specs=role_specs,
-        role_numpr_remap=role_numpr_remap,
-        source_styles_xml=source_styles_xml,
-        source_numbering_xml=source_numbering_xml,
-        policy=policy,
-    )
+    with diag.timed(diag_events, "target", "apply_classifications") as phase:
+        apply_report = apply_phase2_classifications(
+            extract_dir=extract_dir,
+            classifications=application_classifications,
+            arch_style_registry=applied_arch_registry,
+            log=log,
+            role_specs=role_specs,
+            role_numpr_remap=role_numpr_remap,
+            source_styles_xml=source_styles_xml,
+            source_numbering_xml=source_numbering_xml,
+            policy=policy,
+        )
+        phase.set(
+            requested=apply_report.requested,
+            modified=apply_report.modified,
+            skipped_sectpr=len(apply_report.skipped_sectpr),
+            invalid_indices=len(apply_report.invalid_indices),
+            unmapped_roles=len(apply_report.unmapped_roles),
+            missing_style_ids=len(apply_report.missing_style_ids),
+            stripped_direct_ppr=apply_report.stripped_direct_ppr,
+            preserved_direct_ppr=apply_report.preserved_direct_ppr,
+            preserved_automatic_numbering=apply_report.preserved_automatic_numbering,
+            suppressed_architect_numbering=apply_report.suppressed_architect_numbering,
+            stripped_run_fonts=apply_report.stripped_run_fonts,
+            ignored=apply_report.ignored,
+        )
     verify_stability(extract_dir, snap)
     log.append("Applied classifications, stability verified")
 
-    output_path = _build_and_patch_output(
-        docx_path,
-        extract_dir,
-        env_result,
-        output_dir,
-        arch_template_registry=env_registry,
-        conversion_mode=policy.conversion_mode,
-        allowed_rpr_properties_by_paragraph=(
-            apply_report.allowed_rpr_properties_by_paragraph
-        ),
-    )
+    with diag.timed(diag_events, "target", "build_output"):
+        output_path = _build_and_patch_output(
+            docx_path,
+            extract_dir,
+            env_result,
+            output_dir,
+            arch_template_registry=env_registry,
+            conversion_mode=policy.conversion_mode,
+            allowed_rpr_properties_by_paragraph=(
+                apply_report.allowed_rpr_properties_by_paragraph
+            ),
+        )
 
     classified, total, unresolved = _coverage_counts(bundle, classifications)
     class_coverage = (classified / total * 100) if total > 0 else 100.0
@@ -594,6 +660,7 @@ def process_single_file(
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log: List[str] = []
+    per_file_diag: List[Dict[str, Any]] = []
     filename = docx_path.name
     output_path: Optional[Path] = None
     conversion_report: Optional[CanadianConversionReport] = None
@@ -608,17 +675,26 @@ def process_single_file(
             extract_dir_name = f"work_{digest}"
 
             per_file_log.append("Extracting DOCX...")
-            decomposer = DocxDecomposer(str(docx_path))
-            extract_dir = decomposer.extract(output_dir=Path(tmp_root) / extract_dir_name)
+            with diag.timed(per_file_diag, "target", "extract"):
+                decomposer = DocxDecomposer(str(docx_path))
+                extract_dir = decomposer.extract(output_dir=Path(tmp_root) / extract_dir_name)
 
             per_file_log.append("Building slim bundle...")
-            bundle = build_phase2_slim_bundle(
-                extract_dir,
-                available_roles=available_roles,
-                role_specs=role_specs,
-            )
-            unresolved = len(bundle.get("paragraphs", []))
-            deterministic = len(bundle.get("deterministic_classifications", []))
+            with diag.timed(per_file_diag, "target", "slim_bundle") as phase:
+                bundle = build_phase2_slim_bundle(
+                    extract_dir,
+                    available_roles=available_roles,
+                    role_specs=role_specs,
+                )
+                unresolved = len(bundle.get("paragraphs", []))
+                deterministic = len(bundle.get("deterministic_classifications", []))
+                phase.set(
+                    unresolved=unresolved,
+                    deterministic=deterministic,
+                    deterministic_ignored=len(
+                        bundle.get("deterministic_ignored_paragraphs", [])
+                    ),
+                )
             per_file_log.append(
                 f"Built slim bundle: {unresolved} unresolved + {deterministic} deterministic"
             )
@@ -632,12 +708,14 @@ def process_single_file(
                 per_file_log.append(
                     "All paragraphs classified deterministically; Anthropic request skipped"
                 )
-            classifications = classify_target_document(
-                slim_bundle=bundle,
-                available_roles=available_roles,
-                api_key=api_key,
-                model=model,
-            )
+            with diag.timed(per_file_diag, "target", "classify") as phase:
+                phase.set(unresolved_sent=unresolved, llm_used=bool(unresolved), model=model)
+                classifications = classify_target_document(
+                    slim_bundle=bundle,
+                    available_roles=available_roles,
+                    api_key=api_key,
+                    model=model,
+                )
 
             (
                 output_path,
@@ -659,6 +737,7 @@ def process_single_file(
                 arch_root=arch_root,
                 role_specs=role_specs,
                 conversion_mode=conversion_mode,
+                diagnostics=per_file_diag,
             )
 
         return BatchResult(
@@ -672,6 +751,7 @@ def process_single_file(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            diagnostics=per_file_diag,
         )
     except Exception as exc:
         per_file_log.append(f"FAILED: {exc}")
@@ -686,6 +766,7 @@ def process_single_file(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            diagnostics=per_file_diag,
         )
 
 
@@ -731,6 +812,7 @@ def _apply_batch_result(
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log = list(prepared.prep_log)
+    per_file_diag: List[Dict[str, Any]] = []
     output_path: Optional[Path] = None
     conversion_report: Optional[CanadianConversionReport] = None
     filename = prepared.docx_path.name
@@ -760,6 +842,7 @@ def _apply_batch_result(
             arch_root=arch_root,
             role_specs=role_specs,
             conversion_mode=conversion_mode,
+            diagnostics=per_file_diag,
         )
 
         return BatchResult(
@@ -773,6 +856,7 @@ def _apply_batch_result(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            diagnostics=per_file_diag,
         )
     except Exception as exc:
         per_file_log.append(f"FAILED: {exc}")
@@ -787,6 +871,7 @@ def _apply_batch_result(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            diagnostics=per_file_diag,
         )
 
 
