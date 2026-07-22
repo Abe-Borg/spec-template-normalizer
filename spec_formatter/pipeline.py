@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+from . import diagnostics as diag
 from . import template_analysis
 from .style_application.batch_runner import (
     BatchResult,
@@ -90,6 +91,9 @@ class TargetFormatResult:
     audit_summary: dict[str, int] = field(default_factory=_empty_audit_summary)
     audit: dict[str, Any] = field(default_factory=dict)
     numbering_checks: dict[str, Any] = field(default_factory=dict)
+    # Structured, redaction-safe phase-timing/count events for this target,
+    # folded into the run-wide diagnostics recorder before publication.
+    diagnostics: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,7 @@ class FormatRunResult:
     output_root: Optional[Path] = None
     run_dir: Optional[Path] = None
     manifest_path: Optional[Path] = None
+    diagnostics_path: Optional[Path] = None
 
     def __post_init__(self) -> None:
         # Keep the historical ``output_dir`` attribute as a concrete alias of
@@ -900,11 +905,15 @@ def _format_one_target(
     audit_summary = _empty_audit_summary()
     audit: dict[str, Any] = {}
     numbering_checks: dict[str, Any] = {}
+    # Structured pipeline-side phase events (snapshot/publish) interleaved with
+    # the engine's own phase events.  Carries counts/timings only, never text.
+    diag_events: list[dict[str, Any]] = []
     try:
         # Deliberately avoid carrying user-controlled filenames into the work
         # tree.  This keeps Windows paths short even for deeply nested inputs.
         snapshot = staging_dir / "source.docx"
-        snapshot_sha256 = _snapshot_input(target, snapshot)
+        with diag.timed(diag_events, "target", "snapshot"):
+            snapshot_sha256 = _snapshot_input(target, snapshot)
         result = processor(
             docx_path=snapshot,
             arch_registry=shared.arch_registry,
@@ -920,6 +929,7 @@ def _format_one_target(
             conversion_mode=conversion_mode,
         )
         processor_log = tuple(result.log)
+        diag_events.extend(getattr(result, "diagnostics", None) or [])
         conversion_report = result.conversion_report
         audit_summary = _normalize_audit_summary(
             getattr(result, "audit_summary", None)
@@ -941,6 +951,7 @@ def _format_one_target(
                 audit_summary=audit_summary,
                 audit=audit,
                 numbering_checks=numbering_checks,
+                diagnostics=tuple(diag_events),
             )
         if result.output_path is None or not result.output_path.is_file():
             raise RuntimeError("Style application reported success without an output DOCX.")
@@ -948,7 +959,8 @@ def _format_one_target(
             raise RuntimeError(
                 f"{target.name} changed during formatting. Finish saving it and run again."
             )
-        output_sha256 = _publish_output(result.output_path, final_output)
+        with diag.timed(diag_events, "target", "publish"):
+            output_sha256 = _publish_output(result.output_path, final_output)
         return TargetFormatResult(
             source_path=target,
             success=True,
@@ -962,6 +974,7 @@ def _format_one_target(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            diagnostics=tuple(diag_events),
         )
     except Exception as exc:
         return TargetFormatResult(
@@ -976,6 +989,7 @@ def _format_one_target(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            diagnostics=tuple(diag_events),
         )
 
 
@@ -1006,6 +1020,28 @@ def _redact_json(value: Any, secrets: Sequence[str]) -> Any:
     return value
 
 
+def _write_diagnostics_log(
+    run_dir: Path,
+    recorder: diag.DiagnosticsRecorder,
+    secrets: Sequence[str],
+) -> Path:
+    """Publish the structured diagnostics stream as one redacted JSONL file.
+
+    Every event's ``fields`` were already reduced to safe scalars/identifiers
+    by the recorder; the secret redaction here is defense in depth so an API
+    key can never survive even if one slipped into a structural field.
+    """
+
+    diagnostics_path = run_dir / "diagnostics.jsonl"
+    lines = [
+        json.dumps(_redact_json(event, secrets), ensure_ascii=False, sort_keys=True)
+        for event in recorder.iter_dicts()
+    ]
+    payload = ("\n".join(lines) + "\n") if lines else ""
+    _atomic_write_bytes(diagnostics_path, payload.encode("utf-8"))
+    return diagnostics_path
+
+
 def _write_run_artifacts(
     *,
     run_id: str,
@@ -1021,8 +1057,9 @@ def _write_run_artifacts(
     targets: Sequence[TargetFormatResult],
     events: Sequence[str],
     secrets: Sequence[str],
-) -> tuple[tuple[TargetFormatResult, ...], Path]:
-    """Publish per-target audits, run.log, and finally the run manifest."""
+    recorder: diag.DiagnosticsRecorder,
+) -> tuple[tuple[TargetFormatResult, ...], Path, Path]:
+    """Publish per-target audits, diagnostics, run.log, and the run manifest."""
 
     audited_results: list[TargetFormatResult] = []
     for index, item in enumerate(targets, start=1):
@@ -1058,6 +1095,10 @@ def _write_run_artifacts(
             "numbering_checks": _redact_json(item.numbering_checks, secrets),
             "application_audit": _redact_json(item.audit, secrets),
             "conversion_report": _redact_json(conversion, secrets),
+            "diagnostics": _redact_json(
+                [diag.sanitize_event(event) for event in item.diagnostics],
+                secrets,
+            ),
         }
         _atomic_write_json(audit_path, audit_payload)
         audited_results.append(replace(item, audit_path=audit_path))
@@ -1091,6 +1132,8 @@ def _write_run_artifacts(
         ("\n".join(log_lines).rstrip() + "\n").encode("utf-8"),
     )
 
+    diagnostics_path = _write_diagnostics_log(run_dir, recorder, secrets)
+
     succeeded = sum(1 for item in audited_results if item.success)
     failed = len(audited_results) - succeeded
     profile_metadata = _profile_provenance(profile)
@@ -1115,11 +1158,13 @@ def _write_run_artifacts(
             "application_policy_version": APPLICATION_POLICY_VERSION,
             "profile_contract_version": _PROFILE_CONTRACT_VERSION,
         },
+        "diagnostics": _redact_json(recorder.summary(), secrets),
         "paths": {
             "output_root": str(output_root),
             "run_dir": str(run_dir),
             "run_manifest": str(manifest_path),
             "run_log": str(run_log_path),
+            "diagnostics_log": str(diagnostics_path),
         },
         "architect_template": {
             "path": str(architect),
@@ -1157,7 +1202,7 @@ def _write_run_artifacts(
         ],
     }
     _atomic_write_json(manifest_path, manifest)
-    return tuple(audited_results), manifest_path
+    return tuple(audited_results), manifest_path, diagnostics_path
 
 
 def _write_initialization_failure_artifacts(
@@ -1174,6 +1219,7 @@ def _write_initialization_failure_artifacts(
     events: Sequence[str],
     error: Exception,
     secrets: Sequence[str],
+    recorder: diag.DiagnosticsRecorder,
 ) -> Path:
     """Persist a complete failed-run record when preparation cannot finish."""
 
@@ -1242,6 +1288,8 @@ def _write_initialization_failure_artifacts(
         ("\n".join(log_lines).rstrip() + "\n").encode("utf-8"),
     )
 
+    diagnostics_path = _write_diagnostics_log(run_dir, recorder, secrets)
+
     manifest_path = run_dir / "run.json"
     manifest = {
         "schema_version": _RUN_MANIFEST_VERSION,
@@ -1258,11 +1306,13 @@ def _write_initialization_failure_artifacts(
             "application_policy_version": APPLICATION_POLICY_VERSION,
             "profile_contract_version": _PROFILE_CONTRACT_VERSION,
         },
+        "diagnostics": _redact_json(recorder.summary(), secrets),
         "paths": {
             "output_root": str(output_root),
             "run_dir": str(run_dir),
             "run_manifest": str(manifest_path),
             "run_log": str(run_log_path),
+            "diagnostics_log": str(diagnostics_path),
         },
         "architect_template": {"path": str(architect), "sha256": architect_hash},
         "template_profile": None,
@@ -1294,6 +1344,7 @@ def format_specifications(
     template_model: str = template_analysis.DEFAULT_MODEL,
     target_model: str = "claude-sonnet-5",
     conversion_mode: str = FORMAT_ONLY,
+    diagnostics_level: str = "info",
     template_prompt_dir: Optional[Path] = None,
     template_classifier: Optional[TemplateClassifier] = None,
     progress: Optional[ProgressCallback] = None,
@@ -1309,10 +1360,22 @@ def format_specifications(
     then every target is processed independently so one bad target does not
     discard successful outputs. ``conversion_mode`` selects either formatting
     only or fail-closed CSI-to-Canadian hierarchy conversion in the same run.
+
+    ``diagnostics_level`` (``debug``/``info``/``warning``/``error``) controls how
+    much of the structured diagnostics stream is persisted to
+    ``diagnostics.jsonl`` and rolled up into ``run.json``.  The
+    ``SPEC_FORMATTER_DIAGNOSTICS_LEVEL`` environment variable overrides it so a
+    field build can be asked for verbose diagnostics without a code change.
+    Diagnostics never contain secrets or document text.
     """
 
     started_utc = _utc_now()
     events: list[str] = []
+    resolved_level = diag.level_from_name(
+        os.environ.get("SPEC_FORMATTER_DIAGNOSTICS_LEVEL", "") or diagnostics_level,
+        default=diag.INFO,
+    )
+    recorder = diag.DiagnosticsRecorder(min_level=resolved_level)
 
     def report(message: str) -> None:
         events.append(f"{_iso_utc(_utc_now())} {message}")
@@ -1335,28 +1398,39 @@ def format_specifications(
         else default_template_cache_dir().expanduser().resolve()
     )
     run_id, run_dir = _create_run_directory(destination, conversion_mode)
+    recorder.info(
+        "pipeline",
+        "run_start",
+        targets=len(targets),
+        workers=workers,
+        mode=conversion_mode,
+    )
     try:
-        profile = prepare_template_profile(
-            architect,
-            profile_cache,
-            normalized_api_key,
-            force_analysis=force_template_analysis,
-            model=template_model,
-            prompt_dir=template_prompt_dir,
-            progress=report,
-            classifier=template_classifier,
-            analyzer=_template_analyzer,
-        )
+        with recorder.timer("pipeline", "template_analysis") as phase:
+            profile = prepare_template_profile(
+                architect,
+                profile_cache,
+                normalized_api_key,
+                force_analysis=force_template_analysis,
+                model=template_model,
+                prompt_dir=template_prompt_dir,
+                progress=report,
+                classifier=template_classifier,
+                analyzer=_template_analyzer,
+            )
+            phase.set(reused=profile.reused)
         if _stable_source_sha256(architect) != profile.source_sha256:
             raise RuntimeError(
                 "The architect template changed during this run. Finish saving it and run again."
             )
 
         report("Validating the template profile...")
-        shared = _config_loader(profile.bundle_dir)
+        with recorder.timer("pipeline", "config_load"):
+            shared = _config_loader(profile.bundle_dir)
         planned_outputs = _plan_output_paths(targets, run_dir, conversion_mode)
         _validate_output_plan(architect, targets, planned_outputs)
     except Exception as exc:
+        recorder.error("pipeline", "init_failed", error_type=type(exc).__name__.lower())
         manifest_path = _write_initialization_failure_artifacts(
             run_id=run_id,
             conversion_mode=conversion_mode,
@@ -1370,6 +1444,7 @@ def format_specifications(
             events=events,
             error=exc,
             secrets=(normalized_api_key,),
+            recorder=recorder,
         )
         try:
             setattr(exc, "run_dir", run_dir)
@@ -1384,7 +1459,7 @@ def format_specifications(
     ) as job_temp:
         job_root = Path(job_temp)
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures: dict[Future[TargetFormatResult], Path] = {}
+            futures: dict[Future[TargetFormatResult], tuple[int, Path]] = {}
             for index, target in enumerate(targets):
                 staging_dir = job_root / f"t{index:04d}"
                 report(f"Started {index + 1} of {len(targets)}: {target.name}")
@@ -1399,11 +1474,11 @@ def format_specifications(
                     _target_processor,
                     conversion_mode,
                 )
-                futures[future] = target
+                futures[future] = (index + 1, target)
 
             completed = 0
             for future in as_completed(futures):
-                target = futures[future]
+                target_number, target = futures[future]
                 try:
                     result = future.result()
                 except Exception as exc:  # pragma: no cover - defensive boundary
@@ -1417,9 +1492,22 @@ def format_specifications(
                     )
                 results_by_target[target] = result
                 completed += 1
+                recorder.ingest(result.diagnostics, target=target_number)
+                counts = result.audit_summary
+                recorder.record(
+                    diag.INFO if result.success else diag.WARNING,
+                    "pipeline",
+                    "target_done",
+                    target=target_number,
+                    success=result.success,
+                    duration_ms=round(result.duration_seconds * 1000.0, 3),
+                    styled=counts.get("styled", 0),
+                    ignored=counts.get("ignored", 0),
+                    out_of_scope=counts.get("out_of_scope", 0),
+                    unresolved=counts.get("unresolved", 0),
+                )
                 for line in result.log:
                     report(f"Target {target.name}: {line}")
-                counts = result.audit_summary
                 report(
                     f"Target {target.name}: audit styled={counts.get('styled', 0)}, "
                     f"ignored={counts.get('ignored', 0)}, "
@@ -1432,10 +1520,17 @@ def format_specifications(
     ordered_results = tuple(results_by_target[target] for target in targets)
     succeeded = sum(1 for item in ordered_results if item.success)
     failed = len(ordered_results) - succeeded
+    recorder.info(
+        "pipeline",
+        "run_complete",
+        targets=len(ordered_results),
+        succeeded=succeeded,
+        failed=failed,
+    )
     complete_message = f"Complete: {succeeded} succeeded, {failed} failed."
     events.append(f"{_iso_utc(_utc_now())} {complete_message}")
     finished_utc = _utc_now()
-    audited_results, manifest_path = _write_run_artifacts(
+    audited_results, manifest_path, diagnostics_path = _write_run_artifacts(
         run_id=run_id,
         conversion_mode=conversion_mode,
         output_root=destination,
@@ -1449,6 +1544,7 @@ def format_specifications(
         targets=ordered_results,
         events=events,
         secrets=(normalized_api_key,),
+        recorder=recorder,
     )
     run_result = FormatRunResult(
         template_profile=profile,
@@ -1459,6 +1555,7 @@ def format_specifications(
         output_root=destination,
         run_dir=run_dir,
         manifest_path=manifest_path,
+        diagnostics_path=diagnostics_path,
     )
     _emit(progress, complete_message)
     return run_result

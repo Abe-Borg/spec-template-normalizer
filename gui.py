@@ -865,6 +865,11 @@ class App(ctk.CTk):
         self.open_button.configure(state="normal" if run_dir is not None else "disabled")
         if run_dir is not None:
             self._append_log(f"Persisted run log: {run_dir / 'run.log'}")
+        diagnostics_path = getattr(result, "diagnostics_path", None) or (
+            run_dir / "diagnostics.jsonl" if run_dir is not None else None
+        )
+        if diagnostics_path is not None:
+            self._append_log(f"Diagnostics log: {diagnostics_path}")
         self.active_output_dir = None
         if status == "success":
             messagebox.showinfo("Formatting complete", summary, parent=self)
