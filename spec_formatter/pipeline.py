@@ -1014,7 +1014,12 @@ def _redact_json(value: Any, secrets: Sequence[str]) -> Any:
     if isinstance(value, str):
         return _redact(value, secrets)
     if isinstance(value, Mapping):
-        return {str(key): _redact_json(item, secrets) for key, item in value.items()}
+        # Redact secrets in KEYS as well as values: JSON object keys are a
+        # distinct channel that a plain value walk would leave untouched.
+        return {
+            (_redact(str(key), secrets) or str(key)): _redact_json(item, secrets)
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_redact_json(item, secrets) for item in value]
     return value
