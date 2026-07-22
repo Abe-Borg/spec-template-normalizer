@@ -243,8 +243,8 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Specification Formatter")
-        self.geometry("980x930")
-        self.minsize(820, 720)
+        self.geometry("980x1000")
+        self.minsize(820, 780)
         self.configure(fg_color=COLORS["bg"])
 
         self.architect_var = ctk.StringVar()
@@ -294,12 +294,37 @@ class App(ctk.CTk):
 
         header = ctk.CTkFrame(shell, fg_color="transparent")
         header.pack(fill="x", pady=(0, 16))
+
+        help_row = ctk.CTkFrame(header, fg_color="transparent")
+        help_row.pack(fill="x")
+        help_buttons = ctk.CTkFrame(help_row, fg_color="transparent")
+        help_buttons.pack(side="right")
+        for label, handler in (
+            ("How to Use", self._show_how_to_use_dialog),
+            ("How It Works", self._show_how_it_works_dialog),
+            ("Why Trust It?", self._show_why_trust_it_dialog),
+            ("About", self._show_about_dialog),
+        ):
+            ctk.CTkButton(
+                help_buttons,
+                text=label,
+                command=handler,
+                width=104,
+                height=26,
+                fg_color="transparent",
+                hover_color=COLORS["input"],
+                border_width=1,
+                border_color=COLORS["border"],
+                text_color=COLORS["secondary"],
+                font=_font(12),
+            ).pack(side="left", padx=(8, 0))
+
         ctk.CTkLabel(
             header,
             text="SPECIFICATION FORMATTER",
             text_color=COLORS["text"],
             font=_font(30, "bold"),
-        ).pack(anchor="w")
+        ).pack(anchor="w", pady=(6, 0))
         ctk.CTkLabel(
             header,
             text="Apply an architect's Word template to one or more target specifications.",
@@ -471,6 +496,24 @@ class App(ctk.CTk):
         )
         self.remember_key_checkbox.pack(side="left", padx=(12, 0))
         self.run_affecting_controls.append(self.remember_key_checkbox)
+
+        key_help_row = ctk.CTkFrame(card, fg_color="transparent")
+        key_help_row.pack(fill="x", padx=22, pady=(4, 0))
+        ctk.CTkLabel(
+            key_help_row,
+            text="Don't have a key?",
+            text_color=COLORS["muted"],
+            font=_font(12),
+        ).pack(side="left")
+        key_help_link = ctk.CTkLabel(
+            key_help_row,
+            text="How do I get one?",
+            text_color=COLORS["accent"],
+            font=_font(12, "bold"),
+            cursor="hand2",
+        )
+        key_help_link.pack(side="left", padx=(4, 0))
+        key_help_link.bind("<Button-1>", lambda _event: self._show_api_key_help_dialog())
 
         action_row = ctk.CTkFrame(card, fg_color="transparent")
         self.action_row = action_row
@@ -883,6 +926,336 @@ class App(ctk.CTk):
             secrets.save_api_key(self.api_key_var.get())
         else:
             secrets.clear_api_key()
+
+    # ------------------------------------------------------------------
+    # Help / informational dialogs
+    # ------------------------------------------------------------------
+
+    def _show_help_dialog(
+        self,
+        title: str,
+        sections: list[tuple[str, object]],
+        *,
+        subtitle: Optional[str] = None,
+    ) -> None:
+        """Show a modal, scrollable dialog of (heading, content) sections; content is a paragraph, a bullet list, or ("link", label, url)."""
+        win = ctk.CTkToplevel(self)
+        win.title(title)
+        win.geometry("640x580")
+        win.minsize(560, 420)
+        win.configure(fg_color=COLORS["bg"])
+        win.transient(self)
+        win.after(150, lambda: self._grab_dialog(win))
+
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24, pady=20)
+
+        ctk.CTkLabel(
+            body,
+            text=title,
+            text_color=COLORS["text"],
+            font=_font(20, "bold"),
+            anchor="w",
+            justify="left",
+            wraplength=580,
+        ).pack(anchor="w")
+        if subtitle:
+            ctk.CTkLabel(
+                body,
+                text=subtitle,
+                text_color=COLORS["secondary"],
+                font=_font(13),
+                anchor="w",
+                justify="left",
+                wraplength=580,
+            ).pack(anchor="w", pady=(4, 0))
+
+        scroll = ctk.CTkScrollableFrame(body, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, pady=(14, 14))
+
+        for heading, content in sections:
+            ctk.CTkLabel(
+                scroll,
+                text=heading,
+                text_color=COLORS["accent"],
+                font=_font(15, "bold"),
+                anchor="w",
+                justify="left",
+            ).pack(anchor="w", pady=(10, 4))
+            if isinstance(content, tuple) and content and content[0] == "link":
+                _, link_label, url = content
+                link = ctk.CTkLabel(
+                    scroll,
+                    text=link_label,
+                    text_color=COLORS["accent"],
+                    font=_font(13),
+                    anchor="w",
+                    justify="left",
+                    cursor="hand2",
+                )
+                link.pack(anchor="w")
+                link.bind("<Button-1>", lambda _event, target=url: webbrowser.open(target))
+            elif isinstance(content, (list, tuple)):
+                for item in content:
+                    ctk.CTkLabel(
+                        scroll,
+                        text=f"•  {item}",
+                        text_color=COLORS["secondary"],
+                        font=_font(13),
+                        anchor="w",
+                        justify="left",
+                        wraplength=560,
+                    ).pack(anchor="w", pady=(2, 0))
+            else:
+                ctk.CTkLabel(
+                    scroll,
+                    text=str(content),
+                    text_color=COLORS["secondary"],
+                    font=_font(13),
+                    anchor="w",
+                    justify="left",
+                    wraplength=560,
+                ).pack(anchor="w")
+
+        ctk.CTkButton(
+            body,
+            text="Close",
+            command=win.destroy,
+            width=100,
+            height=34,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#FFFFFF",
+            font=_font(14, "bold"),
+        ).pack(anchor="e")
+
+    def _show_how_to_use_dialog(self) -> None:
+        self._show_help_dialog(
+            "How to Use",
+            [
+                (
+                    "Before you start",
+                    "You need the architect's Word template — the specification "
+                    "whose formatting you want applied — and one or more target "
+                    "specifications to reformat. An Anthropic API key is only "
+                    "required when a template or target contains content that "
+                    "cannot be classified without AI.",
+                ),
+                (
+                    "Run a formatting pass",
+                    [
+                        "Choose the architect's template — the .docx whose CSI "
+                        "styles, numbering, and page layout will be applied to "
+                        "your targets.",
+                        "Add target files or a folder. Selecting a folder finds "
+                        "every .docx inside it (one level deep) and skips the "
+                        "architect if it's in the same folder.",
+                        "Choose Format only to keep each target's own text and "
+                        "numbering, or Convert CSI hierarchy to Canadian CSC "
+                        "PageFormat to retarget recognized CSI numbering to the "
+                        "architect's automatic numbering.",
+                        "Choose the output folder. Each run publishes into its "
+                        "own timestamped subfolder, so nothing is ever "
+                        "overwritten.",
+                        "Enter the Anthropic API key if it isn't already filled "
+                        "in, then click Format Specs.",
+                    ],
+                ),
+                (
+                    "While it runs",
+                    "Progress and per-file detail stream into the activity log "
+                    "below. Duration depends on template complexity and target "
+                    "size. The architect template and every target file are only "
+                    "ever read, never modified, so rerunning is always safe.",
+                ),
+                (
+                    "When it finishes",
+                    "Each run folder contains the formatted DOCX files, one audit "
+                    "JSON per target, run.log, and run.json with full run "
+                    "provenance. Click Open Output Folder to jump straight there.",
+                ),
+            ],
+        )
+
+    def _show_how_it_works_dialog(self) -> None:
+        self._show_help_dialog(
+            "How It Works",
+            [
+                (
+                    "Two passes, one workflow",
+                    "The app first analyzes the architect template once, then "
+                    "applies that analysis to every target specification. You "
+                    "never see or manage these as separate tools — Format Specs "
+                    "runs both.",
+                ),
+                (
+                    "Architect analysis",
+                    [
+                        "Snapshots the template immutably and safely extracts it "
+                        "inside strict package limits.",
+                        "Classifies its paragraphs into CSI roles (PART, ARTICLE, "
+                        "PARAGRAPH, and the rest) and derives portable styles "
+                        "without changing the source file.",
+                        "Captures the template's shell: styles, theme and "
+                        "document defaults, settings, and page/section layout.",
+                        "Publishes a checksummed, versioned profile and reuses it "
+                        "on later runs as long as the template is unchanged.",
+                    ],
+                ),
+                (
+                    "Target application",
+                    [
+                        "Snapshots each target immutably and classifies every "
+                        "visible paragraph as styled CSI content or an explicit, "
+                        "auditable ignore.",
+                        "Applies the mode you chose — Format only keeps the "
+                        "target's own text and numbering; Canadian conversion "
+                        "retargets recognized CSI numbering to the architect's "
+                        "automatic numbering, and only when the architect can "
+                        "prove it.",
+                        "Imports the architect's styles into private, "
+                        "collision-safe IDs and applies its complete document "
+                        "shell.",
+                        "Validates content, numbering, and the DOCX package "
+                        "before publishing anything.",
+                    ],
+                ),
+                (
+                    "One run, full provenance",
+                    "Every invocation publishes into one isolated, timestamped "
+                    "run folder with a per-target audit, a redacted run log, and "
+                    "a run manifest — so any output can be traced back to "
+                    "exactly what template, mode, and model version produced it.",
+                ),
+            ],
+        )
+
+    def _show_why_trust_it_dialog(self) -> None:
+        self._show_help_dialog(
+            "Why Trust It?",
+            [
+                (
+                    "Your files are read-only",
+                    "The architect template and every target file are copied to "
+                    "a private snapshot before anything is read; the app "
+                    "processes that snapshot, never the original. Outputs are "
+                    "always separate files.",
+                ),
+                (
+                    "Untrusted input is treated as untrusted",
+                    [
+                        "DOCX packages are validated as untrusted ZIP "
+                        "containers: no absolute paths, traversal, duplicate "
+                        "members, or symbolic links.",
+                        "Package size is bounded — 10,000 entries, 512 MiB "
+                        "uncompressed, 128 MiB per part, and a 1,000:1 "
+                        "compression-ratio cap.",
+                        "External relationship targets are recorded but never "
+                        "fetched.",
+                    ],
+                ),
+                (
+                    "Nothing is silently dropped",
+                    [
+                        "Every visible paragraph in a target is explicitly "
+                        "classified as styled content or an ignored item with a "
+                        "reason — never silently skipped.",
+                        "Format-only mode verifies the target's body text and "
+                        "effective numbering are unchanged before publishing.",
+                        "Canadian conversion is fail-closed: if the architect "
+                        "template can't prove true automatic Canadian numbering "
+                        "for a role, that target is rejected instead of "
+                        "producing a misleading result.",
+                        "Imported architect styles are namespaced privately and "
+                        "never overwrite an existing target style ID, including "
+                        "Normal.",
+                    ],
+                ),
+                (
+                    "Publication is atomic and auditable",
+                    "Every output DOCX is fully validated before it is "
+                    "published, and publication itself is atomic — a run either "
+                    "completes into its timestamped folder or leaves nothing "
+                    "partial behind. The run manifest and per-target audits "
+                    "record exactly what happened, and API keys and document "
+                    "text are never written to that metadata.",
+                ),
+            ],
+        )
+
+    def _show_about_dialog(self) -> None:
+        self._show_help_dialog(
+            "About",
+            [
+                (
+                    f"Specification Formatter v{__version__}",
+                    "Applies an architect's Word specification template — its "
+                    "CSI styles, numbering, fonts, headers, footers, settings, "
+                    "and page layout — to one or more target specifications, "
+                    "then publishes validated, formatted DOCX files plus "
+                    "complete run provenance. The original architect template "
+                    "and target files are never modified.",
+                ),
+                (
+                    "Releases",
+                    ("link", "View releases on GitHub", updates.releases_page_url()),
+                ),
+                (
+                    "Copyright",
+                    "Copyright 2025 Abraham Borg. All Rights Reserved. "
+                    "Proprietary software; no license is granted without "
+                    "written permission.",
+                ),
+            ],
+        )
+
+    def _show_api_key_help_dialog(self) -> None:
+        self._show_help_dialog(
+            "How to get an Anthropic API key",
+            [
+                (
+                    "What a key is",
+                    "An API key is a secret password that lets this app use "
+                    "Anthropic's Claude models on your behalf. You pay "
+                    "Anthropic directly for what you use — there is no "
+                    "subscription.",
+                ),
+                (
+                    "Get one in four steps",
+                    [
+                        "Go to console.anthropic.com and sign up, or log in if "
+                        "you already have an account. Creating one is free.",
+                        "Open Billing (or \"Plans & billing\"), add a payment "
+                        "method, and buy a little credit to start. Usage is "
+                        "pay-as-you-go.",
+                        "Open API keys in the left-hand menu, click Create Key, "
+                        "give it any name, and press Copy. The key is shown "
+                        "only once, so copy it now.",
+                        "Paste it into the Anthropic API Key field above. It "
+                        "works immediately, and is remembered for next time "
+                        "only if you tick Remember.",
+                    ],
+                ),
+                (
+                    "Open the console",
+                    (
+                        "link",
+                        "console.anthropic.com/settings/keys",
+                        "https://console.anthropic.com/settings/keys",
+                    ),
+                ),
+                (
+                    "Keep it safe",
+                    "Your key begins with \"sk-ant-\". Treat it like a "
+                    "password: anyone who has it can spend your credit. This "
+                    "app never stores it unless you tick Remember, and only "
+                    "then does it save to your operating system's secure "
+                    "credential store — never in plain text — so you won't "
+                    "have to paste it again.",
+                ),
+            ],
+            subtitle="A one-time setup, about five minutes. You only do this once.",
+        )
 
     # ------------------------------------------------------------------
     # Footer + self-update flow
