@@ -272,7 +272,6 @@ class App(ctk.CTk):
         self.failed_run_dir: Optional[Path] = None
         self.active_output_dir: Optional[Path] = None
         self.active_run_summary: Optional[ActiveRunSummary] = None
-        self.advanced_visible = False
 
         self._update_state_path = updates.default_state_path()
         self._update_checking = False
@@ -516,53 +515,6 @@ class App(ctk.CTk):
         key_help_link.pack(side="left", padx=(4, 0))
         key_help_link.bind("<Button-1>", lambda _event: self._show_api_key_help_dialog())
 
-        advanced_button = ctk.CTkButton(
-            card,
-            text="Advanced settings  ▸",
-            command=self._toggle_advanced,
-            width=170,
-            height=30,
-            fg_color="transparent",
-            hover_color=COLORS["input"],
-            text_color=COLORS["muted"],
-            font=_font(13),
-        )
-        advanced_button.pack(anchor="w", padx=16, pady=(14, 0))
-        self.advanced_button = advanced_button
-
-        self.advanced_frame = ctk.CTkFrame(card, fg_color=COLORS["input"])
-        self.reuse_checkbox = ctk.CTkCheckBox(
-            self.advanced_frame,
-            text="Reuse analysis when the architect template has not changed",
-            variable=self.reuse_var,
-            text_color=COLORS["secondary"],
-            font=_font(13),
-            fg_color=COLORS["accent"],
-        )
-        self.reuse_checkbox.pack(side="left", padx=14, pady=12)
-        self.run_affecting_controls.append(self.reuse_checkbox)
-        workers = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
-        workers.pack(side="right", padx=14, pady=8)
-        ctk.CTkLabel(
-            workers,
-            text="Concurrent files",
-            text_color=COLORS["secondary"],
-            font=_font(13),
-        ).pack(side="left", padx=(0, 8))
-        self.workers_menu = ctk.CTkOptionMenu(
-            workers,
-            values=["1", "2", "3", "4", "5", "6"],
-            variable=self.workers_var,
-            width=66,
-            height=30,
-            fg_color=COLORS["border"],
-            button_color=COLORS["accent"],
-            button_hover_color=COLORS["accent_hover"],
-            font=_font(13),
-        )
-        self.workers_menu.pack(side="left")
-        self.run_affecting_controls.append(self.workers_menu)
-
         action_row = ctk.CTkFrame(card, fg_color="transparent")
         self.action_row = action_row
         action_row.pack(fill="x", padx=22, pady=20)
@@ -760,20 +712,6 @@ class App(ctk.CTk):
 
     def _toggle_key(self) -> None:
         self.api_entry.configure(show="" if self.show_key_var.get() else "•")
-
-    def _toggle_advanced(self) -> None:
-        self.advanced_visible = not self.advanced_visible
-        if self.advanced_visible:
-            self.advanced_frame.pack(
-                fill="x",
-                padx=22,
-                pady=(8, 0),
-                before=self.action_row,
-            )
-            self.advanced_button.configure(text="Advanced settings  ▾")
-        else:
-            self.advanced_frame.pack_forget()
-            self.advanced_button.configure(text="Advanced settings  ▸")
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
