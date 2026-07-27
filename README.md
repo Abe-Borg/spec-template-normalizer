@@ -92,19 +92,26 @@ Each run creates an isolated directory below the selected output root:
   <target>_CANADIAN_FORMATTED.docx     # Canadian mode
   target-<sequence>-<source-hash>.audit.json
   run.log
+  diagnostics.jsonl
   run.json
 ```
 
 When selected targets from different folders share a filename, the app adds a
 stable source suffix so neither output can overwrite the other. Failed reruns
 therefore cannot make an older output appear current. `run.json` records the
-mode, application/template-pipeline/profile contract versions, template and
-target hashes, model and prompt fingerprints, cache identity, output hashes,
-disposition counts, numbering checks, terminal processing stages, durations,
-and stable error codes. Run manifest and target-audit schema version 2
-introduced these fields and separated the application version from the
-template-pipeline version. API keys and document text are never written to run
-metadata.
+mode, application/profile contract versions, template and target hashes, model
+and prompt fingerprints, cache identity, output hashes, disposition counts,
+numbering checks, durations, a `diagnostics` rollup, and errors. API keys and
+document text are never written to run metadata.
+
+`diagnostics.jsonl` is the detailed, structured diagnostics stream: one JSON
+object per phase event (`seq`, `ts`, `level`, `component`, `event`, and a
+`fields` object of counts/timings such as per-phase `duration_ms`, styles
+imported, numbering remaps, and paragraphs modified). It complements the
+human-readable `run.log`. Diagnostics carry only numbers and short structural
+identifiers -- never document text or secrets -- and the verbosity is set with
+`diagnostics_level` (`debug`/`info`/`warning`/`error`, default `info`) or the
+`SPEC_FORMATTER_DIAGNOSTICS_LEVEL` environment variable, which overrides it.
 
 Folder discovery ignores Word lock files, current `_FORMATTED.docx` outputs,
 and legacy `_PHASE2_FORMATTED.docx` outputs. If the architect is present in a
@@ -212,6 +219,7 @@ result = format_specifications(
     output_dir=Path("Formatted Specs"),
     api_key="...",
     conversion_mode="csi_to_canadian",  # omit for format-only behavior
+    diagnostics_level="debug",          # optional; default "info"
 )
 
 for target in result.targets:
@@ -219,6 +227,7 @@ for target in result.targets:
 
 print(result.run_id, result.conversion_mode)
 print(result.output_root, result.run_dir, result.manifest_path)
+print(result.diagnostics_path)  # diagnostics.jsonl for this run
 ```
 
 Target inputs may be individual DOCX paths or folders. Folder expansion is
@@ -228,11 +237,11 @@ as a failure without discarding valid outputs from other targets.
 backward-compatible alias of the concrete `result.run_dir`.
 
 `FormatRunResult` exposes `run_id`, `conversion_mode`, `output_root`, `run_dir`,
-`manifest_path`, `targets`, `success`, `succeeded`, `failed`, and
-`output_paths`. Each `TargetFormatResult` includes source/output hashes,
-`audit_path`, disposition counts, numbering checks, processor log lines,
-duration, conversion report, and any error in addition to the historical
-source/success/output fields.
+`manifest_path`, `diagnostics_path`, `targets`, `success`, `succeeded`,
+`failed`, and `output_paths`. Each `TargetFormatResult` includes source/output
+hashes, `audit_path`, disposition counts, numbering checks, structured
+`diagnostics` events, processor log lines, duration, conversion report, and any
+error in addition to the historical source/success/output fields.
 
 ## Internal architecture
 

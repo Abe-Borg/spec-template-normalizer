@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from .. import diagnostics as diag
 from .arch_env_applier import apply_environment_to_target
 from .core.classification import apply_phase2_classifications, build_phase2_slim_bundle
 from .core.application_policy import ApplicationPolicy, application_policy_for_mode
@@ -77,6 +78,7 @@ class BatchResult:
     audit_summary: Dict[str, int] = field(default_factory=dict)
     audit: Dict[str, Any] = field(default_factory=dict)
     numbering_checks: Dict[str, Any] = field(default_factory=dict)
+<<<<<<< HEAD
     stage: Optional[str] = None
 
 
@@ -155,6 +157,11 @@ class _ApplicationCheckpoint:
             audit=_safe_application_audit(self.audit),
             numbering_checks=_safe_numbering_checks(self.numbering_checks),
         )
+=======
+    # Structured, redaction-safe phase-timing/count events for this target.
+    # Carries no free text; the pipeline folds it into the run diagnostics.
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
 
 
 @dataclass(frozen=True)
@@ -638,6 +645,7 @@ def _apply_classified_target_impl(
     arch_root: Optional[Path],
     role_specs: Optional[Dict[str, Dict[str, Any]]],
     conversion_mode: str,
+<<<<<<< HEAD
     checkpoint: _ApplicationCheckpoint,
 ) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
     """Apply one validated classification payload through the shared engine."""
@@ -645,6 +653,21 @@ def _apply_classified_target_impl(
     checkpoint.stage = "application_policy"
     policy: ApplicationPolicy = application_policy_for_mode(conversion_mode)
     checkpoint.stage = "classification_checkpoint"
+=======
+    diagnostics: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
+    """Apply one validated classification payload through the shared engine."""
+
+    # A throwaway sink keeps callers that do not collect diagnostics working
+    # without scattering ``if diagnostics is not None`` across every phase.
+    diag_events: List[Dict[str, Any]] = diagnostics if diagnostics is not None else []
+
+    policy: ApplicationPolicy = application_policy_for_mode(conversion_mode)
+    diag.emit(diag_events, "INFO", "target", "policy",
+              conversion_mode=policy.conversion_mode,
+              import_body_numbering=bool(policy.import_body_numbering),
+              preserve_target_numbering=bool(policy.preserve_target_numbering))
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
     classifications_path = extract_dir / "phase2_classifications.json"
     classifications_path.write_text(json.dumps(classifications, indent=2), encoding="utf-8")
     log.append("Classification checkpoint saved")
@@ -666,6 +689,7 @@ def _apply_classified_target_impl(
     if policy.convert_to_canadian:
         checkpoint.stage = "csi_conversion"
         log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
+<<<<<<< HEAD
         conversion_report = apply_csi_to_canadian(
             extract_dir,
             classifications,
@@ -677,11 +701,36 @@ def _apply_classified_target_impl(
         )
         checkpoint.conversion_report = conversion_report
         checkpoint.stage = "canadian_classification_mapping"
+=======
+        with diag.timed(diag_events, "target", "csi_to_canadian") as phase:
+            conversion_report = apply_csi_to_canadian(
+                extract_dir,
+                classifications,
+                role_specs,
+                log,
+                architect_numbering_xml=(
+                    env_registry.get("numbering", {}).get("numbering_xml") or ""
+                ),
+            )
+            phase.set(
+                paragraphs_examined=conversion_report.paragraphs_examined,
+                paragraphs_converted=conversion_report.paragraphs_converted,
+                literal_markers_removed=conversion_report.literal_markers_removed,
+                automatic_numbering_retargeted=(
+                    conversion_report.automatic_numbering_retargeted
+                ),
+                unnumbered_paragraphs_numbered=(
+                    conversion_report.unnumbered_paragraphs_numbered
+                ),
+                warnings=len(conversion_report.warnings),
+            )
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         application_classifications = classifications_for_canadian_application(
             classifications,
             conversion_report,
         )
 
+<<<<<<< HEAD
     checkpoint.stage = "environment_application"
     env_result = apply_environment_to_target(
         target_extract_dir=extract_dir,
@@ -689,6 +738,20 @@ def _apply_classified_target_impl(
         log=log,
         registry_dir=arch_root,
     )
+=======
+    with diag.timed(diag_events, "target", "apply_environment") as phase:
+        env_result = apply_environment_to_target(
+            target_extract_dir=extract_dir,
+            registry=env_registry,
+            log=log,
+            registry_dir=arch_root,
+        )
+        _hf_import = env_result.get("header_footer_import", {}) if isinstance(env_result, dict) else {}
+        phase.set(
+            header_footer_parts=len(_hf_import.get("part_names", set()) or set()),
+            header_footer_media=len(_hf_import.get("media_names", set()) or set()),
+        )
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
     log.append("Applied environment")
     checkpoint.stage = "header_footer_token_patch"
     _patch_header_footer_tokens_if_imported(
@@ -715,6 +778,7 @@ def _apply_classified_target_impl(
     num_id_remap: Dict[int, int] = {}
     numbering_style_ids = needed_style_ids if policy.import_body_numbering else sorted(hf_style_ids)
     numbering_roles = sorted(used_roles) if policy.import_body_numbering else []
+<<<<<<< HEAD
     checkpoint.stage = "numbering_import"
     if HAS_NUMBERING_IMPORTER:
         numbering_contract = import_numbering(
@@ -727,14 +791,36 @@ def _apply_classified_target_impl(
             roles_to_apply=numbering_roles,
             additional_num_ids=sorted(hf_direct_num_ids),
             return_contract=True,
+=======
+    with diag.timed(diag_events, "target", "numbering_import") as phase:
+        if HAS_NUMBERING_IMPORTER:
+            numbering_contract = import_numbering(
+                target_extract_dir=extract_dir,
+                arch_template_registry=env_registry,
+                arch_styles_xml=arch_styles_xml,
+                style_ids_to_import=numbering_style_ids,
+                log=log,
+                role_specs=role_specs,
+                roles_to_apply=numbering_roles,
+                additional_num_ids=sorted(hf_direct_num_ids),
+                return_contract=True,
+            )
+            style_numid_remap = numbering_contract["style_numid_remap"]
+            role_numpr_remap = numbering_contract["role_numpr_remap"]
+            num_id_remap = numbering_contract["num_id_remap"]
+        else:
+            _check_numbering_module_needed(arch_styles_xml, numbering_style_ids)
+            if hf_direct_num_ids:
+                raise ImportError("numbering_importer is required by architect headers/footers")
+        phase.set(
+            importer_available=bool(HAS_NUMBERING_IMPORTER),
+            styles_considered=len(numbering_style_ids),
+            roles_considered=len(numbering_roles),
+            num_id_remaps=len(num_id_remap),
+            style_numid_remaps=len(style_numid_remap),
+            role_numpr_remaps=len(role_numpr_remap),
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         )
-        style_numid_remap = numbering_contract["style_numid_remap"]
-        role_numpr_remap = numbering_contract["role_numpr_remap"]
-        num_id_remap = numbering_contract["num_id_remap"]
-    else:
-        _check_numbering_module_needed(arch_styles_xml, numbering_style_ids)
-        if hf_direct_num_ids:
-            raise ImportError("numbering_importer is required by architect headers/footers")
 
     checkpoint.stage = "header_footer_numbering_remap"
     remap_header_footer_numids(
@@ -744,6 +830,7 @@ def _apply_classified_target_impl(
         log,
     )
 
+<<<<<<< HEAD
     checkpoint.stage = "style_import"
     style_result = import_arch_styles_into_target(
         target_extract_dir=extract_dir,
@@ -755,6 +842,27 @@ def _apply_classified_target_impl(
         shell_style_ids=hf_style_ids,
         namespace_seed=hashlib.sha256(arch_styles_xml.encode("utf-8")).hexdigest(),
     )
+=======
+    with diag.timed(diag_events, "target", "style_import") as phase:
+        style_result = import_arch_styles_into_target(
+            target_extract_dir=extract_dir,
+            arch_styles_xml=arch_styles_xml,
+            needed_style_ids=needed_style_ids,
+            log=log,
+            style_numid_remap=style_numid_remap,
+            format_only_body_style_ids=(body_style_ids if policy.preserve_target_numbering else None),
+            shell_style_ids=hf_style_ids,
+            namespace_seed=hashlib.sha256(arch_styles_xml.encode("utf-8")).hexdigest(),
+        )
+        phase.set(
+            requested_styles=len(needed_style_ids),
+            body_style_ids=len(body_style_ids),
+            header_footer_style_ids=len(hf_style_ids),
+            namespaced_collisions=sum(
+                1 for src, dst in style_result.style_id_map.items() if src != dst
+            ),
+        )
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
     applied_arch_registry = {
         role: style_result.body_style_id_map.get(style_id, style_id)
         for role, style_id in arch_registry.items()
@@ -770,6 +878,7 @@ def _apply_classified_target_impl(
 
     checkpoint.stage = "stability_snapshot"
     snap = snapshot_stability(extract_dir)
+<<<<<<< HEAD
     checkpoint.stage = "classification_application"
     apply_report = apply_phase2_classifications(
         extract_dir=extract_dir,
@@ -791,6 +900,51 @@ def _apply_classified_target_impl(
 
     checkpoint.stage = "application_reporting"
     classified, total, _unresolved = _coverage_counts(bundle, classifications)
+=======
+    with diag.timed(diag_events, "target", "apply_classifications") as phase:
+        apply_report = apply_phase2_classifications(
+            extract_dir=extract_dir,
+            classifications=application_classifications,
+            arch_style_registry=applied_arch_registry,
+            log=log,
+            role_specs=role_specs,
+            role_numpr_remap=role_numpr_remap,
+            source_styles_xml=source_styles_xml,
+            source_numbering_xml=source_numbering_xml,
+            policy=policy,
+        )
+        phase.set(
+            requested=apply_report.requested,
+            modified=apply_report.modified,
+            skipped_sectpr=len(apply_report.skipped_sectpr),
+            invalid_indices=len(apply_report.invalid_indices),
+            unmapped_roles=len(apply_report.unmapped_roles),
+            missing_style_ids=len(apply_report.missing_style_ids),
+            stripped_direct_ppr=apply_report.stripped_direct_ppr,
+            preserved_direct_ppr=apply_report.preserved_direct_ppr,
+            preserved_automatic_numbering=apply_report.preserved_automatic_numbering,
+            suppressed_architect_numbering=apply_report.suppressed_architect_numbering,
+            stripped_run_fonts=apply_report.stripped_run_fonts,
+            ignored=apply_report.ignored,
+        )
+    verify_stability(extract_dir, snap)
+    log.append("Applied classifications, stability verified")
+
+    with diag.timed(diag_events, "target", "build_output"):
+        output_path = _build_and_patch_output(
+            docx_path,
+            extract_dir,
+            env_result,
+            output_dir,
+            arch_template_registry=env_registry,
+            conversion_mode=policy.conversion_mode,
+            allowed_rpr_properties_by_paragraph=(
+                apply_report.allowed_rpr_properties_by_paragraph
+            ),
+        )
+
+    classified, total, unresolved = _coverage_counts(bundle, classifications)
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
     class_coverage = (classified / total * 100) if total > 0 else 100.0
     expected_targetable = apply_report.requested - len(apply_report.skipped_sectpr)
     app_coverage = (
@@ -798,6 +952,7 @@ def _apply_classified_target_impl(
         if expected_targetable > 0
         else 100.0
     )
+<<<<<<< HEAD
     classification_coverage_log = (
         f"Classification coverage: {classified}/{total} ({class_coverage:.1f}%)"
     )
@@ -819,6 +974,8 @@ def _apply_classified_target_impl(
             apply_report.allowed_rpr_properties_by_paragraph
         ),
     )
+=======
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
     log.append(f"Output: {output_path}")
     log.append(classification_coverage_log)
     log.append(application_coverage_log)
@@ -898,6 +1055,7 @@ def process_single_file(
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log: List[str] = []
+    per_file_diag: List[Dict[str, Any]] = []
     filename = docx_path.name
     output_path: Optional[Path] = None
     conversion_report: Optional[CanadianConversionReport] = None
@@ -914,18 +1072,27 @@ def process_single_file(
 
             stage = "extraction"
             per_file_log.append("Extracting DOCX...")
-            decomposer = DocxDecomposer(str(docx_path))
-            extract_dir = decomposer.extract(output_dir=Path(tmp_root) / extract_dir_name)
+            with diag.timed(per_file_diag, "target", "extract"):
+                decomposer = DocxDecomposer(str(docx_path))
+                extract_dir = decomposer.extract(output_dir=Path(tmp_root) / extract_dir_name)
 
             stage = "bundle_build"
             per_file_log.append("Building slim bundle...")
-            bundle = build_phase2_slim_bundle(
-                extract_dir,
-                available_roles=available_roles,
-                role_specs=role_specs,
-            )
-            unresolved = len(bundle.get("paragraphs", []))
-            deterministic = len(bundle.get("deterministic_classifications", []))
+            with diag.timed(per_file_diag, "target", "slim_bundle") as phase:
+                bundle = build_phase2_slim_bundle(
+                    extract_dir,
+                    available_roles=available_roles,
+                    role_specs=role_specs,
+                )
+                unresolved = len(bundle.get("paragraphs", []))
+                deterministic = len(bundle.get("deterministic_classifications", []))
+                phase.set(
+                    unresolved=unresolved,
+                    deterministic=deterministic,
+                    deterministic_ignored=len(
+                        bundle.get("deterministic_ignored_paragraphs", [])
+                    ),
+                )
             per_file_log.append(
                 f"Built slim bundle: {unresolved} unresolved + {deterministic} deterministic"
             )
@@ -941,12 +1108,14 @@ def process_single_file(
                 per_file_log.append(
                     "All paragraphs classified deterministically; Anthropic request skipped"
                 )
-            classifications = classify_target_document(
-                slim_bundle=bundle,
-                available_roles=available_roles,
-                api_key=api_key,
-                model=model,
-            )
+            with diag.timed(per_file_diag, "target", "classify") as phase:
+                phase.set(unresolved_sent=unresolved, llm_used=bool(unresolved), model=model)
+                classifications = classify_target_document(
+                    slim_bundle=bundle,
+                    available_roles=available_roles,
+                    api_key=api_key,
+                    model=model,
+                )
 
             stage = "application"
             (
@@ -969,6 +1138,7 @@ def process_single_file(
                 arch_root=arch_root,
                 role_specs=role_specs,
                 conversion_mode=conversion_mode,
+                diagnostics=per_file_diag,
             )
 
         return BatchResult(
@@ -982,7 +1152,11 @@ def process_single_file(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+<<<<<<< HEAD
             stage="complete",
+=======
+            diagnostics=per_file_diag,
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         )
     except Exception as exc:
         if isinstance(exc, ApplicationStageError):
@@ -1003,7 +1177,11 @@ def process_single_file(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+<<<<<<< HEAD
             stage=stage,
+=======
+            diagnostics=per_file_diag,
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         )
 
 
@@ -1049,6 +1227,7 @@ def _apply_batch_result(
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log = list(prepared.prep_log)
+    per_file_diag: List[Dict[str, Any]] = []
     output_path: Optional[Path] = None
     conversion_report: Optional[CanadianConversionReport] = None
     filename = prepared.docx_path.name
@@ -1080,6 +1259,7 @@ def _apply_batch_result(
             arch_root=arch_root,
             role_specs=role_specs,
             conversion_mode=conversion_mode,
+            diagnostics=per_file_diag,
         )
 
         return BatchResult(
@@ -1093,7 +1273,11 @@ def _apply_batch_result(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+<<<<<<< HEAD
             stage="complete",
+=======
+            diagnostics=per_file_diag,
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         )
     except Exception as exc:
         if isinstance(exc, ApplicationStageError):
@@ -1114,7 +1298,11 @@ def _apply_batch_result(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+<<<<<<< HEAD
             stage=stage,
+=======
+            diagnostics=per_file_diag,
+>>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         )
 
 
