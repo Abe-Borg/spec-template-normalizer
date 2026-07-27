@@ -601,14 +601,10 @@ def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
         assert "PART 9 - CONFIDENTIAL" not in artifact_text
         assert "leaked_secret" not in artifact_text
 
-<<<<<<< HEAD
-    audit = json.loads(artifact_texts[-1])
     manifest = json.loads(artifact_texts[0])
     assert manifest["targets"][0]["error_code"] == "untrusted_error"
     assert manifest["targets"][0]["error"] == "[document content omitted]"
-=======
     audit = json.loads(artifact_texts[2])
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
     assert audit["application_audit"]["ignored_paragraphs"] == [
         {"paragraph_index": 4, "reason": "unspecified"}
     ]

@@ -94,6 +94,7 @@ class TargetFormatResult:
     audit_summary: dict[str, int] = field(default_factory=_empty_audit_summary)
     audit: dict[str, Any] = field(default_factory=dict)
     numbering_checks: dict[str, Any] = field(default_factory=dict)
+    stage: Optional[str] = None
     # Structured, redaction-safe phase-timing/count events for this target,
     # folded into the run-wide diagnostics recorder before publication.
     diagnostics: tuple[dict[str, Any], ...] = ()
@@ -1206,6 +1207,7 @@ def _format_one_target(
     audit_summary = _empty_audit_summary()
     audit: dict[str, Any] = {}
     numbering_checks: dict[str, Any] = {}
+    stage: Optional[str] = None
     # Structured pipeline-side phase events (snapshot/publish) interleaved with
     # the engine's own phase events.  Carries counts/timings only, never text.
     diag_events: list[dict[str, Any]] = []
@@ -1232,7 +1234,17 @@ def _format_one_target(
             role_specs=shared.role_specs,
             conversion_mode=conversion_mode,
         )
-        processor_log = tuple(result.log)
+        # The processor writes into an isolated staging directory. Its final
+        # path diagnostics therefore point at files that are deleted when the
+        # job temp directory closes. The public result already carries the
+        # durable published path, so never replay or persist staging paths.
+        staging_marker = os.path.normcase(str(staging_dir))
+        processor_log = tuple(
+            line
+            for line in result.log
+            if not str(line).lstrip().startswith("Output:")
+            and staging_marker not in os.path.normcase(str(line))
+        )
         diag_events.extend(getattr(result, "diagnostics", None) or [])
         conversion_report = result.conversion_report
         audit_summary = _normalize_audit_summary(
@@ -1256,6 +1268,7 @@ def _format_one_target(
                 audit_summary=audit_summary,
                 audit=audit,
                 numbering_checks=numbering_checks,
+                stage=stage,
                 diagnostics=tuple(diag_events),
             )
         stage = "publication"
@@ -1280,6 +1293,7 @@ def _format_one_target(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            stage=getattr(result, "stage", None) or "complete",
             diagnostics=tuple(diag_events),
         )
     except Exception as exc:
@@ -1295,6 +1309,7 @@ def _format_one_target(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            stage=stage,
             diagnostics=tuple(diag_events),
         )
 
@@ -1722,6 +1737,10 @@ def format_specifications(
 
     started_utc = _utc_now()
     events: list[str] = []
+    pending_events: queue.SimpleQueue[tuple[datetime, str]] = queue.SimpleQueue()
+    event_order_lock = threading.Lock()
+    event_owner_thread = threading.get_ident()
+    last_event_at: Optional[datetime] = None
     resolved_level = diag.level_from_name(
         os.environ.get("SPEC_FORMATTER_DIAGNOSTICS_LEVEL", "") or diagnostics_level,
         default=diag.INFO,
@@ -1837,6 +1856,7 @@ def format_specifications(
         planned_outputs = _plan_output_paths(targets, run_dir, conversion_mode)
         _validate_output_plan(architect, targets, planned_outputs)
     except Exception as exc:
+        drain_reported_events()
         recorder.error("pipeline", "init_failed", error_type=type(exc).__name__.lower())
         manifest_path = _write_initialization_failure_artifacts(
             run_id=run_id,
@@ -1886,48 +1906,21 @@ def format_specifications(
                     ),
                 )
                 futures[future] = (index + 1, target)
+                # A fast worker can start before ``submit`` returns. Publish
+                # its queued event before submitting another target.
+                drain_reported_events()
 
             completed = 0
-            for future in as_completed(futures):
-                target_number, target = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:  # pragma: no cover - defensive boundary
-                    result = TargetFormatResult(
-                        source_path=target,
-                        success=False,
-                        output_path=None,
-                        log=(f"FAILED: {exc}",),
-                        error=str(exc),
-                        duration_seconds=0.0,
-                    )
-                results_by_target[target] = result
-                completed += 1
-                recorder.ingest(result.diagnostics, target=target_number)
-                counts = result.audit_summary
-                recorder.record(
-                    diag.INFO if result.success else diag.WARNING,
-                    "pipeline",
-                    "target_done",
-                    target=target_number,
-                    success=result.success,
-                    duration_ms=round(result.duration_seconds * 1000.0, 3),
-                    styled=counts.get("styled", 0),
-                    ignored=counts.get("ignored", 0),
-                    out_of_scope=counts.get("out_of_scope", 0),
-                    unresolved=counts.get("unresolved", 0),
-                )
-                for line in result.log:
-                    report(f"Target {target.name}: {line}")
-                report(
-                    f"Target {target.name}: audit styled={counts.get('styled', 0)}, "
-                    f"ignored={counts.get('ignored', 0)}, "
-                    f"out_of_scope={counts.get('out_of_scope', 0)}, "
-                    f"unresolved={counts.get('unresolved', 0)}"
-                )
+            pending = set(futures)
+            while pending:
                 drain_reported_events()
+                done, pending = wait(
+                    pending,
+                    timeout=0.05,
+                    return_when=FIRST_COMPLETED,
+                )
                 for future in done:
-                    target = futures[future]
+                    target_number, target = futures[future]
                     try:
                         result = future.result()
                     except Exception as exc:  # pragma: no cover - defensive boundary
@@ -1942,6 +1935,20 @@ def format_specifications(
                         )
                     results_by_target[target] = result
                     completed += 1
+                    recorder.ingest(result.diagnostics, target=target_number)
+                    counts = result.audit_summary
+                    recorder.record(
+                        diag.INFO if result.success else diag.WARNING,
+                        "pipeline",
+                        "target_done",
+                        target=target_number,
+                        success=result.success,
+                        duration_ms=round(result.duration_seconds * 1000.0, 3),
+                        styled=counts.get("styled", 0),
+                        ignored=counts.get("ignored", 0),
+                        out_of_scope=counts.get("out_of_scope", 0),
+                        unresolved=counts.get("unresolved", 0),
+                    )
                     for line in result.log:
                         if str(line).lstrip().startswith("FAILED:"):
                             continue
@@ -1954,10 +1961,17 @@ def format_specifications(
                             if not safe_part or _SAFE_REDACTION_RX.fullmatch(safe_part):
                                 continue
                             report(f"Target {target.name}: {safe_part}")
+                    report(
+                        f"Target {target.name}: audit styled={counts.get('styled', 0)}, "
+                        f"ignored={counts.get('ignored', 0)}, "
+                        f"out_of_scope={counts.get('out_of_scope', 0)}, "
+                        f"unresolved={counts.get('unresolved', 0)}"
+                    )
                     status = "Formatted" if result.success else "Failed"
                     report(
                         f"{status} {completed} of {len(targets)}: {target.name}"
                     )
+                drain_reported_events()
             drain_reported_events()
 
     ordered_results = tuple(results_by_target[target] for target in targets)
