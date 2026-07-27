@@ -4,11 +4,14 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import spec_formatter
 from spec_formatter import pipeline
 from spec_formatter.style_application.batch_runner import BatchResult, SharedConfig
 from spec_formatter.style_application.core.csi_to_canadian import (
@@ -133,7 +136,10 @@ def _fake_dependencies(
             filename=source.name,
             success=True,
             output_path=staged_output,
-            log=["Applied classifications, stability verified"],
+            log=[
+                "Applied classifications, stability verified",
+                f"Output: {staged_output}",
+            ],
             error=None,
             duration_seconds=0.02,
             audit_summary={
@@ -169,6 +175,7 @@ def _run_with_fakes(
     processor,
     cache_dir: Path | None = None,
     progress=None,
+    progress_event=None,
 ):
     if cache_dir is None:
         cache_dir = output_dir.parent / "test-profile-cache"
@@ -180,6 +187,7 @@ def _run_with_fakes(
         cache_dir=cache_dir,
         max_workers=3,
         progress=progress,
+        progress_event=progress_event,
         _template_analyzer=analyzer,
         _config_loader=config_loader,
         _target_processor=processor,
@@ -310,8 +318,18 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
     assert api_key not in manifest_text
     assert api_key not in run_log_text
     manifest = json.loads(manifest_text)
+    assert manifest["schema_version"] == 2
     assert manifest["run_id"] == result.run_id
     assert manifest["conversion_mode"] == pipeline.FORMAT_ONLY
+    assert manifest["application"]["version"] == spec_formatter.__version__
+    assert (
+        manifest["application"]["template_pipeline_version"]
+        == pipeline.template_analysis.PIPELINE_VERSION
+    )
+    assert (
+        manifest["template_profile"]["producer"]["version"]
+        == pipeline.template_analysis.PIPELINE_VERSION
+    )
     assert manifest["paths"]["output_root"] == str(result.output_root)
     assert manifest["paths"]["run_dir"] == str(result.run_dir)
     assert manifest["architect_template"]["sha256"] == hashlib.sha256(
@@ -335,6 +353,7 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
     ).hexdigest()
     assert target_result.audit_path is not None
     audit = json.loads(target_result.audit_path.read_text(encoding="utf-8"))
+    assert audit["schema_version"] == 2
     assert audit["disposition_counts"] == target_result.audit_summary
     assert audit["application_audit"]["paragraph_indices"] == [0]
     assert "original_text_preview" not in manifest_text
@@ -342,7 +361,15 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
         encoding="utf-8"
     )
     assert audit["numbering_checks"] == {"checked": 1, "preserved": True}
-    assert "Applied classifications, stability verified" in run_log_text
+    assert run_log_text.count("Applied classifications, stability verified") == 1
+    assert run_log_text.count("TARGET target.docx: succeeded") == 1
+    assert f"OUTPUT: {target_result.output_path}" in run_log_text
+    assert "sf-" not in run_log_text
+    assert "[untrusted detail omitted" not in run_log_text
+    assert not any(
+        str(line).lstrip().startswith("Output:") for line in target_result.log
+    )
+    assert manifest["targets"][0]["stage"] == "complete"
 
 
 def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
@@ -429,6 +456,9 @@ def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
         assert "PART 9 - CONFIDENTIAL" not in artifact_text
 
     audit = json.loads(artifact_texts[-1])
+    manifest = json.loads(artifact_texts[0])
+    assert manifest["targets"][0]["error_code"] == "untrusted_error"
+    assert manifest["targets"][0]["error"] == "[document content omitted]"
     assert audit["application_audit"]["ignored_paragraphs"] == [
         {"paragraph_index": 4, "reason": "unspecified"}
     ]
@@ -444,6 +474,7 @@ def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
         }
     ]
     assert "[document content omitted]" in artifact_texts[1]
+    assert artifact_texts[1].count("Classifying target") == 1
 
 
 def test_run_text_sanitizer_rejects_unstructured_model_authored_details() -> None:
@@ -458,6 +489,201 @@ def test_run_text_sanitizer_rejects_unstructured_model_authored_details() -> Non
         (),
         allow_operational=True,
     ) == "Applied classifications, stability verified"
+
+
+def test_safe_error_diagnostic_extracts_only_allowlisted_internal_message() -> None:
+    canonical = (
+        "Architect template has conflicting section shells; use one canonical "
+        "page layout and default/even/first header-footer mapping."
+    )
+    wrapped = (
+        "Preflight validation failed (page_layout semantic validation failed: "
+        f"{canonical}) trailing payload must not persist"
+    )
+
+    diagnostic = pipeline.safe_error_diagnostic(wrapped)
+    unknown = pipeline.safe_error_diagnostic(
+        "unknown ValueError with confidential paragraph prose"
+    )
+
+    assert diagnostic == pipeline.SafeErrorDiagnostic(
+        code="template_section_shell_conflict",
+        message=canonical,
+    )
+    assert "Preflight" not in diagnostic.message
+    assert "trailing payload" not in diagnostic.message
+    assert unknown is not None
+    assert unknown.code == "untrusted_error"
+    assert "confidential paragraph prose" not in unknown.message
+    assert unknown.message.startswith("[untrusted detail omitted; sha256=")
+
+    additional_known = {
+        "template_default_section_conflict": (
+            "Architect template default section conflicts with its section chain."
+        ),
+        "template_duplicate_section_index": (
+            "Architect template section chain has duplicate section_index values."
+        ),
+        "template_api_key_required": (
+            "An Anthropic API key is required to analyze a new architect template."
+        ),
+    }
+    for code, message in additional_known.items():
+        assert pipeline.safe_error_diagnostic(message) == pipeline.SafeErrorDiagnostic(
+            code=code,
+            message=message,
+        )
+
+
+@pytest.mark.parametrize(
+    ("raw_error", "expected_code", "expected_message"),
+    [
+        (
+            r"Architect template does not exist: C:\Private\Client A\template.docx",
+            "input_architect_missing",
+            "Architect template does not exist.",
+        ),
+        (
+            r"Target specification does not exist: C:\Private\Client A\secret.docx",
+            "input_target_missing",
+            "A selected target specification does not exist.",
+        ),
+        (
+            "Select at least one target specification DOCX file.",
+            "input_target_required",
+            "Select at least one target specification DOCX file.",
+        ),
+        (
+            "conversion_mode must be one of: csi_to_canadian, format_only",
+            "invalid_conversion_mode",
+            "conversion_mode must be one of: csi_to_canadian, format_only",
+        ),
+        (
+            "max_workers must be an integer.",
+            "invalid_max_workers",
+            "max_workers must be an integer.",
+        ),
+        (
+            "Output directory could not be created.",
+            "output_create_failed",
+            "Output directory could not be created.",
+        ),
+    ],
+)
+def test_safe_error_diagnostic_exposes_path_free_input_remediation(
+    raw_error: str,
+    expected_code: str,
+    expected_message: str,
+) -> None:
+    diagnostic = pipeline.safe_error_diagnostic(raw_error)
+
+    assert diagnostic == pipeline.SafeErrorDiagnostic(
+        code=expected_code,
+        message=expected_message,
+    )
+    assert "Private" not in diagnostic.message
+    assert "secret.docx" not in diagnostic.message
+
+
+def test_progress_uses_queued_then_actual_processing_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    progress_messages: list[str] = []
+
+    _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+        progress=progress_messages.append,
+    )
+
+    assert "Queued 1 of 1: target.docx" in progress_messages
+    assert "Processing target 1 of 1: target.docx" in progress_messages
+    assert not any(message.startswith("Started ") for message in progress_messages)
+
+
+def test_target_progress_callbacks_keep_calling_thread_affinity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    targets = [
+        _write_input(tmp_path / f"target-{index}.docx", f"target-{index}".encode())
+        for index in range(4)
+    ]
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    calling_thread = threading.get_ident()
+    callback_threads: list[int] = []
+
+    _run_with_fakes(
+        architect,
+        targets,
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+        progress=lambda _message: callback_threads.append(threading.get_ident()),
+    )
+
+    assert callback_threads
+    assert set(callback_threads) == {calling_thread}
+
+
+def test_timestamped_progress_events_are_ordered_and_match_persisted_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    targets = [
+        _write_input(tmp_path / f"target-{index}.docx", f"target-{index}".encode())
+        for index in range(4)
+    ]
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    calling_thread = threading.get_ident()
+    observed: list[tuple[str, datetime, int]] = []
+
+    result = _run_with_fakes(
+        architect,
+        targets,
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+        progress_event=lambda message, occurred_at: observed.append(
+            (message, occurred_at, threading.get_ident())
+        ),
+    )
+
+    messages = [message for message, _occurred_at, _thread_id in observed]
+    event_times = [occurred_at for _message, occurred_at, _thread_id in observed]
+    assert event_times == sorted(event_times)
+    assert {thread_id for _message, _occurred_at, thread_id in observed} == {
+        calling_thread
+    }
+    for index, target in enumerate(targets, start=1):
+        queued = f"Queued {index} of {len(targets)}: {target.name}"
+        processing = f"Processing target {index} of {len(targets)}: {target.name}"
+        assert messages.index(queued) < messages.index(processing)
+
+    run_log_lines = (result.run_dir / "run.log").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    persisted_events = [
+        line for line in run_log_lines if pipeline._EVENT_TIMESTAMP_RX.match(line)
+    ]
+    persisted_times = [
+        datetime.fromisoformat(line.split(" ", 1)[0].replace("Z", "+00:00"))
+        for line in persisted_events
+    ]
+    assert persisted_times == sorted(persisted_times)
+    assert [line.split(" ", 1)[1] for line in persisted_events] == messages
 
 
 def test_pre_contract_cache_entry_is_ignored_once(
@@ -588,7 +814,10 @@ def test_input_preflight_fails_before_analyzer_or_other_pipeline_work(
         calls.append("called")
         raise AssertionError("pipeline dependency ran before input preflight completed")
 
-    with pytest.raises(FileNotFoundError, match="Target specification does not exist"):
+    with pytest.raises(
+        FileNotFoundError,
+        match="Target specification does not exist",
+    ) as raised:
         pipeline.format_specifications(
             architect,
             [missing_target],
@@ -604,6 +833,12 @@ def test_input_preflight_fails_before_analyzer_or_other_pipeline_work(
     assert not output_dir.exists()
     assert not cache_dir.exists()
     assert architect.read_bytes() == b"architect-original"
+    diagnostic = pipeline.safe_error_diagnostic(raised.value)
+    assert diagnostic == pipeline.SafeErrorDiagnostic(
+        code="input_target_missing",
+        message="A selected target specification does not exist.",
+    )
+    assert str(missing_target) not in diagnostic.message
 
 
 def test_isolated_run_output_cannot_overwrite_the_architect_input(
@@ -667,6 +902,55 @@ def test_target_failure_is_isolated_and_successful_output_is_retained(
     assert by_name["bad.docx"].error == "simulated target failure"
     assert result.output_paths == (by_name["good.docx"].output_path,)
     assert {path: path.read_bytes() for path in originals} == originals
+
+
+def test_known_target_failure_persists_actionable_code_message_and_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+    canonical = (
+        "Architect template has conflicting section shells; use one canonical "
+        "page layout and default/even/first header-footer mapping."
+    )
+    wrapped = (
+        "Preflight validation failed (page_layout semantic validation failed: "
+        f"{canonical}) PRIVATE WRAPPER DETAIL"
+    )
+
+    def processor(**kwargs) -> BatchResult:
+        return BatchResult(
+            filename=Path(kwargs["docx_path"]).name,
+            success=False,
+            output_path=None,
+            log=[f"FAILED: {wrapped}"],
+            error=wrapped,
+            duration_seconds=0.01,
+            stage="page_layout",
+        )
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    audit = json.loads(result.targets[0].audit_path.read_text(encoding="utf-8"))
+    run_log = (result.run_dir / "run.log").read_text(encoding="utf-8")
+    for record in (manifest["targets"][0], audit):
+        assert record["error_code"] == "template_section_shell_conflict"
+        assert record["error"] == canonical
+        assert record["stage"] == "page_layout"
+    assert "ERROR [template_section_shell_conflict]" in run_log
+    assert run_log.count("ERROR [template_section_shell_conflict]") == 1
+    assert canonical in run_log
+    assert "PRIVATE WRAPPER DETAIL" not in run_log
 
 
 def test_target_processor_receives_an_isolated_snapshot(
@@ -857,7 +1141,7 @@ def test_invalid_conversion_mode_fails_before_analysis_or_filesystem_writes(
         calls.append("called")
         raise AssertionError("pipeline work started for an invalid conversion mode")
 
-    with pytest.raises(ValueError, match="conversion_mode"):
+    with pytest.raises(ValueError, match="conversion_mode") as raised:
         pipeline.format_specifications(
             architect,
             [target],
@@ -871,6 +1155,71 @@ def test_invalid_conversion_mode_fails_before_analysis_or_filesystem_writes(
 
     assert calls == []
     assert not (tmp_path / "formatted").exists()
+    assert pipeline.safe_error_diagnostic(raised.value) == (
+        pipeline.SafeErrorDiagnostic(
+            code="invalid_conversion_mode",
+            message="conversion_mode must be one of: csi_to_canadian, format_only",
+        )
+    )
+
+
+@pytest.mark.parametrize("invalid_workers", [True, 1.5, "three", None])
+def test_invalid_max_workers_has_stable_diagnostic_before_filesystem_writes(
+    tmp_path: Path,
+    invalid_workers: object,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+
+    with pytest.raises(ValueError, match="max_workers must be an integer") as raised:
+        pipeline.format_specifications(
+            architect,
+            [target],
+            tmp_path / "formatted",
+            api_key="offline-test-key",
+            max_workers=invalid_workers,  # type: ignore[arg-type]
+        )
+
+    assert not (tmp_path / "formatted").exists()
+    assert pipeline.safe_error_diagnostic(raised.value) == (
+        pipeline.SafeErrorDiagnostic(
+            code="invalid_max_workers",
+            message="max_workers must be an integer.",
+        )
+    )
+
+
+def test_output_directory_creation_failure_has_path_free_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    output_dir = (tmp_path / "Private Client" / "formatted").resolve()
+    original_mkdir = Path.mkdir
+
+    def fail_output_mkdir(path: Path, *args, **kwargs) -> None:
+        if path == output_dir:
+            raise PermissionError(f"denied: {path}")
+        original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_output_mkdir)
+
+    with pytest.raises(OSError, match="could not be created") as raised:
+        pipeline.format_specifications(
+            architect,
+            [target],
+            output_dir,
+            api_key="offline-test-key",
+        )
+
+    diagnostic = pipeline.safe_error_diagnostic(raised.value)
+    assert diagnostic == pipeline.SafeErrorDiagnostic(
+        code="output_create_failed",
+        message="Output directory could not be created.",
+    )
+    assert str(output_dir) not in diagnostic.message
+    assert isinstance(raised.value.__cause__, PermissionError)
 
 
 def test_template_initialization_failure_still_publishes_failed_run_artifacts(
@@ -963,3 +1312,25 @@ def test_publication_failure_preserves_processor_log_and_conversion_report(
     assert result.success is False
     assert result.conversion_report is report
     assert result.log == ("conversion complete", "FAILED: publish failed")
+    assert result.stage == "publication"
+
+
+def test_processor_exception_records_processing_stage(tmp_path: Path) -> None:
+    target = _write_input(tmp_path / "target.docx", b"source")
+
+    def processor(**_kwargs):
+        raise RuntimeError("injected processor failure")
+
+    result = pipeline._format_one_target(
+        target,
+        tmp_path / "final.docx",
+        tmp_path / "staging",
+        SharedConfig({}, {}, "", [], {}, tmp_path, {}),
+        "",
+        "test-model",
+        processor,
+        pipeline.FORMAT_ONLY,
+    )
+
+    assert result.success is False
+    assert result.stage == "processing"

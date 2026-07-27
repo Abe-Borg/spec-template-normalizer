@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,9 +62,79 @@ def test_format_worker_reports_pipeline_errors(monkeypatch):
 
     kind, payload = events.get_nowait()
     assert kind == "error"
-    assert payload["message"] == "invalid Canadian template"
+    assert payload["message"].startswith("[untrusted detail omitted; sha256=")
+    assert "invalid Canadian template" not in payload["message"]
+    assert payload["error_code"] == "untrusted_error"
     assert "ValueError" in payload["traceback"]
     assert payload["run_dir"] is None
+
+
+def test_format_worker_reports_input_failure_without_exposing_path(monkeypatch):
+    private_path = r"C:\Private\Client A\secret-template.docx"
+
+    def fail(**_kwargs):
+        raise FileNotFoundError(
+            f"Architect template does not exist: {private_path}"
+        )
+
+    monkeypatch.setattr(gui, "format_specifications", fail)
+    monkeypatch.setattr(gui, "default_template_cache_dir", lambda: Path("cache"))
+    events: queue.Queue = queue.Queue()
+
+    _worker(events, FORMAT_ONLY).run()
+
+    kind, payload = events.get_nowait()
+    assert kind == "error"
+    assert payload["error_code"] == "input_architect_missing"
+    assert payload["message"] == "Architect template does not exist."
+    assert private_path not in payload["message"]
+    assert private_path not in payload["traceback"]
+
+
+def test_format_worker_preserves_pipeline_progress_event_timestamp(monkeypatch):
+    occurred_at = datetime(2026, 7, 21, 21, 35, 24, tzinfo=timezone.utc)
+    sentinel = object()
+
+    def fake_format_specifications(**kwargs):
+        kwargs["progress_event"]("Processing target", occurred_at)
+        return sentinel
+
+    monkeypatch.setattr(gui, "format_specifications", fake_format_specifications)
+    monkeypatch.setattr(gui, "default_template_cache_dir", lambda: Path("cache"))
+    events: queue.Queue = queue.Queue()
+
+    _worker(events, FORMAT_ONLY).run()
+
+    assert events.get_nowait() == (
+        "progress",
+        {"message": "Processing target", "occurred_at": occurred_at},
+    )
+    assert events.get_nowait() == ("complete", sentinel)
+
+
+def test_format_worker_reports_wrapped_known_internal_error_actionably(monkeypatch):
+    canonical = (
+        "Architect template has conflicting section shells; use one canonical "
+        "page layout and default/even/first header-footer mapping."
+    )
+
+    def fail(**_kwargs):
+        raise ValueError(
+            "Preflight validation failed (page_layout semantic validation failed: "
+            f"{canonical}) PRIVATE DETAIL"
+        )
+
+    monkeypatch.setattr(gui, "format_specifications", fail)
+    monkeypatch.setattr(gui, "default_template_cache_dir", lambda: Path("cache"))
+    events: queue.Queue = queue.Queue()
+
+    _worker(events, CSI_TO_CANADIAN).run()
+
+    kind, payload = events.get_nowait()
+    assert kind == "error"
+    assert payload["error_code"] == "template_section_shell_conflict"
+    assert payload["message"] == canonical
+    assert "PRIVATE DETAIL" not in payload["traceback"]
 
 
 def test_format_worker_forwards_failed_run_artifact_paths(monkeypatch):
@@ -211,7 +282,32 @@ class _FakeWidget:
         self.configurations.append(kwargs)
 
 
-def test_completion_logs_processor_details_and_saves_log_in_run_dir(monkeypatch):
+class _FakeLogBox(_FakeWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.insertions: list[tuple[str, str]] = []
+
+    def insert(self, index: str, value: str) -> None:
+        self.insertions.append((index, value))
+
+    def see(self, _index: str) -> None:
+        return None
+
+
+def test_append_log_converts_utc_progress_time_to_local_time():
+    occurred_at = datetime(2026, 7, 21, 21, 35, 24, tzinfo=timezone.utc)
+    log_box = _FakeLogBox()
+    app = SimpleNamespace(log_box=log_box)
+
+    gui.App._append_log(app, "Processing target", occurred_at=occurred_at)
+
+    expected_time = occurred_at.astimezone().strftime("%H:%M:%S")
+    assert log_box.insertions == [
+        ("end", f"[{expected_time}] Processing target\n")
+    ]
+
+
+def test_completion_does_not_replay_processor_details_and_saves_summaries(monkeypatch):
     run_dir = Path("output/20260721_format_only_abcd1234")
     target = SimpleNamespace(
         success=True,
@@ -244,9 +340,41 @@ def test_completion_logs_processor_details_and_saves_log_in_run_dir(monkeypatch)
 
     gui.App._handle_complete(app, result)
 
-    assert "processor detail one" in messages
-    assert "processor detail two" in messages
+    assert "processor detail one" not in messages
+    assert "processor detail two" not in messages
     assert any("styled=121, ignored=1" in line for line in messages)
+    assert f"Output: {target.output_path}" in messages
     assert f"Run folder: {run_dir}" in messages
     assert f"Persisted run log: {run_dir / 'run.log'}" in messages
     assert app.last_result is result
+
+
+def test_poll_events_uses_captured_progress_timestamp_and_accepts_legacy_string():
+    occurred_at = datetime(2026, 7, 21, 14, 35, 24)
+    events: queue.Queue = queue.Queue()
+    events.put(
+        (
+            "progress",
+            {"message": "Processing target", "occurred_at": occurred_at},
+        )
+    )
+    events.put(("progress", "legacy progress"))
+    logged: list[tuple[str, datetime | None]] = []
+    app = SimpleNamespace(
+        events=events,
+        status_label=_FakeWidget(),
+        _append_log=lambda message, occurred_at=None: logged.append(
+            (message, occurred_at)
+        ),
+        _handle_complete=lambda _payload: None,
+        _handle_error=lambda _payload: None,
+        _poll_events=lambda: None,
+        after=lambda *_args: None,
+    )
+
+    gui.App._poll_events(app)
+
+    assert logged == [
+        ("Processing target", occurred_at),
+        ("legacy progress", None),
+    ]

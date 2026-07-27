@@ -158,3 +158,37 @@ def test_imported_architect_header_tokens_are_patched(monkeypatch, tmp_path):
     assert changed is True
     assert len(calls) == 1
     assert calls[0][1]["part_names"] == ["word/header1.xml"]
+
+
+def test_imported_architect_tokens_can_be_inferred_when_source_map_is_empty(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+    monkeypatch.setattr(
+        "spec_formatter.style_application.batch_runner.patch_header_footer_tokens",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    changed = _patch_header_footer_tokens_if_imported(
+        tmp_path,
+        {
+            "header_footer_import": {
+                "part_names": {"word/header1.xml", "word/footer1.xml"}
+            }
+        },
+        {},
+        {
+            "SectionID": "SECTION 012900",
+            "SectionTitle": "PAYMENT PROCEDURES",
+        },
+        [],
+    )
+
+    assert changed is True
+    assert len(calls) == 1
+    assert calls[0][0][1] == {}
+    assert calls[0][1]["part_names"] == [
+        "word/footer1.xml",
+        "word/header1.xml",
+    ]

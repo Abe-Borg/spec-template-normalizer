@@ -21,6 +21,8 @@ from .core.csi_to_canadian import (
     CSI_TO_CANADIAN,
     FORMAT_ONLY,
     CanadianConversionReport,
+    ConversionIssue,
+    MarkerEdit,
     apply_csi_to_canadian,
     classifications_for_canadian_application,
     validate_conversion_mode,
@@ -75,6 +77,84 @@ class BatchResult:
     audit_summary: Dict[str, int] = field(default_factory=dict)
     audit: Dict[str, Any] = field(default_factory=dict)
     numbering_checks: Dict[str, Any] = field(default_factory=dict)
+    stage: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ApplicationFailureDiagnostics:
+    """Text-free checkpoints retained when classified-target application fails."""
+
+    stage: str
+    conversion_report: Optional[CanadianConversionReport] = None
+    audit_summary: Dict[str, int] = field(default_factory=dict)
+    audit: Dict[str, Any] = field(default_factory=dict)
+    numbering_checks: Dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return the structural, JSON-safe representation for outer pipelines."""
+
+        return {
+            "stage": self.stage,
+            "conversion_report": (
+                self.conversion_report.as_dict()
+                if self.conversion_report is not None
+                else None
+            ),
+            "audit_summary": dict(self.audit_summary),
+            "audit": dict(self.audit),
+            "numbering_checks": dict(self.numbering_checks),
+        }
+
+
+class ApplicationStageError(RuntimeError):
+    """Application failure augmented with the last safe diagnostic checkpoint."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostics: ApplicationFailureDiagnostics,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+    @property
+    def stage(self) -> str:
+        return self.diagnostics.stage
+
+    @property
+    def conversion_report(self) -> Optional[CanadianConversionReport]:
+        return self.diagnostics.conversion_report
+
+    @property
+    def audit_summary(self) -> Dict[str, int]:
+        return self.diagnostics.audit_summary
+
+    @property
+    def audit(self) -> Dict[str, Any]:
+        return self.diagnostics.audit
+
+    @property
+    def numbering_checks(self) -> Dict[str, Any]:
+        return self.diagnostics.numbering_checks
+
+
+@dataclass
+class _ApplicationCheckpoint:
+    stage: str
+    audit_summary: Dict[str, int]
+    audit: Dict[str, Any]
+    conversion_report: Optional[CanadianConversionReport] = None
+    numbering_checks: Dict[str, Any] = field(default_factory=dict)
+
+    def failure_diagnostics(self) -> ApplicationFailureDiagnostics:
+        return ApplicationFailureDiagnostics(
+            stage=self.stage,
+            conversion_report=_safe_conversion_report(self.conversion_report),
+            audit_summary=dict(self.audit_summary),
+            audit=_safe_application_audit(self.audit),
+            numbering_checks=_safe_numbering_checks(self.numbering_checks),
+        )
 
 
 @dataclass(frozen=True)
@@ -230,7 +310,7 @@ def _patch_header_footer_tokens_if_imported(
     log: List[str],
 ) -> bool:
     """Patch project tokens only in architect parts imported during this run."""
-    if not source_tokens or not target_tokens:
+    if not target_tokens:
         return False
     imported_parts = env_result.get("header_footer_import", {}).get("part_names", set())
     if not imported_parts:
@@ -240,10 +320,10 @@ def _patch_header_footer_tokens_if_imported(
         return False
     patch_header_footer_tokens(
         extract_dir,
-        source_tokens,
+        source_tokens or {},
         target_tokens,
         log,
-        part_names=list(imported_parts),
+        part_names=sorted(imported_parts),
     )
     return True
 
@@ -285,6 +365,147 @@ def _remap_imported_header_footer_style_ids(
         log.append(
             f"Remapped collision-safe style IDs in {changed_parts} imported header/footer parts"
         )
+
+
+_DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:/#@+\-]{1,160}")
+_SAFE_AUDIT_REASONS = frozenset(
+    {
+        "boilerplate",
+        "drawing_or_textbox_subtree",
+        "editorial_comment_style",
+        "end_of_section_no_role",
+        "non_csi_content",
+        "section_header_no_role",
+        "section_title_no_role",
+        "table",
+    }
+)
+
+
+def _safe_identifier(value: Any, fallback: str = "unspecified") -> str:
+    if isinstance(value, str) and _DIAGNOSTIC_IDENTIFIER.fullmatch(value):
+        return value
+    return fallback
+
+
+def _safe_conversion_report(
+    report: Optional[CanadianConversionReport],
+) -> Optional[CanadianConversionReport]:
+    """Strip paragraph previews, messages, and literal markers from a report."""
+
+    if report is None:
+        return None
+    edits = tuple(
+        MarkerEdit(
+            paragraph_index=item.paragraph_index,
+            role=_safe_identifier(item.role),
+            source_kind=_safe_identifier(item.source_kind),
+            target_kind=_safe_identifier(item.target_kind),
+            source_marker=None,
+            target_marker=None,
+        )
+        for item in report.edits
+    )
+    warnings = tuple(
+        ConversionIssue(
+            paragraph_index=item.paragraph_index,
+            code=_safe_identifier(item.code),
+            message=f"Conversion warning: {_safe_identifier(item.code)}",
+            text_preview="",
+        )
+        for item in report.warnings
+    )
+    return CanadianConversionReport(
+        paragraphs_examined=report.paragraphs_examined,
+        paragraphs_converted=report.paragraphs_converted,
+        literal_markers_removed=report.literal_markers_removed,
+        automatic_numbering_retargeted=report.automatic_numbering_retargeted,
+        unnumbered_paragraphs_numbered=report.unnumbered_paragraphs_numbered,
+        edits=edits,
+        warnings=warnings,
+    )
+
+
+def _safe_numbering_checks(value: Any) -> Dict[str, Any]:
+    """Retain only structural scalar/list values from numbering diagnostics."""
+
+    if not isinstance(value, dict):
+        return {}
+    safe: Dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            continue
+        if item is None or isinstance(item, (bool, int, float)):
+            safe[key] = item
+        elif (
+            key in {"conversion_mode", "policy", "status"}
+            and isinstance(item, str)
+            and _DIAGNOSTIC_IDENTIFIER.fullmatch(item)
+        ):
+            safe[key] = item
+        elif isinstance(item, (list, tuple)) and all(
+            element is None or isinstance(element, (bool, int, float))
+            for element in item
+        ):
+            safe[key] = list(item)
+    return safe
+
+
+def _safe_application_audit(value: Any) -> Dict[str, Any]:
+    """Project an application audit to disposition metadata only."""
+
+    if not isinstance(value, dict):
+        return {}
+
+    def dispositions(items: Any, value_key: str) -> List[Dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        safe_items: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            index = item.get("paragraph_index")
+            if not isinstance(index, int) or isinstance(index, bool):
+                continue
+            raw_value = item.get(value_key)
+            if value_key == "reason":
+                safe_value = (
+                    raw_value
+                    if isinstance(raw_value, str)
+                    and raw_value in _SAFE_AUDIT_REASONS
+                    else "unspecified"
+                )
+            else:
+                safe_value = _safe_identifier(raw_value)
+            safe_items.append(
+                {"paragraph_index": index, value_key: safe_value}
+            )
+        return safe_items
+
+    raw_summary = value.get("summary", {})
+    summary = (
+        {
+            key: count
+            for key, count in raw_summary.items()
+            if isinstance(key, str)
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= 0
+        }
+        if isinstance(raw_summary, dict)
+        else {}
+    )
+    return {
+        "schema_version": 1,
+        "summary": summary,
+        "classifications": dispositions(
+            value.get("classifications", []), "csi_role"
+        ),
+        "ignored_paragraphs": dispositions(
+            value.get("ignored_paragraphs", []), "reason"
+        ),
+        "out_of_scope": dispositions(value.get("out_of_scope", []), "reason"),
+    }
 
 
 def _classification_audit(
@@ -402,7 +623,7 @@ def _build_and_patch_output(
     return output_path
 
 
-def _apply_classified_target(
+def _apply_classified_target_impl(
     *,
     docx_path: Path,
     extract_dir: Path,
@@ -417,27 +638,33 @@ def _apply_classified_target(
     arch_root: Optional[Path],
     role_specs: Optional[Dict[str, Dict[str, Any]]],
     conversion_mode: str,
+    checkpoint: _ApplicationCheckpoint,
 ) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
     """Apply one validated classification payload through the shared engine."""
 
+    checkpoint.stage = "application_policy"
     policy: ApplicationPolicy = application_policy_for_mode(conversion_mode)
+    checkpoint.stage = "classification_checkpoint"
     classifications_path = extract_dir / "phase2_classifications.json"
     classifications_path.write_text(json.dumps(classifications, indent=2), encoding="utf-8")
-    log.append(f"Classifications saved: {classifications_path}")
+    log.append("Classification checkpoint saved")
 
     # Capture the target's style and list catalogs before any architect
     # environment or numbering parts are imported.
+    checkpoint.stage = "source_catalog_snapshot"
     source_styles_xml = read_xml_text(extract_dir / "word" / "styles.xml")
     source_numbering_path = extract_dir / "word" / "numbering.xml"
     source_numbering_xml = (
         read_xml_text(source_numbering_path) if source_numbering_path.is_file() else ""
     )
 
+    checkpoint.stage = "target_token_extraction"
     target_tokens = extract_target_tokens(extract_dir, classifications)
     application_classifications = classifications
     conversion_report: Optional[CanadianConversionReport] = None
 
     if policy.convert_to_canadian:
+        checkpoint.stage = "csi_conversion"
         log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
         conversion_report = apply_csi_to_canadian(
             extract_dir,
@@ -448,11 +675,14 @@ def _apply_classified_target(
                 env_registry.get("numbering", {}).get("numbering_xml") or ""
             ),
         )
+        checkpoint.conversion_report = conversion_report
+        checkpoint.stage = "canadian_classification_mapping"
         application_classifications = classifications_for_canadian_application(
             classifications,
             conversion_report,
         )
 
+    checkpoint.stage = "environment_application"
     env_result = apply_environment_to_target(
         target_extract_dir=extract_dir,
         registry=env_registry,
@@ -460,6 +690,7 @@ def _apply_classified_target(
         registry_dir=arch_root,
     )
     log.append("Applied environment")
+    checkpoint.stage = "header_footer_token_patch"
     _patch_header_footer_tokens_if_imported(
         extract_dir,
         env_result,
@@ -484,6 +715,7 @@ def _apply_classified_target(
     num_id_remap: Dict[int, int] = {}
     numbering_style_ids = needed_style_ids if policy.import_body_numbering else sorted(hf_style_ids)
     numbering_roles = sorted(used_roles) if policy.import_body_numbering else []
+    checkpoint.stage = "numbering_import"
     if HAS_NUMBERING_IMPORTER:
         numbering_contract = import_numbering(
             target_extract_dir=extract_dir,
@@ -504,6 +736,7 @@ def _apply_classified_target(
         if hf_direct_num_ids:
             raise ImportError("numbering_importer is required by architect headers/footers")
 
+    checkpoint.stage = "header_footer_numbering_remap"
     remap_header_footer_numids(
         extract_dir,
         list(hf_manifest.get("part_names", set())),
@@ -511,6 +744,7 @@ def _apply_classified_target(
         log,
     )
 
+    checkpoint.stage = "style_import"
     style_result = import_arch_styles_into_target(
         target_extract_dir=extract_dir,
         arch_styles_xml=arch_styles_xml,
@@ -525,6 +759,7 @@ def _apply_classified_target(
         role: style_result.body_style_id_map.get(style_id, style_id)
         for role, style_id in arch_registry.items()
     }
+    checkpoint.stage = "header_footer_style_remap"
     _remap_imported_header_footer_style_ids(
         extract_dir,
         list(hf_manifest.get("part_names", set())),
@@ -533,7 +768,9 @@ def _apply_classified_target(
     )
     log.append(f"Imported {len(needed_style_ids)} requested styles collision-safely")
 
+    checkpoint.stage = "stability_snapshot"
     snap = snapshot_stability(extract_dir)
+    checkpoint.stage = "classification_application"
     apply_report = apply_phase2_classifications(
         extract_dir=extract_dir,
         classifications=application_classifications,
@@ -545,9 +782,32 @@ def _apply_classified_target(
         source_numbering_xml=source_numbering_xml,
         policy=policy,
     )
+    checkpoint.numbering_checks = dict(
+        getattr(apply_report, "numbering_checks", {}) or {}
+    )
+    checkpoint.stage = "stability_verification"
     verify_stability(extract_dir, snap)
     log.append("Applied classifications, stability verified")
 
+    checkpoint.stage = "application_reporting"
+    classified, total, _unresolved = _coverage_counts(bundle, classifications)
+    class_coverage = (classified / total * 100) if total > 0 else 100.0
+    expected_targetable = apply_report.requested - len(apply_report.skipped_sectpr)
+    app_coverage = (
+        (apply_report.modified / expected_targetable * 100)
+        if expected_targetable > 0
+        else 100.0
+    )
+    classification_coverage_log = (
+        f"Classification coverage: {classified}/{total} ({class_coverage:.1f}%)"
+    )
+    application_coverage_log = (
+        f"Application coverage: {apply_report.modified}/{expected_targetable} ({app_coverage:.1f}%)"
+    )
+
+    # Atomic packaging is deliberately last: if any earlier stage fails there
+    # is no output path to publish, and the builder itself removes its temp file.
+    checkpoint.stage = "output_publication"
     output_path = _build_and_patch_output(
         docx_path,
         extract_dir,
@@ -559,23 +819,67 @@ def _apply_classified_target(
             apply_report.allowed_rpr_properties_by_paragraph
         ),
     )
-
-    classified, total, unresolved = _coverage_counts(bundle, classifications)
-    class_coverage = (classified / total * 100) if total > 0 else 100.0
-    expected_targetable = apply_report.requested - len(apply_report.skipped_sectpr)
-    app_coverage = (
-        (apply_report.modified / expected_targetable * 100)
-        if expected_targetable > 0
-        else 100.0
-    )
     log.append(f"Output: {output_path}")
-    log.append(f"Classification coverage: {classified}/{total} ({class_coverage:.1f}%)")
-    log.append(
-        f"Application coverage: {apply_report.modified}/{expected_targetable} ({app_coverage:.1f}%)"
+    log.append(classification_coverage_log)
+    log.append(application_coverage_log)
+    checkpoint.stage = "complete"
+    return (
+        output_path,
+        conversion_report,
+        checkpoint.audit_summary,
+        checkpoint.audit,
+        checkpoint.numbering_checks,
     )
+
+
+def _apply_classified_target(
+    *,
+    docx_path: Path,
+    extract_dir: Path,
+    bundle: Dict[str, Any],
+    classifications: Dict[str, Any],
+    arch_registry: Dict[str, str],
+    env_registry: Dict[str, Any],
+    arch_styles_xml: str,
+    output_dir: Path,
+    log: List[str],
+    source_tokens: Optional[Dict[str, str]],
+    arch_root: Optional[Path],
+    role_specs: Optional[Dict[str, Dict[str, Any]]],
+    conversion_mode: str,
+) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
+    """Apply classifications while preserving safe late-failure diagnostics."""
+
     audit_summary, audit = _classification_audit(bundle, classifications)
-    numbering_checks = dict(getattr(apply_report, "numbering_checks", {}) or {})
-    return output_path, conversion_report, audit_summary, audit, numbering_checks
+    checkpoint = _ApplicationCheckpoint(
+        stage="classification_ready",
+        audit_summary=audit_summary,
+        audit=audit,
+    )
+    try:
+        return _apply_classified_target_impl(
+            docx_path=docx_path,
+            extract_dir=extract_dir,
+            bundle=bundle,
+            classifications=classifications,
+            arch_registry=arch_registry,
+            env_registry=env_registry,
+            arch_styles_xml=arch_styles_xml,
+            output_dir=output_dir,
+            log=log,
+            source_tokens=source_tokens,
+            arch_root=arch_root,
+            role_specs=role_specs,
+            conversion_mode=conversion_mode,
+            checkpoint=checkpoint,
+        )
+    except ApplicationStageError:
+        raise
+    except Exception as exc:
+        raise ApplicationStageError(
+            str(exc),
+            diagnostics=checkpoint.failure_diagnostics(),
+        ) from exc
 
 
 def process_single_file(
@@ -600,6 +904,7 @@ def process_single_file(
     audit_summary: Dict[str, int] = {}
     audit: Dict[str, Any] = {}
     numbering_checks: Dict[str, Any] = {}
+    stage = "validation"
 
     try:
         conversion_mode = validate_conversion_mode(conversion_mode)
@@ -607,10 +912,12 @@ def process_single_file(
             digest = hashlib.sha256(str(docx_path.resolve()).encode("utf-8")).hexdigest()[:8]
             extract_dir_name = f"work_{digest}"
 
+            stage = "extraction"
             per_file_log.append("Extracting DOCX...")
             decomposer = DocxDecomposer(str(docx_path))
             extract_dir = decomposer.extract(output_dir=Path(tmp_root) / extract_dir_name)
 
+            stage = "bundle_build"
             per_file_log.append("Building slim bundle...")
             bundle = build_phase2_slim_bundle(
                 extract_dir,
@@ -623,9 +930,11 @@ def process_single_file(
                 f"Built slim bundle: {unresolved} unresolved + {deterministic} deterministic"
             )
 
+            stage = "classification_preflight"
             if unresolved > 0 and not api_key:
                 raise ValueError("Anthropic API key is required when unresolved paragraphs exist.")
 
+            stage = "classification"
             if unresolved:
                 per_file_log.append("Classifying unresolved paragraphs with Anthropic...")
             else:
@@ -639,6 +948,7 @@ def process_single_file(
                 model=model,
             )
 
+            stage = "application"
             (
                 output_path,
                 conversion_report,
@@ -672,8 +982,15 @@ def process_single_file(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            stage="complete",
         )
     except Exception as exc:
+        if isinstance(exc, ApplicationStageError):
+            stage = exc.stage
+            conversion_report = exc.conversion_report
+            audit_summary = dict(exc.audit_summary)
+            audit = dict(exc.audit)
+            numbering_checks = dict(exc.numbering_checks)
         per_file_log.append(f"FAILED: {exc}")
         return BatchResult(
             filename=filename,
@@ -686,6 +1003,7 @@ def process_single_file(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            stage=stage,
         )
 
 
@@ -737,9 +1055,11 @@ def _apply_batch_result(
     audit_summary: Dict[str, int] = {}
     audit: Dict[str, Any] = {}
     numbering_checks: Dict[str, Any] = {}
+    stage = "validation"
 
     try:
         conversion_mode = validate_conversion_mode(conversion_mode)
+        stage = "application"
         (
             output_path,
             conversion_report,
@@ -773,8 +1093,15 @@ def _apply_batch_result(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            stage="complete",
         )
     except Exception as exc:
+        if isinstance(exc, ApplicationStageError):
+            stage = exc.stage
+            conversion_report = exc.conversion_report
+            audit_summary = dict(exc.audit_summary)
+            audit = dict(exc.audit)
+            numbering_checks = dict(exc.numbering_checks)
         per_file_log.append(f"FAILED: {exc}")
         return BatchResult(
             filename=filename,
@@ -787,6 +1114,7 @@ def _apply_batch_result(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            stage=stage,
         )
 
 

@@ -26,6 +26,7 @@ from .opc_paths import (
     relationship_part_name_for_owner,
     resolve_internal_relationship_target as _resolve_safe_internal_relationship_target,
 )
+from .section_mapping import choose_section_sources
 
 
 PHASE1_BUNDLE_FORMAT = "spec-template-normalizer.phase1"
@@ -1472,6 +1473,7 @@ def _validate_page_layout(
     template_registry: Dict[str, Any], errors: List[str]
 ) -> None:
     """Check 8: page_layout contract required for Phase 2 layout sync."""
+    initial_error_count = len(errors)
     page_layout = template_registry.get("page_layout")
     if not isinstance(page_layout, dict):
         errors.append(
@@ -1516,6 +1518,22 @@ def _validate_page_layout(
         err = _check_xml_fragment(chain_sectpr, "w:sectPr")
         if err:
             errors.append(f"page_layout.section_chain[{idx}].sectPr: {err}")
+
+    # Page-layout application requires one effective architect shell.  Perform
+    # the same semantic check here so a truly conflicting template fails once
+    # during shared-profile loading instead of independently after every target
+    # has already been classified and converted.  The section mapper resolves
+    # legal Word header/footer inheritance before comparing shell signatures.
+    if len(errors) == initial_error_count:
+        try:
+            choose_section_sources(
+                1,
+                page_layout,
+                require_default=True,
+                log=[],
+            )
+        except ValueError as exc:
+            errors.append(f"page_layout semantic validation failed: {exc}")
 
 
 def _validate_style_cross_ref(

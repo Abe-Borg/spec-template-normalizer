@@ -218,6 +218,71 @@ def test_missing_page_layout_is_error():
     assert any("missing page_layout" in e for e in errors)
 
 
+def test_conflicting_section_shells_fail_during_registry_preflight():
+    tmpl = _minimal_template_registry()
+    first = {
+        "sectPr": '<w:sectPr><w:pgSz w:w="10000" w:h="15000"/></w:sectPr>',
+        "section_index": 0,
+        "page_size": {"w": 10000, "h": 15000},
+    }
+    second = {
+        "sectPr": '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>',
+        "section_index": 1,
+        "page_size": {"w": 12240, "h": 15840},
+    }
+    tmpl["page_layout"] = {
+        "default_section": second,
+        "section_chain": [first, second],
+    }
+
+    errors = preflight_validate_registries(_minimal_style_registry(), tmpl)
+
+    assert any(
+        "page_layout semantic validation failed" in error
+        and "conflicting section shells" in error
+        for error in errors
+    )
+
+
+def test_inherited_header_chain_passes_registry_preflight():
+    tmpl = _with_header(
+        _minimal_template_registry(),
+        _header_entry(
+            part_xml=(
+                '<w:hdr xmlns:w="http://schemas.openxmlformats.org/'
+                'wordprocessingml/2006/main"/>'
+            ),
+            rels_xml=None,
+            rel_id="rIdHeader",
+        ),
+    )
+    sectpr = (
+        '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>'
+        '<w:pgMar w:top="1800" w:right="1080" w:bottom="1440" '
+        'w:left="2160" w:header="900" w:footer="720"/></w:sectPr>'
+    )
+    first = {
+        "sectPr": sectpr,
+        "section_index": 0,
+        "page_size": {"w": 12240, "h": 15840},
+        "header_refs": {"default": "rIdHeader", "even": None, "first": None},
+        "footer_refs": {"default": None, "even": None, "first": None},
+    }
+    inherited = {
+        "sectPr": sectpr,
+        "section_index": 1,
+        "page_size": {"w": 12240, "h": 15840},
+        "header_refs": {"default": None, "even": None, "first": None},
+        "footer_refs": {"default": None, "even": None, "first": None},
+    }
+    tmpl["page_layout"] = {
+        "default_section": inherited,
+        "section_chain": [first, inherited],
+    }
+
+    assert preflight_validate_registries(_minimal_style_registry(), tmpl) == []
+
+
 # ---------------------------------------------------------------------------
 # Additional edge cases
 # ---------------------------------------------------------------------------

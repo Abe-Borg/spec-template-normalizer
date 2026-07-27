@@ -10,17 +10,20 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import tempfile
+import threading
 import time
 import uuid
 import warnings
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+from . import __version__ as APPLICATION_VERSION
 from . import template_analysis
 from .style_application.batch_runner import (
     BatchResult,
@@ -38,6 +41,7 @@ from .style_application.core.csi_to_canadian import (
 
 
 ProgressCallback = Callable[[str], None]
+ProgressEventCallback = Callable[[str, datetime], None]
 TemplateClassifier = Callable[..., dict[str, Any]]
 TemplateAnalyzer = Callable[..., template_analysis.Phase1Result]
 TargetProcessor = Callable[..., BatchResult]
@@ -48,8 +52,8 @@ _FORMATTED_SUFFIXES = (
     "_PHASE2_FORMATTED.DOCX",
 )
 _MAX_WORKERS = 6
-_RUN_MANIFEST_VERSION = 1
-_RUN_AUDIT_VERSION = 1
+_RUN_MANIFEST_VERSION = 2
+_RUN_AUDIT_VERSION = 2
 _PROFILE_CONTRACT_VERSION = "2"
 _PROFILE_CACHE_NAMESPACE = f"contract-v{_PROFILE_CONTRACT_VERSION}"
 _MAX_OUTPUT_COMPONENT_UTF16_UNITS = 240
@@ -90,6 +94,7 @@ class TargetFormatResult:
     audit_summary: dict[str, int] = field(default_factory=_empty_audit_summary)
     audit: dict[str, Any] = field(default_factory=dict)
     numbering_checks: dict[str, Any] = field(default_factory=dict)
+    stage: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,27 @@ class FormatRunResult:
         )
 
 
+@dataclass(frozen=True)
+class SafeErrorDiagnostic:
+    """Persistable error identity that cannot contain document/model text."""
+
+    code: str
+    message: str
+
+
+def _attach_safe_error_diagnostic(
+    error: Exception,
+    *,
+    code: str,
+    message: str,
+) -> Exception:
+    """Attach path-free public identity while preserving the exception type."""
+
+    setattr(error, "safe_error_code", code)
+    setattr(error, "safe_error_message", message)
+    return error
+
+
 def _emit(progress: Optional[ProgressCallback], message: str) -> None:
     if progress is None:
         return
@@ -144,6 +170,25 @@ def _emit(progress: Optional[ProgressCallback], message: str) -> None:
     except Exception as exc:
         warnings.warn(
             f"Formatting progress callback failed and was ignored: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def _emit_progress_event(
+    progress_event: Optional[ProgressEventCallback],
+    message: str,
+    occurred_at: datetime,
+) -> None:
+    """Emit a timestamped progress event without changing the legacy callback."""
+
+    if progress_event is None:
+        return
+    try:
+        progress_event(message, occurred_at)
+    except Exception as exc:
+        warnings.warn(
+            f"Formatting progress event callback failed and was ignored: {exc}",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -238,33 +283,98 @@ def _validate_inputs(
 ) -> tuple[Path, tuple[Path, ...], Path]:
     architect = Path(architect_template).expanduser().resolve()
     if not architect.is_file():
-        raise FileNotFoundError(f"Architect template does not exist: {architect}")
+        raise _attach_safe_error_diagnostic(
+            FileNotFoundError(f"Architect template does not exist: {architect}"),
+            code="input_architect_missing",
+            message="Architect template does not exist.",
+        )
     if architect.suffix.lower() != ".docx":
-        raise ValueError(f"Architect template must be a .docx file: {architect}")
+        raise _attach_safe_error_diagnostic(
+            ValueError(f"Architect template must be a .docx file: {architect}"),
+            code="input_architect_not_docx",
+            message="Architect template must be a .docx file.",
+        )
     if architect.name.startswith("~$"):
-        raise ValueError("Select the saved architect DOCX, not Word's temporary lock file.")
+        message = "Select the saved architect DOCX, not Word's temporary lock file."
+        raise _attach_safe_error_diagnostic(
+            ValueError(message),
+            code="input_architect_lock_file",
+            message=message,
+        )
 
     targets = collect_target_specs(target_specs, exclude_discovered=architect)
     if not targets:
-        raise ValueError("Select at least one target specification DOCX file.")
+        message = "Select at least one target specification DOCX file."
+        raise _attach_safe_error_diagnostic(
+            ValueError(message),
+            code="input_target_required",
+            message=message,
+        )
 
     architect_key = os.path.normcase(str(architect))
     for target in targets:
         if not target.is_file():
-            raise FileNotFoundError(f"Target specification does not exist: {target}")
+            raise _attach_safe_error_diagnostic(
+                FileNotFoundError(
+                    f"Target specification does not exist: {target}"
+                ),
+                code="input_target_missing",
+                message="A selected target specification does not exist.",
+            )
         if target.suffix.lower() != ".docx":
-            raise ValueError(f"Target specification must be a .docx file: {target}")
+            raise _attach_safe_error_diagnostic(
+                ValueError(
+                    f"Target specification must be a .docx file: {target}"
+                ),
+                code="input_target_not_docx",
+                message="Every target specification must be a .docx file.",
+            )
         if target.name.startswith("~$"):
-            raise ValueError(f"Target is a Word temporary lock file: {target}")
+            raise _attach_safe_error_diagnostic(
+                ValueError(f"Target is a Word temporary lock file: {target}"),
+                code="input_target_lock_file",
+                message="A selected target is a Word temporary lock file.",
+            )
         if _is_formatted_output(target):
-            raise ValueError(f"Target is already a formatted output: {target}")
+            raise _attach_safe_error_diagnostic(
+                ValueError(f"Target is already a formatted output: {target}"),
+                code="input_target_already_formatted",
+                message="A selected target is already a formatted output.",
+            )
         if os.path.normcase(str(target)) == architect_key:
-            raise ValueError("The architect template cannot also be a target specification.")
+            message = "The architect template cannot also be a target specification."
+            raise _attach_safe_error_diagnostic(
+                ValueError(message),
+                code="input_architect_is_target",
+                message=message,
+            )
 
     destination = Path(output_dir).expanduser().resolve()
-    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as exc:
+        raise _attach_safe_error_diagnostic(
+            NotADirectoryError(
+                f"Output location is not a directory: {destination}"
+            ),
+            code="output_not_directory",
+            message="Output location is not a directory.",
+        ) from exc
+    except OSError as exc:
+        message = "Output directory could not be created."
+        raise _attach_safe_error_diagnostic(
+            OSError(message),
+            code="output_create_failed",
+            message=message,
+        ) from exc
     if not destination.is_dir():
-        raise NotADirectoryError(f"Output location is not a directory: {destination}")
+        raise _attach_safe_error_diagnostic(
+            NotADirectoryError(
+                f"Output location is not a directory: {destination}"
+            ),
+            code="output_not_directory",
+            message="Output location is not a directory.",
+        )
     try:
         with tempfile.NamedTemporaryFile(
             prefix=".spec-formatter-write-check-",
@@ -272,7 +382,11 @@ def _validate_inputs(
         ):
             pass
     except OSError as exc:
-        raise PermissionError(f"Output directory is not writable: {destination}") from exc
+        raise _attach_safe_error_diagnostic(
+            PermissionError(f"Output directory is not writable: {destination}"),
+            code="output_not_writable",
+            message="Output directory is not writable.",
+        ) from exc
     return architect, targets, destination
 
 
@@ -696,6 +810,139 @@ _OOXML_FRAGMENT_RX = re.compile(
     r"<\??/?(?:a|m|mc|o|pic|r|v|w|w10|w14|wp|wps):|<\?xml",
     re.IGNORECASE,
 )
+_EVENT_TIMESTAMP_RX = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+"
+)
+_TARGET_EVENT_RX = re.compile(r"^(Target .+?: )(.*)$")
+_SAFE_REDACTION_RX = re.compile(
+    r"^\[(?:document content omitted|untrusted detail omitted; sha256=[0-9a-f]{12})\]$"
+)
+
+_KNOWN_SAFE_ERROR_MESSAGES = {
+    "template_section_shell_conflict": (
+        "Architect template has conflicting section shells; use one canonical "
+        "page layout and default/even/first header-footer mapping."
+    ),
+    "template_default_section_conflict": (
+        "Architect template default section conflicts with its section chain."
+    ),
+    "template_duplicate_section_index": (
+        "Architect template section chain has duplicate section_index values."
+    ),
+    "template_api_key_required": (
+        "An Anthropic API key is required to analyze a new architect template."
+    ),
+    "target_api_key_required": (
+        "Anthropic API key is required when unresolved paragraphs exist."
+    ),
+    "target_output_missing": (
+        "Style application reported success without an output DOCX."
+    ),
+    "target_formatting_failed": "Target formatting failed.",
+    "input_architect_lock_file": (
+        "Select the saved architect DOCX, not Word's temporary lock file."
+    ),
+    "input_target_required": (
+        "Select at least one target specification DOCX file."
+    ),
+    "input_architect_is_target": (
+        "The architect template cannot also be a target specification."
+    ),
+    "invalid_conversion_mode": (
+        "conversion_mode must be one of: csi_to_canadian, format_only"
+    ),
+    "invalid_max_workers": "max_workers must be an integer.",
+    "output_create_failed": "Output directory could not be created.",
+    "api_key_invalid_type": "Anthropic API key must be text.",
+}
+
+# These internal validation errors append a user-supplied filesystem path to
+# the exception for direct Python callers. Public diagnostics retain only the
+# stable code and path-free remediation text below.
+_PATH_BEARING_SAFE_ERROR_PREFIXES = (
+    (
+        "Architect template does not exist:",
+        SafeErrorDiagnostic(
+            code="input_architect_missing",
+            message="Architect template does not exist.",
+        ),
+    ),
+    (
+        "Architect template must be a .docx file:",
+        SafeErrorDiagnostic(
+            code="input_architect_not_docx",
+            message="Architect template must be a .docx file.",
+        ),
+    ),
+    (
+        "Target specification does not exist:",
+        SafeErrorDiagnostic(
+            code="input_target_missing",
+            message="A selected target specification does not exist.",
+        ),
+    ),
+    (
+        "Target specification must be a .docx file:",
+        SafeErrorDiagnostic(
+            code="input_target_not_docx",
+            message="Every target specification must be a .docx file.",
+        ),
+    ),
+    (
+        "Target is a Word temporary lock file:",
+        SafeErrorDiagnostic(
+            code="input_target_lock_file",
+            message="A selected target is a Word temporary lock file.",
+        ),
+    ),
+    (
+        "Target is already a formatted output:",
+        SafeErrorDiagnostic(
+            code="input_target_already_formatted",
+            message="A selected target is already a formatted output.",
+        ),
+    ),
+    (
+        "Output location is not a directory:",
+        SafeErrorDiagnostic(
+            code="output_not_directory",
+            message="Output location is not a directory.",
+        ),
+    ),
+    (
+        "Output directory is not writable:",
+        SafeErrorDiagnostic(
+            code="output_not_writable",
+            message="Output directory is not writable.",
+        ),
+    ),
+)
+
+_WRAPPED_SAFE_ERROR_CODES = frozenset(
+    {
+        "template_section_shell_conflict",
+        "template_default_section_conflict",
+        "template_duplicate_section_index",
+    }
+)
+
+
+def _known_safe_error_diagnostic(value: Optional[str]) -> Optional[SafeErrorDiagnostic]:
+    """Recognize exact internal diagnostics, including safe wrapped variants."""
+
+    if not value:
+        return None
+    for prefix, diagnostic in _PATH_BEARING_SAFE_ERROR_PREFIXES:
+        if value.startswith(prefix) and value[len(prefix) :].strip():
+            return diagnostic
+    for code, message in _KNOWN_SAFE_ERROR_MESSAGES.items():
+        # The preflight layer may add stable context around a lower-level
+        # diagnostic.  Persist only the canonical marker, never that wrapper.
+        if value == message or (
+            code in _WRAPPED_SAFE_ERROR_CODES and message in value
+        ):
+            return SafeErrorDiagnostic(code=code, message=message)
+    return None
 
 
 _SAFE_OPERATIONAL_PREFIXES = (
@@ -709,8 +956,9 @@ _SAFE_OPERATIONAL_PREFIXES = (
     "Checking input files",
     "Checking the architect template",
     "Classification coverage:",
-    "Classifications saved:",
+    "Classification checkpoint saved",
     "Classifying ",
+    "Canadian conversion:",
     "Complete:",
     "Converting CSI hierarchy",
     "Created ",
@@ -733,6 +981,8 @@ _SAFE_OPERATIONAL_PREFIXES = (
     "Output:",
     "Patched sectPr[",
     "Patched tokens ",
+    "Processing target ",
+    "Queued ",
     "Reading the architect template",
     "Rebuilt ",
     "Remapped ",
@@ -761,6 +1011,8 @@ def _is_safe_operational_line(line: str) -> bool:
     )
     if not candidate:
         return True
+    if _SAFE_REDACTION_RX.fullmatch(candidate):
+        return True
     if re.fullmatch(r"=+", candidate) or re.match(r"^\[\d+/\d+\] ", candidate):
         return True
     if re.match(r"^numId \d+ -> \d+ \(abstractNum \d+ -> \d+\)$", candidate):
@@ -787,18 +1039,68 @@ def _sanitize_run_text(
         return None
     safe_lines: list[str] = []
     for raw_line in redacted.splitlines() or [redacted]:
-        if _OOXML_FRAGMENT_RX.search(raw_line) or _DOCUMENT_DATA_FIELD_RX.search(
-            raw_line
-        ):
-            safe_lines.append("[document content omitted]")
-            continue
         bounded = raw_line[:4096]
-        if allow_operational and _is_safe_operational_line(bounded):
+        timestamp_match = _EVENT_TIMESTAMP_RX.match(bounded)
+        timestamp = timestamp_match.group(0) if timestamp_match else ""
+        candidate = bounded[len(timestamp) :]
+
+        target_match = _TARGET_EVENT_RX.fullmatch(candidate)
+        if target_match is not None:
+            detail = _sanitize_run_text(
+                target_match.group(2),
+                secrets,
+                allow_operational=allow_operational,
+            )
+            safe_lines.append(f"{timestamp}{target_match.group(1)}{detail or ''}")
+            continue
+
+        if _OOXML_FRAGMENT_RX.search(candidate) or _DOCUMENT_DATA_FIELD_RX.search(
+            candidate
+        ):
+            safe_lines.append(f"{timestamp}[document content omitted]")
+            continue
+
+        known = _known_safe_error_diagnostic(candidate)
+        if known is not None:
+            safe_lines.append(f"{timestamp}ERROR [{known.code}]: {known.message}")
+            continue
+
+        if allow_operational and _is_safe_operational_line(candidate):
             safe_lines.append(bounded)
             continue
-        fingerprint = hashlib.sha256(bounded.encode("utf-8")).hexdigest()[:12]
-        safe_lines.append(f"[untrusted detail omitted; sha256={fingerprint}]")
+        fingerprint = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:12]
+        safe_lines.append(
+            f"{timestamp}[untrusted detail omitted; sha256={fingerprint}]"
+        )
     return "\n".join(safe_lines)
+
+
+def safe_error_diagnostic(
+    value: Optional[str | BaseException],
+    secrets: Sequence[str] = (),
+) -> Optional[SafeErrorDiagnostic]:
+    """Return a stable safe error code/message for artifacts and user summaries."""
+
+    if value is None:
+        return None
+    if isinstance(value, BaseException):
+        code = getattr(value, "safe_error_code", None)
+        message = getattr(value, "safe_error_message", None)
+        if isinstance(code, str) and isinstance(message, str):
+            return SafeErrorDiagnostic(code=code, message=message)
+        raw_value = str(value)
+    else:
+        raw_value = value
+    known = _known_safe_error_diagnostic(raw_value)
+    if known is not None:
+        return known
+    return SafeErrorDiagnostic(
+        code="untrusted_error",
+        message=(
+            _sanitize_run_text(raw_value, secrets)
+            or "[untrusted detail omitted]"
+        ),
+    )
 
 
 def _plan_output_paths(
@@ -892,6 +1194,7 @@ def _format_one_target(
     model: str,
     processor: TargetProcessor,
     conversion_mode: str,
+    on_started: Optional[Callable[[], None]] = None,
 ) -> TargetFormatResult:
     start = time.monotonic()
     processor_log: tuple[str, ...] = ()
@@ -900,7 +1203,11 @@ def _format_one_target(
     audit_summary = _empty_audit_summary()
     audit: dict[str, Any] = {}
     numbering_checks: dict[str, Any] = {}
+    stage: Optional[str] = None
     try:
+        stage = "processing"
+        if on_started is not None:
+            on_started()
         # Deliberately avoid carrying user-controlled filenames into the work
         # tree.  This keeps Windows paths short even for deeply nested inputs.
         snapshot = staging_dir / "source.docx"
@@ -919,7 +1226,17 @@ def _format_one_target(
             role_specs=shared.role_specs,
             conversion_mode=conversion_mode,
         )
-        processor_log = tuple(result.log)
+        # The processor writes into an isolated staging directory. Its final
+        # path diagnostics therefore point at files that are deleted when the
+        # job temp directory closes. The public result already carries the
+        # durable published path, so never replay or persist staging paths.
+        staging_marker = os.path.normcase(str(staging_dir))
+        processor_log = tuple(
+            line
+            for line in result.log
+            if not str(line).lstrip().startswith("Output:")
+            and staging_marker not in os.path.normcase(str(line))
+        )
         conversion_report = result.conversion_report
         audit_summary = _normalize_audit_summary(
             getattr(result, "audit_summary", None)
@@ -928,6 +1245,7 @@ def _format_one_target(
         numbering_checks = _normalize_numbering_checks(
             getattr(result, "numbering_checks", None)
         )
+        stage = getattr(result, "stage", None)
         if not result.success:
             return TargetFormatResult(
                 source_path=target,
@@ -941,7 +1259,9 @@ def _format_one_target(
                 audit_summary=audit_summary,
                 audit=audit,
                 numbering_checks=numbering_checks,
+                stage=stage,
             )
+        stage = "publication"
         if result.output_path is None or not result.output_path.is_file():
             raise RuntimeError("Style application reported success without an output DOCX.")
         if _stable_source_sha256(target) != snapshot_sha256:
@@ -962,6 +1282,7 @@ def _format_one_target(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            stage=getattr(result, "stage", None) or "complete",
         )
     except Exception as exc:
         return TargetFormatResult(
@@ -976,6 +1297,7 @@ def _format_one_target(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
+            stage=stage,
         )
 
 
@@ -1026,6 +1348,7 @@ def _write_run_artifacts(
 
     audited_results: list[TargetFormatResult] = []
     for index, item in enumerate(targets, start=1):
+        error_diagnostic = safe_error_diagnostic(item.error, secrets)
         identity = (item.source_sha256 or hashlib.sha256(
             str(item.source_path).encode("utf-8")
         ).hexdigest())[:12]
@@ -1052,8 +1375,14 @@ def _write_run_artifacts(
                 else None
             ),
             "success": item.success,
+            "stage": item.stage,
             "duration_seconds": round(item.duration_seconds, 6),
-            "error": _sanitize_run_text(item.error, secrets),
+            "error_code": (
+                error_diagnostic.code if error_diagnostic is not None else None
+            ),
+            "error": (
+                error_diagnostic.message if error_diagnostic is not None else None
+            ),
             "disposition_counts": dict(item.audit_summary),
             "numbering_checks": _redact_json(item.numbering_checks, secrets),
             "application_audit": _redact_json(item.audit, secrets),
@@ -1072,17 +1401,28 @@ def _write_run_artifacts(
         for event in events
     ]
     for item in audited_results:
+        error_diagnostic = safe_error_diagnostic(item.error, secrets)
         log_lines.append(
             f"TARGET {item.source_path.name}: "
             f"{'succeeded' if item.success else 'failed'} "
             f"({item.duration_seconds:.3f}s)"
         )
-        for line in item.log:
+        if item.stage:
+            log_lines.append(f"  STAGE: {item.stage}")
+        counts = item.audit_summary
+        log_lines.append(
+            "  AUDIT COUNTS: "
+            f"styled={counts.get('styled', 0)}, "
+            f"ignored={counts.get('ignored', 0)}, "
+            f"out_of_scope={counts.get('out_of_scope', 0)}, "
+            f"unresolved={counts.get('unresolved', 0)}"
+        )
+        if item.output_path is not None:
+            log_lines.append(f"  OUTPUT: {item.output_path}")
+        if error_diagnostic is not None:
             log_lines.append(
-                f"  {_sanitize_run_text(str(line), secrets, allow_operational=True)}"
+                f"  ERROR [{error_diagnostic.code}]: {error_diagnostic.message}"
             )
-        if item.error:
-            log_lines.append(f"  ERROR: {_sanitize_run_text(item.error, secrets)}")
         if item.audit_path is not None:
             log_lines.append(f"  AUDIT: {item.audit_path.name}")
     run_log_path = run_dir / "run.log"
@@ -1094,6 +1434,29 @@ def _write_run_artifacts(
     succeeded = sum(1 for item in audited_results if item.success)
     failed = len(audited_results) - succeeded
     profile_metadata = _profile_provenance(profile)
+    target_records: list[dict[str, Any]] = []
+    for item in audited_results:
+        error_diagnostic = safe_error_diagnostic(item.error, secrets)
+        target_records.append(
+            {
+                "source_path": str(item.source_path),
+                "source_sha256": item.source_sha256,
+                "success": item.success,
+                "stage": item.stage,
+                "output_path": str(item.output_path) if item.output_path else None,
+                "output_sha256": item.output_sha256,
+                "audit_path": str(item.audit_path) if item.audit_path else None,
+                "duration_seconds": round(item.duration_seconds, 6),
+                "error_code": (
+                    error_diagnostic.code if error_diagnostic is not None else None
+                ),
+                "error": (
+                    error_diagnostic.message if error_diagnostic is not None else None
+                ),
+                "disposition_counts": dict(item.audit_summary),
+                "numbering_checks": _redact_json(item.numbering_checks, secrets),
+            }
+        )
     manifest_path = run_dir / "run.json"
     manifest = {
         "schema_version": _RUN_MANIFEST_VERSION,
@@ -1111,7 +1474,8 @@ def _write_run_artifacts(
         "duration_seconds": round((finished_utc - started_utc).total_seconds(), 6),
         "application": {
             "name": "spec-template-normalizer",
-            "version": template_analysis.PIPELINE_VERSION,
+            "version": APPLICATION_VERSION,
+            "template_pipeline_version": template_analysis.PIPELINE_VERSION,
             "application_policy_version": APPLICATION_POLICY_VERSION,
             "profile_contract_version": _PROFILE_CONTRACT_VERSION,
         },
@@ -1140,21 +1504,7 @@ def _write_run_artifacts(
             "failed": failed,
             "dispositions": total_counts,
         },
-        "targets": [
-            {
-                "source_path": str(item.source_path),
-                "source_sha256": item.source_sha256,
-                "success": item.success,
-                "output_path": str(item.output_path) if item.output_path else None,
-                "output_sha256": item.output_sha256,
-                "audit_path": str(item.audit_path) if item.audit_path else None,
-                "duration_seconds": round(item.duration_seconds, 6),
-                "error": _sanitize_run_text(item.error, secrets),
-                "disposition_counts": dict(item.audit_summary),
-                "numbering_checks": _redact_json(item.numbering_checks, secrets),
-            }
-            for item in audited_results
-        ],
+        "targets": target_records,
     }
     _atomic_write_json(manifest_path, manifest)
     return tuple(audited_results), manifest_path
@@ -1178,7 +1528,12 @@ def _write_initialization_failure_artifacts(
     """Persist a complete failed-run record when preparation cannot finish."""
 
     finished_utc = _utc_now()
-    safe_error = _sanitize_run_text(str(error), secrets)
+    error_diagnostic = safe_error_diagnostic(error, secrets)
+    if error_diagnostic is None:  # pragma: no cover - ``error`` is concrete
+        error_diagnostic = SafeErrorDiagnostic(
+            code="untrusted_error",
+            message="[untrusted detail omitted]",
+        )
     architect_hash: Optional[str]
     try:
         architect_hash = _stable_source_sha256(architect)
@@ -1200,12 +1555,14 @@ def _write_initialization_failure_artifacts(
             "run_id": run_id,
             "conversion_mode": conversion_mode,
             "phase": "not_started",
+            "stage": "not_started",
             "source": {"path": str(target), "sha256": source_hash},
             "output": None,
             "success": False,
             "duration_seconds": 0.0,
             "error_type": type(error).__name__,
-            "error": safe_error,
+            "error_code": error_diagnostic.code,
+            "error": error_diagnostic.message,
             "disposition_counts": _empty_audit_summary(),
             "numbering_checks": {},
             "application_audit": {},
@@ -1217,12 +1574,14 @@ def _write_initialization_failure_artifacts(
                 "source_path": str(target),
                 "source_sha256": source_hash,
                 "success": False,
+                "stage": "not_started",
                 "output_path": None,
                 "output_sha256": None,
                 "audit_path": str(audit_path),
                 "duration_seconds": 0.0,
                 "error_type": type(error).__name__,
-                "error": safe_error,
+                "error_code": error_diagnostic.code,
+                "error": error_diagnostic.message,
                 "disposition_counts": _empty_audit_summary(),
                 "numbering_checks": {},
             }
@@ -1234,8 +1593,8 @@ def _write_initialization_failure_artifacts(
         for event in events
     ]
     log_lines.append(
-        f"RUN FAILED DURING INITIALIZATION: "
-        f"{_sanitize_run_text(str(error), secrets)}"
+        "RUN FAILED DURING INITIALIZATION "
+        f"[{error_diagnostic.code}]: {error_diagnostic.message}"
     )
     _atomic_write_bytes(
         run_log_path,
@@ -1254,7 +1613,8 @@ def _write_initialization_failure_artifacts(
         "duration_seconds": round((finished_utc - started_utc).total_seconds(), 6),
         "application": {
             "name": "spec-template-normalizer",
-            "version": template_analysis.PIPELINE_VERSION,
+            "version": APPLICATION_VERSION,
+            "template_pipeline_version": template_analysis.PIPELINE_VERSION,
             "application_policy_version": APPLICATION_POLICY_VERSION,
             "profile_contract_version": _PROFILE_CONTRACT_VERSION,
         },
@@ -1269,7 +1629,8 @@ def _write_initialization_failure_artifacts(
         "models": {"template": template_model, "target": target_model},
         "prompt_fingerprints": {"target": _target_prompt_fingerprints()},
         "error_type": type(error).__name__,
-        "error": safe_error,
+        "error_code": error_diagnostic.code,
+        "error": error_diagnostic.message,
         "summary": {
             "targets": len(target_records),
             "succeeded": 0,
@@ -1297,6 +1658,7 @@ def format_specifications(
     template_prompt_dir: Optional[Path] = None,
     template_classifier: Optional[TemplateClassifier] = None,
     progress: Optional[ProgressCallback] = None,
+    progress_event: Optional[ProgressEventCallback] = None,
     _template_analyzer: TemplateAnalyzer = template_analysis.run_phase1,
     _config_loader: Callable[[Path], SharedConfig] = load_and_validate_shared_config,
     _target_processor: TargetProcessor = process_single_file,
@@ -1309,26 +1671,88 @@ def format_specifications(
     then every target is processed independently so one bad target does not
     discard successful outputs. ``conversion_mode`` selects either formatting
     only or fail-closed CSI-to-Canadian hierarchy conversion in the same run.
+    The legacy ``progress`` callback continues to receive plain strings;
+    ``progress_event`` additionally receives the UTC occurrence time.
     """
 
     started_utc = _utc_now()
     events: list[str] = []
+    pending_events: queue.SimpleQueue[tuple[datetime, str]] = queue.SimpleQueue()
+    event_order_lock = threading.Lock()
+    event_owner_thread = threading.get_ident()
+    last_event_at: Optional[datetime] = None
 
-    def report(message: str) -> None:
-        events.append(f"{_iso_utc(_utc_now())} {message}")
-        _emit(progress, message)
+    def enqueue_event(
+        message: str,
+        *,
+        occurred_at: Optional[datetime] = None,
+    ) -> datetime:
+        """Serialize event timestamps across the caller and target workers."""
+
+        nonlocal last_event_at
+        with event_order_lock:
+            event_time = occurred_at or _utc_now()
+            if last_event_at is not None and event_time < last_event_at:
+                event_time = last_event_at
+            last_event_at = event_time
+            pending_events.put((event_time, message))
+        return event_time
+
+    def drain_reported_events(*, emit_callbacks: bool = True) -> None:
+        """Publish queued events from the calling thread in occurrence order."""
+
+        while True:
+            try:
+                event_time, message = pending_events.get_nowait()
+            except queue.Empty:
+                return
+            events.append(f"{_iso_utc(event_time)} {message}")
+            if emit_callbacks:
+                _emit(progress, message)
+                _emit_progress_event(progress_event, message, event_time)
+
+    def report(
+        message: str,
+        *,
+        occurred_at: Optional[datetime] = None,
+    ) -> None:
+        enqueue_event(message, occurred_at=occurred_at)
+        # Worker events are drained by the calling thread's submit/wait loop,
+        # preserving the historical callback thread affinity.
+        if threading.get_ident() == event_owner_thread:
+            drain_reported_events()
 
     report("Checking input files...")
-    conversion_mode = validate_conversion_mode(conversion_mode)
+    try:
+        conversion_mode = validate_conversion_mode(conversion_mode)
+    except ValueError as exc:
+        _attach_safe_error_diagnostic(
+            exc,
+            code="invalid_conversion_mode",
+            message="conversion_mode must be one of: csi_to_canadian, format_only",
+        )
+        raise
     if not isinstance(api_key, str):
-        raise ValueError("Anthropic API key must be text.")
+        message = "Anthropic API key must be text."
+        raise _attach_safe_error_diagnostic(
+            ValueError(message),
+            code="api_key_invalid_type",
+            message=message,
+        )
+    if not isinstance(max_workers, int) or isinstance(max_workers, bool):
+        message = "max_workers must be an integer."
+        raise _attach_safe_error_diagnostic(
+            ValueError(message),
+            code="invalid_max_workers",
+            message=message,
+        )
     normalized_api_key = api_key.strip()
     architect, targets, destination = _validate_inputs(
         architect_template,
         tuple(target_specs),
         output_dir,
     )
-    workers = max(1, min(int(max_workers), _MAX_WORKERS, len(targets)))
+    workers = max(1, min(max_workers, _MAX_WORKERS, len(targets)))
     profile_cache = (
         Path(cache_dir).expanduser().resolve()
         if cache_dir is not None
@@ -1357,6 +1781,7 @@ def format_specifications(
         planned_outputs = _plan_output_paths(targets, run_dir, conversion_mode)
         _validate_output_plan(architect, targets, planned_outputs)
     except Exception as exc:
+        drain_reported_events()
         manifest_path = _write_initialization_failure_artifacts(
             run_id=run_id,
             conversion_mode=conversion_mode,
@@ -1385,9 +1810,10 @@ def format_specifications(
         job_root = Path(job_temp)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures: dict[Future[TargetFormatResult], Path] = {}
+
             for index, target in enumerate(targets):
                 staging_dir = job_root / f"t{index:04d}"
-                report(f"Started {index + 1} of {len(targets)}: {target.name}")
+                report(f"Queued {index + 1} of {len(targets)}: {target.name}")
                 future = executor.submit(
                     _format_one_target,
                     target,
@@ -1398,42 +1824,68 @@ def format_specifications(
                     target_model,
                     _target_processor,
                     conversion_mode,
+                    lambda index=index, target=target: report(
+                        f"Processing target {index + 1} of {len(targets)}: "
+                        f"{target.name}"
+                    ),
                 )
                 futures[future] = target
+                # A very fast worker may have started before ``submit``
+                # returns. Surface that event before queuing the next target.
+                drain_reported_events()
 
             completed = 0
-            for future in as_completed(futures):
-                target = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:  # pragma: no cover - defensive boundary
-                    result = TargetFormatResult(
-                        source_path=target,
-                        success=False,
-                        output_path=None,
-                        log=(f"FAILED: {exc}",),
-                        error=str(exc),
-                        duration_seconds=0.0,
-                    )
-                results_by_target[target] = result
-                completed += 1
-                for line in result.log:
-                    report(f"Target {target.name}: {line}")
-                counts = result.audit_summary
-                report(
-                    f"Target {target.name}: audit styled={counts.get('styled', 0)}, "
-                    f"ignored={counts.get('ignored', 0)}, "
-                    f"out_of_scope={counts.get('out_of_scope', 0)}, "
-                    f"unresolved={counts.get('unresolved', 0)}"
+            pending = set(futures)
+            while pending:
+                drain_reported_events()
+                done, pending = wait(
+                    pending,
+                    timeout=0.05,
+                    return_when=FIRST_COMPLETED,
                 )
-                status = "Formatted" if result.success else "Failed"
-                report(f"{status} {completed} of {len(targets)}: {target.name}")
+                drain_reported_events()
+                for future in done:
+                    target = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:  # pragma: no cover - defensive boundary
+                        result = TargetFormatResult(
+                            source_path=target,
+                            success=False,
+                            output_path=None,
+                            log=(f"FAILED: {exc}",),
+                            error=str(exc),
+                            duration_seconds=0.0,
+                            stage="processing",
+                        )
+                    results_by_target[target] = result
+                    completed += 1
+                    for line in result.log:
+                        if str(line).lstrip().startswith("FAILED:"):
+                            continue
+                        safe_line = _sanitize_run_text(
+                            str(line),
+                            (normalized_api_key,),
+                            allow_operational=True,
+                        )
+                        for safe_part in (safe_line or "").splitlines():
+                            if not safe_part or _SAFE_REDACTION_RX.fullmatch(safe_part):
+                                continue
+                            report(f"Target {target.name}: {safe_part}")
+                    status = "Formatted" if result.success else "Failed"
+                    report(
+                        f"{status} {completed} of {len(targets)}: {target.name}"
+                    )
+            drain_reported_events()
 
     ordered_results = tuple(results_by_target[target] for target in targets)
     succeeded = sum(1 for item in ordered_results if item.success)
     failed = len(ordered_results) - succeeded
     complete_message = f"Complete: {succeeded} succeeded, {failed} failed."
-    events.append(f"{_iso_utc(_utc_now())} {complete_message}")
+    complete_occurred_at = enqueue_event(complete_message)
+    # Keep the durable log's terminal event while preserving the historical
+    # guarantee that UI completion is emitted only after artifacts publish.
+    drain_reported_events(emit_callbacks=False)
     finished_utc = _utc_now()
     audited_results, manifest_path = _write_run_artifacts(
         run_id=run_id,
@@ -1461,6 +1913,7 @@ def format_specifications(
         manifest_path=manifest_path,
     )
     _emit(progress, complete_message)
+    _emit_progress_event(progress_event, complete_message, complete_occurred_at)
     return run_result
 
 
@@ -1468,10 +1921,13 @@ __all__ = [
     "FormatRunResult",
     "CSI_TO_CANADIAN",
     "FORMAT_ONLY",
+    "ProgressEventCallback",
+    "SafeErrorDiagnostic",
     "TargetFormatResult",
     "TemplateProfile",
     "collect_target_specs",
     "default_template_cache_dir",
     "format_specifications",
     "prepare_template_profile",
+    "safe_error_diagnostic",
 ]

@@ -98,10 +98,13 @@ Each run creates an isolated directory below the selected output root:
 When selected targets from different folders share a filename, the app adds a
 stable source suffix so neither output can overwrite the other. Failed reruns
 therefore cannot make an older output appear current. `run.json` records the
-mode, application/profile contract versions, template and target hashes, model
-and prompt fingerprints, cache identity, output hashes, disposition counts,
-numbering checks, durations, and errors. API keys and document text are never
-written to run metadata.
+mode, application/template-pipeline/profile contract versions, template and
+target hashes, model and prompt fingerprints, cache identity, output hashes,
+disposition counts, numbering checks, terminal processing stages, durations,
+and stable error codes. Run manifest and target-audit schema version 2
+introduced these fields and separated the application version from the
+template-pipeline version. API keys and document text are never written to run
+metadata.
 
 Folder discovery ignores Word lock files, current `_FORMATTED.docx` outputs,
 and legacy `_PHASE2_FORMATTED.docx` outputs. If the architect is present in a
@@ -287,6 +290,18 @@ from the architect's OOXML, including style inheritance and numbering. Empty
 structural paragraphs and table content are out of scope, while visible
 section-break paragraphs remain classifiable and retain their `sectPr`.
 
+Word sections that omit a default/even/first header or footer reference inherit
+that reference from the preceding section. Shell compatibility is therefore
+checked against effective inherited references, not the raw omitted fields;
+genuine explicit page-layout or header/footer conflicts still fail during
+template-profile preflight before any target is processed.
+
+Section-specific metadata in imported architect headers and footers is updated
+only in proven `SECTION`, `DIVISION`, standalone-title, and same-section
+filename slots. This includes mirrored DrawingML/VML text boxes. The patch
+preserves the architect's number separators and every non-text OOXML byte, and
+fails closed when the source shell or target section identity is ambiguous.
+
 ## Safety guarantees
 
 - Input DOCX packages are treated as untrusted ZIP containers. Unsafe paths,
@@ -302,6 +317,8 @@ section-break paragraphs remain classifiable and retain their `sectPr`.
 - Template profiles are reused only after manifest, size, checksum, source hash,
   producer-version, prompt/model fingerprint, and cache-contract validation.
 - Tables and drawing/text-box content are excluded from paragraph restyling.
+- Header/footer metadata substitution is limited to just-imported architect
+  parts and verified across every mirrored Word compatibility branch.
 - Explicit ignored paragraphs receive no paragraph/run edits; unresolved or
   overlapping dispositions fail closed.
 - Imported architect styles never replace an existing target style ID.

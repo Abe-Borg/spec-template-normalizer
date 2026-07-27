@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import queue
 import threading
-import traceback
 import webbrowser
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -25,6 +24,7 @@ from spec_formatter.pipeline import (
     collect_target_specs,
     default_template_cache_dir,
     format_specifications,
+    safe_error_diagnostic,
 )
 
 
@@ -151,19 +151,27 @@ def result_run_directory(result: object) -> Optional[Path]:
     return None
 
 
-def target_result_log_lines(item: object) -> tuple[str, ...]:
+def target_result_log_lines(
+    item: object,
+    *,
+    include_processor_log: bool = True,
+) -> tuple[str, ...]:
     """Return every processor log line plus any available audit diagnostics."""
 
     lines: list[str] = []
-    raw_log = getattr(item, "log", ()) or ()
-    if isinstance(raw_log, str):
-        raw_log = (raw_log,)
-    for entry in raw_log:
-        text = str(entry)
-        split = text.splitlines()
-        lines.extend(split if split else ("",))
+    if include_processor_log:
+        raw_log = getattr(item, "log", ()) or ()
+        if isinstance(raw_log, str):
+            raw_log = (raw_log,)
+        for entry in raw_log:
+            text = str(entry)
+            split = text.splitlines()
+            lines.extend(split if split else ("",))
 
     source_path = Path(getattr(item, "source_path", "target.docx"))
+    stage = getattr(item, "stage", None)
+    if stage:
+        lines.append(f"{source_path.name}: stage: {stage}")
     audit_summary = getattr(item, "audit_summary", None)
     if isinstance(audit_summary, Mapping) and audit_summary:
         preferred_keys = ("styled", "ignored", "out_of_scope", "unresolved")
@@ -208,8 +216,20 @@ class FormatWorker(threading.Thread):
         self.conversion_mode = conversion_mode
         self.events = events
 
-    def _progress(self, message: str) -> None:
-        self.events.put(("progress", message))
+    def _progress(
+        self,
+        message: str,
+        occurred_at: Optional[datetime] = None,
+    ) -> None:
+        self.events.put(
+            (
+                "progress",
+                {
+                    "message": message,
+                    "occurred_at": occurred_at or datetime.now(),
+                },
+            )
+        )
 
     def run(self) -> None:
         try:
@@ -222,16 +242,24 @@ class FormatWorker(threading.Thread):
                 force_template_analysis=not self.reuse_template_analysis,
                 max_workers=self.max_workers,
                 conversion_mode=self.conversion_mode,
-                progress=self._progress,
+                progress_event=self._progress,
             )
             self.events.put(("complete", result))
         except Exception as exc:
+            diagnostic = safe_error_diagnostic(exc, (self.api_key,))
+            if diagnostic is None:  # pragma: no cover - ``exc`` is concrete
+                message = "Formatting failed."
+                error_code = "untrusted_error"
+            else:
+                message = diagnostic.message
+                error_code = diagnostic.code
             self.events.put(
                 (
                     "error",
                     {
-                        "message": str(exc),
-                        "traceback": traceback.format_exc(),
+                        "message": message,
+                        "error_code": error_code,
+                        "traceback": f"{type(exc).__name__}: {message}",
                         "run_dir": getattr(exc, "run_dir", None),
                         "manifest_path": getattr(exc, "manifest_path", None),
                     },
@@ -732,8 +760,15 @@ class App(ctk.CTk):
             self.advanced_frame.pack_forget()
             self.advanced_button.configure(text="Advanced settings  ▸")
 
-    def _append_log(self, message: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
+    def _append_log(
+        self,
+        message: str,
+        occurred_at: Optional[datetime] = None,
+    ) -> None:
+        event_time = occurred_at or datetime.now()
+        if event_time.tzinfo is not None:
+            event_time = event_time.astimezone()
+        timestamp = event_time.strftime("%H:%M:%S")
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"[{timestamp}] {message.rstrip()}\n")
         self.log_box.see("end")
@@ -838,8 +873,21 @@ class App(ctk.CTk):
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == "progress":
-                    self.status_label.configure(text=str(payload))
-                    self._append_log(str(payload))
+                    if isinstance(payload, Mapping):
+                        message = str(payload.get("message", ""))
+                        occurred_at = payload.get("occurred_at")
+                    else:  # Backward-compatible support for string events.
+                        message = str(payload)
+                        occurred_at = None
+                    self.status_label.configure(text=message)
+                    self._append_log(
+                        message,
+                        occurred_at=(
+                            occurred_at
+                            if isinstance(occurred_at, datetime)
+                            else None
+                        ),
+                    )
                 elif kind == "complete":
                     self._handle_complete(payload)
                 elif kind == "error":
@@ -875,12 +923,21 @@ class App(ctk.CTk):
         if manifest_path:
             self._append_log(f"Run manifest: {manifest_path}")
         for item in result.targets:
-            for line in target_result_log_lines(item):
+            # Processor details were already streamed as progress events. At
+            # completion, retain only durable audit/conversion/output summaries.
+            for line in target_result_log_lines(item, include_processor_log=False):
                 self._append_log(line)
             if item.success and item.output_path is not None:
                 self._append_log(f"Output: {item.output_path}")
             else:
-                self._append_log(f"Failed: {item.source_path.name} — {item.error}")
+                diagnostic = safe_error_diagnostic(getattr(item, "error", None))
+                if diagnostic is None:
+                    self._append_log(f"Failed: {item.source_path.name}")
+                else:
+                    self._append_log(
+                        f"Failed [{diagnostic.code}]: {item.source_path.name} "
+                        f"— {diagnostic.message}"
+                    )
         self.open_button.configure(state="normal" if run_dir is not None else "disabled")
         if run_dir is not None:
             self._append_log(f"Persisted run log: {run_dir / 'run.log'}")

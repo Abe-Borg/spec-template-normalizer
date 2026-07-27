@@ -16,6 +16,15 @@ PRESERVE_ACRONYMS = {
 }
 
 
+_COMBINED_SECTION_HEADING_RE = re.compile(
+    r"^\s*SECTION\s+"
+    r"(?P<section>\d{2}(?:[ \t\u00a0]*\d{2}){2})"
+    r"\s*[-\u2010\u2011\u2012\u2013\u2014\u2015:]\s*"
+    r"(?P<title>\S(?:.*\S)?)\s*$",
+    flags=re.IGNORECASE,
+)
+
+
 def _title_word(word: str) -> str:
     if "-" in word:
         return "-".join(_title_word(part) for part in word.split("-"))
@@ -81,5 +90,54 @@ def extract_target_tokens(extract_dir: Path, classifications: Dict[str, Any]) ->
             tokens["SectionTitle_display"] = smart_title_case(text)
         if "SectionID" in tokens and "SectionTitle" in tokens:
             break
+
+    # Some valid architect profiles intentionally expose neither SectionID nor
+    # SectionTitle as body roles.  In that contract, a document's combined
+    # top-level heading is retained as a deterministic ignored disposition.
+    # Recover tokens only from that exact structural disposition and an
+    # anchored ``SECTION 012900 - PAYMENT PROCEDURES`` shape.  This must not
+    # become a general scan for section cross-references elsewhere in the body.
+    if "SectionID" not in tokens or "SectionTitle" not in tokens:
+        combined_headings: set[tuple[str, str]] = set()
+        for item in classifications.get("ignored_paragraphs", []):
+            if not isinstance(item, dict) or item.get("reason") != "section_header_no_role":
+                continue
+            idx = item.get("paragraph_index")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(para_blocks):
+                continue
+            text = paragraph_text_from_block(para_blocks[idx][2]).strip()
+            match = _COMBINED_SECTION_HEADING_RE.fullmatch(text)
+            if match is None:
+                continue
+            section_numeric = re.sub(r"\D", "", match.group("section"))
+            title = match.group("title").strip()
+            if len(section_numeric) != 6 or not title:
+                continue
+            combined_headings.add((section_numeric, title))
+
+        # A target package represents one specification section.  Multiple
+        # distinct combined headings are ambiguous, so fail closed rather than
+        # choosing the first apparent match.
+        if len(combined_headings) == 1:
+            section_numeric, title = next(iter(combined_headings))
+            compatible = True
+            if "SectionID" in tokens:
+                existing_id = (
+                    tokens.get("SectionID_numeric")
+                    or tokens.get("SectionID", "")
+                )
+                compatible = re.sub(r"\D", "", existing_id) == section_numeric
+            if compatible and "SectionTitle" in tokens:
+                compatible = (
+                    re.sub(r"\s+", " ", tokens["SectionTitle"]).strip().casefold()
+                    == re.sub(r"\s+", " ", title).strip().casefold()
+                )
+            if compatible:
+                if "SectionID" not in tokens:
+                    tokens["SectionID"] = f"SECTION {section_numeric}"
+                    tokens["SectionID_numeric"] = section_numeric
+                if "SectionTitle" not in tokens:
+                    tokens["SectionTitle"] = title
+                    tokens["SectionTitle_display"] = smart_title_case(title)
 
     return tokens

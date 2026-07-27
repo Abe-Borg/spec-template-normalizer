@@ -259,8 +259,15 @@ Return the source-to-final style-ID map to every body/header/footer consumer.
 
 - `arch_env_applier.py` applies document defaults, theme/settings,
   compatibility, and canonical section/page layout.
+- `core/section_mapping.py` resolves Word's per-type header/footer inheritance
+  before comparing the architect's effective section shells. Raw profile
+  registries stay immutable, and explicit shell conflicts fail in shared
+  profile preflight before target work begins.
 - `header_footer_importer.py` and `numbering_importer.py` import bounded
-  dependency sets and remap relationships/IDs.
+  dependency sets and remap relationships/IDs. Header/footer section metadata
+  substitution is restricted to corroborated section/division/title/filename
+  slots in just-imported parts, including mirrored DrawingML/VML text boxes;
+  ambiguous shells or incomplete target tokens fail closed.
 - `phase2_invariants.py` verifies body, numbering, protected structure,
   section, header/footer, relationship, and package contracts.
 - `docx_decomposer.py` extracts targets safely; `docx_patch.py` assembles and
@@ -324,19 +331,23 @@ Each invocation creates:
   run.json
 ```
 
-`run.json` records the run/mode/status/timestamps; application, policy, and
-profile contract versions; output paths; architect path/hash; cache bundle
-identity; model/prompt fingerprints; target/output hashes; audit paths;
-disposition counts; numbering checks; durations; and redacted errors. It must
-not contain API keys or document text.
+`run.json` records the run/mode/status/timestamps; application,
+template-pipeline, policy, and profile contract versions; output paths;
+architect path/hash; cache bundle identity; model/prompt fingerprints;
+target/output hashes; audit paths; disposition counts; numbering checks;
+terminal processing stages; durations; and stable, redacted error
+codes/messages. Run manifest schema 2 separates the application version from
+the template-pipeline version and accompanies target-audit schema 2. Neither
+artifact may contain API keys or document text.
 
 `FormatRunResult` retains `success`, `succeeded`, `failed`, `output_paths`, and
 the historical `output_dir`, and adds `run_id`, `conversion_mode`,
 `output_root`, `run_dir`, and `manifest_path`. `TargetFormatResult` retains its
 historical fields and adds source/output SHA-256, `audit_path`,
-`audit_summary`, application audit details, and numbering checks. Additive
-fields must keep safe defaults so existing test doubles and callers continue
-to work.
+`audit_summary`, application audit details, numbering checks, and the terminal
+processing `stage` (`complete` on success; the attempted/failing operation on
+failure). Additive fields must keep safe defaults so existing test doubles and
+callers continue to work.
 
 ## Development commands
 

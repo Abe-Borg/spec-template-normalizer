@@ -700,7 +700,7 @@ def import_numbering(
     
     # Write updated numbering.xml
     write_xml_text(target_numbering_path, new_numbering_xml)
-    log.append(f"Updated {target_numbering_path}")
+    log.append("Updated target numbering definitions")
     
     return _result(
         plan["style_numid_remap"],

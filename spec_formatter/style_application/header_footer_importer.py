@@ -8,7 +8,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 from .core.ooxml_namespaces import (
     CT_NS,
@@ -36,6 +36,7 @@ from .core.sectpr_tools import (
 )
 from .core.xml_helpers import (
     edit_preserving_out_of_scope_subtrees,
+    iter_element_xml_blocks,
     iter_paragraph_xml_blocks,
     strip_out_of_scope_subtrees,
 )
@@ -755,6 +756,706 @@ def import_headers_footers(target_extract_dir: Path, registry: Dict[str, Any], l
     return result
 
 
+_WT_PATTERN = re.compile(r"(<w:t\b[^>]*>)([\s\S]*?)(</w:t>)")
+_SECTION_NUMBER_PATTERN = r"\d{2}(?:[ \t\u00a0]*\d{2}){2}"
+_LABELED_SECTION_RE = re.compile(
+    rf"\bSECTION\s+(?P<number>{_SECTION_NUMBER_PATTERN})(?!\d)",
+    flags=re.IGNORECASE,
+)
+_LABELED_DIVISION_RE = re.compile(
+    r"\bDIVISION\s+(?P<number>\d{2})(?!\d)",
+    flags=re.IGNORECASE,
+)
+_SECTION_FILENAME_RE = re.compile(
+    rf"(?<!\d)(?P<number>{_SECTION_NUMBER_PATTERN})\s+"
+    r"(?P<title>[^\r\n<>]+?)\.docx\b",
+    flags=re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _InferredHeaderFooterTokens:
+    section_numeric: str
+    section_forms: Tuple[str, ...]
+    division_numeric: str | None
+    title_aliases: Tuple[str, ...]
+
+
+def _normalized_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _w_text(xml_text: str) -> str:
+    return "".join(
+        html.unescape(match.group(2)) for match in _WT_PATTERN.finditer(xml_text)
+    )
+
+
+def _textbox_texts(xml_text: str) -> List[str]:
+    return [
+        text
+        for _start, _end, block in iter_element_xml_blocks(
+            xml_text,
+            "w:txbxContent",
+        )
+        if (text := _w_text(block).strip())
+    ]
+
+
+def _canonical_section_number(value: str) -> str:
+    digits = re.sub(r"\D", "", value or "")
+    return digits if len(digits) == 6 else ""
+
+
+def _bounded_text_ranges(text: str, token: str) -> List[Tuple[int, int]]:
+    if not token:
+        return []
+    return [
+        match.span()
+        for match in re.finditer(
+            rf"(?<![\w]){re.escape(token)}(?![\w])",
+            text,
+        )
+    ]
+
+
+def _titles_correspond(left: str, right: str) -> bool:
+    left_key = _normalized_text(left).casefold()
+    right_key = _normalized_text(right).casefold()
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    shorter, longer = sorted((left_key, right_key), key=len)
+    # This does not invent a replacement alias. It only corroborates two
+    # strings that are both actually present in the imported architect parts.
+    return longer.endswith("s") and longer[:-1] == shorter
+
+
+def _alternate_content_semantics(block: str, element_name: str) -> List[Tuple[str, ...]]:
+    return [
+        tuple(_textbox_texts(branch))
+        for _start, _end, branch in iter_element_xml_blocks(block, element_name)
+    ]
+
+
+def _validate_relevant_alternate_content_mirrors(
+    xml_text: str,
+    *,
+    section_numeric: str,
+    division_numeric: str | None,
+    title_aliases: Tuple[str, ...],
+) -> None:
+    """Require token-bearing Choice/Fallback branches to expose equal text."""
+
+    def is_relevant(semantics: Tuple[str, ...]) -> bool:
+        joined = "\n".join(semantics)
+        for match in _LABELED_SECTION_RE.finditer(joined):
+            if _canonical_section_number(match.group("number")) == section_numeric:
+                return True
+        for match in _SECTION_FILENAME_RE.finditer(joined):
+            if _canonical_section_number(match.group("number")) == section_numeric:
+                return True
+        if division_numeric:
+            for match in _LABELED_DIVISION_RE.finditer(joined):
+                if match.group("number") == division_numeric:
+                    return True
+        for text in semantics:
+            if any(
+                _normalized_text(text).casefold()
+                == _normalized_text(alias).casefold()
+                for alias in title_aliases
+            ):
+                return True
+            for match in _SECTION_FILENAME_RE.finditer(text):
+                if (
+                    _canonical_section_number(match.group("number"))
+                    == section_numeric
+                    and any(
+                        _normalized_text(match.group("title")).casefold()
+                        == _normalized_text(alias).casefold()
+                        for alias in title_aliases
+                    )
+                ):
+                    return True
+        return False
+
+    for _start, _end, alternate in iter_element_xml_blocks(
+        xml_text,
+        "mc:AlternateContent",
+    ):
+        choices = _alternate_content_semantics(alternate, "mc:Choice")
+        fallbacks = _alternate_content_semantics(alternate, "mc:Fallback")
+        all_semantics = [*choices, *fallbacks]
+        if not any(is_relevant(item) for item in all_semantics):
+            continue
+        if not choices or len(fallbacks) != 1:
+            raise ValueError(
+                "Ambiguous architect header/footer AlternateContent token branches"
+            )
+        fallback = fallbacks[0]
+        if any(choice != fallback for choice in choices):
+            raise ValueError(
+                "Conflicting architect header/footer Choice/Fallback token text"
+            )
+
+
+def _infer_header_footer_tokens(
+    part_xml_by_path: Dict[Path, str],
+    *,
+    expected_section_numeric: str | None = None,
+    _probe_conflicts: bool = True,
+) -> _InferredHeaderFooterTokens | None:
+    """Infer architect tokens only from a corroborated mirrored shell."""
+
+    textbox_texts_by_path = {
+        path: _textbox_texts(xml_text)
+        for path, xml_text in part_xml_by_path.items()
+    }
+    all_texts = [
+        text
+        for texts in textbox_texts_by_path.values()
+        for text in texts
+    ]
+
+    section_matches: List[Tuple[str, str]] = []
+    for text in all_texts:
+        for match in _LABELED_SECTION_RE.finditer(text):
+            source_form = match.group("number")
+            canonical = _canonical_section_number(source_form)
+            if canonical:
+                section_matches.append((canonical, source_form))
+    section_numbers = {canonical for canonical, _form in section_matches}
+    if not section_numbers:
+        return None
+    section_counts = {
+        candidate: sum(
+            1
+            for canonical, _form in section_matches
+            if canonical == candidate
+        )
+        for candidate in section_numbers
+    }
+
+    def no_match_or_conflict() -> _InferredHeaderFooterTokens | None:
+        if not expected_section_numeric or not _probe_conflicts:
+            return None
+        for candidate, count in sorted(section_counts.items()):
+            if candidate == expected_section_numeric or count < 2:
+                continue
+            conflicting_shell = _infer_header_footer_tokens(
+                part_xml_by_path,
+                expected_section_numeric=candidate,
+                _probe_conflicts=False,
+            )
+            if conflicting_shell is not None:
+                raise ValueError(
+                    "Explicit architect SectionID conflicts with imported "
+                    "header/footer shell"
+                )
+        return None
+
+    if expected_section_numeric:
+        if section_counts.get(expected_section_numeric, 0) < 2:
+            return no_match_or_conflict()
+        section_numeric = expected_section_numeric
+    elif len(section_numbers) != 1:
+        raise ValueError("Ambiguous architect header/footer section numbers")
+    else:
+        section_numeric = next(iter(section_numbers))
+    # The fallback path is intentionally limited to mirrored shells. A lone
+    # apparent SECTION label is not enough evidence to rewrite imported parts.
+    if sum(1 for canonical, _form in section_matches if canonical == section_numeric) < 2:
+        return no_match_or_conflict()
+
+    filename_titles: Dict[str, Tuple[str, int]] = {}
+    filename_forms: List[str] = []
+    for text in all_texts:
+        for match in _SECTION_FILENAME_RE.finditer(text):
+            number_form = match.group("number")
+            if _canonical_section_number(number_form) != section_numeric:
+                continue
+            title = match.group("title").strip()
+            if not title:
+                continue
+            key = _normalized_text(title).casefold()
+            previous = filename_titles.get(key)
+            filename_titles[key] = (
+                previous[0] if previous else title,
+                (previous[1] if previous else 0) + 1,
+            )
+            filename_forms.append(number_form)
+    if len(filename_titles) != 1:
+        if filename_titles:
+            raise ValueError("Ambiguous architect header/footer filename titles")
+        return no_match_or_conflict()
+    footer_title, footer_title_count = next(iter(filename_titles.values()))
+    if footer_title_count < 2:
+        return no_match_or_conflict()
+
+    header_candidates: Dict[str, Tuple[str, int]] = {}
+    for path, texts in textbox_texts_by_path.items():
+        if "header" not in path.name.casefold():
+            continue
+        for text in texts:
+            candidate = text.strip()
+            if (
+                not candidate
+                or any(char.isdigit() for char in candidate)
+                or candidate.casefold().endswith(".docx")
+                or len(candidate.split()) < 2
+                or not _titles_correspond(candidate, footer_title)
+            ):
+                continue
+            key = _normalized_text(candidate).casefold()
+            previous = header_candidates.get(key)
+            header_candidates[key] = (
+                previous[0] if previous else candidate,
+                (previous[1] if previous else 0) + 1,
+            )
+
+    observed_header_aliases = [
+        candidate
+        for candidate, count in header_candidates.values()
+        if count >= 2
+    ]
+    if not observed_header_aliases:
+        return no_match_or_conflict()
+
+    division_values = {
+        match.group("number")
+        for text in all_texts
+        for match in _LABELED_DIVISION_RE.finditer(text)
+    }
+    if expected_section_numeric:
+        if (
+            division_values
+            and expected_section_numeric[:2] not in division_values
+        ):
+            raise ValueError(
+                "Explicit architect SectionID conflicts with imported "
+                "header/footer DIVISION token"
+            )
+        division_numeric = (
+            expected_section_numeric[:2]
+            if expected_section_numeric[:2] in division_values
+            else None
+        )
+    elif len(division_values) > 1:
+        raise ValueError("Ambiguous architect header/footer division numbers")
+    else:
+        division_numeric = next(iter(division_values), None)
+    if division_numeric and division_numeric != section_numeric[:2]:
+        raise ValueError(
+            "Architect header/footer DIVISION token conflicts with SECTION token"
+        )
+
+    title_aliases = tuple(
+        sorted(
+            {footer_title, *observed_header_aliases},
+            key=lambda item: (-len(item), item.casefold()),
+        )
+    )
+    section_forms = tuple(
+        sorted(
+            {
+                form
+                for canonical, form in section_matches
+                if canonical == section_numeric
+            }
+            | set(filename_forms),
+            key=lambda item: (-len(item), item),
+        )
+    )
+    inferred = _InferredHeaderFooterTokens(
+        section_numeric=section_numeric,
+        section_forms=section_forms,
+        division_numeric=division_numeric,
+        title_aliases=title_aliases,
+    )
+    for xml_text in part_xml_by_path.values():
+        _validate_relevant_alternate_content_mirrors(
+            xml_text,
+            section_numeric=inferred.section_numeric,
+            division_numeric=inferred.division_numeric,
+            title_aliases=inferred.title_aliases,
+        )
+    if expected_section_numeric and _probe_conflicts:
+        for candidate, count in sorted(section_counts.items()):
+            if candidate == expected_section_numeric or count < 2:
+                continue
+            conflicting_shell = _infer_header_footer_tokens(
+                part_xml_by_path,
+                expected_section_numeric=candidate,
+                _probe_conflicts=False,
+            )
+            if conflicting_shell is not None:
+                raise ValueError(
+                    "Explicit architect SectionID conflicts with multiple "
+                    "imported header/footer shells"
+                )
+    return inferred
+
+
+def _render_numeric_like(source_form: str, target_numeric: str) -> str:
+    digit_groups = list(re.finditer(r"\d+", source_form))
+    if (
+        not digit_groups
+        or sum(len(match.group(0)) for match in digit_groups)
+        != len(target_numeric)
+    ):
+        return target_numeric
+    pieces: List[str] = []
+    source_cursor = 0
+    target_cursor = 0
+    for match in digit_groups:
+        pieces.append(source_form[source_cursor:match.start()])
+        group_length = len(match.group(0))
+        pieces.append(target_numeric[target_cursor:target_cursor + group_length])
+        source_cursor = match.end()
+        target_cursor += group_length
+    pieces.append(source_form[source_cursor:])
+    return "".join(pieces)
+
+
+def _replace_visible_ranges(
+    xml_text: str,
+    ranges: List[Tuple[int, int]],
+    replacement: str,
+) -> tuple[str, bool]:
+    nodes = list(_WT_PATTERN.finditer(xml_text))
+    if not nodes or not ranges:
+        return xml_text, False
+
+    node_texts = [html.unescape(node.group(2)) for node in nodes]
+    node_offsets: List[Tuple[int, int]] = []
+    offset = 0
+    for node_text in node_texts:
+        node_offsets.append((offset, offset + len(node_text)))
+        offset += len(node_text)
+
+    valid_ranges = sorted(
+        {
+            (start, end)
+            for start, end in ranges
+            if 0 <= start < end <= offset
+        }
+    )
+    if not valid_ranges:
+        return xml_text, False
+    if any(
+        valid_ranges[index][0] < valid_ranges[index - 1][1]
+        for index in range(1, len(valid_ranges))
+    ):
+        raise ValueError("Overlapping header/footer token matches")
+
+    edits_by_node: List[List[Tuple[int, int, str]]] = [
+        [] for _node in nodes
+    ]
+    for match_start, match_end in valid_ranges:
+        replacement_placed = False
+        for index, (node_start, node_end) in enumerate(node_offsets):
+            if node_end <= match_start or node_start >= match_end:
+                continue
+            local_start = max(match_start, node_start) - node_start
+            local_end = min(match_end, node_end) - node_start
+            edits_by_node[index].append(
+                (
+                    local_start,
+                    local_end,
+                    replacement if not replacement_placed else "",
+                )
+            )
+            replacement_placed = True
+
+    out: List[str] = []
+    cursor = 0
+    changed = False
+    for index, node in enumerate(nodes):
+        out.append(xml_text[cursor:node.start()])
+        edits = sorted(edits_by_node[index])
+        if not edits:
+            out.append(node.group(0))
+        else:
+            node_text = node_texts[index]
+            rebuilt: List[str] = []
+            text_cursor = 0
+            for start, end, inserted in edits:
+                rebuilt.extend((node_text[text_cursor:start], inserted))
+                text_cursor = end
+            rebuilt.append(node_text[text_cursor:])
+            out.extend(
+                (
+                    node.group(1),
+                    html.escape("".join(rebuilt), quote=False),
+                    node.group(3),
+                )
+            )
+            changed = True
+        cursor = node.end()
+    out.append(xml_text[cursor:])
+    return "".join(out), changed
+
+
+def _section_context_ranges(
+    visible_text: str,
+    source_form: str,
+    title_aliases: Tuple[str, ...],
+) -> List[Tuple[int, int]]:
+    accepted: List[Tuple[int, int]] = []
+    for start, end in _bounded_text_ranges(visible_text, source_form):
+        before = visible_text[:start]
+        after = visible_text[end:].lstrip()
+        labeled = re.search(r"\bSECTION\s*$", before, flags=re.IGNORECASE)
+        filename_scoped = any(
+            ranges and ranges[0][0] == 0
+            for alias in title_aliases
+            if (ranges := _bounded_text_ranges(after, alias))
+        )
+        if labeled or filename_scoped:
+            accepted.append((start, end))
+    return accepted
+
+
+def _title_context_ranges(
+    visible_text: str,
+    alias: str,
+    section_numbers: set[str],
+) -> List[Tuple[int, int]]:
+    ranges = _bounded_text_ranges(visible_text, alias)
+    if not ranges:
+        return []
+    if (
+        _normalized_text(visible_text).casefold()
+        == _normalized_text(alias).casefold()
+    ):
+        return ranges
+
+    accepted: List[Tuple[int, int]] = []
+    for filename_match in _SECTION_FILENAME_RE.finditer(visible_text):
+        if (
+            _canonical_section_number(filename_match.group("number"))
+            not in section_numbers
+            or _normalized_text(filename_match.group("title")).casefold()
+            != _normalized_text(alias).casefold()
+        ):
+            continue
+        title_start, title_end = filename_match.span("title")
+        accepted.extend(
+            (start, end)
+            for start, end in ranges
+            if title_start <= start and end <= title_end
+        )
+    return accepted
+
+
+def _patch_inferred_textbox_tokens(
+    xml_text: str,
+    inferred: _InferredHeaderFooterTokens,
+    *,
+    target_section_numeric: str,
+    target_title: str,
+) -> tuple[str, bool]:
+    from .core.token_utils import apply_case_pattern, detect_case_pattern
+
+    def apply_live_edit(
+        paragraph_xml: str,
+        range_builder: Callable[[str], List[Tuple[int, int]]],
+        replacement: str,
+    ) -> tuple[str, bool]:
+        changed = False
+
+        def edit(protected_xml: str) -> str:
+            nonlocal changed
+            updated, changed = _replace_visible_ranges(
+                protected_xml,
+                range_builder(_w_text(protected_xml)),
+                replacement,
+            )
+            return updated
+
+        return edit_preserving_out_of_scope_subtrees(paragraph_xml, edit), changed
+
+    textbox_blocks = list(iter_element_xml_blocks(xml_text, "w:txbxContent"))
+    if not textbox_blocks:
+        return xml_text, False
+
+    updated_textboxes: List[str] = []
+    outer_cursor = 0
+    any_changed = False
+    for start, end, textbox in textbox_blocks:
+        updated_textboxes.append(xml_text[outer_cursor:start])
+        paragraph_blocks = list(iter_paragraph_xml_blocks(textbox))
+        updated_paragraphs: List[str] = []
+        paragraph_cursor = 0
+        for paragraph_start, paragraph_end, paragraph in paragraph_blocks:
+            updated_paragraphs.append(textbox[paragraph_cursor:paragraph_start])
+            updated = paragraph
+
+            if inferred.division_numeric and target_section_numeric:
+                division_pattern = re.compile(
+                    rf"\bDIVISION\s+(?P<number>{re.escape(inferred.division_numeric)})(?!\d)",
+                    flags=re.IGNORECASE,
+                )
+                updated, changed = apply_live_edit(
+                    updated,
+                    lambda visible: [
+                        match.span("number")
+                        for match in division_pattern.finditer(visible)
+                    ],
+                    target_section_numeric[:2],
+                )
+                any_changed = any_changed or changed
+
+            if target_section_numeric:
+                for source_form in inferred.section_forms:
+                    updated, changed = apply_live_edit(
+                        updated,
+                        lambda visible, form=source_form: _section_context_ranges(
+                            visible,
+                            form,
+                            inferred.title_aliases,
+                        ),
+                        _render_numeric_like(source_form, target_section_numeric),
+                    )
+                    any_changed = any_changed or changed
+                    if changed:
+                        break
+
+            if target_title:
+                for alias in inferred.title_aliases:
+                    replacement = apply_case_pattern(
+                        target_title,
+                        detect_case_pattern(alias),
+                    )
+                    updated, changed = apply_live_edit(
+                        updated,
+                        lambda visible, source_alias=alias: _title_context_ranges(
+                            visible,
+                            source_alias,
+                            {inferred.section_numeric, target_section_numeric},
+                        ),
+                        replacement,
+                    )
+                    any_changed = any_changed or changed
+                    if changed:
+                        break
+
+            updated_paragraphs.append(updated)
+            paragraph_cursor = paragraph_end
+        updated_paragraphs.append(textbox[paragraph_cursor:])
+        updated_textboxes.append("".join(updated_paragraphs))
+        outer_cursor = end
+    updated_textboxes.append(xml_text[outer_cursor:])
+    return "".join(updated_textboxes), any_changed
+
+
+def _count_section_slots(xml_text: str, section_numeric: str) -> int:
+    count = 0
+    for text in _textbox_texts(xml_text):
+        count += sum(
+            1
+            for match in _LABELED_SECTION_RE.finditer(text)
+            if _canonical_section_number(match.group("number")) == section_numeric
+        )
+        count += sum(
+            1
+            for match in _SECTION_FILENAME_RE.finditer(text)
+            if _canonical_section_number(match.group("number")) == section_numeric
+        )
+    return count
+
+
+def _count_division_slots(xml_text: str, division_numeric: str) -> int:
+    return sum(
+        1
+        for text in _textbox_texts(xml_text)
+        for match in _LABELED_DIVISION_RE.finditer(text)
+        if match.group("number") == division_numeric
+    )
+
+
+def _count_title_slots(
+    xml_text: str,
+    aliases: Tuple[str, ...],
+    section_numbers: set[str],
+) -> int:
+    return sum(
+        1
+        for text in _textbox_texts(xml_text)
+        for alias in aliases
+        if _title_context_ranges(text, alias, section_numbers)
+    )
+
+
+def _validate_inferred_patch_postconditions(
+    original_xml: str,
+    updated_xml: str,
+    inferred: _InferredHeaderFooterTokens,
+    *,
+    target_section_numeric: str,
+    target_title_aliases: Tuple[str, ...],
+) -> None:
+    source_section_count = _count_section_slots(
+        original_xml,
+        inferred.section_numeric,
+    )
+    if source_section_count:
+        if (
+            inferred.section_numeric != target_section_numeric
+            and _count_section_slots(updated_xml, inferred.section_numeric)
+        ):
+            raise ValueError("Imported header/footer source SECTION token remained after patch")
+        if _count_section_slots(updated_xml, target_section_numeric) < source_section_count:
+            raise ValueError("Imported header/footer target SECTION token is incomplete")
+
+    if inferred.division_numeric:
+        source_division_count = _count_division_slots(
+            original_xml,
+            inferred.division_numeric,
+        )
+        target_division = target_section_numeric[:2]
+        if source_division_count:
+            if (
+                inferred.division_numeric != target_division
+                and _count_division_slots(updated_xml, inferred.division_numeric)
+            ):
+                raise ValueError(
+                    "Imported header/footer source DIVISION token remained after patch"
+                )
+            if _count_division_slots(updated_xml, target_division) < source_division_count:
+                raise ValueError("Imported header/footer target DIVISION token is incomplete")
+
+    source_title_count = _count_title_slots(
+        original_xml,
+        inferred.title_aliases,
+        {inferred.section_numeric},
+    )
+    if source_title_count:
+        source_and_target_overlap = any(
+            source == target
+            for source in inferred.title_aliases
+            for target in target_title_aliases
+        )
+        if (
+            not source_and_target_overlap
+            and _count_title_slots(
+                updated_xml,
+                inferred.title_aliases,
+                {inferred.section_numeric, target_section_numeric},
+            )
+        ):
+            raise ValueError(
+                "Imported header/footer source SectionTitle token remained after patch"
+            )
+        if _count_title_slots(
+            updated_xml,
+            target_title_aliases,
+            {target_section_numeric},
+        ) < source_title_count:
+            raise ValueError("Imported header/footer target SectionTitle token is incomplete")
+
+
 def _extract_numeric_from_section_id(value: str) -> str:
     m = re.search(r"SECTION\s+([\d\s]+)", value or "", flags=re.IGNORECASE)
     if m:
@@ -776,57 +1477,6 @@ def patch_header_footer_tokens(
     if not word_dir.exists():
         return
 
-    arch_title = source_tokens.get("SectionTitle", "")
-    target_title_display = target_tokens.get("SectionTitle_display", "") or target_tokens.get("SectionTitle", "")
-    target_title_raw = target_tokens.get("SectionTitle", "")
-    arch_id_numeric = source_tokens.get("SectionID_numeric") or _extract_numeric_from_section_id(source_tokens.get("SectionID", ""))
-    target_id_numeric = target_tokens.get("SectionID_numeric") or _extract_numeric_from_section_id(target_tokens.get("SectionID", ""))
-
-    wt_pattern = re.compile(r"(<w:t\b[^>]*>)([\s\S]*?)(</w:t>)")
-
-    def _replace_first_visible_text(paragraph_xml: str, old_text: str, new_text: str) -> tuple[str, bool]:
-        nodes = list(wt_pattern.finditer(paragraph_xml))
-        if not nodes:
-            return paragraph_xml, False
-
-        visible = "".join(html.unescape(n.group(2)) for n in nodes)
-        start = visible.find(old_text)
-        if start < 0:
-            return paragraph_xml, False
-        end = start + len(old_text)
-
-        out: List[str] = []
-        cursor = 0
-        vis_offset = 0
-        replacement_placed = False
-        changed = False
-        for node in nodes:
-            out.append(paragraph_xml[cursor:node.start()])
-            open_tag, escaped_text, close_tag = node.groups()
-            node_text = html.unescape(escaped_text)
-            node_start = vis_offset
-            node_end = vis_offset + len(node_text)
-            new_node_text = node_text
-
-            if node_end > start and node_start < end:
-                overlap_start = max(start, node_start) - node_start
-                overlap_end = min(end, node_end) - node_start
-                before = node_text[:overlap_start]
-                after = node_text[overlap_end:]
-                if not replacement_placed:
-                    new_node_text = before + new_text + after
-                    replacement_placed = True
-                else:
-                    new_node_text = before + after
-                changed = True
-
-            out.append(f"{open_tag}{html.escape(new_node_text)}{close_tag}")
-            cursor = node.end()
-            vis_offset = node_end
-
-        out.append(paragraph_xml[cursor:])
-        return "".join(out), changed
-
     def _replace_host_visible_text(
         paragraph_xml: str,
         old_text: str,
@@ -836,9 +1486,13 @@ def patch_header_footer_tokens(
 
         def _edit(protected_xml: str) -> str:
             nonlocal changed
-            updated, changed = _replace_first_visible_text(
+            visible = _w_text(protected_xml)
+            start = visible.find(old_text)
+            if start < 0:
+                return protected_xml
+            updated, changed = _replace_visible_ranges(
                 protected_xml,
-                old_text,
+                [(start, start + len(old_text))],
                 new_text,
             )
             return updated
@@ -858,8 +1512,75 @@ def patch_header_footer_tokens(
             part_path = target_extract_dir / part_name
             if part_path.is_file():
                 part_paths.append(part_path)
-    for part_path in part_paths:
-        part_xml = read_xml_text(part_path)
+
+    part_xml_by_path = {
+        part_path: read_xml_text(part_path)
+        for part_path in part_paths
+    }
+    arch_title = source_tokens.get("SectionTitle", "")
+    arch_id_numeric = (
+        source_tokens.get("SectionID_numeric")
+        or _extract_numeric_from_section_id(source_tokens.get("SectionID", ""))
+    )
+    expected_source_section = _canonical_section_number(arch_id_numeric)
+    inferred = (
+        _infer_header_footer_tokens(
+            part_xml_by_path,
+            expected_section_numeric=expected_source_section or None,
+        )
+        if part_xml_by_path
+        else None
+    )
+
+    target_title_display = (
+        target_tokens.get("SectionTitle_display", "")
+        or target_tokens.get("SectionTitle", "")
+    )
+    target_title_raw = target_tokens.get("SectionTitle", "")
+    if inferred is not None:
+        explicit_section_numeric = _canonical_section_number(arch_id_numeric)
+        if arch_id_numeric and explicit_section_numeric != inferred.section_numeric:
+            raise ValueError(
+                "Explicit architect SectionID conflicts with imported header/footer shell"
+            )
+        if arch_title and not any(
+            _titles_correspond(arch_title, alias)
+            for alias in inferred.title_aliases
+        ):
+            raise ValueError(
+                "Explicit architect SectionTitle conflicts with imported header/footer shell"
+            )
+    target_id_numeric = (
+        target_tokens.get("SectionID_numeric")
+        or _extract_numeric_from_section_id(target_tokens.get("SectionID", ""))
+    )
+    target_section_numeric = _canonical_section_number(target_id_numeric)
+    target_title_for_patch = target_title_raw or target_title_display
+    if inferred is not None and (
+        not target_section_numeric or not target_title_for_patch.strip()
+    ):
+        raise ValueError(
+            "Imported header/footer token substitution requires a complete "
+            "target SectionID and SectionTitle"
+        )
+    if inferred is not None:
+        log.append(
+            "Inferred architect section tokens from mirrored imported header/footer parts"
+        )
+        inferred_target_title_aliases = tuple(
+            dict.fromkeys(
+                apply_case_pattern(
+                    target_title_for_patch,
+                    detect_case_pattern(alias),
+                )
+                for alias in inferred.title_aliases
+            )
+        )
+    else:
+        inferred_target_title_aliases = ()
+
+    for part_path, original_part_xml in part_xml_by_path.items():
+        part_xml = original_part_xml
         modified = False
         paragraph_matches = list(iter_paragraph_xml_blocks(part_xml))
         updated_chunks: List[str] = []
@@ -868,8 +1589,7 @@ def patch_header_footer_tokens(
             updated_chunks.append(part_xml[cursor:start])
 
             analysis_xml = strip_out_of_scope_subtrees(paragraph_xml)
-            wt_nodes = list(wt_pattern.finditer(analysis_xml))
-            visible_norm = "".join(html.unescape(n.group(2)) for n in wt_nodes)
+            visible_norm = _w_text(analysis_xml)
             new_paragraph = paragraph_xml
 
             if visible_norm and arch_title and target_title_display:
@@ -891,9 +1611,19 @@ def patch_header_footer_tokens(
                         break
 
             if arch_id_numeric and target_id_numeric:
+                canonical_target = _canonical_section_number(target_id_numeric)
                 for src_variant, dst_variant in (
-                    (arch_id_numeric, target_id_numeric),
-                    (arch_id_numeric.replace(" ", ""), target_id_numeric.replace(" ", "")),
+                    (
+                        arch_id_numeric,
+                        _render_numeric_like(arch_id_numeric, canonical_target)
+                        if canonical_target
+                        else target_id_numeric,
+                    ),
+                    (
+                        re.sub(r"\s+", "", arch_id_numeric),
+                        canonical_target
+                        or re.sub(r"\s+", "", target_id_numeric),
+                    ),
                 ):
                     if not src_variant:
                         continue
@@ -912,6 +1642,32 @@ def patch_header_footer_tokens(
         updated_chunks.append(part_xml[cursor:])
         if paragraph_matches:
             part_xml = "".join(updated_chunks)
+
+        if inferred is not None:
+            part_xml, inferred_changed = _patch_inferred_textbox_tokens(
+                part_xml,
+                inferred,
+                target_section_numeric=target_section_numeric,
+                target_title=target_title_for_patch,
+            )
+            modified = modified or inferred_changed
+            _validate_inferred_patch_postconditions(
+                original_part_xml,
+                part_xml,
+                inferred,
+                target_section_numeric=target_section_numeric,
+                target_title_aliases=inferred_target_title_aliases,
+            )
+            _validate_relevant_alternate_content_mirrors(
+                part_xml,
+                section_numeric=target_section_numeric,
+                division_numeric=(
+                    target_section_numeric[:2]
+                    if target_section_numeric and inferred.division_numeric
+                    else None
+                ),
+                title_aliases=inferred_target_title_aliases,
+            )
 
         if modified:
             part_path.write_text(prepare_xml_text_for_utf8(part_xml), encoding="utf-8")

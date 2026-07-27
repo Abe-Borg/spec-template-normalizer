@@ -463,6 +463,356 @@ def test_token_patching_preserves_nested_textbox_subtree_byte_for_byte(tmp_path)
     assert "AIR TERMINALS" in output
 
 
+def test_empty_source_tokens_patch_mirrored_imported_textboxes_without_xml_drift(
+    tmp_path,
+):
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+
+    def runs(*values):
+        return "".join(
+            f'<w:r data-run="{index}"><w:t>{value}</w:t></w:r>'
+            for index, value in enumerate(values)
+        )
+
+    def mirrored_textbox(paragraph_content):
+        return (
+            '<w:p data-host="stable"><w:r><mc:AlternateContent>'
+            '<mc:Choice Requires="wps"><w:drawing data-kind="drawingml">'
+            '<wps:txbx><w:txbxContent><w:p>'
+            f'{paragraph_content}'
+            '</w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice>'
+            '<mc:Fallback><w:pict data-kind="vml"><v:textbox>'
+            '<w:txbxContent><w:p>'
+            f'{paragraph_content}'
+            '</w:p></w:txbxContent></v:textbox></w:pict></mc:Fallback>'
+            '</mc:AlternateContent></w:r></w:p>'
+        )
+
+    namespaces = (
+        ' xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"'
+        ' xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"'
+        ' xmlns:v="urn:schemas-microsoft-com:vml"'
+    )
+    source_number = "05\u00a050\t00"
+    protected_nested_text = (
+        '<w:drawing data-protected="keep"><w:txbxContent><w:p>'
+        '<w:r><w:t>NESTED TOKEN GUARD</w:t></w:r>'
+        '</w:p></w:txbxContent></w:drawing>'
+    )
+    header_xml = (
+        f'<w:hdr{namespaces} data-shell="keep">'
+        + mirrored_textbox(runs("Harvey Tank Replacement Project No. 60546407"))
+        + mirrored_textbox(
+            runs("Miscellaneous", " ", "Metal", " Project No. 60546407")
+        )
+        + mirrored_textbox(runs("DIVISION", " ", "05"))
+        + mirrored_textbox(
+            protected_nested_text
+            + runs(" ", "SECTION", " ", "05", "\u00a0", "50", "\t", "00")
+            + '<w:r data-field="keep"><w:instrText> PAGE </w:instrText></w:r>'
+        )
+        + mirrored_textbox(runs("September", " ", "2018"))
+        + mirrored_textbox(runs("Miscellaneous", " ", "Metal"))
+        + '</w:hdr>'
+    )
+    footer_xml = (
+        f'<w:ftr{namespaces} data-shell="keep">'
+        + mirrored_textbox(
+            runs(
+                "05",
+                "\u00a0",
+                "50",
+                "\t",
+                "00",
+                " ",
+                "Miscellaneous",
+                " ",
+                "Metals.docx",
+            )
+        )
+        + '</w:ftr>'
+    )
+    header_path = word_dir / "header1.xml"
+    footer_path = word_dir / "footer1.xml"
+    header_path.write_text(header_xml, encoding="utf-8")
+    footer_path.write_text(footer_xml, encoding="utf-8")
+
+    incomplete_log = []
+    with pytest.raises(ValueError, match="complete target SectionID and SectionTitle"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={},
+            target_tokens={"SectionTitle": "PAYMENT PROCEDURES"},
+            log=incomplete_log,
+            part_names=["word/header1.xml", "word/footer1.xml"],
+        )
+    assert header_path.read_text(encoding="utf-8") == header_xml
+    assert footer_path.read_text(encoding="utf-8") == footer_xml
+
+    division_five = mirrored_textbox(runs("DIVISION", " ", "05"))
+    division_six = mirrored_textbox(runs("DIVISION", " ", "06"))
+    mismatched_division_header = header_xml.replace(
+        division_five,
+        division_six,
+    )
+    assert mismatched_division_header != header_xml
+    header_path.write_text(mismatched_division_header, encoding="utf-8")
+    footer_path.write_text(footer_xml, encoding="utf-8")
+    with pytest.raises(ValueError, match="header/footer DIVISION token"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={
+                "SectionID": "SECTION 05 50 00",
+                "SectionTitle": "MISCELLANEOUS METALS",
+            },
+            target_tokens={
+                "SectionID": "SECTION 012900",
+                "SectionTitle": "PAYMENT PROCEDURES",
+            },
+            log=[],
+            part_names=["word/header1.xml", "word/footer1.xml"],
+        )
+    assert header_path.read_text(encoding="utf-8") == mismatched_division_header
+    assert footer_path.read_text(encoding="utf-8") == footer_xml
+
+    single_expected_reference = (
+        '<w:p><w:r><w:drawing><wps:txbx><w:txbxContent><w:p>'
+        + runs("SECTION", " ", "01", " ", "29", " ", "00")
+        + '</w:p></w:txbxContent></wps:txbx></w:drawing></w:r></w:p>'
+    )
+    header_with_expected_reference = header_xml.replace(
+        "</w:hdr>",
+        f"{single_expected_reference}</w:hdr>",
+    )
+    header_path.write_text(header_with_expected_reference, encoding="utf-8")
+    footer_path.write_text(footer_xml, encoding="utf-8")
+    with pytest.raises(ValueError, match="Explicit architect SectionID conflicts"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={
+                "SectionID": "SECTION 01 29 00",
+                "SectionTitle": "PAYMENT PROCEDURES",
+            },
+            target_tokens={
+                "SectionID": "SECTION 012900",
+                "SectionTitle": "PAYMENT PROCEDURES",
+            },
+            log=[],
+            part_names=["word/header1.xml", "word/footer1.xml"],
+        )
+    assert header_path.read_text(encoding="utf-8") == header_with_expected_reference
+    assert footer_path.read_text(encoding="utf-8") == footer_xml
+
+    mirrored_expected_reference = mirrored_textbox(
+        runs("SECTION", " ", "01", " ", "29", " ", "00")
+    )
+    header_with_mirrored_expected_reference = header_xml.replace(
+        "</w:hdr>",
+        f"{mirrored_expected_reference}</w:hdr>",
+    )
+    header_path.write_text(
+        header_with_mirrored_expected_reference,
+        encoding="utf-8",
+    )
+    footer_path.write_text(footer_xml, encoding="utf-8")
+    with pytest.raises(ValueError, match="Explicit architect SectionID conflicts"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={
+                "SectionID": "SECTION 01 29 00",
+                "SectionTitle": "PAYMENT PROCEDURES",
+            },
+            target_tokens={
+                "SectionID": "SECTION 012900",
+                "SectionTitle": "PAYMENT PROCEDURES",
+            },
+            log=[],
+            part_names=["word/header1.xml", "word/footer1.xml"],
+        )
+    assert (
+        header_path.read_text(encoding="utf-8")
+        == header_with_mirrored_expected_reference
+    )
+    assert footer_path.read_text(encoding="utf-8") == footer_xml
+
+    second_shell_header = header_xml.replace(
+        "</w:hdr>",
+        (
+            mirrored_textbox(runs("DIVISION", " ", "01"))
+            + mirrored_textbox(
+                runs("SECTION", " ", "01", " ", "00", " ", "00")
+            )
+            + mirrored_textbox(runs("General", " ", "Requirements"))
+            + "</w:hdr>"
+        ),
+    )
+    second_shell_footer = footer_xml.replace(
+        "</w:ftr>",
+        (
+            mirrored_textbox(
+                runs(
+                    "01",
+                    " ",
+                    "00",
+                    " ",
+                    "00",
+                    " ",
+                    "General",
+                    " ",
+                    "Requirements.docx",
+                )
+            )
+            + "</w:ftr>"
+        ),
+    )
+    header_path.write_text(second_shell_header, encoding="utf-8")
+    footer_path.write_text(second_shell_footer, encoding="utf-8")
+    with pytest.raises(ValueError, match="multiple imported header/footer shells"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={
+                "SectionID": "SECTION 05 50 00",
+                "SectionTitle": "MISCELLANEOUS METALS",
+            },
+            target_tokens={
+                "SectionID": "SECTION 012900",
+                "SectionTitle": "PAYMENT PROCEDURES",
+            },
+            log=[],
+            part_names=["word/header1.xml", "word/footer1.xml"],
+        )
+    assert header_path.read_text(encoding="utf-8") == second_shell_header
+    assert footer_path.read_text(encoding="utf-8") == second_shell_footer
+
+    header_path.write_text(header_xml, encoding="utf-8")
+    footer_path.write_text(footer_xml, encoding="utf-8")
+
+    def xml_skeleton(value):
+        return re.sub(
+            r"(<w:t\b[^>]*>)[\s\S]*?(</w:t>)",
+            r"\1__TEXT__\2",
+            value,
+        )
+
+    original_skeletons = {
+        header_path: xml_skeleton(header_xml),
+        footer_path: xml_skeleton(footer_xml),
+    }
+    log = []
+    patch_header_footer_tokens(
+        target_extract_dir=tmp_path,
+        source_tokens={},
+        target_tokens={
+            "SectionID": "SECTION 012900",
+            "SectionID_numeric": "012900",
+            "SectionTitle": "PAYMENT PROCEDURES",
+            "SectionTitle_display": "Payment Procedures",
+        },
+        log=log,
+        part_names=["word/header1.xml", "word/footer1.xml"],
+    )
+
+    updated_header = header_path.read_text(encoding="utf-8")
+    updated_footer = footer_path.read_text(encoding="utf-8")
+    header_visible = "".join(re.findall(r"<w:t\b[^>]*>([\s\S]*?)</w:t>", updated_header))
+    footer_visible = "".join(re.findall(r"<w:t\b[^>]*>([\s\S]*?)</w:t>", updated_footer))
+
+    assert header_visible.count("DIVISION 01") == 2
+    assert header_visible.count("SECTION 01\u00a029\t00") == 2
+    assert header_visible.count("Payment Procedures") == 2
+    assert footer_visible.count("01\u00a029\t00 Payment Procedures.docx") == 2
+    assert "Payment Proceduress" not in footer_visible
+    assert source_number not in header_visible
+    assert source_number not in footer_visible
+    assert header_visible.count("Harvey Tank Replacement Project No. 60546407") == 2
+    assert header_visible.count("Miscellaneous Metal Project No. 60546407") == 2
+    assert header_visible.count("September 2018") == 2
+    assert updated_header.count("<w:instrText> PAGE </w:instrText>") == 2
+    assert updated_header.count("NESTED TOKEN GUARD") == 2
+    assert xml_skeleton(updated_header) == original_skeletons[header_path]
+    assert xml_skeleton(updated_footer) == original_skeletons[footer_path]
+    ET.fromstring(updated_header.encode("utf-8"))
+    ET.fromstring(updated_footer.encode("utf-8"))
+    assert any("Inferred architect section tokens" in line for line in log)
+
+    # A truthy partial source-token map must still use the corroborated textbox
+    # slots. The target may legitimately contain the old title as a prefix.
+    header_path.write_text(header_xml, encoding="utf-8")
+    footer_path.write_text(footer_xml, encoding="utf-8")
+    patch_header_footer_tokens(
+        target_extract_dir=tmp_path,
+        source_tokens={"SectionTitle": "MISCELLANEOUS METALS"},
+        target_tokens={
+            "SectionID": "SECTION 012900",
+            "SectionTitle": "MISCELLANEOUS METAL ASSEMBLIES",
+        },
+        log=[],
+        part_names=["word/header1.xml", "word/footer1.xml"],
+    )
+    partial_header = header_path.read_text(encoding="utf-8")
+    partial_footer = footer_path.read_text(encoding="utf-8")
+    partial_header_visible = "".join(
+        re.findall(r"<w:t\b[^>]*>([\s\S]*?)</w:t>", partial_header)
+    )
+    partial_footer_visible = "".join(
+        re.findall(r"<w:t\b[^>]*>([\s\S]*?)</w:t>", partial_footer)
+    )
+    assert partial_header_visible.count("Miscellaneous Metal Assemblies") == 2
+    assert partial_footer_visible.count("Miscellaneous Metal Assemblies.docx") == 2
+    assert partial_header_visible.count("Miscellaneous Metal Project No. 60546407") == 2
+
+    # A complete explicit source map guides inference to its shell and leaves
+    # mirrored cross-references to other sections untouched.
+    related_section = mirrored_textbox(
+        runs("SECTION", " ", "01", " ", "00", " ", "00")
+    )
+    header_path.write_text(
+        header_xml.replace("</w:hdr>", f"{related_section}</w:hdr>"),
+        encoding="utf-8",
+    )
+    footer_path.write_text(footer_xml, encoding="utf-8")
+    patch_header_footer_tokens(
+        target_extract_dir=tmp_path,
+        source_tokens={
+            "SectionID": "SECTION 05 50 00",
+            "SectionTitle": "MISCELLANEOUS METALS",
+        },
+        target_tokens={
+            "SectionID": "SECTION 012900",
+            "SectionTitle": "PAYMENT PROCEDURES",
+        },
+        log=[],
+        part_names=["word/header1.xml", "word/footer1.xml"],
+    )
+    explicit_header = header_path.read_text(encoding="utf-8")
+    explicit_header_visible = "".join(
+        re.findall(r"<w:t\b[^>]*>([\s\S]*?)</w:t>", explicit_header)
+    )
+    assert explicit_header_visible.count("SECTION 01 00 00") == 2
+    assert explicit_header_visible.count("SECTION 01\u00a029\t00") == 2
+
+    header_path.write_text(header_xml, encoding="utf-8")
+    footer_path.write_text(footer_xml, encoding="utf-8")
+    with pytest.raises(ValueError, match="Explicit architect SectionID conflicts"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={
+                "SectionID": "SECTION 01 29 00",
+                "SectionTitle": "PAYMENT PROCEDURES",
+            },
+            target_tokens={
+                "SectionID": "SECTION 012900",
+                "SectionTitle": "PAYMENT PROCEDURES",
+            },
+            log=[],
+            part_names=["word/header1.xml", "word/footer1.xml"],
+        )
+    assert header_path.read_text(encoding="utf-8") == header_xml
+    assert footer_path.read_text(encoding="utf-8") == footer_xml
+
+
 def test_import_reports_and_remaps_direct_header_numbering(tmp_path):
     extract = _seed_extract(tmp_path)
     registry = {
