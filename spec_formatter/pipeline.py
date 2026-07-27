@@ -94,13 +94,9 @@ class TargetFormatResult:
     audit_summary: dict[str, int] = field(default_factory=_empty_audit_summary)
     audit: dict[str, Any] = field(default_factory=dict)
     numbering_checks: dict[str, Any] = field(default_factory=dict)
-<<<<<<< HEAD
-    stage: Optional[str] = None
-=======
     # Structured, redaction-safe phase-timing/count events for this target,
     # folded into the run-wide diagnostics recorder before publication.
     diagnostics: tuple[dict[str, Any], ...] = ()
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
 
 
 @dataclass(frozen=True)
@@ -1210,13 +1206,9 @@ def _format_one_target(
     audit_summary = _empty_audit_summary()
     audit: dict[str, Any] = {}
     numbering_checks: dict[str, Any] = {}
-<<<<<<< HEAD
-    stage: Optional[str] = None
-=======
     # Structured pipeline-side phase events (snapshot/publish) interleaved with
     # the engine's own phase events.  Carries counts/timings only, never text.
     diag_events: list[dict[str, Any]] = []
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
     try:
         stage = "processing"
         if on_started is not None:
@@ -1240,22 +1232,8 @@ def _format_one_target(
             role_specs=shared.role_specs,
             conversion_mode=conversion_mode,
         )
-<<<<<<< HEAD
-        # The processor writes into an isolated staging directory. Its final
-        # path diagnostics therefore point at files that are deleted when the
-        # job temp directory closes. The public result already carries the
-        # durable published path, so never replay or persist staging paths.
-        staging_marker = os.path.normcase(str(staging_dir))
-        processor_log = tuple(
-            line
-            for line in result.log
-            if not str(line).lstrip().startswith("Output:")
-            and staging_marker not in os.path.normcase(str(line))
-        )
-=======
         processor_log = tuple(result.log)
         diag_events.extend(getattr(result, "diagnostics", None) or [])
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         conversion_report = result.conversion_report
         audit_summary = _normalize_audit_summary(
             getattr(result, "audit_summary", None)
@@ -1278,11 +1256,7 @@ def _format_one_target(
                 audit_summary=audit_summary,
                 audit=audit,
                 numbering_checks=numbering_checks,
-<<<<<<< HEAD
-                stage=stage,
-=======
                 diagnostics=tuple(diag_events),
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
             )
         stage = "publication"
         if result.output_path is None or not result.output_path.is_file():
@@ -1306,11 +1280,7 @@ def _format_one_target(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
-<<<<<<< HEAD
-            stage=getattr(result, "stage", None) or "complete",
-=======
             diagnostics=tuple(diag_events),
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         )
     except Exception as exc:
         return TargetFormatResult(
@@ -1325,11 +1295,7 @@ def _format_one_target(
             audit_summary=audit_summary,
             audit=audit,
             numbering_checks=numbering_checks,
-<<<<<<< HEAD
-            stage=stage,
-=======
             diagnostics=tuple(diag_events),
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         )
 
 
@@ -1745,10 +1711,6 @@ def format_specifications(
     then every target is processed independently so one bad target does not
     discard successful outputs. ``conversion_mode`` selects either formatting
     only or fail-closed CSI-to-Canadian hierarchy conversion in the same run.
-<<<<<<< HEAD
-    The legacy ``progress`` callback continues to receive plain strings;
-    ``progress_event`` additionally receives the UTC occurrence time.
-=======
 
     ``diagnostics_level`` (``debug``/``info``/``warning``/``error``) controls how
     much of the structured diagnostics stream is persisted to
@@ -1756,23 +1718,15 @@ def format_specifications(
     ``SPEC_FORMATTER_DIAGNOSTICS_LEVEL`` environment variable overrides it so a
     field build can be asked for verbose diagnostics without a code change.
     Diagnostics never contain secrets or document text.
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
     """
 
     started_utc = _utc_now()
     events: list[str] = []
-<<<<<<< HEAD
-    pending_events: queue.SimpleQueue[tuple[datetime, str]] = queue.SimpleQueue()
-    event_order_lock = threading.Lock()
-    event_owner_thread = threading.get_ident()
-    last_event_at: Optional[datetime] = None
-=======
     resolved_level = diag.level_from_name(
         os.environ.get("SPEC_FORMATTER_DIAGNOSTICS_LEVEL", "") or diagnostics_level,
         default=diag.INFO,
     )
     recorder = diag.DiagnosticsRecorder(min_level=resolved_level)
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
 
     def enqueue_event(
         message: str,
@@ -1883,11 +1837,7 @@ def format_specifications(
         planned_outputs = _plan_output_paths(targets, run_dir, conversion_mode)
         _validate_output_plan(architect, targets, planned_outputs)
     except Exception as exc:
-<<<<<<< HEAD
-        drain_reported_events()
-=======
         recorder.error("pipeline", "init_failed", error_type=type(exc).__name__.lower())
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
         manifest_path = _write_initialization_failure_artifacts(
             run_id=run_id,
             conversion_mode=conversion_mode,
@@ -1916,12 +1866,7 @@ def format_specifications(
     ) as job_temp:
         job_root = Path(job_temp)
         with ThreadPoolExecutor(max_workers=workers) as executor:
-<<<<<<< HEAD
-            futures: dict[Future[TargetFormatResult], Path] = {}
-
-=======
             futures: dict[Future[TargetFormatResult], tuple[int, Path]] = {}
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
             for index, target in enumerate(targets):
                 staging_dir = job_root / f"t{index:04d}"
                 report(f"Queued {index + 1} of {len(targets)}: {target.name}")
@@ -1940,21 +1885,6 @@ def format_specifications(
                         f"{target.name}"
                     ),
                 )
-<<<<<<< HEAD
-                futures[future] = target
-                # A very fast worker may have started before ``submit``
-                # returns. Surface that event before queuing the next target.
-                drain_reported_events()
-
-            completed = 0
-            pending = set(futures)
-            while pending:
-                drain_reported_events()
-                done, pending = wait(
-                    pending,
-                    timeout=0.05,
-                    return_when=FIRST_COMPLETED,
-=======
                 futures[future] = (index + 1, target)
 
             completed = 0
@@ -1994,7 +1924,6 @@ def format_specifications(
                     f"ignored={counts.get('ignored', 0)}, "
                     f"out_of_scope={counts.get('out_of_scope', 0)}, "
                     f"unresolved={counts.get('unresolved', 0)}"
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
                 )
                 drain_reported_events()
                 for future in done:
