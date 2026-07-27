@@ -23,11 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
-<<<<<<< HEAD
-from . import __version__ as APPLICATION_VERSION
-=======
 from . import diagnostics as diag
->>>>>>> 769bf0ca3a9a2744c852a1a23a7b3e5f88efb5b3
 from . import template_analysis
 from .style_application.batch_runner import (
     BatchResult,
