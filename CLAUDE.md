@@ -450,5 +450,14 @@ is deliberately not an OSI-approved open source license.
 
 Third-party dependency licenses are inventoried in `THIRD_PARTY_NOTICES.md`.
 All runtime dependencies are permissive except `certifi` (MPL-2.0, file-level
-copyleft, bundled unmodified). Keep that file current when dependency pins in
-`requirements*.txt` change, and ship it with every binary distribution.
+copyleft, bundled unmodified).
+
+That file is generated, never hand-edited, by
+`packaging/windows/generate_third_party_notices.py`. It resolves the full
+runtime closure of `requirements.txt` -- transitive dependencies included, with
+environment markers evaluated for the target platform -- and reproduces each
+distribution's own license file. The Windows release workflow regenerates it
+from the real build environment before PyInstaller runs, so the shipped notices
+always match the shipped code. Do not maintain the dependency list by hand:
+`requirements.txt` pins only direct dependencies, so a hand-written list silently
+omits whatever pip resolves underneath them.
