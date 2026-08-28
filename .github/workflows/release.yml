@@ -100,6 +100,17 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-build.txt
 
+      - name: Generate third-party notices from the build environment
+        shell: pwsh
+        # requirements.txt pins only the direct dependencies, so the transitive
+        # packages pip resolves (keyring alone pulls in jaraco.*, zipp,
+        # more-itertools, importlib-metadata and backports.tarfile) would
+        # otherwise be frozen into the app with no attribution. Regenerating
+        # here, from the environment that is about to be frozen, keeps the
+        # shipped notices matched to the shipped code. The spec bundles this
+        # file into the one-folder output.
+        run: python packaging/windows/generate_third_party_notices.py
+
       - name: Build one-folder app (PyInstaller)
         shell: pwsh
         run: pyinstaller packaging/windows/specification-formatter.spec --noconfirm --clean

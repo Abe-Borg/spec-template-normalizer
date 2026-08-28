@@ -36,6 +36,11 @@ AppUpdatesURL={#MyAppURL}/releases/latest
 DefaultDirName={autopf}\Specification Formatter
 DefaultGroupName=Specification Formatter
 DisableProgramGroupPage=yes
+; Specification Formatter is source-available under the PolyForm Noncommercial
+; License 1.0.0: commercial use needs a separate license, so the installer puts
+; the user on notice rather than burying the terms in the app folder. Drop this
+; line if the extra wizard page is not wanted.
+LicenseFile=..\..\LICENSE
 ; Per-user install: no admin/UAC prompt, which keeps the unsigned experience as
 ; smooth as possible (the user only sees the one SmartScreen notice, not an
 ; elevation prompt on top of it).

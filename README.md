@@ -360,10 +360,26 @@ the public unified application. It verifies all 121 inherited automatic list
 items, the 19 critical markers, `GENERAL` as `PART`, byte-stable ignored XML,
 and the architect shell without any sibling-repository dependency.
 
-## Copyright Notice
+## License
 
-**Copyright 2025 Abraham Borg. All Rights Reserved.**
+**Copyright 2025 Abraham Borg.**
 
-This software and associated documentation files are proprietary. Unauthorized
-copying, modification, distribution, or use is prohibited without the copyright
-holder's express written permission.
+Specification Formatter is released under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). It is **source-available**, not
+open source in the [OSI](https://opensource.org/osd) sense, because the Open
+Source Definition does not permit a restriction on commercial use.
+
+You may read, run, modify, fork, and redistribute this software for **any
+noncommercial purpose**, including personal projects, study, research,
+education, and use by charities, public research organizations, and government
+institutions. Redistribution must carry the license and the `Required Notice`
+line at the top of `LICENSE`.
+
+**Commercial use requires a separate license.** Using this software in the
+course of a business — including formatting specifications on a paid project —
+is not covered by the PolyForm grant. Open an issue or contact the copyright
+holder to arrange commercial terms.
+
+Third-party components bundled with the application are licensed by their own
+copyright holders under their own terms; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
