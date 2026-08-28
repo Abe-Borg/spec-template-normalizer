@@ -90,6 +90,15 @@ datas += [
     ),
 ]
 
+# The app's own license plus third-party attribution. The MIT, BSD, Apache, PSF,
+# and MPL components collected above all require their notices to accompany a
+# binary distribution, so these must ship in the one-folder output -- the
+# installer copies the folder wholesale, and the About dialog points at them.
+datas += [
+    (os.path.join(_REPO_ROOT, "LICENSE"), "."),
+    (os.path.join(_REPO_ROOT, "THIRD_PARTY_NOTICES.md"), "."),
+]
+
 a = Analysis(
     [os.path.join(SPECPATH, "app_entry.py")],
     pathex=[_REPO_ROOT],

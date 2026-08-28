@@ -443,4 +443,12 @@ Before considering a formatter change complete:
 
 Runtime is Python 3.9+ with Windows as the primary GUI platform. Core package processing is intended to remain portable.
 
-Copyright 2025 Abraham Borg. All Rights Reserved. Proprietary software; no license is granted without written permission.
+Copyright 2025 Abraham Borg. Released under the PolyForm Noncommercial License
+1.0.0 (`LICENSE`): source-available, with noncommercial use, modification, and
+redistribution permitted, and commercial use requiring a separate license. This
+is deliberately not an OSI-approved open source license.
+
+Third-party dependency licenses are inventoried in `THIRD_PARTY_NOTICES.md`.
+All runtime dependencies are permissive except `certifi` (MPL-2.0, file-level
+copyleft, bundled unmodified). Keep that file current when dependency pins in
+`requirements*.txt` change, and ship it with every binary distribution.

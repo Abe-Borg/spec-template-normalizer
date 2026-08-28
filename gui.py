@@ -1256,10 +1256,14 @@ class App(ctk.CTk):
                     ("link", "View releases on GitHub", updates.releases_page_url()),
                 ),
                 (
-                    "Copyright",
-                    "Copyright 2025 Abraham Borg. All Rights Reserved. "
-                    "Proprietary software; no license is granted without "
-                    "written permission.",
+                    "License",
+                    "Copyright 2025 Abraham Borg. Released under the PolyForm "
+                    "Noncommercial License 1.0.0. Noncommercial use, "
+                    "modification, and redistribution are permitted; "
+                    "commercial use requires a separate license from the "
+                    "copyright holder. Bundled third-party components are "
+                    "licensed by their own copyright holders — see "
+                    "THIRD_PARTY_NOTICES.md, installed alongside this app.",
                 ),
             ],
         )
