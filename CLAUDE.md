@@ -128,6 +128,19 @@ Automatic numbering evidence precedes text-only heuristics. An automatically
 numbered paragraph whose stored text is `GENERAL` can be a PART, while an
 automatically numbered requirement beginning `Section ...` is not a SectionID.
 
+Text-only PART/ARTICLE hits are deterministic only when the rest of the line
+is shaped like a heading: empty, or starting with a capital letter or digit,
+not ending like a sentence, and at most about twelve words. `1.01 SUMMARY`,
+`PART 1 - GENERAL`, and `1.1 General requirements` qualify; `1.5 times the
+pipe diameter shall be maintained.` and `PART 1 of the Contract Documents
+shall govern.` are left for the model. A section header whose remainder
+names a second `SECTION <number>` is a cross-reference, not a SectionID. A
+typed single-letter marker `i.`/`v.`/`x.` (any case, any of the `x.`, `x)`,
+`(x)` styles) may be a roman numeral, so it is deterministic only when the
+previous paragraph carries the preceding letter in the same style. A
+deterministic text-only classification cannot be overridden by the model, so
+when in doubt the heuristics return nothing.
+
 ### 5. Architect formatting is source-derived and collision-safe
 
 The LLM selects roles/dispositions, not XML formatting. Role styles come from

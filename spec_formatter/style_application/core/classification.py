@@ -37,7 +37,7 @@ from .style_import import (
     ensure_explicit_numpr_from_current_style,
 )
 from .ooxml_text import read_xml_text, write_xml_text
-from .section_numbers import SECTION_HEADING_RE
+from .section_numbers import LABELED_SECTION_RE, SECTION_HEADING_RE
 
 
 def _load_prompt_text(filename: str) -> str:
@@ -156,18 +156,101 @@ _MARKER_RX = [
 ]
 
 
+_HEADING_SEPARATORS = " \t\u00a0-\u2010\u2011\u2012\u2013\u2014\u2015:"
+_SENTENCE_TERMINAL_RX = re.compile(r"[.!?;]$")
+_HEADING_MAX_WORDS = 12
+_ROMAN_AMBIGUOUS_LETTERS = frozenset("ivx")
+_ALPHA_MARKER_RXS = (
+    (re.compile(r"^\s*([A-Za-z])\.\s+"), "dot"),
+    (re.compile(r"^\s*([a-z])\)\s+"), "paren"),
+    (re.compile(r"^\s*\(([a-z])\)\s+"), "parens"),
+)
+
+
+def _heading_remainder_ok(remainder: str) -> bool:
+    """Whether the text after a PART/ARTICLE marker is shaped like a heading.
+
+    Headings are short, start with a capital letter or a digit, and do not
+    end like a sentence. Prose that merely begins with a decimal number or the
+    word PART (``1.5 times the pipe diameter shall be maintained.``,
+    ``PART 1 of the Contract Documents shall govern.``) fails those tests and
+    is left for the model instead of being locked in as a wrong role.
+    ``1.01 SUMMARY``, ``PART 1 - GENERAL``, and ``1.1 General requirements``
+    all pass.
+    """
+
+    remainder = remainder.strip()
+    if not remainder:
+        return True
+    if not (remainder[0].isupper() or remainder[0].isdigit()):
+        return False
+    if _SENTENCE_TERMINAL_RX.search(remainder):
+        return False
+    return len(remainder.split()) <= _HEADING_MAX_WORDS
+
+
+def _match_marker_heading(
+    pattern: "re.Pattern[str]",
+    text: str,
+) -> Optional[re.Match[str]]:
+    match = pattern.match(text)
+    if match is None:
+        return None
+    remainder = text[match.end():].strip(_HEADING_SEPARATORS)
+    return match if _heading_remainder_ok(remainder) else None
+
+
+def _match_part_heading(text: str) -> Optional[re.Match[str]]:
+    return _match_marker_heading(_PART_RX, text)
+
+
+def _match_article_heading(text: str) -> Optional[re.Match[str]]:
+    return _match_marker_heading(_ARTICLE_RX, text)
+
+
 def _match_section_header(text: str) -> Optional[re.Match[str]]:
     """Match a section header without consuming sentence-form cross-references."""
 
     match = SECTION_HEADING_RE.match(text)
     if match is None:
         return None
-    remainder = text[match.end():].strip(
-        " \t\u00a0-\u2010\u2011\u2012\u2013\u2014\u2015:"
-    )
+    remainder = text[match.end():].strip(_HEADING_SEPARATORS)
     if remainder and not _ALL_CAPS_RX.fullmatch(remainder):
         return None
+    # ``SECTION 23 05 00 AND SECTION 23 07 00 APPLY`` names two sections; it
+    # is a cross-reference, not the header of this section.
+    if LABELED_SECTION_RE.search(remainder):
+        return None
     return match
+
+
+def _alpha_marker(text: str) -> Optional[Tuple[str, str]]:
+    """Return ``(style, letter)`` for a typed single-letter list marker."""
+
+    for pattern, style in _ALPHA_MARKER_RXS:
+        match = pattern.match(text or "")
+        if match is not None:
+            return style, match.group(1)
+    return None
+
+
+def _roman_ambiguous_marker_is_unresolved(text: str, prev_text: str) -> bool:
+    """``i.``/``v.``/``x.`` (any case) may be roman numerals, not letters.
+
+    Such a marker is treated as an alphabetic level only when the previous
+    paragraph carries the preceding letter in the same marker style
+    (``H.`` before ``I.``, ``u)`` before ``v)``); otherwise it is left for the
+    model, which sees the surrounding hierarchy.
+    """
+
+    marker = _alpha_marker(text)
+    if marker is None or marker[1].lower() not in _ROMAN_AMBIGUOUS_LETTERS:
+        return False
+    previous = _alpha_marker(prev_text)
+    if previous is None:
+        return True
+    style, letter = marker
+    return previous != (style, chr(ord(letter) - 1))
 
 
 def _table_ranges(document_xml_text: str) -> List[Tuple[int, int]]:
@@ -566,13 +649,15 @@ def _deterministic_role_for_paragraph(paragraph: Dict[str, Any], prev_text: str 
     if _END_OF_SECTION_RX.match(text):
         return "END_OF_SECTION"
     if _PART_RX.match(text):
-        return "PART"
+        return "PART" if _match_part_heading(text) else None
     if _ARTICLE_RX.match(text):
-        return "ARTICLE"
+        return "ARTICLE" if _match_article_heading(text) else None
     if prev_text and _match_section_header(prev_text) and _ALL_CAPS_RX.match(text):
         return "SectionTitle"
 
     marker_type = paragraph.get("marker_type")
+    if _roman_ambiguous_marker_is_unresolved(text, prev_text):
+        return None
     if marker_type == "upper_alpha":
         return "PARAGRAPH"
     if marker_type == "number":
