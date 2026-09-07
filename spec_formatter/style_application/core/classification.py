@@ -37,6 +37,7 @@ from .style_import import (
     ensure_explicit_numpr_from_current_style,
 )
 from .ooxml_text import read_xml_text, write_xml_text
+from .section_numbers import SECTION_HEADING_RE
 
 
 def _load_prompt_text(filename: str) -> str:
@@ -129,10 +130,6 @@ _BOILERPLATE_RX = [(re.compile(pat, flags=re.MULTILINE), tag) for pat, tag in BO
 
 _PART_RX = re.compile(r"^\s*PART\s+[123]\b", re.IGNORECASE)
 _ARTICLE_RX = re.compile(r"^\s*\d{1,2}\.\d{1,3}\b")
-_SECTION_ID_RX = re.compile(
-    r"^\s*SECTION\s+(?:\d{6,}|\d{2}(?:[ \t\u00a0]+\d{2}){2,})\b",
-    re.IGNORECASE,
-)
 _END_OF_SECTION_RX = re.compile(r"^\s*END\s+OF\s+SECTION\s*", re.IGNORECASE)
 _ALL_CAPS_RX = re.compile(r"^[^a-z]*[A-Z][^a-z]*$")
 _EDITORIAL_COMMENT_STYLE_IDS = frozenset({"CMT"})
@@ -158,7 +155,7 @@ _MARKER_RX = [
 def _match_section_header(text: str) -> Optional[re.Match[str]]:
     """Match a section header without consuming sentence-form cross-references."""
 
-    match = _SECTION_ID_RX.match(text)
+    match = SECTION_HEADING_RE.match(text)
     if match is None:
         return None
     remainder = text[match.end():].strip(

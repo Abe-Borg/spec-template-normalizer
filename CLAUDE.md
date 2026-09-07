@@ -207,7 +207,7 @@ Allowed roles and reserved generated style IDs are:
 | `SUBPARAGRAPH_LEVEL_8` | `CSI_SubparagraphLevel8__ARCH` |
 | `END_OF_SECTION` | `CSI_EndOfSection__ARCH` |
 
-Role expectations come from text signals and effective Word numbering, including numbering inherited through paragraph styles. Do not treat arbitrary `A.`, `1.`, or `a.` text globally as proof of CSI hierarchy. Validate exemplars, role/style coherence, numbering family/level coverage, style inheritance, and style references against the source catalogs.
+Role expectations come from text signals and effective Word numbering, including numbering inherited through paragraph styles. Do not treat arbitrary `A.`, `1.`, or `a.` text globally as proof of CSI hierarchy. Section numbers (`230500`, `23 05 00`, `23 0500`, `23 05 00.13`) are recognised by the one grammar in `spec_formatter/style_application/core/section_numbers.py`; the classifier, the target token extractor, and the header/footer token patcher must all consume it rather than carrying their own regex. Validate exemplars, role/style coherence, numbering family/level coverage, style inheritance, and style references against the source catalogs.
 
 ## Module responsibilities
 

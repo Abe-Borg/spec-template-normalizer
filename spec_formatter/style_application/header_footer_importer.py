@@ -25,6 +25,14 @@ from .core.opc_paths import (
     resolve_internal_relationship_target,
 )
 from .core.section_mapping import choose_section_sources
+from .core.section_numbers import (
+    LABELED_SECTION_RE as _LABELED_SECTION_RE,
+    SECTION_NUMBER_BOUNDARY,
+    SECTION_NUMBER_PATTERN,
+    canonical_section_number as _canonical_section_number,
+    render_section_number_like as _render_numeric_like,
+    section_number_display_form,
+)
 from .core.sectpr_tools import (
     canonical_sectpr_order_index,
     child_tag_name,
@@ -757,17 +765,12 @@ def import_headers_footers(target_extract_dir: Path, registry: Dict[str, Any], l
 
 
 _WT_PATTERN = re.compile(r"(<w:t\b[^>]*>)([\s\S]*?)(</w:t>)")
-_SECTION_NUMBER_PATTERN = r"\d{2}(?:[ \t\u00a0]*\d{2}){2}"
-_LABELED_SECTION_RE = re.compile(
-    rf"\bSECTION\s+(?P<number>{_SECTION_NUMBER_PATTERN})(?!\d)",
-    flags=re.IGNORECASE,
-)
 _LABELED_DIVISION_RE = re.compile(
     r"\bDIVISION\s+(?P<number>\d{2})(?!\d)",
     flags=re.IGNORECASE,
 )
 _SECTION_FILENAME_RE = re.compile(
-    rf"(?<!\d)(?P<number>{_SECTION_NUMBER_PATTERN})\s+"
+    rf"(?<![\w.])(?P<number>{SECTION_NUMBER_PATTERN}){SECTION_NUMBER_BOUNDARY}\s+"
     r"(?P<title>[^\r\n<>]+?)\.docx\b",
     flags=re.IGNORECASE,
 )
@@ -800,11 +803,6 @@ def _textbox_texts(xml_text: str) -> List[str]:
         )
         if (text := _w_text(block).strip())
     ]
-
-
-def _canonical_section_number(value: str) -> str:
-    digits = re.sub(r"\D", "", value or "")
-    return digits if len(digits) == 6 else ""
 
 
 def _bounded_text_ranges(text: str, token: str) -> List[Tuple[int, int]]:
@@ -1095,27 +1093,6 @@ def _infer_header_footer_tokens(
                     "imported header/footer shells"
                 )
     return inferred
-
-
-def _render_numeric_like(source_form: str, target_numeric: str) -> str:
-    digit_groups = list(re.finditer(r"\d+", source_form))
-    if (
-        not digit_groups
-        or sum(len(match.group(0)) for match in digit_groups)
-        != len(target_numeric)
-    ):
-        return target_numeric
-    pieces: List[str] = []
-    source_cursor = 0
-    target_cursor = 0
-    for match in digit_groups:
-        pieces.append(source_form[source_cursor:match.start()])
-        group_length = len(match.group(0))
-        pieces.append(target_numeric[target_cursor:target_cursor + group_length])
-        source_cursor = match.end()
-        target_cursor += group_length
-    pieces.append(source_form[source_cursor:])
-    return "".join(pieces)
 
 
 def _replace_visible_ranges(
@@ -1457,11 +1434,7 @@ def _validate_inferred_patch_postconditions(
 
 
 def _extract_numeric_from_section_id(value: str) -> str:
-    m = re.search(r"SECTION\s+([\d\s]+)", value or "", flags=re.IGNORECASE)
-    if m:
-        return re.sub(r"\s+", " ", m.group(1)).strip()
-    digits = re.findall(r"\d+", value or "")
-    return " ".join(digits).strip()
+    return section_number_display_form(value)
 
 
 def patch_header_footer_tokens(

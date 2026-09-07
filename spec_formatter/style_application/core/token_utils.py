@@ -5,6 +5,12 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .ooxml_text import read_xml_text
+from .section_numbers import (
+    SECTION_NUMBER_BOUNDARY,
+    SECTION_NUMBER_PATTERN,
+    canonical_section_number,
+    section_number_display_form,
+)
 from .xml_helpers import iter_paragraph_xml_blocks, paragraph_text_from_block
 
 
@@ -18,7 +24,7 @@ PRESERVE_ACRONYMS = {
 
 _COMBINED_SECTION_HEADING_RE = re.compile(
     r"^\s*SECTION\s+"
-    r"(?P<section>\d{2}(?:[ \t\u00a0]*\d{2}){2})"
+    rf"(?P<section>{SECTION_NUMBER_PATTERN}){SECTION_NUMBER_BOUNDARY}"
     r"\s*[-\u2010\u2011\u2012\u2013\u2014\u2015:]\s*"
     r"(?P<title>\S(?:.*\S)?)\s*$",
     flags=re.IGNORECASE,
@@ -82,9 +88,9 @@ def extract_target_tokens(extract_dir: Path, classifications: Dict[str, Any]) ->
         text = paragraph_text_from_block(para_blocks[idx][2]).strip()
         if role == "SectionID" and "SectionID" not in tokens:
             tokens["SectionID"] = text
-            m = re.match(r"SECTION\s+([\d\s]+)", text, flags=re.IGNORECASE)
-            if m:
-                tokens["SectionID_numeric"] = re.sub(r"\s+", " ", m.group(1)).strip()
+            numeric_form = section_number_display_form(text)
+            if numeric_form:
+                tokens["SectionID_numeric"] = numeric_form
         if role == "SectionTitle" and "SectionTitle" not in tokens:
             tokens["SectionTitle"] = text
             tokens["SectionTitle_display"] = smart_title_case(text)
@@ -109,9 +115,9 @@ def extract_target_tokens(extract_dir: Path, classifications: Dict[str, Any]) ->
             match = _COMBINED_SECTION_HEADING_RE.fullmatch(text)
             if match is None:
                 continue
-            section_numeric = re.sub(r"\D", "", match.group("section"))
+            section_numeric = canonical_section_number(match.group("section"))
             title = match.group("title").strip()
-            if len(section_numeric) != 6 or not title:
+            if not section_numeric or not title:
                 continue
             combined_headings.add((section_numeric, title))
 
@@ -126,7 +132,9 @@ def extract_target_tokens(extract_dir: Path, classifications: Dict[str, Any]) ->
                     tokens.get("SectionID_numeric")
                     or tokens.get("SectionID", "")
                 )
-                compatible = re.sub(r"\D", "", existing_id) == section_numeric
+                compatible = canonical_section_number(
+                    section_number_display_form(existing_id)
+                ) == section_numeric
             if compatible and "SectionTitle" in tokens:
                 compatible = (
                     re.sub(r"\s+", " ", tokens["SectionTitle"]).strip().casefold()

@@ -543,6 +543,11 @@ def test_preclassify_markers():
         "SECTION 012900 - PAYMENT PROCEDURES",
         "SECTION 01 29 00",
         "SECTION 01\u00a029\u00a000 - PAYMENT PROCEDURES",
+        # Mixed grouping and MasterFormat level-4 numbers share the one
+        # section-number grammar with the token extractor and patcher.
+        "SECTION 23 0500",
+        "SECTION 23 05 00.13",
+        "SECTION 230500.13 - COMMON MOTOR REQUIREMENTS",
     ],
 )
 def test_section_header_number_formats_are_preclassified(text):
@@ -552,6 +557,24 @@ def test_section_header_number_formats_are_preclassified(text):
     )
 
     assert out == {0: "SectionID"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SECTION 2305001",
+        "SECTION 23050013",
+        "SECTION 230500.1",
+        "SECTION 230500A",
+    ],
+)
+def test_malformed_section_numbers_are_not_preclassified(text):
+    out = preclassify_paragraphs(
+        [{"paragraph_index": 0, "text": text, "in_table": False}],
+        ["SectionID", "SectionTitle", "PART"],
+    )
+
+    assert out == {}
 
 
 def test_combined_section_header_without_template_role_is_preserved_unclassified(
