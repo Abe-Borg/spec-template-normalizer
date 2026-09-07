@@ -1,3 +1,4 @@
+import pytest
 from inspect import signature
 from pathlib import Path
 
@@ -192,3 +193,29 @@ def test_imported_architect_tokens_can_be_inferred_when_source_map_is_empty(
         "word/footer1.xml",
         "word/header1.xml",
     ]
+
+
+def test_runner_wrapper_fails_closed_when_target_cannot_fill_an_imported_slot(tmp_path):
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+    footer = word_dir / "footer1.xml"
+    footer.write_text(
+        '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:p><w:r><w:t>SECTION 01 00 00</w:t></w:r></w:p></w:ftr>",
+        encoding="utf-8",
+    )
+    original = footer.read_bytes()
+    log: list[str] = []
+
+    with pytest.raises(ValueError, match="requires a recognisable target SectionID"):
+        _patch_header_footer_tokens_if_imported(
+            tmp_path,
+            {"header_footer_import": {"part_names": {"word/footer1.xml"}}},
+            {"SectionID": "SECTION 01 00 00"},
+            {},
+            log,
+        )
+
+    assert footer.read_bytes() == original
+    assert not any("preserved target tokens unchanged" in line for line in log)
+

@@ -312,6 +312,12 @@ only in proven `SECTION`, `DIVISION`, standalone-title, and same-section
 filename slots. This includes mirrored DrawingML/VML text boxes. The patch
 preserves the architect's number separators and every non-text OOXML byte, and
 fails closed when the source shell or target section identity is ambiguous.
+Completeness is judged against the slots actually present in the imported
+parts: if they carry the architect's section number the target must supply a
+recognisable `SectionID`, if they carry the architect's title the target must
+supply a `SectionTitle`, and every patched part is re-read to prove that no
+architect section number or title survived. A target that cannot fill a slot
+fails instead of publishing a header that still names the architect's section.
 
 ## Safety guarantees
 

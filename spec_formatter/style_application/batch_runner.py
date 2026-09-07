@@ -311,9 +311,14 @@ def _patch_header_footer_tokens_if_imported(
     target_tokens: Optional[Dict[str, str]],
     log: List[str],
 ) -> bool:
-    """Patch project tokens only in architect parts imported during this run."""
-    if not target_tokens:
-        return False
+    """Patch project tokens only in architect parts imported during this run.
+
+    Once architect parts have been imported the patcher always runs, even when
+    the target supplied no tokens at all: it decides from the slots actually
+    present in those parts whether the target must supply a SectionID or a
+    SectionTitle, and raises when it cannot fill one. Shipping the architect's
+    section number in a target's header is never an acceptable outcome.
+    """
     imported_parts = env_result.get("header_footer_import", {}).get("part_names", set())
     if not imported_parts:
         log.append(
@@ -323,7 +328,7 @@ def _patch_header_footer_tokens_if_imported(
     patch_header_footer_tokens(
         extract_dir,
         source_tokens or {},
-        target_tokens,
+        target_tokens or {},
         log,
         part_names=sorted(imported_parts),
     )

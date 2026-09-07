@@ -38,12 +38,16 @@ SECTION_NUMBER_PATTERN = (
 )
 
 #: Boundary that stops a section number from being read out of a longer digit
-#: run, an identifier, or a partial level-4 suffix such as ``230500.1``.
-SECTION_NUMBER_BOUNDARY = r"(?!\w)(?!\.\d)"
+#: run, a letter-adjacent identifier, or a partial level-4 suffix such as
+#: ``230500.1``. Underscores are allowed neighbours so a footer filename such
+#: as ``233100_Metal Ducts.docx`` still exposes its number.
+SECTION_NUMBER_BOUNDARY = r"(?![A-Za-z0-9])(?!\.\d)"
+_SECTION_NUMBER_LEFT_BOUNDARY = r"(?<![A-Za-z0-9.])"
 
 #: A section number anywhere in text, exposed as the ``number`` group.
 SECTION_NUMBER_RE = re.compile(
-    rf"(?<![\w.])(?P<number>{SECTION_NUMBER_PATTERN}){SECTION_NUMBER_BOUNDARY}"
+    rf"{_SECTION_NUMBER_LEFT_BOUNDARY}(?P<number>{SECTION_NUMBER_PATTERN})"
+    rf"{SECTION_NUMBER_BOUNDARY}"
 )
 
 #: ``SECTION <number>`` at the start of a paragraph, exposed as ``number``.

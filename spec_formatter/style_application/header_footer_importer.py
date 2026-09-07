@@ -29,6 +29,7 @@ from .core.section_numbers import (
     LABELED_SECTION_RE as _LABELED_SECTION_RE,
     SECTION_NUMBER_BOUNDARY,
     SECTION_NUMBER_PATTERN,
+    SECTION_NUMBER_RE,
     canonical_section_number as _canonical_section_number,
     render_section_number_like as _render_numeric_like,
     section_number_display_form,
@@ -770,7 +771,7 @@ _LABELED_DIVISION_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _SECTION_FILENAME_RE = re.compile(
-    rf"(?<![\w.])(?P<number>{SECTION_NUMBER_PATTERN}){SECTION_NUMBER_BOUNDARY}\s+"
+    rf"(?<![A-Za-z0-9.])(?P<number>{SECTION_NUMBER_PATTERN}){SECTION_NUMBER_BOUNDARY}\s+"
     r"(?P<title>[^\r\n<>]+?)\.docx\b",
     flags=re.IGNORECASE,
 )
@@ -806,12 +807,19 @@ def _textbox_texts(xml_text: str) -> List[str]:
 
 
 def _bounded_text_ranges(text: str, token: str) -> List[Tuple[int, int]]:
+    """Every occurrence of ``token`` not glued to a letter or digit.
+
+    Underscores and punctuation are legitimate neighbours (a footer filename
+    such as ``233100_Metal Ducts.docx``), letters and digits are not
+    (``METAL`` inside ``METALS`` or ``SHEETMETAL``).
+    """
+
     if not token:
         return []
     return [
         match.span()
         for match in re.finditer(
-            rf"(?<![\w]){re.escape(token)}(?![\w])",
+            rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])",
             text,
         )
     ]
@@ -1437,6 +1445,134 @@ def _extract_numeric_from_section_id(value: str) -> str:
     return section_number_display_form(value)
 
 
+def _title_match_forms(title: str) -> Tuple[str, ...]:
+    """The case variants an architect title may take in its header/footer."""
+
+    from .core.token_utils import smart_title_case
+
+    forms: List[str] = []
+    for form in (smart_title_case(title), title.upper(), title):
+        if form and form not in forms:
+            forms.append(form)
+    return tuple(forms)
+
+
+def _matching_section_number_ranges(
+    visible_text: str,
+    canonical: str,
+) -> List[Tuple[int, int, str]]:
+    """Bounded section numbers in ``visible_text`` with the given canonical form.
+
+    Every spacing of the same number is found (``23 31 00``, ``233100``,
+    ``23 3100``) because the shared grammar canonicalises each match; digits
+    that are part of a longer run or identifier never match.
+    """
+
+    if not canonical:
+        return []
+    return [
+        (match.start("number"), match.end("number"), match.group("number"))
+        for match in SECTION_NUMBER_RE.finditer(visible_text)
+        if _canonical_section_number(match.group("number")) == canonical
+    ]
+
+
+def _host_visible_text(paragraph_xml: str) -> str:
+    """Visible text of a paragraph excluding drawings, text boxes, and history."""
+
+    return _w_text(strip_out_of_scope_subtrees(paragraph_xml))
+
+
+def _host_visible_texts(part_xml: str) -> List[str]:
+    return [
+        _host_visible_text(block)
+        for _start, _end, block in iter_paragraph_xml_blocks(part_xml)
+    ]
+
+
+def _replace_host_visible_ranges(
+    paragraph_xml: str,
+    edit_builder: Callable[[str], List[Tuple[int, int, str]]],
+) -> tuple[str, bool]:
+    """Apply every ``(start, end, replacement)`` the builder reports.
+
+    The builder receives the host-visible text of the paragraph with its
+    out-of-scope subtrees protected, so text boxes and drawings are never
+    edited or counted here. Edits are applied right-to-left so that earlier
+    offsets stay valid while each one is written back through the ``w:t``
+    node map.
+    """
+
+    changed = False
+
+    def _edit(protected_xml: str) -> str:
+        nonlocal changed
+        updated = protected_xml
+        edits = edit_builder(_w_text(protected_xml))
+        for start, end, replacement in sorted(edits, reverse=True):
+            updated, did_change = _replace_visible_ranges(
+                updated,
+                [(start, end)],
+                replacement,
+            )
+            changed = changed or did_change
+        return updated
+
+    return edit_preserving_out_of_scope_subtrees(paragraph_xml, _edit), changed
+
+
+def _validate_explicit_token_postconditions(
+    part_name: str,
+    updated_xml: str,
+    *,
+    source_canonical: str,
+    target_section_numeric: str,
+    arch_title_forms: Tuple[str, ...],
+    target_title_forms: Tuple[str, ...],
+) -> None:
+    """Prove no architect token survived in a part the patcher just touched.
+
+    Mirrors ``_validate_inferred_patch_postconditions`` for the explicit
+    (non-inferred) path. A residual architect section number anywhere in the
+    part, including a text box that no corroborated mirrored shell covered,
+    fails closed: shipping the architect's section number in a target's
+    header is never acceptable. A residual title is checked in host text
+    only, and only when the target title does not itself contain the
+    architect title as a phrase (``METAL DUCTS`` -> ``METAL DUCTS AND
+    ACCESSORIES`` legitimately keeps the words).
+    """
+
+    host_text = "\n".join(_host_visible_texts(updated_xml))
+    if source_canonical and source_canonical != target_section_numeric:
+        if _matching_section_number_ranges(host_text, source_canonical):
+            raise ValueError(
+                "Architect SECTION number remained in imported header/footer "
+                f"part {part_name} after token substitution"
+            )
+        textbox_text = "\n".join(_textbox_texts(updated_xml))
+        if _matching_section_number_ranges(textbox_text, source_canonical):
+            raise ValueError(
+                "Architect SECTION number remained in a text box of imported "
+                f"header/footer part {part_name}; the text box is not part of "
+                "a corroborated mirrored shell, so it cannot be patched safely"
+            )
+    if not arch_title_forms:
+        return
+    overlap = any(
+        _bounded_text_ranges(target_form, source_form)
+        for source_form in arch_title_forms
+        for target_form in target_title_forms
+    )
+    if overlap:
+        return
+    for form in arch_title_forms:
+        if _bounded_text_ranges(host_text, form):
+            raise ValueError(
+                "Architect SectionTitle remained in imported header/footer "
+                f"part {part_name} after token substitution"
+            )
+
+
 def patch_header_footer_tokens(
     target_extract_dir: Path,
     source_tokens: Dict[str, str],
@@ -1444,33 +1580,21 @@ def patch_header_footer_tokens(
     log: List[str],
     part_names: List[str] | None = None,
 ) -> None:
-    from .core.token_utils import apply_case_pattern, detect_case_pattern, smart_title_case
+    """Replace architect section tokens in just-imported header/footer parts.
+
+    The substitution fails closed. Completeness is judged against the slots
+    actually present in the imported parts: if they carry the architect's
+    section number the target must supply a recognisable SectionID, and if
+    they carry the architect's title the target must supply a SectionTitle.
+    No part is modified until both checks pass, and every patched part is
+    re-read to prove no architect token survived.
+    """
+
+    from .core.token_utils import apply_case_pattern, detect_case_pattern
 
     word_dir = target_extract_dir / "word"
     if not word_dir.exists():
         return
-
-    def _replace_host_visible_text(
-        paragraph_xml: str,
-        old_text: str,
-        new_text: str,
-    ) -> tuple[str, bool]:
-        changed = False
-
-        def _edit(protected_xml: str) -> str:
-            nonlocal changed
-            visible = _w_text(protected_xml)
-            start = visible.find(old_text)
-            if start < 0:
-                return protected_xml
-            updated, changed = _replace_visible_ranges(
-                protected_xml,
-                [(start, start + len(old_text))],
-                new_text,
-            )
-            return updated
-
-        return edit_preserving_out_of_scope_subtrees(paragraph_xml, _edit), changed
 
     if part_names is None:
         part_paths = [
@@ -1495,11 +1619,12 @@ def patch_header_footer_tokens(
         source_tokens.get("SectionID_numeric")
         or _extract_numeric_from_section_id(source_tokens.get("SectionID", ""))
     )
-    expected_source_section = _canonical_section_number(arch_id_numeric)
+    source_canonical = _canonical_section_number(arch_id_numeric)
+    arch_title_forms = _title_match_forms(arch_title) if arch_title else ()
     inferred = (
         _infer_header_footer_tokens(
             part_xml_by_path,
-            expected_section_numeric=expected_source_section or None,
+            expected_section_numeric=source_canonical or None,
         )
         if part_xml_by_path
         else None
@@ -1511,8 +1636,7 @@ def patch_header_footer_tokens(
     )
     target_title_raw = target_tokens.get("SectionTitle", "")
     if inferred is not None:
-        explicit_section_numeric = _canonical_section_number(arch_id_numeric)
-        if arch_id_numeric and explicit_section_numeric != inferred.section_numeric:
+        if arch_id_numeric and source_canonical != inferred.section_numeric:
             raise ValueError(
                 "Explicit architect SectionID conflicts with imported header/footer shell"
             )
@@ -1528,9 +1652,31 @@ def patch_header_footer_tokens(
         or _extract_numeric_from_section_id(target_tokens.get("SectionID", ""))
     )
     target_section_numeric = _canonical_section_number(target_id_numeric)
-    target_title_for_patch = target_title_raw or target_title_display
+    target_title_for_patch = (target_title_raw or target_title_display).strip()
+
+    # Completeness relative to the slots present in the imported parts. This
+    # runs before any part is modified so a failure leaves every byte intact.
+    number_slots = sum(
+        len(_matching_section_number_ranges(_w_text(xml_text), source_canonical))
+        for xml_text in part_xml_by_path.values()
+    )
+    title_slots = sum(
+        len(_bounded_text_ranges(_w_text(xml_text), form))
+        for xml_text in part_xml_by_path.values()
+        for form in arch_title_forms
+    )
+    if number_slots and not target_section_numeric:
+        raise ValueError(
+            "Imported header/footer parts carry the architect SECTION number; "
+            "token substitution requires a recognisable target SectionID"
+        )
+    if title_slots and not target_title_for_patch:
+        raise ValueError(
+            "Imported header/footer parts carry the architect SectionTitle; "
+            "token substitution requires a target SectionTitle"
+        )
     if inferred is not None and (
-        not target_section_numeric or not target_title_for_patch.strip()
+        not target_section_numeric or not target_title_for_patch
     ):
         raise ValueError(
             "Imported header/footer token substitution requires a complete "
@@ -1551,6 +1697,34 @@ def patch_header_footer_tokens(
         )
     else:
         inferred_target_title_aliases = ()
+    target_title_forms = tuple(
+        dict.fromkeys(
+            apply_case_pattern(target_title_for_patch, detect_case_pattern(form))
+            for form in arch_title_forms
+        )
+    ) if target_title_for_patch else ()
+
+    def title_edits(visible: str) -> List[Tuple[int, int, str]]:
+        edits: List[Tuple[int, int, str]] = []
+        for form in arch_title_forms:
+            replacement = apply_case_pattern(
+                target_title_for_patch,
+                detect_case_pattern(form),
+            )
+            edits.extend(
+                (start, end, replacement)
+                for start, end in _bounded_text_ranges(visible, form)
+            )
+        return edits
+
+    def number_edits(visible: str) -> List[Tuple[int, int, str]]:
+        return [
+            (start, end, _render_numeric_like(source_form, target_section_numeric))
+            for start, end, source_form in _matching_section_number_ranges(
+                visible,
+                source_canonical,
+            )
+        ]
 
     for part_path, original_part_xml in part_xml_by_path.items():
         part_xml = original_part_xml
@@ -1560,55 +1734,20 @@ def patch_header_footer_tokens(
         cursor = 0
         for start, end, paragraph_xml in paragraph_matches:
             updated_chunks.append(part_xml[cursor:start])
-
-            analysis_xml = strip_out_of_scope_subtrees(paragraph_xml)
-            visible_norm = _w_text(analysis_xml)
             new_paragraph = paragraph_xml
-
-            if visible_norm and arch_title and target_title_display:
-                match_forms = [smart_title_case(arch_title), arch_title.upper(), arch_title]
-                seen_forms = set()
-                for form in match_forms:
-                    if not form or form in seen_forms:
-                        continue
-                    seen_forms.add(form)
-                    if form in visible_norm:
-                        pattern = detect_case_pattern(form)
-                        replacement = apply_case_pattern(target_title_raw or target_title_display, pattern)
-                        new_paragraph, changed = _replace_host_visible_text(
-                            new_paragraph,
-                            form,
-                            replacement,
-                        )
-                        modified = modified or changed
-                        break
-
-            if arch_id_numeric and target_id_numeric:
-                canonical_target = _canonical_section_number(target_id_numeric)
-                for src_variant, dst_variant in (
-                    (
-                        arch_id_numeric,
-                        _render_numeric_like(arch_id_numeric, canonical_target)
-                        if canonical_target
-                        else target_id_numeric,
-                    ),
-                    (
-                        re.sub(r"\s+", "", arch_id_numeric),
-                        canonical_target
-                        or re.sub(r"\s+", "", target_id_numeric),
-                    ),
-                ):
-                    if not src_variant:
-                        continue
-                    if src_variant in visible_norm:
-                        new_paragraph, changed = _replace_host_visible_text(
-                            new_paragraph,
-                            src_variant,
-                            dst_variant,
-                        )
-                        modified = modified or changed
-                        break
-
+            if _host_visible_text(paragraph_xml):
+                if arch_title_forms and target_title_for_patch:
+                    new_paragraph, changed = _replace_host_visible_ranges(
+                        new_paragraph,
+                        title_edits,
+                    )
+                    modified = modified or changed
+                if source_canonical and target_section_numeric:
+                    new_paragraph, changed = _replace_host_visible_ranges(
+                        new_paragraph,
+                        number_edits,
+                    )
+                    modified = modified or changed
             updated_chunks.append(new_paragraph)
             cursor = end
 
@@ -1641,6 +1780,14 @@ def patch_header_footer_tokens(
                 ),
                 title_aliases=inferred_target_title_aliases,
             )
+        _validate_explicit_token_postconditions(
+            part_path.name,
+            part_xml,
+            source_canonical=source_canonical,
+            target_section_numeric=target_section_numeric,
+            arch_title_forms=arch_title_forms,
+            target_title_forms=target_title_forms,
+        )
 
         if modified:
             part_path.write_text(prepare_xml_text_for_utf8(part_xml), encoding="utf-8")
