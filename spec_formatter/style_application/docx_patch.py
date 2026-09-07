@@ -202,7 +202,11 @@ def patch_docx(
         if out_docx.exists():
             out_docx.unlink()
 
-        with zipfile.ZipFile(out_docx, "w") as zout:
+        # New XML parts are deflated; a 200 KB imported numbering part used to
+        # ship stored at 0% compression. New media stays stored because image
+        # formats are already compressed. Existing entries keep their own
+        # compression type, so a source package round-trips as it was.
+        with zipfile.ZipFile(out_docx, "w", compression=zipfile.ZIP_DEFLATED) as zout:
             # preserve archive comment if any
             zout.comment = zin.comment
 
@@ -222,4 +226,12 @@ def patch_docx(
 
             # Add any new parts that didn't exist in source
             for new_name in new_parts:
-                zout.writestr(new_name, rep_bytes[new_name])
+                zout.writestr(
+                    new_name,
+                    rep_bytes[new_name],
+                    compress_type=(
+                        zipfile.ZIP_STORED
+                        if new_name.startswith("word/media/")
+                        else zipfile.ZIP_DEFLATED
+                    ),
+                )
