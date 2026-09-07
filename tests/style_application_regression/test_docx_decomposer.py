@@ -30,22 +30,24 @@ def _write_package(path: Path, extra=()) -> None:
             else:
                 archive.writestr(item[0], item[1], compress_type=item[2])
 
-    # ``zipfile`` normalizes backslashes while writing on Windows. Replace
-    # equal-length names in both headers so this fixture contains the hostile
-    # bytes a cross-platform producer can put in a real archive.
+    # ``zipfile`` normalizes backslashes while writing only when ``os.sep`` is
+    # not ``/`` (Windows). On POSIX the raw name is already in both headers.
+    # Either way the fixture must end up containing the hostile bytes a
+    # cross-platform producer can put in a real archive, so re-inject the
+    # backslash name into the equal-length normalized slots when needed.
     for item in extra:
         raw_name = item[0]
         if "\\" not in raw_name:
             continue
-        normalized_name = raw_name.replace("\\", "/")
+        raw_bytes = raw_name.encode("ascii")
+        normalized_bytes = raw_name.replace("\\", "/").encode("ascii")
         payload = path.read_bytes()
-        assert payload.count(normalized_name.encode("ascii")) == 2
-        path.write_bytes(
-            payload.replace(
-                normalized_name.encode("ascii"),
-                raw_name.encode("ascii"),
-            )
+        if payload.count(raw_bytes) == 2:
+            continue
+        assert payload.count(normalized_bytes) == 2, (
+            "fixture expects the member name in both ZIP headers"
         )
+        path.write_bytes(payload.replace(normalized_bytes, raw_bytes))
 
 
 def test_extracts_valid_package_into_new_directory(tmp_path: Path) -> None:

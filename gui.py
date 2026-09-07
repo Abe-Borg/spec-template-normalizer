@@ -51,17 +51,6 @@ def _font(size: int, weight: str = "normal", family: str = UI_FONT) -> ctk.CTkFo
     return ctk.CTkFont(family=family, size=size, weight=weight)
 
 
-def _load_prompt_file(path: Path) -> str:
-    """Compatibility helper retained for the template-engine contract tests."""
-
-    if not path.exists():
-        raise FileNotFoundError(f"Missing required prompt file: {path}")
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception as exc:
-        raise RuntimeError(f"Failed reading prompt file {path}: {exc}") from exc
-
-
 def discover_target_docx(folder: Path) -> list[Path]:
     """Compatibility helper used by tests and folder-preview code."""
 

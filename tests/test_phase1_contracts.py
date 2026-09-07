@@ -12,8 +12,8 @@ from docx_decomposer import (
     validate_instructions,
     build_style_registry_dict,
 )
-from gui import _load_prompt_file
 from llm_classifier import _parse_response
+from phase1_pipeline import load_prompt_file
 
 
 def _bundle() -> dict:
@@ -126,7 +126,7 @@ def test_rpr_hints_and_whitespace_run_handling():
 def test_prompt_loader_missing_file_error(tmp_path: Path):
     missing = tmp_path / "master_prompt.txt"
     with pytest.raises(FileNotFoundError, match="Missing required prompt file"):
-        _load_prompt_file(missing)
+        load_prompt_file(missing)
 
 
 def test_template_registry_contains_raw_style_xml(tmp_path: Path):

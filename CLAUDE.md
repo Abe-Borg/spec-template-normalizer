@@ -378,6 +378,12 @@ python gui.py
 python output/spec_test_corpus_smoke.py
 ```
 
+The GUI tests (`tests/test_gui_modes.py`) import `gui.py`, which needs
+`customtkinter` and therefore a Python with `tkinter`. They skip automatically
+where `tkinter` is absent (typical Linux CI images), so the rest of the suite
+still collects and runs there. The Windows CI job runs everything and is the
+authoritative gate.
+
 Headless usage is through Python:
 
 ```python

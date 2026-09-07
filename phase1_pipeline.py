@@ -106,6 +106,18 @@ def _snapshot_source(source: Path, destination: Path) -> None:
         )
 
 
+
+def load_prompt_file(path: Path) -> str:
+    """Read one required prompt file, failing with a stable path-bearing message."""
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing required prompt file: {path}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed reading prompt file {path}: {exc}") from exc
+
 def run_phase1(
     source_docx: Path,
     output_root: Path,
@@ -133,8 +145,8 @@ def run_phase1(
         raise NotADirectoryError(f"Output root is not a directory: {output_root}")
 
     prompt_dir = Path(prompt_dir) if prompt_dir is not None else Path(__file__).resolve().parent
-    master_prompt = (prompt_dir / "master_prompt.txt").read_text(encoding="utf-8")
-    run_instruction = (prompt_dir / "run_instruction_prompt.txt").read_text(encoding="utf-8")
+    master_prompt = load_prompt_file(prompt_dir / "master_prompt.txt")
+    run_instruction = load_prompt_file(prompt_dir / "run_instruction_prompt.txt")
     classifier_is_injected = classifier is not None
     classify = classifier or classify_document
 

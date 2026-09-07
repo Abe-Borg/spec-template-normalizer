@@ -6,8 +6,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-import gui
 import pytest
+
+# gui.py imports customtkinter (and therefore tkinter) at module scope. Linux
+# CI images ship Python without tkinter, so the GUI tests skip there; the
+# Windows CI job is authoritative for this module.
+pytest.importorskip("customtkinter")
+
+import gui  # noqa: E402
 from spec_formatter.pipeline import CSI_TO_CANADIAN, FORMAT_ONLY
 from spec_formatter.style_application.core.csi_to_canadian import (
     CanadianConversionReport,
