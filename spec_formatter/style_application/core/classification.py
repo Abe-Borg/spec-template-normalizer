@@ -134,6 +134,10 @@ _END_OF_SECTION_RX = re.compile(r"^\s*END\s+OF\s+SECTION\s*", re.IGNORECASE)
 _ALL_CAPS_RX = re.compile(r"^[^a-z]*[A-Z][^a-z]*$")
 _EDITORIAL_COMMENT_STYLE_IDS = frozenset({"CMT"})
 LLM_IGNORED_REASON = "non_csi_content"
+# The direct paragraph-layout overrides strip_conflicting_direct_ppr removes.
+# A replacement style "has replacement pPr" when its effective (basedOn-
+# resolved) paragraph properties supply at least one of them.
+_DIRECT_PPR_OVERRIDE_PROPERTIES = frozenset({"spacing", "ind", "jc", "numPr"})
 _FORMAT_ONLY_PROTECTED_PPR_PROPERTIES = frozenset({
     "pStyle",
     "numPr",
@@ -1573,7 +1577,6 @@ def apply_phase2_classifications(
         ignored_indices.add(idx)
     report.ignored = len(ignored_indices)
 
-    style_xml_by_id = _build_style_xml_map(styles_xml_text)
     replacement_style_ids = {
         arch_style_registry.get(item.get("csi_role"))
         for item in items
@@ -1658,7 +1661,13 @@ def apply_phase2_classifications(
             continue
 
         pb = para_blocks[idx]
-        style_xml = style_xml_by_id.get(style_id, "")
+        # Resolved through the full basedOn chain and limited to paragraph
+        # properties: a character-spacing <w:spacing> inside the style's rPr
+        # must not count, and an <w:ind> inherited from a parent style must.
+        has_replacement_ppr = bool(
+            ppr_properties_by_style.get(style_id, set())
+            & _DIRECT_PPR_OVERRIDE_PROPERTIES
+        )
         role_spec = role_specs.get(role) if role_specs else None
         provenance = role_spec.get("numbering_provenance") if isinstance(role_spec, dict) else None
         if role_specs is not None and not isinstance(role_spec, dict):
@@ -1708,26 +1717,26 @@ def apply_phase2_classifications(
                     pb,
                     numbering_source_styles_xml,
                 )
-                if _style_has_replacement_ppr(style_xml):
+                if has_replacement_ppr:
                     pb = strip_conflicting_direct_ppr(pb, preserve_numpr=True)
                     report.stripped_direct_ppr += 1
                 else:
                     report.preserved_direct_ppr += 1
                 report.preserved_automatic_numbering += 1
-            elif _style_has_replacement_ppr(style_xml):
+            elif has_replacement_ppr:
                 pb = strip_conflicting_direct_ppr(pb)
                 report.stripped_direct_ppr += 1
             else:
                 pb = _strip_direct_numpr_only(pb)
                 report.preserved_direct_ppr += 1
         elif provenance == "none":
-            if _style_has_replacement_ppr(style_xml):
+            if has_replacement_ppr:
                 pb = strip_conflicting_direct_ppr(pb)
                 report.stripped_direct_ppr += 1
             else:
                 pb = _strip_direct_numpr_only(pb)
                 report.preserved_direct_ppr += 1
-        elif _style_has_replacement_ppr(style_xml):
+        elif has_replacement_ppr:
             pb = strip_conflicting_direct_ppr(pb)
             report.stripped_direct_ppr += 1
         else:
@@ -1887,17 +1896,3 @@ class ApplyReport:
     )
 
 
-def _build_style_xml_map(styles_xml_text: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for match in re.finditer(r'(<w:style\b[^>]*w:styleId="([^"]+)"[^>]*>[\s\S]*?</w:style>)', styles_xml_text):
-        out[match.group(2)] = match.group(1)
-    return out
-
-
-def _style_has_replacement_ppr(style_block_xml: str) -> bool:
-    if not style_block_xml:
-        return False
-    return any(
-        tag in style_block_xml
-        for tag in ("<w:spacing", "<w:ind", "<w:jc", "<w:numPr")
-    )
