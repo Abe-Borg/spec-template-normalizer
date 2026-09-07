@@ -28,6 +28,7 @@ from .core.csi_to_canadian import (
     classifications_for_canadian_application,
     validate_conversion_mode,
 )
+from .core.classification import validate_phase2_final_payload
 from .core.token_utils import extract_target_tokens
 from .core.batch_classifier import (
     BatchClassificationError,
@@ -533,7 +534,9 @@ def _classification_audit(
         "styled": len(styled),
         "ignored": len(ignored),
         "out_of_scope": len(out_of_scope),
-        "unresolved": max(0, total - resolved),
+        # Never clamped: a negative value exposes an over-full payload
+        # (duplicate or unknown indices) instead of hiding it as zero.
+        "unresolved": total - resolved,
     }
     audit = {
         "schema_version": 1,
@@ -647,12 +650,30 @@ def _apply_classified_target_impl(
     conversion_mode: str,
     checkpoint: _ApplicationCheckpoint,
     diagnostics: Optional[List[Dict[str, Any]]] = None,
+    available_roles: Optional[List[str]] = None,
 ) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
     """Apply one validated classification payload through the shared engine."""
 
     # A throwaway sink keeps callers that do not collect diagnostics working
     # without scattering ``if diagnostics is not None`` across every phase.
     diag_events: List[Dict[str, Any]] = diagnostics if diagnostics is not None else []
+
+    # Re-verify coverage in the one place every caller passes through, so the
+    # invariant does not depend on each caller having coerced its own payload:
+    # every classifiable paragraph occurs exactly once across styled and
+    # ignored dispositions, deterministic dispositions are not overridden,
+    # and no unknown index or role is present.
+    checkpoint.stage = "disposition_verification"
+    validate_phase2_final_payload(
+        bundle,
+        classifications,
+        list(available_roles) if available_roles is not None else sorted(arch_registry),
+    )
+    summary, _audit = _classification_audit(bundle, classifications)
+    if summary["unresolved"]:
+        raise ValueError(
+            f"{summary['unresolved']} classifiable paragraph(s) have no disposition"
+        )
 
     checkpoint.stage = "application_policy"
     policy: ApplicationPolicy = application_policy_for_mode(conversion_mode)
@@ -920,6 +941,7 @@ def _apply_classified_target(
     role_specs: Optional[Dict[str, Dict[str, Any]]],
     conversion_mode: str,
     diagnostics: Optional[List[Dict[str, Any]]] = None,
+    available_roles: Optional[List[str]] = None,
 ) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
     """Apply classifications while preserving safe late-failure diagnostics."""
 
@@ -946,6 +968,7 @@ def _apply_classified_target(
             conversion_mode=conversion_mode,
             checkpoint=checkpoint,
             diagnostics=diagnostics,
+            available_roles=available_roles,
         )
     except ApplicationStageError:
         raise
@@ -1056,6 +1079,7 @@ def process_single_file(
                 role_specs=role_specs,
                 conversion_mode=conversion_mode,
                 diagnostics=per_file_diag,
+                available_roles=available_roles,
             )
 
         return BatchResult(
@@ -1135,6 +1159,7 @@ def _apply_batch_result(
     arch_root: Optional[Path] = None,
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
     conversion_mode: str = FORMAT_ONLY,
+    available_roles: Optional[List[str]] = None,
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log = list(prepared.prep_log)
@@ -1171,6 +1196,7 @@ def _apply_batch_result(
             role_specs=role_specs,
             conversion_mode=conversion_mode,
             diagnostics=per_file_diag,
+            available_roles=available_roles,
         )
 
         return BatchResult(
@@ -1355,6 +1381,7 @@ def run_batch_api(
                         env_registry,
                         arch_styles_xml,
                         output_dir,
+                        available_roles=available_roles,
                     ): file_key
                     for file_key, prepared in prepared_files.items()
                 }
@@ -1372,6 +1399,7 @@ def run_batch_api(
                         arch_root,
                         role_specs,
                         conversion_mode,
+                        available_roles,
                     ): file_key
                     for file_key, prepared in prepared_files.items()
                 }

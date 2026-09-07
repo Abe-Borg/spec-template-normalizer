@@ -409,3 +409,109 @@ def test_missing_target_api_key_reports_classification_preflight_stage(
     assert result.error == (
         "Anthropic API key is required when unresolved paragraphs exist."
     )
+
+
+def _seed_verification_kwargs(tmp_path: Path, classifications: dict) -> dict:
+    extract_dir = _seed_extract(tmp_path)
+    kwargs = _application_kwargs(tmp_path, extract_dir)
+    kwargs["classifications"] = classifications
+    return kwargs
+
+
+@pytest.mark.parametrize(
+    ("classifications", "match"),
+    [
+        (
+            {"classifications": [], "ignored_paragraphs": []},
+            "missing coverage",
+        ),
+        (
+            {
+                "classifications": [
+                    {"paragraph_index": 0, "csi_role": "PARAGRAPH"},
+                    {"paragraph_index": 0, "csi_role": "PARAGRAPH"},
+                ],
+                "ignored_paragraphs": [],
+            },
+            "[Dd]uplicate",
+        ),
+        (
+            {
+                "classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}],
+                "ignored_paragraphs": [{"paragraph_index": 0, "reason": "editorial"}],
+            },
+            "both|overlap|[Dd]uplicate",
+        ),
+        (
+            {
+                "classifications": [
+                    {"paragraph_index": 0, "csi_role": "PARAGRAPH"},
+                    {"paragraph_index": 7, "csi_role": "PARAGRAPH"},
+                ],
+                "ignored_paragraphs": [],
+            },
+            "not classifiable",
+        ),
+    ],
+)
+def test_shared_application_path_reverifies_disposition_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    classifications: dict,
+    match: str,
+) -> None:
+    kwargs = _seed_verification_kwargs(tmp_path, classifications)
+    monkeypatch.setattr(
+        batch_runner,
+        "apply_environment_to_target",
+        lambda **_kwargs: pytest.fail("application must not start"),
+    )
+
+    with pytest.raises(ApplicationStageError, match=match) as raised:
+        batch_runner._apply_classified_target(**kwargs)
+
+    assert raised.value.stage == "disposition_verification"
+    assert not (tmp_path / "output").exists()
+
+
+def test_shared_application_path_rejects_deterministic_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    extract_dir = _seed_extract(tmp_path)
+    kwargs = _application_kwargs(tmp_path, extract_dir)
+    kwargs["bundle"] = {
+        "paragraphs": [],
+        "deterministic_classifications": [
+            {"paragraph_index": 0, "csi_role": "PARAGRAPH"}
+        ],
+        "deterministic_ignored_paragraphs": [],
+        "filter_report": {"paragraphs_out_of_scope": []},
+    }
+    kwargs["classifications"] = {
+        "classifications": [{"paragraph_index": 0, "csi_role": "ARTICLE"}],
+        "ignored_paragraphs": [],
+    }
+    kwargs["arch_registry"] = {"PARAGRAPH": "Body", "ARTICLE": "Body"}
+    monkeypatch.setattr(
+        batch_runner,
+        "apply_environment_to_target",
+        lambda **_kwargs: pytest.fail("application must not start"),
+    )
+
+    with pytest.raises(ApplicationStageError, match="override") as raised:
+        batch_runner._apply_classified_target(**kwargs)
+
+    assert raised.value.stage == "disposition_verification"
+
+
+def test_classification_audit_does_not_clamp_an_overfull_payload() -> None:
+    bundle, classifications = _bundle_and_classifications()
+    classifications["classifications"].append(
+        {"paragraph_index": 0, "csi_role": "PARAGRAPH"}
+    )
+
+    summary, _audit = batch_runner._classification_audit(bundle, classifications)
+
+    assert summary["unresolved"] == -1
+

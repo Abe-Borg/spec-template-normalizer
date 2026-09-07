@@ -114,6 +114,13 @@ out of scope. Ignored paragraphs receive no paragraph or run edits. Missing,
 duplicate, overlapping, or unknown dispositions fail closed; never restore
 nearest-neighbor fallback.
 
+The shared application path (`_apply_classified_target_impl`) re-verifies this
+coverage itself, as its first stage (`disposition_verification`), against the
+same role list the bundle was built with. It does not trust that a caller
+coerced its payload, and the audit's `unresolved` count is never clamped: a
+negative value exposes an over-full payload instead of hiding it as zero, and
+any non-zero value fails the target before application begins.
+
 ### 4. Format-only numbering is target-owned
 
 Snapshot effective target numbering before shell/style changes, including
