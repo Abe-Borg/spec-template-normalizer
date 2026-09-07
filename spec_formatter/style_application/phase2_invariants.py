@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Dict, Any, Optional, Set
 from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
+from .core.untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .core.ooxml_namespaces import CT_NS, PKG_REL_NS, R_NS, W_NS
 from .core.ooxml_text import decode_xml_bytes, prepare_xml_text_for_utf8
 from .core.section_mapping import choose_section_sources
@@ -88,7 +89,7 @@ def _element_semantic_signature(element: ET.Element) -> tuple:
 def _numbering_definition_signatures(numbering_xml: str) -> Counter:
     if not numbering_xml.strip():
         return Counter()
-    root = ET.fromstring(numbering_xml)
+    root = parse_untrusted_xml(numbering_xml, "word/numbering.xml")
     return Counter(_element_semantic_signature(child) for child in root)
 
 
@@ -400,9 +401,9 @@ def validate_docx_package(docx_path: Path) -> None:
                 if not (name.endswith(".xml") or name.endswith(".rels") or name == "[Content_Types].xml"):
                     continue
                 try:
-                    parsed_xml[name] = ET.fromstring(zf.read(name))
-                except ET.ParseError as exc:
-                    errors.append(f"{name}: XML parse error: {exc}")
+                    parsed_xml[name] = parse_untrusted_xml(zf.read(name), name)
+                except UntrustedXmlError as exc:
+                    errors.append(str(exc))
 
             ct_root = parsed_xml.get("[Content_Types].xml")
             if ct_root is not None:
@@ -831,7 +832,10 @@ def _verify_target_header_footer_preserved(src_docx: Path, new_docx: Path) -> No
         raise RuntimeError("INVARIANT FAIL: relationship subset changed")
 
     def _targets(rels_xml: str) -> set[str]:
-        root = ET.fromstring(prepare_xml_text_for_utf8(rels_xml).encode("utf-8"))
+        root = parse_untrusted_xml(
+            prepare_xml_text_for_utf8(rels_xml),
+            "word/_rels/document.xml.rels",
+        )
         targets: set[str] = set()
         for rel in root.findall(f"{{{PKG_REL_NS}}}Relationship"):
             rel_type = rel.attrib.get("Type", "")
@@ -1014,7 +1018,10 @@ def verify_phase2_invariants(
         if expected_parts:
             with zipfile.ZipFile(new_docx, "r") as z_after:
                 rels_xml = z_after.read("word/_rels/document.xml.rels")
-                rels_root = ET.fromstring(rels_xml)
+                rels_root = parse_untrusted_xml(
+                    rels_xml,
+                    "word/_rels/document.xml.rels (output)",
+                )
                 relationships = {
                     rel.attrib.get("Id"): rel
                     for rel in rels_root.findall('.//{*}Relationship')

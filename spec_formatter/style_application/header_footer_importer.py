@@ -34,6 +34,7 @@ from .core.section_numbers import (
     render_section_number_like as _render_numeric_like,
     section_number_display_form,
 )
+from .core.untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .core.sectpr_tools import (
     canonical_sectpr_order_index,
     child_tag_name,
@@ -107,7 +108,7 @@ def _remove_existing_hf_files(
     rels_path = target_extract_dir / "word" / "_rels" / "document.xml.rels"
     if not rels_path.is_file():
         return set(), set()
-    root = ET.fromstring(rels_path.read_bytes())
+    root = parse_untrusted_xml(rels_path.read_bytes(), "word/_rels/document.xml.rels")
     part_names: set[str] = set()
     for rel in root.findall(f"{{{PKG_REL_NS}}}Relationship"):
         rel_type = rel.attrib.get("Type", "")
@@ -204,8 +205,11 @@ def _media_original_package_targets(media_item: Dict[str, Any]) -> set[str]:
 
 def _relationship_ids_referenced_by_part(xml_content: str) -> set[str]:
     try:
-        root = ET.fromstring(prepare_xml_text_for_utf8(xml_content).encode("utf-8"))
-    except ET.ParseError as exc:
+        root = parse_untrusted_xml(
+            prepare_xml_text_for_utf8(xml_content),
+            "header/footer part",
+        )
+    except UntrustedXmlError as exc:
         raise ValueError(f"Malformed header/footer XML: {exc}") from exc
     relationship_attributes = {
         f"{{{R_NS}}}id",
@@ -237,8 +241,11 @@ def _validate_part_relationship_references(
             f"{part_name} contains relationship references but has no relationships part"
         )
     try:
-        root = ET.fromstring(prepare_xml_text_for_utf8(rels_xml).encode("utf-8"))
-    except ET.ParseError as exc:
+        root = parse_untrusted_xml(
+            prepare_xml_text_for_utf8(rels_xml),
+            f"relationships of {part_name}",
+        )
+    except UntrustedXmlError as exc:
         raise ValueError(f"Malformed relationships XML for {part_name}: {exc}") from exc
     declared = {
         rel.attrib.get("Id", "")
@@ -365,8 +372,9 @@ def _write_hf_parts(
                     f"Invalid rels_part_name for {part_name}: {rels_name!r}"
                 )
             if target_by_rid or target_by_original:
-                rels_root = ET.fromstring(
-                    prepare_xml_text_for_utf8(rels_xml).encode("utf-8")
+                rels_root = parse_untrusted_xml(
+                    prepare_xml_text_for_utf8(rels_xml),
+                    f"relationships of {part_name}",
                 )
                 matched_rids: set[str] = set()
                 matched_targets: set[str] = set()
@@ -433,7 +441,7 @@ def _rebuild_document_rels(target_extract_dir: Path, part_to_type: Dict[str, str
     if not rels_path.exists():
         raise FileNotFoundError(f"Missing required file: {rels_path}")
 
-    root = ET.fromstring(rels_path.read_bytes())
+    root = parse_untrusted_xml(rels_path.read_bytes(), "word/_rels/document.xml.rels")
     for rel in list(root.findall(f"{{{PKG_REL_NS}}}Relationship")):
         rel_type = rel.attrib.get("Type", "")
         if rel_type.endswith("/header") or rel_type.endswith("/footer"):
@@ -653,7 +661,7 @@ def _rewire_document_sectpr(target_extract_dir: Path, registry: Dict[str, Any], 
         updated_xml = replace_nth_sectpr_block(updated_xml, idx, updated_sectpr)
 
     updated_xml = prepare_xml_text_for_utf8(updated_xml)
-    ET.fromstring(updated_xml.encode("utf-8"))
+    parse_untrusted_xml(updated_xml, "word/document.xml")
     doc_path.write_text(updated_xml, encoding="utf-8")
     log.append(f"Rewired sectPr header/footer references in {len(sectprs)} sections")
 
@@ -668,7 +676,7 @@ def _ensure_content_types(
     if not ct_path.exists():
         return
 
-    root = ET.fromstring(ct_path.read_bytes())
+    root = parse_untrusted_xml(ct_path.read_bytes(), "[Content_Types].xml")
     imported_parts = {name.casefold() for name in part_to_type}
     for node in list(root.findall(f"{{{CT_NS}}}Override")):
         part_name = node.attrib.get("PartName", "")
@@ -1828,6 +1836,6 @@ def remap_header_footer_numids(
         updated = re.sub(r'(<w:numId\b[^>]*w:val=")(\d+)"', _replace, xml)
         if replacements:
             updated = prepare_xml_text_for_utf8(updated)
-            ET.fromstring(updated.encode("utf-8"))
+            parse_untrusted_xml(updated, part_name)
             path.write_text(updated, encoding="utf-8")
             log.append(f"Remapped {replacements} direct numbering reference(s) in {part_name}")

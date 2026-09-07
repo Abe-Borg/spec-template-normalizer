@@ -4,10 +4,10 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import zipfile
-import xml.etree.ElementTree as ET
 from typing import Dict, List, Set, Union
 
 from .core.ooxml_text import prepare_xml_text_for_utf8
+from .core.untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .core.opc_paths import (
     is_safe_header_footer_part_name,
     is_safe_package_part_name,
@@ -62,9 +62,9 @@ def validate_xml_wellformedness(replacements: Dict[str, bytes]) -> List[str]:
         if not (name.endswith(".xml") or name.endswith(".rels") or name == "[Content_Types].xml"):
             continue
         try:
-            ET.fromstring(content)
-        except ET.ParseError as exc:
-            errors.append(f"{name}: XML parse error: {exc}")
+            parse_untrusted_xml(content, name)
+        except UntrustedXmlError as exc:
+            errors.append(str(exc))
     return errors
 
 

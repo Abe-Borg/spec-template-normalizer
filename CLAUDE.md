@@ -323,6 +323,13 @@ DOCX input and relationship metadata are untrusted.
 - Parse and validate relationship parts. Resolve internal targets only inside the package root.
 - Never dereference external relationship targets, local paths, UNC paths, URLs, or encoded traversal.
 - Reject malformed relationship XML and broken required relationship metadata.
+- Reject any `DOCTYPE` or `ENTITY` declaration in an XML part before it reaches
+  the parser: `xml.etree.ElementTree` expands internal entities, so every
+  untrusted part (document, styles, numbering, relationships, content types,
+  headers/footers, and the engine's own rewritten parts) is parsed only
+  through `core/untrusted_xml.parse_untrusted_xml()`, which also wraps parse
+  errors with the part name. Never call `ET.fromstring` on package bytes
+  directly.
 - Header/footer media limits: 16 MiB per asset and 64 MiB total.
 - Preserve content types from `[Content_Types].xml` where available.
 

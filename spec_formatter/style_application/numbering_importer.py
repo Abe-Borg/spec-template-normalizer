@@ -25,6 +25,7 @@ from .core.ooxml_namespaces import (
     serialize_package_relationships,
 )
 from .core.ooxml_text import read_xml_text, write_xml_text
+from .core.untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .core.style_import import (
     _find_style_numpr_in_chain,
     collect_style_dependency_closure,
@@ -58,8 +59,11 @@ def _ensure_numbering_package_wiring(target_extract_dir: Path, log: List[str]) -
         )
 
     try:
-        content_types_root = ET.fromstring(content_types_path.read_bytes())
-    except ET.ParseError as exc:
+        content_types_root = parse_untrusted_xml(
+            content_types_path.read_bytes(),
+            "[Content_Types].xml",
+        )
+    except UntrustedXmlError as exc:
         raise ValueError(f"Invalid [Content_Types].xml: {exc}") from exc
     if content_types_root.tag != f"{{{CT_NS}}}Types":
         raise ValueError("Invalid [Content_Types].xml root element")
@@ -84,8 +88,11 @@ def _ensure_numbering_package_wiring(target_extract_dir: Path, log: List[str]) -
         )
 
     try:
-        document_rels_root = ET.fromstring(document_rels_path.read_bytes())
-    except ET.ParseError as exc:
+        document_rels_root = parse_untrusted_xml(
+            document_rels_path.read_bytes(),
+            "word/_rels/document.xml.rels",
+        )
+    except UntrustedXmlError as exc:
         raise ValueError(f"Invalid document.xml.rels: {exc}") from exc
     if document_rels_root.tag != f"{{{PKG_REL_NS}}}Relationships":
         raise ValueError("Invalid document.xml.rels root element")
@@ -553,8 +560,8 @@ def inject_numbering_into_xml(
             raise ValueError(f"Injected num references missing abstractNumId={aid}")
 
     try:
-        ET.fromstring(result.encode("utf-8"))
-    except ET.ParseError as exc:
+        parse_untrusted_xml(result, "word/numbering.xml")
+    except UntrustedXmlError as exc:
         raise ValueError(f"Imported numbering.xml is not well-formed: {exc}") from exc
 
     return result

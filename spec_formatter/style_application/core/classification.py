@@ -38,6 +38,7 @@ from .style_import import (
 )
 from .ooxml_text import read_xml_text, write_xml_text
 from .section_numbers import LABELED_SECTION_RE, SECTION_HEADING_RE
+from .untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 
 
 def _load_prompt_text(filename: str) -> str:
@@ -378,7 +379,7 @@ def _build_numbering_catalog(numbering_xml_text: str) -> Dict[str, Any]:
     """Parse just enough numbering.xml to resolve a rendered list signature."""
     if not numbering_xml_text.strip():
         return {"nums": {}, "abstracts": {}}
-    root = ET.fromstring(numbering_xml_text)
+    root = parse_untrusted_xml(numbering_xml_text, "word/numbering.xml")
     abstracts: Dict[str, Dict[str, Any]] = {}
     nums: Dict[str, Dict[str, Any]] = {}
 
@@ -1456,8 +1457,8 @@ def _style_replacement_properties(
     """Return WML properties supplied anywhere in a style's basedOn chain."""
 
     try:
-        styles_root = ET.fromstring(styles_xml_text)
-    except ET.ParseError as exc:
+        styles_root = parse_untrusted_xml(styles_xml_text, "word/styles.xml")
+    except UntrustedXmlError as exc:
         raise ValueError(
             "Could not parse styles.xml while resolving replacement properties"
         ) from exc

@@ -19,6 +19,7 @@ from xml.sax.saxutils import escape as _sax_escape
 
 from spec_formatter.role_contract import ALLOWED_ROLES
 
+from .untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .ooxml_namespaces import W_NS
 from .ooxml_text import prepare_xml_text_for_utf8
 from .opc_paths import (
@@ -598,8 +599,8 @@ def validate_phase1_bundle_directory(
         if path is None:
             continue
         try:
-            xml_roots[artifact_id] = _ET.fromstring(path.read_bytes())
-        except _ET.ParseError as exc:
+            xml_roots[artifact_id] = parse_untrusted_xml(path.read_bytes(), artifact_id)
+        except UntrustedXmlError as exc:
             raise ValueError(f"Bundle artifact {artifact_id} is not well-formed XML: {exc}") from exc
     source_ids = {
         node.attrib.get(f"{{{W_NS}}}styleId")

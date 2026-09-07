@@ -28,6 +28,7 @@ from spec_formatter.role_contract import (
     ROLE_PARENT,
 )
 
+from .untrusted_xml import parse_untrusted_xml
 from .classification import (
     _build_numbering_catalog,
     _effective_numpr,
@@ -708,7 +709,10 @@ def _validate_architect_numbering(
         raise ValueError(
             "Canadian conversion requires the architect template's numbering.xml."
         )
-    root = ET.fromstring(prepare_xml_text_for_utf8(numbering_xml).encode("utf-8"))
+    root = parse_untrusted_xml(
+        prepare_xml_text_for_utf8(numbering_xml),
+        "architect numbering.xml",
+    )
     for role in sorted(roles):
         spec = role_specs[role]
         pattern = spec["numbering_pattern"]
@@ -960,7 +964,10 @@ def plan_csi_to_canadian(
 
     numbering_catalog = _build_numbering_catalog(numbering_xml)
     numbering_root = (
-        ET.fromstring(prepare_xml_text_for_utf8(numbering_xml).encode("utf-8"))
+        parse_untrusted_xml(
+            prepare_xml_text_for_utf8(numbering_xml),
+            "architect numbering.xml",
+        )
         if numbering_xml.strip()
         else None
     )
@@ -1130,7 +1137,10 @@ def plan_csi_to_canadian(
             )
     if extract_all_sectpr_blocks(document_xml) != extract_all_sectpr_blocks(converted_document):
         raise RuntimeError("Canadian conversion invariant failed: section properties changed")
-    ET.fromstring(prepare_xml_text_for_utf8(converted_document).encode("utf-8"))
+    parse_untrusted_xml(
+        prepare_xml_text_for_utf8(converted_document),
+        "word/document.xml (converted)",
+    )
 
     report = CanadianConversionReport(
         paragraphs_examined=sum(
