@@ -210,9 +210,22 @@ def test_batch_result_preserves_late_numbering_checkpoint_without_publishing_doc
         batch_runner,
         "apply_phase2_classifications",
         lambda **_kwargs: SimpleNamespace(
+            # Mirror every ``ApplyReport`` attribute the shared application
+            # path reads while recording the ``apply_classifications`` phase.
+            # A missing attribute aborts the target inside that phase with the
+            # wrong stage, so the stub must stay complete.
             requested=1,
             modified=1,
+            invalid_indices=[],
             skipped_sectpr=[],
+            unmapped_roles=[],
+            missing_style_ids=set(),
+            stripped_direct_ppr=0,
+            preserved_direct_ppr=0,
+            preserved_automatic_numbering=0,
+            suppressed_architect_numbering=0,
+            stripped_run_fonts=0,
+            ignored=0,
             allowed_rpr_properties_by_paragraph={},
             numbering_checks={
                 "policy": CSI_TO_CANADIAN,

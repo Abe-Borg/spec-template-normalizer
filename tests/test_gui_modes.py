@@ -378,3 +378,42 @@ def test_poll_events_uses_captured_progress_timestamp_and_accepts_legacy_string(
         ("Processing target", occurred_at),
         ("legacy progress", None),
     ]
+
+
+def test_poll_events_rearms_after_render_error():
+    """A rendering failure must never leave the event pump dead.
+
+    The pump is the only path that unlocks the controls and stops the spinner,
+    so it re-arms itself in a ``finally`` block even when handling one event
+    raises.  The remaining events stay queued for the next poll.
+    """
+
+    events: queue.Queue = queue.Queue()
+    events.put(("progress", {"message": "first", "occurred_at": None}))
+    events.put(("progress", {"message": "second", "occurred_at": None}))
+    scheduled: list[tuple] = []
+    logged: list[str] = []
+
+    def failing_append_log(message, occurred_at=None):
+        logged.append(message)
+        raise TypeError("unexpected keyword argument")
+
+    app = SimpleNamespace(
+        events=events,
+        status_label=_FakeWidget(),
+        _append_log=failing_append_log,
+        _handle_complete=lambda _payload: None,
+        _handle_error=lambda _payload: None,
+        _poll_events=lambda: None,
+        after=lambda *args: scheduled.append(args),
+    )
+
+    with pytest.raises(TypeError):
+        gui.App._poll_events(app)
+
+    assert logged == ["first"]
+    assert scheduled == [(100, app._poll_events)]
+    assert events.get_nowait() == (
+        "progress",
+        {"message": "second", "occurred_at": None},
+    )

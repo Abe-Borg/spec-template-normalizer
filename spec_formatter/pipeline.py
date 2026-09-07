@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+from . import __version__ as APPLICATION_VERSION
 from . import diagnostics as diag
 from . import template_analysis
 from .style_application.batch_runner import (
@@ -821,6 +822,11 @@ _TARGET_EVENT_RX = re.compile(r"^(Target .+?: )(.*)$")
 _SAFE_REDACTION_RX = re.compile(
     r"^\[(?:document content omitted|untrusted detail omitted; sha256=[0-9a-f]{12})\]$"
 )
+# The per-target disposition summary reported after each target completes.
+# It carries counts only, so it is safe to persist verbatim in ``run.log``.
+_AUDIT_SUMMARY_LINE_RX = re.compile(
+    r"^audit styled=\d+, ignored=\d+, out_of_scope=\d+, unresolved=\d+$"
+)
 
 _KNOWN_SAFE_ERROR_MESSAGES = {
     "template_section_shell_conflict": (
@@ -1020,6 +1026,8 @@ def _is_safe_operational_line(line: str) -> bool:
     if re.fullmatch(r"=+", candidate) or re.match(r"^\[\d+/\d+\] ", candidate):
         return True
     if re.match(r"^numId \d+ -> \d+ \(abstractNum \d+ -> \d+\)$", candidate):
+        return True
+    if _AUDIT_SUMMARY_LINE_RX.fullmatch(candidate):
         return True
     return candidate.startswith(_SAFE_OPERATIONAL_PREFIXES)
 

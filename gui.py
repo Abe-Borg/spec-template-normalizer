@@ -741,8 +741,15 @@ class App(ctk.CTk):
     def _toggle_key(self) -> None:
         self.api_entry.configure(show="" if self.show_key_var.get() else "•")
 
-    def _append_log(self, message: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
+    def _append_log(
+        self,
+        message: str,
+        occurred_at: Optional[datetime] = None,
+    ) -> None:
+        event_time = occurred_at or datetime.now()
+        if event_time.tzinfo is not None:
+            event_time = event_time.astimezone()
+        timestamp = event_time.strftime("%H:%M:%S")
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"[{timestamp}] {message.rstrip()}\n")
         self.log_box.see("end")
@@ -868,7 +875,10 @@ class App(ctk.CTk):
                     self._handle_error(payload)
         except queue.Empty:
             pass
-        self.after(100, self._poll_events)
+        finally:
+            # Re-arm unconditionally: a rendering error must never leave the
+            # pump dead with the controls locked and the spinner running.
+            self.after(100, self._poll_events)
 
     def _finish_busy_state(self) -> None:
         self.progress.stop()
