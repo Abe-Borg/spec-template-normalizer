@@ -8,8 +8,9 @@ workflow uses to smoke-test the frozen executable without opening a window:
     SpecificationFormatter.exe --version     print the version and exit
     SpecificationFormatter.exe --selfcheck   import the app's heavy modules --
                                              proving PyInstaller bundled every
-                                             hidden import -- and exit 0 (non-zero
-                                             on any import error)
+                                             hidden import -- read the bundled
+                                             prompt files, and exit 0 (non-zero
+                                             on any import or resource error)
 
 The GUI build is windowed (``console=False``), so ``sys.stdout`` may be ``None``
 in the frozen app; ``_emit`` writes results to the file named by
@@ -46,6 +47,30 @@ def _print_version() -> int:
     return 0
 
 
+def _check_prompt_resources() -> None:
+    """Prove the frozen bundle can read every prompt the pipeline needs.
+
+    The architect prompts are shipped as data files next to the frozen
+    package and the phase-2 prompts are module constants loaded from package
+    data at import time. A build that imports cleanly but cannot find them
+    would only fail on the user's first real run, so read them here.
+    """
+
+    from pathlib import Path
+
+    import phase1_pipeline
+    from spec_formatter.style_application.core import classification
+
+    prompt_root = Path(phase1_pipeline.__file__).resolve().parent
+    for filename in ("master_prompt.txt", "run_instruction_prompt.txt"):
+        text = phase1_pipeline.load_prompt_file(prompt_root / filename)
+        if not text.strip():
+            raise RuntimeError(f"Bundled prompt file is empty: {filename}")
+    for name in ("PHASE2_MASTER_PROMPT", "PHASE2_RUN_INSTRUCTION"):
+        if not str(getattr(classification, name, "")).strip():
+            raise RuntimeError(f"Phase-2 prompt constant is empty: {name}")
+
+
 def _selfcheck() -> int:
     try:
         import spec_formatter
@@ -54,6 +79,8 @@ def _selfcheck() -> int:
         from spec_formatter import secrets  # noqa: F401 - proves the keyring wrapper froze
         import gui  # noqa: F401 - pulls customtkinter
         import keyring.backends.Windows  # noqa: F401 - Windows Credential Manager backend
+
+        _check_prompt_resources()
     except Exception:
         import traceback
 

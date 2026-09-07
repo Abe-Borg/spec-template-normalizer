@@ -46,11 +46,14 @@ release candidates never auto-offer themselves to stable installs.
    GitHub **pre-release** and is not offered to stable users.
 
 4. **Let CI do the rest.** `release.yml` runs on the tag:
+   - runs the full test suite on Windows first (the `test` job); the build
+     and publish jobs depend on it, so a tag on a red tree never publishes;
    - guards that the tag matches `__version__` (a half-bumped tag fails loudly
      here rather than shipping an installer stuck in a perpetual "update
      available" loop);
    - builds the one-folder app with PyInstaller and runs the frozen exe's
-     `--selfcheck` (catches a missing hidden import before release);
+     `--selfcheck` (catches a missing hidden import or an unreadable bundled
+     prompt file before release);
    - compiles the Inno Setup installer;
    - generates `latest.json` (installer SHA-256 + the download URL);
    - the tag-only `publish` job attaches `SpecificationFormatterSetup.exe` and

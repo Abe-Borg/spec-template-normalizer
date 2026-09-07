@@ -201,7 +201,9 @@ Inno Setup installer. On Windows, from the repo root:
 The app folder is written to `dist\SpecificationFormatter\` and the installer to
 `dist\installer\SpecificationFormatterSetup.exe`. Releases are normally built and
 published automatically by `.github/workflows/release.yml` on a `vX.Y.Z` tag — see
-[docs/RELEASE_WINDOWS.md](docs/RELEASE_WINDOWS.md) for the full runbook. The
+[docs/RELEASE_WINDOWS.md](docs/RELEASE_WINDOWS.md) for the full runbook. That
+workflow runs the full test suite on Windows before it builds anything, so a tag
+on a failing tree never publishes an installer. The
 legacy `build_app.ps1` one-file script is retained for quick local smoke builds.
 
 ## Headless API
