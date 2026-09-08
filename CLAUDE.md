@@ -364,6 +364,16 @@ displays `FormatRunResult`. Lock every run-affecting control while work is
 active, display all target processor log lines and audit counts, and open the
 actual `run_dir`. Never recreate pipeline business logic in the GUI.
 
+The GUI exposes no template-reuse or worker-count knobs: runs use
+`DEFAULT_REUSE_TEMPLATE_ANALYSIS` and `DEFAULT_MAX_WORKERS` (`FormatWorker`
+keeps its parameters for headless callers). The worker strips the API key once
+so the pipeline and the error redaction see the same string. The target
+preview passes the architect as `exclude_discovered` and re-renders when the
+architect changes, mirroring the pipeline's folder discovery. A keyring save
+that fails unchecks "Remember" and shows `KEYRING_UNAVAILABLE_STATUS` instead
+of silently pretending the key was stored. The window opens at 980x930 with an
+820x720 minimum.
+
 ## Untrusted input and limits
 
 DOCX input and relationship metadata are untrusted.

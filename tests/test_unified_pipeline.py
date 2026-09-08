@@ -1854,3 +1854,18 @@ def test_target_error_diagnostic_falls_back_to_text_classification_without_a_cod
     assert _target_error_diagnostic(uncoded, ()).code == "untrusted_error"
     assert _target_error_diagnostic(unknown, ()).code == "untrusted_error"
 
+
+def test_package_exports_every_name_the_gui_imports() -> None:
+    import spec_formatter
+
+    for name in (
+        "SafeErrorDiagnostic",
+        "safe_error_diagnostic",
+        "collect_target_specs",
+        "prepare_template_profile",
+        "format_specifications",
+        "default_template_cache_dir",
+    ):
+        assert name in spec_formatter.__all__
+        assert getattr(spec_formatter, name) is getattr(pipeline, name)
+
