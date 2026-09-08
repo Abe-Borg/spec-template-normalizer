@@ -481,6 +481,7 @@ class TestApplyFontTableValidation:
 from spec_formatter.style_application.arch_env_applier import (  # noqa: E402
     _ensure_theme_in_content_types,
     _ensure_theme_in_rels,
+    apply_theme,
 )
 
 
@@ -504,7 +505,12 @@ class TestParsedPlumbingWiring:
         assert ct.count("theme+xml") == 1
         assert log == []
 
-    def test_existing_relationship_is_matched_by_type_uri(self, tmp_path):
+    def test_existing_relationship_of_the_type_is_retargeted_to_the_written_part(
+        self, tmp_path
+    ):
+        # The target's theme lived under another name. The relationship type
+        # stays a singleton, so the existing entry must now point at the
+        # architect's theme1.xml rather than leaving it orphaned.
         extract = _setup_extract_dir(tmp_path)
         rels_path = extract / "word" / "_rels" / "document.xml.rels"
         rels_path.write_text(
@@ -522,7 +528,64 @@ class TestParsedPlumbingWiring:
 
         rels = rels_path.read_text(encoding="utf-8")
         assert rels.count("relationships/theme") == 1
+        assert 'Id="rId9"' in rels and 'Target="theme/theme1.xml"' in rels
+        assert "custom-theme.xml" not in rels
+        assert log == [
+            "Retargeted theme relationship (rId9) to theme/theme1.xml in document.xml.rels"
+        ]
+
+    def test_existing_relationship_to_the_same_part_is_left_alone(self, tmp_path):
+        extract = _setup_extract_dir(tmp_path)
+        rels_path = extract / "word" / "_rels" / "document.xml.rels"
+        original = _RELS_XML.replace(
+            "</Relationships>",
+            '<Relationship Id="rId9" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" '
+            'Target="/word/Theme/theme1.xml"/></Relationships>',
+        )
+        rels_path.write_text(original, encoding="utf-8")
+        log = []
+
+        _ensure_theme_in_rels(extract, log)
+
+        assert rels_path.read_text(encoding="utf-8") == original
         assert log == []
+
+    def test_apply_theme_retargets_a_custom_named_target_theme(self, tmp_path):
+        extract = _setup_extract_dir(tmp_path)
+        theme_dir = extract / "word" / "theme"
+        theme_dir.mkdir(parents=True)
+        (theme_dir / "custom-theme.xml").write_text(
+            '<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            'name="Target"/>',
+            encoding="utf-8",
+        )
+        rels_path = extract / "word" / "_rels" / "document.xml.rels"
+        rels_path.write_text(
+            _RELS_XML.replace(
+                "</Relationships>",
+                '<Relationship Id="rId9" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" '
+                'Target="theme/custom-theme.xml"/></Relationships>',
+            ),
+            encoding="utf-8",
+        )
+        architect_theme = (
+            '<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            'name="Architect"/>'
+        )
+        log = []
+
+        apply_theme(extract, {"theme": {"theme1_xml": architect_theme}}, log)
+
+        assert (theme_dir / "theme1.xml").read_text(encoding="utf-8") == architect_theme
+        rels = rels_path.read_text(encoding="utf-8")
+        assert rels.count("relationships/theme") == 1
+        assert 'Target="theme/theme1.xml"' in rels
+        assert '<Override PartName="/word/theme/theme1.xml"' in (
+            extract / "[Content_Types].xml"
+        ).read_text(encoding="utf-8")
+        assert "Retargeted theme relationship (rId9)" in " ".join(log)
 
     def test_appended_entries_are_prefix_free_and_parseable(self, tmp_path):
         import xml.etree.ElementTree as ET

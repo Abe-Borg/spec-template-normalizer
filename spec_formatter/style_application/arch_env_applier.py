@@ -170,16 +170,18 @@ def apply_theme(
     
     theme_path = theme_dir / "theme1.xml"
     
-    # Check if target already has a theme
     if theme_path.exists():
         log.append("Replacing target theme1.xml with architect theme")
     else:
         log.append("Adding theme1.xml from architect (none existed)")
-        # May need to update [Content_Types].xml and relationships
-        _ensure_theme_in_content_types(target_extract_dir, log)
-        _ensure_theme_in_rels(target_extract_dir, log)
-    
+
     write_xml_text(theme_path, theme_xml)
+    # Always wire the written part. A target whose theme lived under
+    # another name (theme/custom.xml) has no content type for theme1.xml,
+    # and its existing theme relationship must be retargeted to the part
+    # just written or the document keeps using its own theme.
+    _ensure_theme_in_content_types(target_extract_dir, log)
+    _ensure_theme_in_rels(target_extract_dir, log)
 
 _CT_OVERRIDE_TYPES = {
     "/word/theme/theme1.xml": "application/vnd.openxmlformats-officedocument.theme+xml",
@@ -234,6 +236,18 @@ def _ensure_override_in_content_types(
     log.append(f"Added {label} to [Content_Types].xml")
 
 
+def _same_document_part(existing_target: str, wanted: str) -> bool:
+    """True when a relationship Target already names the ``word/``-relative part."""
+
+    candidate = existing_target.strip().replace("\\", "/")
+    if candidate.startswith("/"):
+        prefix = "/word/"
+        if not candidate.casefold().startswith(prefix):
+            return False
+        candidate = candidate[len(prefix):]
+    return candidate.casefold() == wanted.casefold()
+
+
 def _ensure_relationship_in_document_rels(
     extract_dir: Path,
     target: str,
@@ -260,7 +274,28 @@ def _ensure_relationship_in_document_rels(
         raise ValueError("Invalid document.xml.rels root element")
     rel_type = _DOCUMENT_REL_TYPES[target]
     relationships = root.findall(f"{{{PKG_REL_NS}}}Relationship")
-    if any(node.attrib.get("Type", "") == rel_type for node in relationships):
+    existing = [
+        node for node in relationships if node.attrib.get("Type", "") == rel_type
+    ]
+    if existing:
+        # The document already relates a part of this type, and the type
+        # must stay a singleton. Point the existing relationship at the
+        # part that was just written instead of adding a second one: a
+        # target whose theme lived at theme/custom.xml would otherwise keep
+        # using it and leave the architect's theme1.xml orphaned.
+        retargeted: List[str] = []
+        for node in existing:
+            if _same_document_part(node.attrib.get("Target", ""), target):
+                continue
+            node.attrib["Target"] = target
+            node.attrib.pop("TargetMode", None)
+            retargeted.append(node.attrib.get("Id", ""))
+        if retargeted:
+            rels_path.write_bytes(serialize_package_relationships(root))
+            log.append(
+                f"Retargeted {label} relationship ({', '.join(retargeted)}) "
+                f"to {target} in document.xml.rels"
+            )
         return
     existing_ids = {node.attrib.get("Id", "") for node in relationships}
     numeric_rids = [

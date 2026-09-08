@@ -1703,6 +1703,22 @@ def test_publication_failure_still_writes_a_failed_manifest_with_target_outcomes
     assert record["stage"] == "complete"
     assert record["output_path"] == str(run_dir / "target_FORMATTED.docx")
     assert (run_dir / "target_FORMATTED.docx").is_file()
+    # The fallback audit and summary describe the same outcome as the
+    # target record; they used to claim not_started / all failed.
+    audit = json.loads(Path(record["audit_path"]).read_text(encoding="utf-8"))
+    assert audit["success"] is True
+    assert audit["stage"] == "complete"
+    assert audit["output"]["path"] == record["output_path"]
+    expected_counts = {"styled": 1, "ignored": 2, "out_of_scope": 3, "unresolved": 0}
+    assert audit["disposition_counts"] == expected_counts
+    assert record["disposition_counts"] == expected_counts
+    assert record["numbering_checks"] == {"preserved": True, "checked": 1}
+    assert manifest["summary"] == {
+        "targets": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "dispositions": expected_counts,
+    }
     assert "RUN FAILED DURING PUBLICATION" in (run_dir / "run.log").read_text(encoding="utf-8")
     assert not (run_dir / ".staging").exists()
 
@@ -1869,3 +1885,75 @@ def test_package_exports_every_name_the_gui_imports() -> None:
         assert name in spec_formatter.__all__
         assert getattr(spec_formatter, name) is getattr(pipeline, name)
 
+
+class _InlineExecutor:
+    """A ThreadPoolExecutor stand-in whose futures are complete before submit returns.
+
+    It makes the completion race deterministic: every ``done`` signal is queued
+    (and drained by the submission loop) before the completion loop starts.
+    """
+
+    def __init__(self, max_workers=None):
+        self.max_workers = max_workers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # pragma: no cover - surfaced by the pipeline
+            future.set_exception(exc)
+        return future
+
+
+def test_completion_signals_drained_during_submission_are_not_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target that finishes before the completion loop starts is still collected.
+
+    ``report`` drains the signal queue from the owner thread, so a target that
+    completes while the next one is being queued has its ``done`` signal
+    consumed early. The run used to block forever waiting for a signal that
+    would never be queued again.
+    """
+
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    targets = [
+        _write_input(tmp_path / f"target{index}.docx", f"target{index}-original".encode())
+        for index in range(3)
+    ]
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    monkeypatch.setattr(pipeline, "ThreadPoolExecutor", _InlineExecutor)
+    outcome: dict = {}
+
+    def run() -> None:
+        try:
+            outcome["result"] = _run_with_fakes(
+                architect,
+                targets,
+                tmp_path / "formatted",
+                analyzer=analyzer,
+                config_loader=config_loader,
+                processor=processor,
+            )
+        except BaseException as exc:  # pragma: no cover - reported below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+
+    assert not worker.is_alive(), "the run hung waiting for an already-drained completion"
+    assert "error" not in outcome, outcome.get("error")
+    result = outcome["result"]
+    assert result.success and len(result.targets) == 3
+    assert [item.success for item in result.targets] == [True, True, True]
+    assert result.manifest_path.is_file()

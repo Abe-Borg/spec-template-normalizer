@@ -1510,6 +1510,70 @@ def _write_diagnostics_log(
     return diagnostics_path
 
 
+def _target_audit_path(run_dir: Path, index: int, item: TargetFormatResult) -> Path:
+    identity = (
+        item.source_sha256
+        or hashlib.sha256(str(item.source_path).encode("utf-8")).hexdigest()
+    )[:12]
+    return run_dir / f"target-{index:04d}-{identity}.audit.json"
+
+
+def _target_audit_payload(
+    *,
+    run_id: str,
+    conversion_mode: str,
+    item: TargetFormatResult,
+    secrets: Sequence[str],
+) -> dict[str, Any]:
+    """The per-target ``audit.json`` record.
+
+    Shared by normal publication and by the publication-failure fallback, so
+    a target that ran always gets the same truthful audit whichever path
+    writes it.
+    """
+
+    error_diagnostic = _target_error_diagnostic(item, secrets)
+    conversion = (
+        _normalize_audit_details(item.conversion_report.as_dict())
+        if item.conversion_report is not None
+        else None
+    )
+    return {
+        "schema_version": _RUN_AUDIT_VERSION,
+        "run_id": run_id,
+        "conversion_mode": conversion_mode,
+        "source": {
+            "path": str(item.source_path),
+            "sha256": item.source_sha256,
+        },
+        "output": (
+            {
+                "path": str(item.output_path),
+                "sha256": item.output_sha256,
+            }
+            if item.output_path is not None
+            else None
+        ),
+        "success": item.success,
+        "stage": item.stage,
+        "duration_seconds": round(item.duration_seconds, 6),
+        "error_code": (
+            error_diagnostic.code if error_diagnostic is not None else None
+        ),
+        "error": (
+            error_diagnostic.message if error_diagnostic is not None else None
+        ),
+        "disposition_counts": dict(item.audit_summary),
+        "numbering_checks": _redact_json(item.numbering_checks, secrets),
+        "application_audit": _redact_json(item.audit, secrets),
+        "conversion_report": _redact_json(conversion, secrets),
+        "diagnostics": _redact_json(
+            [diag.sanitize_event(event) for event in item.diagnostics],
+            secrets,
+        ),
+    }
+
+
 def _write_run_artifacts(
     *,
     run_id: str,
@@ -1531,51 +1595,16 @@ def _write_run_artifacts(
 
     audited_results: list[TargetFormatResult] = []
     for index, item in enumerate(targets, start=1):
-        error_diagnostic = _target_error_diagnostic(item, secrets)
-        identity = (item.source_sha256 or hashlib.sha256(
-            str(item.source_path).encode("utf-8")
-        ).hexdigest())[:12]
-        audit_path = run_dir / f"target-{index:04d}-{identity}.audit.json"
-        conversion = (
-            _normalize_audit_details(item.conversion_report.as_dict())
-            if item.conversion_report is not None
-            else None
+        audit_path = _target_audit_path(run_dir, index, item)
+        _atomic_write_json(
+            audit_path,
+            _target_audit_payload(
+                run_id=run_id,
+                conversion_mode=conversion_mode,
+                item=item,
+                secrets=secrets,
+            ),
         )
-        audit_payload = {
-            "schema_version": _RUN_AUDIT_VERSION,
-            "run_id": run_id,
-            "conversion_mode": conversion_mode,
-            "source": {
-                "path": str(item.source_path),
-                "sha256": item.source_sha256,
-            },
-            "output": (
-                {
-                    "path": str(item.output_path),
-                    "sha256": item.output_sha256,
-                }
-                if item.output_path is not None
-                else None
-            ),
-            "success": item.success,
-            "stage": item.stage,
-            "duration_seconds": round(item.duration_seconds, 6),
-            "error_code": (
-                error_diagnostic.code if error_diagnostic is not None else None
-            ),
-            "error": (
-                error_diagnostic.message if error_diagnostic is not None else None
-            ),
-            "disposition_counts": dict(item.audit_summary),
-            "numbering_checks": _redact_json(item.numbering_checks, secrets),
-            "application_audit": _redact_json(item.audit, secrets),
-            "conversion_report": _redact_json(conversion, secrets),
-            "diagnostics": _redact_json(
-                [diag.sanitize_event(event) for event in item.diagnostics],
-                secrets,
-            ),
-        }
-        _atomic_write_json(audit_path, audit_payload)
         audited_results.append(replace(item, audit_path=audit_path))
 
     total_counts = _empty_audit_summary()
@@ -1751,27 +1780,27 @@ def _write_initialization_failure_artifacts(
             :12
         ]
         audit_path = run_dir / f"target-{index:04d}-{identity}.audit.json"
-        audit_payload = {
-            "schema_version": _RUN_AUDIT_VERSION,
-            "run_id": run_id,
-            "conversion_mode": conversion_mode,
-            "phase": "not_started",
-            "stage": "not_started",
-            "source": {"path": str(target), "sha256": source_hash},
-            "output": None,
-            "success": False,
-            "duration_seconds": 0.0,
-            "error_type": type(error).__name__,
-            "error_code": error_diagnostic.code,
-            "error": error_diagnostic.message,
-            "disposition_counts": _empty_audit_summary(),
-            "numbering_checks": {},
-            "application_audit": {},
-            "conversion_report": None,
-        }
-        _atomic_write_json(audit_path, audit_payload)
         outcome = results_by_path.get(Path(target))
         if outcome is None:
+            audit_payload = {
+                "schema_version": _RUN_AUDIT_VERSION,
+                "run_id": run_id,
+                "conversion_mode": conversion_mode,
+                "phase": "not_started",
+                "stage": "not_started",
+                "source": {"path": str(target), "sha256": source_hash},
+                "output": None,
+                "success": False,
+                "duration_seconds": 0.0,
+                "error_type": type(error).__name__,
+                "error_code": error_diagnostic.code,
+                "error": error_diagnostic.message,
+                "disposition_counts": _empty_audit_summary(),
+                "numbering_checks": {},
+                "application_audit": {},
+                "conversion_report": None,
+            }
+            _atomic_write_json(audit_path, audit_payload)
             target_records.append(
                 {
                     "source_path": str(target),
@@ -1790,7 +1819,19 @@ def _write_initialization_failure_artifacts(
                 }
             )
             continue
-        target_error = safe_error_diagnostic(outcome.error, secrets)
+        # A target that ran keeps its truthful audit: the same record the
+        # normal publication path writes, so run.json, the audit, and the
+        # summary below agree about its outcome.
+        _atomic_write_json(
+            audit_path,
+            _target_audit_payload(
+                run_id=run_id,
+                conversion_mode=conversion_mode,
+                item=outcome,
+                secrets=secrets,
+            ),
+        )
+        target_error = _target_error_diagnostic(outcome, secrets)
         target_records.append(
             {
                 "source_path": str(target),
@@ -1801,11 +1842,11 @@ def _write_initialization_failure_artifacts(
                 "output_sha256": outcome.output_sha256,
                 "audit_path": str(audit_path),
                 "duration_seconds": round(float(outcome.duration_seconds), 6),
-                "error_type": None if outcome.success else type(error).__name__,
+                "error_type": None,
                 "error_code": target_error.code if target_error else None,
                 "error": target_error.message if target_error else None,
                 "disposition_counts": _normalize_audit_summary(outcome.audit_summary),
-                "numbering_checks": {},
+                "numbering_checks": _redact_json(outcome.numbering_checks, secrets),
             }
         )
 
@@ -1824,6 +1865,12 @@ def _write_initialization_failure_artifacts(
     )
 
     diagnostics_path = _write_diagnostics_log(run_dir, recorder, secrets)
+
+    succeeded = sum(1 for record in target_records if record["success"])
+    total_counts = _empty_audit_summary()
+    for record in target_records:
+        for key in total_counts:
+            total_counts[key] += record["disposition_counts"].get(key, 0)
 
     manifest_path = run_dir / "run.json"
     manifest = {
@@ -1859,9 +1906,9 @@ def _write_initialization_failure_artifacts(
         "error": error_diagnostic.message,
         "summary": {
             "targets": len(target_records),
-            "succeeded": 0,
-            "failed": len(target_records),
-            "dispositions": _empty_audit_summary(),
+            "succeeded": succeeded,
+            "failed": len(target_records) - succeeded,
+            "dispositions": total_counts,
         },
         "targets": target_records,
     }
@@ -1914,6 +1961,10 @@ def format_specifications(
     # order guarantees a worker's progress events are published before its
     # completion is handled.
     pending_events: queue.SimpleQueue[tuple[Any, ...]] = queue.SimpleQueue()
+    # Completion signals a drain has already consumed. ``report`` drains from
+    # the owner thread at any time, so a target that finishes while another
+    # is being queued or published must not lose its signal.
+    finished_futures: set[Future[TargetFormatResult]] = set()
     event_order_lock = threading.Lock()
     event_owner_thread = threading.get_ident()
     last_event_at: Optional[datetime] = None
@@ -1960,6 +2011,7 @@ def format_specifications(
                 return finished
             first = False
             if item[0] == "done":
+                finished_futures.add(item[1])
                 finished.append(item[1])
                 continue
             _kind, event_time, message = item
@@ -2109,10 +2161,15 @@ def format_specifications(
             completed = 0
             outstanding = set(futures)
             while outstanding:
+                # A completion may already have been drained, by the
+                # submission loop or by ``report`` while another target was
+                # being published, so block only when none is waiting.
+                if not (finished_futures & outstanding):
+                    drain_reported_events(block=True)
                 done = [
                     future
-                    for future in drain_reported_events(block=True)
-                    if future in outstanding
+                    for future in futures
+                    if future in outstanding and future in finished_futures
                 ]
                 outstanding.difference_update(done)
                 for future in done:
