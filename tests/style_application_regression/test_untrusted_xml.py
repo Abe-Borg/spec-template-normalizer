@@ -288,3 +288,12 @@ def test_unsupported_encodings_are_wrapped_with_the_part_name(label, payload):
         parse_untrusted_xml(payload, "part.xml")
     assert isinstance(raised.value, ValueError), label
     assert "part.xml" in str(raised.value), label
+
+
+def test_cdata_declaration_text_is_not_rewritten_by_normalization():
+    """Step 0 must normalize the prolog only, never document content."""
+    original = '<?xml version="1.0" encoding="windows-1252"?>'
+    root = parse_untrusted_xml(
+        f'<w:t xmlns:w="{W_NS}"><![CDATA[{original}]]></w:t>', "word/document.xml"
+    )
+    assert root.text == original

@@ -182,7 +182,16 @@ Primary:
 - `spec_formatter/style_application/core/untrusted_xml.py`
 - `tests/style_application_regression/test_untrusted_xml.py`
 
-`core/ooxml_text.py` needs no change under this design; §4.2 step 0 *calls* its existing `prepare_xml_text_for_utf8` rather than modifying it. Touch that module only if a separate defect is found there, and say so explicitly.
+`core/ooxml_text.py` needs no change *for the guard itself*; §4.2 step 0 calls its
+existing `prepare_xml_text_for_utf8`. A separate defect in that helper was found
+during implementation and is stated here as this section requires:
+`_TEXT_DECLARED_ENCODING` was unanchored, so it rewrote the first
+declaration-shaped text *anywhere* in a part. A part with no prolog but with
+`<?xml ... encoding="..."?>` inside CDATA had that content silently edited --
+through `write_xml_text` onto disk and through `docx_patch.py:135` into a
+published part, which is target document content the formatter must never
+change. The pattern is now anchored to the start of the document, where a
+declaration can legally appear, with an optional leading BOM.
 
 Trace and exercise callers in `header_footer_importer.py` (`_remove_existing_hf_files`, `_rebuild_document_rels`, `_ensure_content_types`), `phase2_invariants.py::validate_docx_package`, `core/registry.py` bundle-artifact loading, `docx_patch.py::validate_xml_wellformedness`, and `arch_env_applier.py` content-type and relationship preparation.
 

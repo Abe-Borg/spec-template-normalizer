@@ -59,3 +59,29 @@ def test_prepare_and_write_make_declaration_match_utf8_bytes(tmp_path: Path) -> 
 def test_unknown_or_incorrect_declared_encoding_is_rejected() -> None:
     with pytest.raises(ValueError, match="Could not decode"):
         decode_xml_bytes(b'<?xml version="1.0" encoding="not-real"?><root/>')
+
+
+def test_only_a_real_declaration_is_normalized(tmp_path: Path):
+    """An unanchored rewrite silently edited document content.
+
+    ``prepare_xml_text_for_utf8`` replaced the first declaration-shaped text
+    anywhere in the part, so a document with no prolog but with an XML
+    declaration inside CDATA had that CDATA rewritten -- through
+    ``write_xml_text`` onto disk, and through ``docx_patch`` into a published
+    part. Only a declaration at the very start (after an optional BOM) is a
+    declaration.
+    """
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    cdata = f'<w:t {w}><![CDATA[<?xml version="1.0" encoding="windows-1252"?>]]></w:t>'
+    assert prepare_xml_text_for_utf8(cdata) == cdata
+
+    path = tmp_path / "part.xml"
+    write_xml_text(path, cdata)
+    assert 'encoding="windows-1252"' in path.read_text(encoding="utf-8")
+
+    # A genuine declaration is still made truthful, with or without a BOM.
+    real = '<?xml version="1.0" encoding="windows-1252"?><r/>'
+    assert 'encoding="UTF-8"' in prepare_xml_text_for_utf8(real)
+    assert 'encoding="UTF-8"' in prepare_xml_text_for_utf8("﻿" + real)
+    # Nothing to normalize when the declaration carries no encoding.
+    assert prepare_xml_text_for_utf8('<?xml version="1.0"?><r/>') == '<?xml version="1.0"?><r/>'

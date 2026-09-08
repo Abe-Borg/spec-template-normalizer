@@ -16,8 +16,14 @@ _DECLARED_ENCODING = re.compile(
     br"<\?xml[^>]*\bencoding\s*=\s*['\"]([A-Za-z0-9._:-]+)['\"]",
     re.IGNORECASE,
 )
+# Anchored to the start of the document, because that is the only place an
+# XML declaration can legally appear. Unanchored, this rewrote the first
+# declaration-shaped text anywhere in the part -- so a document with no
+# prolog but with `<?xml ... encoding="..."?>` inside CDATA had that content
+# silently changed on its way to disk. Only a leading BOM may precede a real
+# declaration.
 _TEXT_DECLARED_ENCODING = re.compile(
-    r"(<\?xml[^>]*\bencoding\s*=\s*['\"])([^'\"]+)(['\"])",
+    r"\A(\ufeff?<\?xml[^>]*\bencoding\s*=\s*['\"])([^'\"]+)(['\"])",
     re.IGNORECASE,
 )
 
