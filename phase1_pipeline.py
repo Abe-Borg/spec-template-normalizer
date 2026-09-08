@@ -40,11 +40,14 @@ from phase1_bundle import (
     stage_phase1_bundle,
     write_classification_audit,
 )
-from phase1_validator import validate_style_registry, validate_template_registry
+from engine_identity import ENGINE_SOURCE_DIGEST
+from phase1_validator import validate_phase1_contracts
 
 
-PIPELINE_VERSION = "2.3.0"
-DEFAULT_MODEL = "claude-opus-4-8"
+# 2.4.0: manifest version 2 with the committed engine fingerprint, Opus 5 as
+# the architect classifier, and cross-registry validation in production.
+PIPELINE_VERSION = "2.4.0"
+DEFAULT_MODEL = "claude-opus-5"
 ProgressCallback = Callable[[str], None]
 Classifier = Callable[..., Dict[str, Any]]
 
@@ -207,8 +210,7 @@ def run_phase1(
             source_sha256=identity.sha256,
         )
         template_registry = extract_arch_template_registry(extract_dir, snapshot_path)
-        validate_style_registry(style_registry)
-        validate_template_registry(template_registry)
+        validate_phase1_contracts(style_registry, template_registry)
 
         style_registry_path = artifact_dir / "arch_style_registry.json"
         style_registry_path.write_text(
@@ -245,6 +247,7 @@ def run_phase1(
             ),
             master_prompt_sha256=_sha256_text(master_prompt),
             run_instruction_sha256=_sha256_text(run_instruction),
+            engine_fingerprint=ENGINE_SOURCE_DIGEST,
         )
         artifacts = BundleArtifacts(
             style_registry=style_registry_path,

@@ -887,7 +887,7 @@ def classify_document(
     master_prompt: str,
     run_instruction: str,
     api_key: str,
-    model: str = "claude-opus-4-8",
+    model: str = "claude-opus-5",
     max_patch_attempts: int = 3,
     max_response_attempts: int = DEFAULT_RESPONSE_ATTEMPTS,
 ) -> dict:

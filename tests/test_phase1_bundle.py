@@ -347,9 +347,16 @@ def test_default_directory_name_is_source_scoped_and_run_unique(tmp_path: Path):
         discard_staged_bundle(second)
 
 
-def test_manifest_schema_is_present_and_declares_v1_contract():
-    schema_path = Path(__file__).parents[1] / "schemas" / "phase1_bundle_manifest.v1.schema.json"
+def test_manifest_schema_is_present_and_declares_the_current_contract():
+    from engine_identity import ENGINE_SOURCE_DIGEST
+    from phase1_bundle import MANIFEST_VERSION
+
+    schema_path = Path(__file__).parents[1] / "schemas" / "phase1_bundle_manifest.v2.schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     assert schema["properties"]["bundle_format"]["const"] == "spec-template-normalizer.phase1"
-    assert schema["properties"]["manifest_version"]["const"] == 1
+    assert schema["properties"]["manifest_version"]["const"] == MANIFEST_VERSION == 2
+    producer = schema["$defs"]["producer"]
+    assert "engine_fingerprint" in producer["required"]
+    import re as _re
+    assert _re.fullmatch(producer["properties"]["engine_fingerprint"]["pattern"], ENGINE_SOURCE_DIGEST)
     assert MANIFEST_FILENAME == "phase1_bundle_manifest.json"

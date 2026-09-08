@@ -43,6 +43,7 @@ def _install_fake_bundle_validator(monkeypatch: pytest.MonkeyPatch) -> None:
             producer={
                 "name": "spec-template-normalizer",
                 "version": pipeline.template_analysis.PIPELINE_VERSION,
+                "engine_fingerprint": pipeline.template_analysis.ENGINE_SOURCE_DIGEST,
                 "classifier": {
                     "provider": "anthropic",
                     "model": pipeline.template_analysis.DEFAULT_MODEL,
@@ -1562,3 +1563,73 @@ def test_processor_exception_records_processing_stage(tmp_path: Path) -> None:
 
     assert result.success is False
     assert result.stage == "processing"
+
+
+def test_cached_profile_with_a_stale_engine_fingerprint_is_not_reused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt_dir = Path(pipeline.__file__).resolve().parents[1]
+    producer = {
+        "name": "spec-template-normalizer",
+        "version": pipeline.template_analysis.PIPELINE_VERSION,
+        "engine_fingerprint": pipeline.template_analysis.ENGINE_SOURCE_DIGEST,
+        "classifier": {
+            "provider": "anthropic",
+            "model": pipeline.template_analysis.DEFAULT_MODEL,
+        },
+        "prompts": pipeline._prompt_fingerprints(prompt_dir)
+        if hasattr(pipeline, "_prompt_fingerprints")
+        else {
+            "master_prompt_sha256": hashlib.sha256(
+                (prompt_dir / "master_prompt.txt").read_text(encoding="utf-8").encode("utf-8")
+            ).hexdigest(),
+            "run_instruction_sha256": hashlib.sha256(
+                (prompt_dir / "run_instruction_prompt.txt").read_text(encoding="utf-8").encode("utf-8")
+            ).hexdigest(),
+        },
+    }
+    current = SimpleNamespace(producer=dict(producer))
+    stale = SimpleNamespace(producer={**producer, "engine_fingerprint": "deadbeefdeadbeef"})
+    common = dict(
+        model=pipeline.template_analysis.DEFAULT_MODEL,
+        prompt_dir=prompt_dir,
+        classifier=None,
+    )
+
+    assert pipeline._manifest_matches_current_engine(current, **common) is True
+    assert pipeline._manifest_matches_current_engine(stale, **common) is False
+
+
+def test_stale_profiles_for_one_template_are_pruned_to_the_newest_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    calls, analyzer, _config_loader, _processor = _fake_dependencies(monkeypatch)
+    cache_dir = tmp_path / "profile-cache"
+    messages: list[str] = []
+
+    profiles = [
+        pipeline.prepare_template_profile(
+            architect,
+            cache_dir,
+            "key",
+            force_analysis=True,
+            analyzer=analyzer,
+            progress=messages.append,
+        )
+        for _ in range(3)
+    ]
+
+    namespace = cache_dir / pipeline._PROFILE_CACHE_NAMESPACE
+    remaining = sorted(p.name for p in namespace.glob("*.phase1"))
+    assert len(calls["analyzer"]) == 3
+    assert len(remaining) == 2
+    # The profile just selected is always kept, and so is the next newest.
+    assert profiles[-1].bundle_dir.name in remaining
+    assert profiles[-2].bundle_dir.name in remaining
+    assert profiles[0].bundle_dir.name not in remaining
+    assert any("Removed 1 older cached profile" in line for line in messages)
+    assert not any(profiles[0].bundle_dir.name in line for line in messages)
+

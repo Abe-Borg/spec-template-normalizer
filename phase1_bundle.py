@@ -27,15 +27,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple, Union
 
+from engine_identity import ENGINE_SOURCE_DIGEST
 from phase1_validator import (
     validate_instruction_contract,
-    validate_style_registry,
-    validate_template_registry,
+    validate_phase1_contracts,
 )
 
 
 BUNDLE_FORMAT = "spec-template-normalizer.phase1"
-MANIFEST_VERSION = 1
+# Version 2 adds the required producer.engine_fingerprint.
+MANIFEST_VERSION = 2
 MANIFEST_FILENAME = "phase1_bundle_manifest.json"
 
 STYLE_REGISTRY_FILENAME = "arch_style_registry.json"
@@ -57,6 +58,11 @@ REQUIRED_ARTIFACT_IDS: Tuple[str, ...] = (
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ENGINE_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{12,64}$")
+
+
+def _is_engine_fingerprint(value: Any) -> bool:
+    return isinstance(value, str) and bool(_ENGINE_FINGERPRINT_RE.fullmatch(value))
 _STAGING_PREFIX = ".phase1-bundle-staging-"
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -72,12 +78,16 @@ class ProducerIdentity:
     classifier_model: Optional[str] = None
     master_prompt_sha256: Optional[str] = None
     run_instruction_sha256: Optional[str] = None
+    #: Committed digest of the analysis engine's source (engine_identity.py).
+    engine_fingerprint: str = ENGINE_SOURCE_DIGEST
 
     def __post_init__(self) -> None:
         for field_name in ("name", "version", "run_id"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"producer {field_name} must be a non-empty string")
+        if not _is_engine_fingerprint(self.engine_fingerprint):
+            raise ValueError("producer engine_fingerprint must be a lowercase hex digest")
         classifier_values = (self.classifier_provider, self.classifier_model)
         if any(value is not None for value in classifier_values) and not all(
             isinstance(value, str) and value.strip() for value in classifier_values
@@ -96,6 +106,7 @@ class ProducerIdentity:
             "name": self.name,
             "version": self.version,
             "run_id": self.run_id,
+            "engine_fingerprint": self.engine_fingerprint,
         }
         if self.classifier_provider is not None:
             result["classifier"] = {
@@ -836,12 +847,14 @@ def _manifest_from_dict(raw: Any) -> BundleManifest:
 def _validate_producer_dict(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("manifest.producer must be an object")
-    required = {"name", "version", "run_id"}
+    required = {"name", "version", "run_id", "engine_fingerprint"}
     allowed = required | {"classifier", "prompts"}
     _require_allowed_and_required_keys(raw, allowed, required, "manifest.producer")
     for key in required:
         if not isinstance(raw[key], str) or not raw[key].strip():
             raise ValueError(f"manifest.producer.{key} must be a non-empty string")
+    if not _is_engine_fingerprint(raw["engine_fingerprint"]):
+        raise ValueError("manifest.producer.engine_fingerprint must be a lowercase hex digest")
     if "classifier" in raw:
         classifier = raw["classifier"]
         if not isinstance(classifier, dict):
@@ -976,8 +989,9 @@ def _validate_registry_files(
 ) -> None:
     style_registry = _read_json_object(style_registry_path, "style registry")
     template_registry = _read_json_object(template_registry_path, "template registry")
-    validate_style_registry(style_registry)
-    validate_template_registry(template_registry)
+    # Both registries and their cross-consistency (every role style must be a
+    # source style or a canonical generated role style).
+    validate_phase1_contracts(style_registry, template_registry)
 
     if style_registry.get("source_docx") != source.filename:
         raise ValueError(

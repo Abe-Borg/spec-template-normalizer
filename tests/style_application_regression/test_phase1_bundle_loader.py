@@ -142,10 +142,15 @@ def _write_bundle(root: Path, *, include_manifest=True) -> Path:
             })
         manifest = {
             "bundle_format": "spec-template-normalizer.phase1",
-            "manifest_version": 1,
+            "manifest_version": 2,
             "bundle_id": "aaaaaaaaaaaa-bbbbbbbbbbbb",
             "created_utc": "2026-07-17T12:00:00Z",
-            "producer": {"name": "spec-template-normalizer", "version": "2", "run_id": "run-1"},
+            "producer": {
+                "name": "spec-template-normalizer",
+                "version": "2",
+                "run_id": "run-1",
+                "engine_fingerprint": "0123456789abcdef",
+            },
             "source": {
                 "filename": "architect.docx",
                 "sha256": SOURCE_SHA,
@@ -198,7 +203,7 @@ def test_strict_loader_verifies_bundle_and_uses_portable_styles(tmp_path):
     assert shared.arch_registry == {"PART": "CSI-Part"}
     assert 'w:styleId="CSI-Part"' in shared.arch_styles_xml
     assert shared.source_tokens == {"SectionTitle": "AIR TERMINALS"}
-    assert shared.bundle_manifest["manifest_version"] == 1
+    assert shared.bundle_manifest["manifest_version"] == 2
     assert shared.legacy_mode is False
 
 
@@ -351,7 +356,7 @@ def test_strict_loader_rejects_unsupported_manifest_version(tmp_path):
     bundle = _write_bundle(tmp_path / "architect.phase1")
     manifest_path = bundle / "phase1_bundle_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["manifest_version"] = 2
+    manifest["manifest_version"] = 3
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="Unsupported manifest_version"):
         load_and_validate_shared_config(bundle)

@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -61,7 +62,9 @@ _FORMATTED_SUFFIXES = (
 _MAX_WORKERS = 6
 _RUN_MANIFEST_VERSION = 2
 _RUN_AUDIT_VERSION = 2
-_PROFILE_CONTRACT_VERSION = "2"
+# Contract 3: manifest version 2 with the committed engine fingerprint.
+_PROFILE_CONTRACT_VERSION = "3"
+_PROFILE_CACHE_KEEP = 2
 _PROFILE_CACHE_NAMESPACE = f"contract-v{_PROFILE_CONTRACT_VERSION}"
 _MAX_OUTPUT_COMPONENT_UTF16_UNITS = 240
 
@@ -428,6 +431,7 @@ def _manifest_matches_current_engine(
     return (
         producer.get("name") == "spec-template-normalizer"
         and producer.get("version") == template_analysis.PIPELINE_VERSION
+        and producer.get("engine_fingerprint") == template_analysis.ENGINE_SOURCE_DIGEST
         and producer.get("classifier")
         == {"provider": expected_provider, "model": expected_model}
         and producer.get("prompts") == prompt_hashes
@@ -588,7 +592,53 @@ def prepare_template_profile(
         classifier=classifier,
     ):
         raise ValueError("Template analysis produced an incompatible profile bundle.")
+    _prune_stale_profiles(
+        cache_root,
+        source_sha256,
+        selected=Path(phase1_result.bundle_dir),
+        progress=progress,
+    )
     return TemplateProfile(phase1_result.bundle_dir, source_sha256, reused=False)
+
+
+def _prune_stale_profiles(
+    cache_root: Path,
+    source_sha256: str,
+    *,
+    selected: Path,
+    progress: Optional[ProgressCallback],
+    keep: int = _PROFILE_CACHE_KEEP,
+) -> int:
+    """Remove older profiles of one template beyond the newest ``keep``.
+
+    Runs only after a fresh profile has been published and validated. The
+    just-selected profile is never removed, only siblings for the same
+    source hash are considered, and the log records counts, never names.
+    """
+
+    pattern = f"*--{source_sha256[:12]}--*.phase1"
+    try:
+        candidates = [
+            item for item in cache_root.glob(pattern)
+            if item.is_dir() and item.resolve() != selected.resolve()
+        ]
+    except OSError:
+        return 0
+    candidates.sort(
+        key=lambda item: (item.stat().st_mtime_ns, item.name),
+        reverse=True,
+    )
+    stale = candidates[max(keep - 1, 0):]
+    removed = 0
+    for item in stale:
+        try:
+            shutil.rmtree(item)
+        except OSError:
+            continue
+        removed += 1
+    if removed:
+        _emit(progress, f"Removed {removed} older cached profile(s) for this template.")
+    return removed
 
 
 def _safe_filename_fragment(value: str) -> str:

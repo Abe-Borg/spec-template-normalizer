@@ -170,8 +170,23 @@ reject a deterministic namespace collision with different content.
 Target application consumes the complete `.phase1` directory after strict
 manifest validation; loose registries are not a valid handoff. Cache profiles
 under a versioned contract namespace and require exact source hash, producer,
-classifier, model, and prompt compatibility. Bump the profile contract when a
-consumer-visible bundle assumption changes.
+engine fingerprint, classifier, model, and prompt compatibility. Bump the
+profile contract when a consumer-visible bundle assumption changes.
+
+The engine fingerprint (`engine_identity.ENGINE_SOURCE_DIGEST`) is a committed
+digest over the files that shape a profile (`arch_env_extractor.py`,
+`docx_decomposer.py`, `llm_classifier.py`, `paragraph_rules.py`,
+`phase1_validator.py`). It is recorded in the manifest as
+`producer.engine_fingerprint` and compared on every cache lookup, so a change
+to repair logic, text-signal rules, or shell capture invalidates cached
+profiles without anyone remembering to bump `PIPELINE_VERSION`. Runtime
+hashing cannot work in the frozen build, so `tests/test_engine_identity.py`
+recomputes the digest from the checkout and fails until the constant is
+updated (`python engine_identity.py` prints the new value).
+
+After a fresh profile is published, older profiles of the same template beyond
+the newest two are removed from the cache namespace; the selected profile is
+never removed and only counts are logged.
 
 Architect analysis remains observational: derive generated styles in
 `portable_styles.xml`; preserve byte-exact `source_styles.xml` and optional
@@ -202,7 +217,7 @@ A successful run publishes:
 | `portable_styles` | `portable_styles.xml` | yes | generated |
 | `source_settings` | `source_settings.xml` | only when the source has `word/settings.xml` | exact source bytes |
 
-`phase1_bundle_manifest.json` identifies format `spec-template-normalizer.phase1`, manifest version 1, bundle ID, UTC creation time, producer/run/classifier identity, prompt hashes, source filename/hash/size, required artifact IDs, and each artifact's path/media type/hash/size/source kind.
+`phase1_bundle_manifest.json` identifies format `spec-template-normalizer.phase1`, manifest version 2, bundle ID, UTC creation time, producer/run/classifier identity, the engine fingerprint, prompt hashes, source filename/hash/size, required artifact IDs, and each artifact's path/media type/hash/size/source kind. Version 2 made `producer.engine_fingerprint` required; the formal contract is `schemas/phase1_bundle_manifest.v2.schema.json`.
 
 The normal directory name is:
 
