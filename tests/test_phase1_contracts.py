@@ -98,10 +98,16 @@ def test_exemplar_rejection(field, value, match):
         validate_instructions(data, slim_bundle=b)
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
 def test_sectiontitle_naming_consistency():
-    assert "SectionName" not in Path("master_prompt.txt").read_text(encoding="utf-8")
-    assert "SectionName" not in Path("run_instruction_prompt.txt").read_text(encoding="utf-8")
-    assert "SectionName" not in Path("instructions.json").read_text(encoding="utf-8")
+    assert "SectionName" not in (REPO_ROOT / "master_prompt.txt").read_text(encoding="utf-8")
+    assert "SectionName" not in (REPO_ROOT / "run_instruction_prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "SectionName" not in (FIXTURES / "instructions.json").read_text(encoding="utf-8")
 
 
 def test_rpr_hints_and_whitespace_run_handling():

@@ -2,8 +2,10 @@
 """Offline smoke test for the supported immutable Phase 1 bundle pipeline.
 
 Usage:
-    python phase1_smoke_test.py TEMPLATE.docx instructions.json [OUTPUT_DIR]
+    python phase1_smoke_test.py TEMPLATE.docx INSTRUCTIONS.json [OUTPUT_DIR]
 
+``tests/fixtures/instructions.json`` is an example instruction file in the
+schema the classifier returns (``schemas/phase1_instructions.schema.json``).
 The supplied instructions replace the live classifier call.  All normal
 runtime validation, environment capture, audit generation, checksum checks,
 and atomic publication still run.

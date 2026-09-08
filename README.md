@@ -212,8 +212,18 @@ The app folder is written to `dist\SpecificationFormatter\` and the installer to
 published automatically by `.github/workflows/release.yml` on a `vX.Y.Z` tag — see
 [docs/RELEASE_WINDOWS.md](docs/RELEASE_WINDOWS.md) for the full runbook. That
 workflow runs the full test suite on Windows before it builds anything, so a tag
-on a failing tree never publishes an installer. The
-legacy `build_app.ps1` one-file script is retained for quick local smoke builds.
+on a failing tree never publishes an installer.
+
+The PyInstaller spec is the only build path; the earlier one-file
+`build_app.ps1` script is gone because it omitted `LICENSE` and
+`THIRD_PARTY_NOTICES.md`, which must accompany a binary distribution, and it
+bypassed the version guard. A local smoke build is the same three commands
+above. To verify one without opening the GUI, run the frozen executable with
+`--version` (prints the version) or `--selfcheck` (imports every bundled
+module, reads the bundled prompts and notice files through the same resource
+root the pipeline uses, and exits non-zero on any failure). The self-check
+writes its result to the file named by `SPEC_FORMATTER_SELFCHECK_OUT` because
+the windowed executable has no console.
 
 ## Headless API
 

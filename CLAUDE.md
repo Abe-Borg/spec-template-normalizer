@@ -73,14 +73,16 @@ schemas/
     formal architect-profile contracts
 tests/
     unit, adversarial, contract, integration, GUI, and round-trip regressions
-output/spec_test_corpus_smoke.py
-    offline realistic-corpus checks against this repository's namespaced engine
+tests/fixtures/
+    example classifier instructions and the sanitized format-only corpus
+tests/test_sanitized_format_only_corpus.py
+    offline realistic-corpus regression against this repository's engine
 ```
 
 `phase1_pipeline.run_phase1()` remains a compatibility and internal profile
-builder surface. New integrations must call the unified public API.
-`apply_instructions()` is a legacy developer surface and must not be wired into
-the GUI or target application.
+builder surface. New integrations must call the unified public API. The
+architect analysis is observational only: there is no surface that writes
+classifications back into the architect package, and none may be added.
 
 ## Non-negotiable invariants
 
@@ -544,7 +546,7 @@ defaults so existing test doubles and callers continue to work.
 pip install -r requirements-dev.txt
 python -m pytest -q
 python gui.py
-python output/spec_test_corpus_smoke.py
+python -m pytest tests/test_sanitized_format_only_corpus.py -q
 ```
 
 The GUI tests (`tests/test_gui_modes.py`) import `gui.py`, which needs
@@ -585,7 +587,8 @@ Before considering a formatter change complete:
    `run.json`, hashes, and redaction behavior for success, partial failure, and
    total failure.
 7. Test deep Windows paths and folder discovery containing the architect.
-8. Run focused tests, the complete suite, and the local realistic-corpus smoke.
+8. Run focused tests, the complete suite, and the offline realistic-corpus
+   regression in `tests/test_sanitized_format_only_corpus.py`.
 9. Render and inspect every page of representative original and output DOCX
    files when formatting or shell behavior changes.
 10. Update prompts, schemas, validators, README, and this guide together for
@@ -593,7 +596,7 @@ Before considering a formatter change complete:
 
 ## Common mistakes
 
-- Calling `apply_instructions()` from the production pipeline.
+- Adding any surface that writes classifications into the architect package.
 - Treating the extraction directory as an output deliverable.
 - Treating the selected output root as the concrete run directory.
 - Writing loose formatted files or logs directly into the output root.
@@ -611,7 +614,7 @@ Before considering a formatter change complete:
 - Following an external relationship or a path that escapes the package.
 - Publishing before the DOCX is fully copied and revalidated.
 - Recording secrets or paragraph text in run metadata.
-- Pointing the corpus smoke at a sibling checkout instead of the namespaced
+- Running a corpus check against a sibling checkout instead of the namespaced
   implementation in this repository.
 
 ## Platform and license
