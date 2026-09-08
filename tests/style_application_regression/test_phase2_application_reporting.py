@@ -220,6 +220,81 @@ def test_strip_direct_ppr_when_style_has_replacement(tmp_path):
     assert report.preserved_direct_ppr == 0
 
 
+STYLE_WITH_RPR_SPACING_ONLY = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+    '<w:style w:type="paragraph" w:styleId="Body"><w:name w:val="Body"/>'
+    '<w:rPr><w:spacing w:val="20"/></w:rPr></w:style>'
+    '</w:styles>'
+)
+
+
+STYLE_WITH_IND_FROM_BASEDON_PARENT = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+    '<w:style w:type="paragraph" w:styleId="Base"><w:name w:val="Base"/>'
+    '<w:pPr><w:ind w:left="360"/></w:pPr></w:style>'
+    '<w:style w:type="paragraph" w:styleId="Body"><w:name w:val="Body"/>'
+    '<w:basedOn w:val="Base"/></w:style>'
+    '</w:styles>'
+)
+
+
+def _seed_extract_with_direct_ind(tmp_path: Path, styles_xml: str) -> Path:
+    extract = _seed_extract(tmp_path, styles_xml)
+    (extract / "word" / "document.xml").write_text(
+        DOC_XML.replace('<w:spacing w:after="120"/>', '<w:ind w:left="720"/>'),
+        encoding="utf-8",
+    )
+    return extract
+
+
+@pytest.mark.parametrize("conversion_mode", ["format_only", "csi_to_canadian"])
+def test_character_spacing_in_style_rpr_is_not_a_paragraph_replacement(
+    tmp_path, conversion_mode
+):
+    # <w:spacing> inside the style's rPr is character spacing. A substring scan
+    # of the style block used to treat it as paragraph spacing and strip the
+    # target's direct indent that the style never replaces.
+    extract = _seed_extract_with_direct_ind(tmp_path, STYLE_WITH_RPR_SPACING_ONLY)
+
+    report = apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+        conversion_mode=conversion_mode,
+    )
+
+    out = (extract / "word" / "document.xml").read_text(encoding="utf-8")
+    assert out.count('<w:ind w:left="720"/>') == 2
+    assert report.preserved_direct_ppr == 1
+    assert report.stripped_direct_ppr == 0
+
+
+@pytest.mark.parametrize("conversion_mode", ["format_only", "csi_to_canadian"])
+def test_indent_supplied_by_basedon_parent_strips_the_direct_indent(
+    tmp_path, conversion_mode
+):
+    extract = _seed_extract_with_direct_ind(
+        tmp_path, STYLE_WITH_IND_FROM_BASEDON_PARENT
+    )
+
+    report = apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+        conversion_mode=conversion_mode,
+    )
+
+    out = (extract / "word" / "document.xml").read_text(encoding="utf-8")
+    # Only the unclassified second paragraph keeps its direct indent.
+    assert out.count('<w:ind w:left="720"/>') == 1
+    assert report.stripped_direct_ppr == 1
+    assert report.preserved_direct_ppr == 0
+
+
 def test_visible_section_break_paragraph_is_styled_and_sectpr_is_exact(tmp_path):
     extract = _seed_extract(tmp_path, STYLE_WITH_PPR)
     doc_path = extract / "word" / "document.xml"
@@ -804,3 +879,29 @@ def test_explicitly_ignored_paragraph_is_byte_exact(tmp_path):
     )[0]
     assert ignored_after == ignored_before
     assert report.ignored == 1
+
+
+def test_body_text_is_re_extracted_only_for_modified_paragraphs(tmp_path, monkeypatch):
+    from spec_formatter.style_application.core import classification as cls
+
+    extract = _seed_extract(tmp_path, STYLE_WITH_PPR)
+    real = cls.paragraph_text_from_block
+    calls = {"count": 0}
+
+    def counting(block):
+        calls["count"] += 1
+        return real(block)
+
+    monkeypatch.setattr(cls, "paragraph_text_from_block", counting)
+
+    apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+    )
+
+    # Two paragraphs extracted before application; only the classified one
+    # again afterwards (the untouched block is the same object).
+    assert calls["count"] == 3
+

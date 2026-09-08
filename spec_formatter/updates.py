@@ -48,6 +48,7 @@ import re
 import subprocess
 import sys
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -115,6 +116,7 @@ _DISABLE_TOKENS = frozenset({"0", "false", "no", "off"})
 DEFAULT_MANIFEST_TIMEOUT = 8.0        # seconds -- one quick GET on launch
 DEFAULT_DOWNLOAD_TIMEOUT = 60.0       # seconds -- per socket op during download
 MAX_MANIFEST_BYTES = 64 * 1024        # 64 KiB is enormous for this manifest
+MAX_INSTALLER_BYTES = 512 * 1024 * 1024  # the one-folder installer is ~100 MiB
 _USER_AGENT = "SpecificationFormatter-Updater"
 
 STATUS_UP_TO_DATE = "UP_TO_DATE"
@@ -284,10 +286,27 @@ def fetch_manifest(url: str, *, timeout: float = DEFAULT_MANIFEST_TIMEOUT) -> di
         url, headers={"User-Agent": _USER_AGENT, "Accept": "application/json"}
     )
     with urllib.request.urlopen(request, timeout=timeout) as resp:  # noqa: S310 - https enforced above
+        _require_https_final_url(resp, url)
         raw = resp.read(MAX_MANIFEST_BYTES + 1)
     if len(raw) > MAX_MANIFEST_BYTES:
         raise UpdateError("update manifest is unexpectedly large; refusing to parse")
     return json.loads(raw.decode("utf-8"))
+
+
+def _require_https_final_url(resp, requested_url: str) -> str:
+    """Refuse a response that arrived after a redirect off https.
+
+    ``urllib`` follows redirects silently, so the https check on the URL we
+    asked for does not cover the URL we were served from. The default
+    manifest URL (``releases/latest/download/...``) is itself a redirect in
+    production, which is exactly why the final URL must be checked too.
+    """
+
+    geturl = getattr(resp, "geturl", None)
+    final_url = geturl() if callable(geturl) else requested_url
+    if not str(final_url).lower().startswith("https://"):
+        raise UpdateError("update transfer was redirected to a non-https URL; refusing")
+    return str(final_url)
 
 
 def check_for_update(
@@ -392,30 +411,38 @@ def download_installer(
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / _installer_filename(info.url)
-    part = dest.with_name(dest.name + ".part")
+    # A unique temp name opened exclusively: two concurrent downloads (or a
+    # stale file left by a crash) can never be written through the same path.
+    part = dest.with_name(f"{dest.name}.{uuid.uuid4().hex[:12]}.part")
 
     open_fn = opener or _open_url
-    digest = hashlib.sha256()
     downloaded = 0
     try:
         with open_fn(info.url, timeout=timeout) as resp:
+            _require_https_final_url(resp, info.url)
             total = _content_length(resp)
-            with open(part, "wb") as fh:
+            if total > MAX_INSTALLER_BYTES:
+                raise UpdateError(
+                    f"installer download announces {total} bytes, above the "
+                    f"{MAX_INSTALLER_BYTES}-byte limit; refusing"
+                )
+            with open(part, "xb") as fh:
                 while True:
                     buf = resp.read(chunk)
                     if not buf:
                         break
-                    fh.write(buf)
-                    digest.update(buf)
                     downloaded += len(buf)
+                    if downloaded > MAX_INSTALLER_BYTES:
+                        raise UpdateError(
+                            f"installer download exceeded the {MAX_INSTALLER_BYTES}-byte "
+                            "limit; refusing"
+                        )
+                    fh.write(buf)
                     if progress is not None:
                         progress(downloaded, total)
-        actual = digest.hexdigest()
-        if actual.lower() != info.sha256.lower():
-            raise UpdateError(
-                f"downloaded installer failed integrity check "
-                f"(expected {info.sha256}, got {actual})"
-            )
+        # One verifier for the product and the tests: re-read the finished
+        # temp file so the promoted installer is exactly what was hashed.
+        verify_sha256(part, info.sha256)
         # Promote atomically: the final installer path only ever appears as a
         # fully-downloaded, integrity-verified file.
         os.replace(part, dest)
@@ -509,9 +536,20 @@ def should_auto_check(
         return True
     try:
         last_dt = datetime.fromisoformat(str(last))
-    except ValueError:
+    except (ValueError, TypeError):
         return True
-    return (now - last_dt) >= timedelta(days=min_interval_days)
+    # A stored timestamp may be tz-aware while ``now`` is naive (or the
+    # reverse) after a code change; comparing them raises TypeError, which
+    # used to crash the launch-time check. Normalise to the same kind.
+    if (last_dt.tzinfo is None) != (now.tzinfo is None):
+        if last_dt.tzinfo is not None:
+            last_dt = last_dt.astimezone().replace(tzinfo=None)
+        else:
+            now = now.astimezone().replace(tzinfo=None)
+    try:
+        return (now - last_dt) >= timedelta(days=min_interval_days)
+    except (TypeError, ValueError, OverflowError):
+        return True
 
 
 def record_check(state: dict, *, now: datetime) -> dict:

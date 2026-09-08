@@ -5,21 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import os
 import tempfile
 import time
-import zipfile
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .. import diagnostics as diag
 from .arch_env_applier import apply_environment_to_target
 from .core.classification import apply_phase2_classifications, build_phase2_slim_bundle
 from .core.application_policy import ApplicationPolicy, application_policy_for_mode
 from .core.csi_to_canadian import (
-    CSI_TO_CANADIAN,
     FORMAT_ONLY,
     CanadianConversionReport,
     ConversionIssue,
@@ -28,13 +25,9 @@ from .core.csi_to_canadian import (
     classifications_for_canadian_application,
     validate_conversion_mode,
 )
+from .core.classification import validate_phase2_final_payload
+from .core.errors import EngineError, attach_engine_error
 from .core.token_utils import extract_target_tokens
-from .core.batch_classifier import (
-    BatchClassificationError,
-    build_batch_requests,
-    reassemble_file_classifications,
-    submit_and_poll,
-)
 from .core.llm_classifier import classify_target_document
 from .core.ooxml_text import read_xml_text, write_xml_text
 from .core.registry import (
@@ -44,7 +37,6 @@ from .core.registry import (
     load_available_roles_from_registry,
     load_role_specs_from_registry,
     preflight_validate_registries,
-    resolve_arch_extract_root,
     validate_phase1_bundle_directory,
 )
 from .core.stability import snapshot_stability, verify_stability
@@ -82,6 +74,10 @@ class BatchResult:
     # Structured, redaction-safe phase-timing/count events for this target.
     # Carries no free text; the pipeline folds it into the run diagnostics.
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    # Stable engine error code and its fixed remediation sentence, when the
+    # failure carried one (core/errors.py). ``error`` keeps the raw detail.
+    error_code: Optional[str] = None
+    safe_error: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -111,16 +107,27 @@ class ApplicationFailureDiagnostics:
 
 
 class ApplicationStageError(RuntimeError):
-    """Application failure augmented with the last safe diagnostic checkpoint."""
+    """Application failure augmented with the last safe diagnostic checkpoint.
+
+    When the underlying failure carries an engine error code, the code and
+    its fixed remediation sentence are forwarded so the runner, the pipeline,
+    and the GUI all report the same identity.
+    """
 
     def __init__(
         self,
         message: str,
         *,
         diagnostics: ApplicationFailureDiagnostics,
+        cause: Optional[BaseException] = None,
     ) -> None:
         super().__init__(message)
         self.diagnostics = diagnostics
+        code = getattr(cause, "safe_error_code", None)
+        safe_message = getattr(cause, "safe_error_message", None)
+        if isinstance(code, str) and isinstance(safe_message, str):
+            self.safe_error_code = code
+            self.safe_error_message = safe_message
 
     @property
     def stage(self) -> str:
@@ -159,6 +166,8 @@ class _ApplicationCheckpoint:
             audit=_safe_application_audit(self.audit),
             numbering_checks=_safe_numbering_checks(self.numbering_checks),
         )
+
+
 @dataclass(frozen=True)
 class SharedConfig:
     arch_registry: Dict[str, str]
@@ -193,49 +202,56 @@ def _coverage_counts(bundle: Dict[str, Any], classifications: Dict[str, Any]) ->
     return resolved, total, len(bundle.get("paragraphs", []))
 
 
+def _safe_error_code(error: BaseException) -> Optional[str]:
+    code = getattr(error, "safe_error_code", None)
+    return code if isinstance(code, str) and code else None
+
+
+def _safe_error_message(error: BaseException) -> Optional[str]:
+    message = getattr(error, "safe_error_message", None)
+    return message if isinstance(message, str) and message else None
+
+
 def _check_numbering_module_needed(arch_styles_xml: str, needed_style_ids: List[str]) -> None:
     """Raise if styles need numbering but numbering_importer is unavailable."""
     for sid in collect_style_dependency_closure(arch_styles_xml, needed_style_ids):
         pat = r'<w:style[^>]*w:styleId="' + re.escape(sid) + r'"[^>]*>[\s\S]*?</w:style>'
         m = re.search(pat, arch_styles_xml)
         if m and '<w:numId' in m.group(0):
-            raise ImportError(
-                "numbering_importer module is not available but imported styles "
-                f"require numbering definitions (e.g. style '{sid}'). "
-                "Ensure numbering_importer.py is on the Python path."
+            raise attach_engine_error(
+                ImportError(
+                    "numbering_importer module is not available but imported styles "
+                    f"require numbering definitions (e.g. style '{sid}'). "
+                    "Ensure numbering_importer.py is on the Python path."
+                ),
+                "numbering_importer_unavailable",
             )
 
 
-def load_and_validate_shared_config(
-    arch_path: Path,
-    *,
-    allow_legacy_bundle: bool = False,
-) -> SharedConfig:
+def load_and_validate_shared_config(arch_path: Path) -> SharedConfig:
+    """Load one strictly validated ``.phase1`` bundle as the shared config.
+
+    The complete bundle directory (with its manifest) is the only accepted
+    handoff. The old opt-in for loose legacy registries is gone: it referenced
+    the retired ``arch_styles_raw.xml`` artifact and had no production caller.
+    """
+
     requested_path = Path(arch_path)
     candidate_root = requested_path.parent if requested_path.is_file() else requested_path
     manifest_path = candidate_root / PHASE1_MANIFEST_FILENAME
 
-    bundle_manifest: Optional[Dict[str, Any]] = None
     legacy_mode = False
-    if manifest_path.exists():
-        bundle_manifest, artifact_paths = validate_phase1_bundle_directory(candidate_root)
-        arch_root = candidate_root
-        style_registry_path = artifact_paths["style_registry"]
-        template_registry_path = artifact_paths["template_registry"]
-        portable_styles_path = artifact_paths["portable_styles"]
-    else:
-        if not allow_legacy_bundle:
-            raise FileNotFoundError(
-                f"Strict Phase 1 bundle required: {manifest_path} was not found. "
-                "Regenerate the template with Phase 1, or explicitly call "
-                "load_and_validate_shared_config(..., allow_legacy_bundle=True) "
-                "for a trusted legacy bundle."
-            )
-        legacy_mode = True
-        arch_root = resolve_arch_extract_root(requested_path)
-        style_registry_path = arch_root / "arch_style_registry.json"
-        template_registry_path = arch_root / "arch_template_registry.json"
-        portable_styles_path = arch_root / "arch_styles_raw.xml"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Strict Phase 1 bundle required: {manifest_path} was not found. "
+            "Regenerate the template profile; loose legacy registries are not a "
+            "valid handoff."
+        )
+    bundle_manifest, artifact_paths = validate_phase1_bundle_directory(candidate_root)
+    arch_root = candidate_root
+    style_registry_path = artifact_paths["style_registry"]
+    template_registry_path = artifact_paths["template_registry"]
+    portable_styles_path = artifact_paths["portable_styles"]
 
     arch_registry = load_arch_style_registry(style_registry_path)
     # Legacy registries predate the numbering provenance contract. Passing
@@ -311,9 +327,14 @@ def _patch_header_footer_tokens_if_imported(
     target_tokens: Optional[Dict[str, str]],
     log: List[str],
 ) -> bool:
-    """Patch project tokens only in architect parts imported during this run."""
-    if not target_tokens:
-        return False
+    """Patch project tokens only in architect parts imported during this run.
+
+    Once architect parts have been imported the patcher always runs, even when
+    the target supplied no tokens at all: it decides from the slots actually
+    present in those parts whether the target must supply a SectionID or a
+    SectionTitle, and raises when it cannot fill one. Shipping the architect's
+    section number in a target's header is never an acceptable outcome.
+    """
     imported_parts = env_result.get("header_footer_import", {}).get("part_names", set())
     if not imported_parts:
         log.append(
@@ -323,7 +344,7 @@ def _patch_header_footer_tokens_if_imported(
     patch_header_footer_tokens(
         extract_dir,
         source_tokens or {},
-        target_tokens,
+        target_tokens or {},
         log,
         part_names=sorted(imported_parts),
     )
@@ -528,7 +549,9 @@ def _classification_audit(
         "styled": len(styled),
         "ignored": len(ignored),
         "out_of_scope": len(out_of_scope),
-        "unresolved": max(0, total - resolved),
+        # Never clamped: a negative value exposes an over-full payload
+        # (duplicate or unknown indices) instead of hiding it as zero.
+        "unresolved": total - resolved,
     }
     audit = {
         "schema_version": 1,
@@ -551,11 +574,7 @@ def _build_and_patch_output(
 ) -> Path:
     conversion_mode = validate_conversion_mode(conversion_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
-    suffix = (
-        "_CANADIAN_FORMATTED.docx"
-        if conversion_mode == CSI_TO_CANADIAN
-        else "_PHASE2_FORMATTED.docx"
-    )
+    suffix = application_policy_for_mode(conversion_mode).output_suffix
     output_path = output_dir / (docx_path.stem + suffix)
     replacements = {
         "word/document.xml": (extract_dir / "word" / "document.xml").read_bytes(),
@@ -642,12 +661,31 @@ def _apply_classified_target_impl(
     conversion_mode: str,
     checkpoint: _ApplicationCheckpoint,
     diagnostics: Optional[List[Dict[str, Any]]] = None,
+    available_roles: Optional[List[str]] = None,
 ) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
     """Apply one validated classification payload through the shared engine."""
 
     # A throwaway sink keeps callers that do not collect diagnostics working
     # without scattering ``if diagnostics is not None`` across every phase.
     diag_events: List[Dict[str, Any]] = diagnostics if diagnostics is not None else []
+
+    # Re-verify coverage in the one place every caller passes through, so the
+    # invariant does not depend on each caller having coerced its own payload:
+    # every classifiable paragraph occurs exactly once across styled and
+    # ignored dispositions, deterministic dispositions are not overridden,
+    # and no unknown index or role is present.
+    checkpoint.stage = "disposition_verification"
+    validate_phase2_final_payload(
+        bundle,
+        classifications,
+        list(available_roles) if available_roles is not None else sorted(arch_registry),
+    )
+    summary, _audit = _classification_audit(bundle, classifications)
+    if summary["unresolved"]:
+        raise EngineError(
+            "classification_coverage_incomplete",
+            f"{summary['unresolved']} classifiable paragraph(s) have no disposition",
+        )
 
     checkpoint.stage = "application_policy"
     policy: ApplicationPolicy = application_policy_for_mode(conversion_mode)
@@ -915,6 +953,7 @@ def _apply_classified_target(
     role_specs: Optional[Dict[str, Dict[str, Any]]],
     conversion_mode: str,
     diagnostics: Optional[List[Dict[str, Any]]] = None,
+    available_roles: Optional[List[str]] = None,
 ) -> tuple[Path, Optional[CanadianConversionReport], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
     """Apply classifications while preserving safe late-failure diagnostics."""
 
@@ -941,6 +980,7 @@ def _apply_classified_target(
             conversion_mode=conversion_mode,
             checkpoint=checkpoint,
             diagnostics=diagnostics,
+            available_roles=available_roles,
         )
     except ApplicationStageError:
         raise
@@ -948,6 +988,7 @@ def _apply_classified_target(
         raise ApplicationStageError(
             str(exc),
             diagnostics=checkpoint.failure_diagnostics(),
+            cause=exc,
         ) from exc
 
 
@@ -1028,6 +1069,15 @@ def process_single_file(
                     api_key=api_key,
                     model=model,
                 )
+                # Token accounting travels out of the classifier as counts
+                # only; it is diagnostics, not part of the disposition payload.
+                usage = classifications.pop("usage", None) if isinstance(classifications, dict) else None
+                if isinstance(usage, dict):
+                    phase.set(**{
+                        key: value
+                        for key, value in usage.items()
+                        if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool)
+                    })
 
             stage = "application"
             (
@@ -1051,6 +1101,7 @@ def process_single_file(
                 role_specs=role_specs,
                 conversion_mode=conversion_mode,
                 diagnostics=per_file_diag,
+                available_roles=available_roles,
             )
 
         return BatchResult(
@@ -1088,6 +1139,8 @@ def process_single_file(
             numbering_checks=numbering_checks,
             stage=stage,
             diagnostics=per_file_diag,
+            error_code=_safe_error_code(exc),
+            safe_error=_safe_error_message(exc),
         )
 
 
@@ -1130,6 +1183,7 @@ def _apply_batch_result(
     arch_root: Optional[Path] = None,
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
     conversion_mode: str = FORMAT_ONLY,
+    available_roles: Optional[List[str]] = None,
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log = list(prepared.prep_log)
@@ -1166,6 +1220,7 @@ def _apply_batch_result(
             role_specs=role_specs,
             conversion_mode=conversion_mode,
             diagnostics=per_file_diag,
+            available_roles=available_roles,
         )
 
         return BatchResult(
@@ -1203,180 +1258,9 @@ def _apply_batch_result(
             numbering_checks=numbering_checks,
             stage=stage,
             diagnostics=per_file_diag,
+            error_code=_safe_error_code(exc),
+            safe_error=_safe_error_message(exc),
         )
-
-
-def run_batch_concurrent(
-    docx_paths: List[Path],
-    arch_registry: Dict[str, str],
-    env_registry: Dict[str, Any],
-    arch_styles_xml: str,
-    available_roles: List[str],
-    api_key: str,
-    output_dir: Path,
-    source_tokens: Optional[Dict[str, str]] = None,
-    arch_root: Optional[Path] = None,
-    max_workers: int = 3,
-    on_file_complete: Optional[Callable[[BatchResult], None]] = None,
-    role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
-    conversion_mode: str = FORMAT_ONLY,
-) -> List[BatchResult]:
-    conversion_mode = validate_conversion_mode(conversion_mode)
-    if not docx_paths:
-        return []
-
-    workers = max(1, min(max_workers, len(docx_paths)))
-    results: List[BatchResult] = []
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        if (
-            source_tokens is None
-            and arch_root is None
-            and role_specs is None
-            and conversion_mode == FORMAT_ONLY
-        ):
-            futures = {
-                executor.submit(
-                    process_single_file,
-                    docx_path,
-                    arch_registry,
-                    env_registry,
-                    arch_styles_xml,
-                    available_roles,
-                    api_key,
-                    output_dir,
-                ): docx_path
-                for docx_path in docx_paths
-            }
-        else:
-            futures = {
-                executor.submit(
-                    process_single_file,
-                    docx_path,
-                    arch_registry,
-                    env_registry,
-                    arch_styles_xml,
-                    available_roles,
-                    api_key,
-                    output_dir,
-                    source_tokens=source_tokens,
-                    arch_root=arch_root,
-                    role_specs=role_specs,
-                    conversion_mode=conversion_mode,
-                ): docx_path
-                for docx_path in docx_paths
-            }
-
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-            if on_file_complete:
-                on_file_complete(result)
-
-    return sorted(results, key=lambda item: item.filename)
-
-
-def run_batch_api(
-    docx_paths: List[Path],
-    arch_registry: Dict[str, str],
-    env_registry: Dict[str, Any],
-    arch_styles_xml: str,
-    available_roles: List[str],
-    api_key: str,
-    output_dir: Path,
-    source_tokens: Optional[Dict[str, str]] = None,
-    arch_root: Optional[Path] = None,
-    max_workers: int = 3,
-    poll_interval: int = 30,
-    on_file_complete: Optional[Callable[[BatchResult], None]] = None,
-    on_batch_poll: Optional[Callable[[str, str, Any], None]] = None,
-    model: str = "claude-sonnet-5",
-    role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
-    conversion_mode: str = FORMAT_ONLY,
-) -> List[BatchResult]:
-    conversion_mode = validate_conversion_mode(conversion_mode)
-    if not docx_paths:
-        return []
-
-    workers = max(1, min(max_workers, len(docx_paths)))
-    prepared_files: Dict[str, PreparedFile] = {}
-
-    with tempfile.TemporaryDirectory(prefix="phase2_batch_") as tmp_root:
-        tmp_base = Path(tmp_root)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(
-                    _prepare_file_for_batch,
-                    docx_path,
-                    available_roles,
-                    tmp_base,
-                    role_specs,
-                ): docx_path
-                for docx_path in docx_paths
-            }
-            for future in as_completed(futures):
-                prepared = future.result()
-                prepared_files[prepared.file_key] = prepared
-
-        file_bundles = {key: prepared.bundle for key, prepared in prepared_files.items()}
-        requests = build_batch_requests(file_bundles, available_roles, model)
-
-        raw_results = submit_and_poll(
-            requests=requests,
-            api_key=api_key,
-            poll_interval=poll_interval,
-            on_poll=on_batch_poll,
-        )
-
-        try:
-            per_file_classifications = reassemble_file_classifications(raw_results, file_bundles, available_roles)
-        except BatchClassificationError:
-            raise
-
-        results: List[BatchResult] = []
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            if (
-                source_tokens is None
-                and arch_root is None
-                and role_specs is None
-                and conversion_mode == FORMAT_ONLY
-            ):
-                futures = {
-                    executor.submit(
-                        _apply_batch_result,
-                        prepared,
-                        per_file_classifications[file_key],
-                        arch_registry,
-                        env_registry,
-                        arch_styles_xml,
-                        output_dir,
-                    ): file_key
-                    for file_key, prepared in prepared_files.items()
-                }
-            else:
-                futures = {
-                    executor.submit(
-                        _apply_batch_result,
-                        prepared,
-                        per_file_classifications[file_key],
-                        arch_registry,
-                        env_registry,
-                        arch_styles_xml,
-                        output_dir,
-                        source_tokens,
-                        arch_root,
-                        role_specs,
-                        conversion_mode,
-                    ): file_key
-                    for file_key, prepared in prepared_files.items()
-                }
-            for future in as_completed(futures):
-                result = future.result()
-                results.append(result)
-                if on_file_complete:
-                    on_file_complete(result)
-
-        return sorted(results, key=lambda item: item.filename)
 
 
 def _build_file_key(docx_path: Path) -> str:

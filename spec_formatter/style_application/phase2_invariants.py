@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Dict, Any, Optional, Set
 from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
+from .core.untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .core.ooxml_namespaces import CT_NS, PKG_REL_NS, R_NS, W_NS
 from .core.ooxml_text import decode_xml_bytes, prepare_xml_text_for_utf8
 from .core.section_mapping import choose_section_sources
@@ -88,7 +89,7 @@ def _element_semantic_signature(element: ET.Element) -> tuple:
 def _numbering_definition_signatures(numbering_xml: str) -> Counter:
     if not numbering_xml.strip():
         return Counter()
-    root = ET.fromstring(numbering_xml)
+    root = parse_untrusted_xml(numbering_xml, "word/numbering.xml")
     return Counter(_element_semantic_signature(child) for child in root)
 
 
@@ -108,8 +109,18 @@ def _verify_format_only_body_invariants(
             f"({len(source_blocks)} -> {len(output_blocks)})"
         )
 
-    source_text = [paragraph_text_from_block(block) for block in source_blocks]
-    output_text = [paragraph_text_from_block(block) for block in output_blocks]
+    # Identical XML has identical visible text; extract only where the
+    # paragraph changed.
+    source_text: List[str] = []
+    output_text: List[str] = []
+    for source_block, output_block in zip(source_blocks, output_blocks):
+        if source_block == output_block:
+            text = paragraph_text_from_block(source_block)
+            source_text.append(text)
+            output_text.append(text)
+        else:
+            source_text.append(paragraph_text_from_block(source_block))
+            output_text.append(paragraph_text_from_block(output_block))
     if source_text != output_text:
         changed = next(
             idx
@@ -349,6 +360,18 @@ def _resolve_relationship_target(owner_part: str, target: str) -> Optional[str]:
     return resolved
 
 
+# Word allows at most one of each of these relationships from the main
+# document part; a second one is what a string-appended wiring step produces
+# when it fails to see an existing entry.
+_SINGLETON_DOCUMENT_RELATIONSHIP_TYPES = {
+    f"{R_NS}/theme": "theme",
+    f"{R_NS}/settings": "settings",
+    f"{R_NS}/numbering": "numbering",
+    f"{R_NS}/styles": "styles",
+    f"{R_NS}/fontTable": "fontTable",
+}
+
+
 def validate_docx_package(docx_path: Path) -> None:
     """Fail closed when an emitted DOCX has broken OPC or Word references."""
     errors: List[str] = []
@@ -400,9 +423,9 @@ def validate_docx_package(docx_path: Path) -> None:
                 if not (name.endswith(".xml") or name.endswith(".rels") or name == "[Content_Types].xml"):
                     continue
                 try:
-                    parsed_xml[name] = ET.fromstring(zf.read(name))
-                except ET.ParseError as exc:
-                    errors.append(f"{name}: XML parse error: {exc}")
+                    parsed_xml[name] = parse_untrusted_xml(zf.read(name), name)
+                except UntrustedXmlError as exc:
+                    errors.append(str(exc))
 
             ct_root = parsed_xml.get("[Content_Types].xml")
             if ct_root is not None:
@@ -460,11 +483,24 @@ def validate_docx_package(docx_path: Path) -> None:
                     errors.append(f"{rels_name}: invalid Relationships root")
                     continue
                 seen_ids: set[str] = set()
+                seen_singleton_types: Dict[str, str] = {}
                 for rel in list(root):
                     if rel.tag != f"{{{PKG_REL_NS}}}Relationship":
                         errors.append(f"{rels_name}: unsupported relationship element")
                         continue
                     rid = rel.attrib.get("Id", "")
+                    if rels_name == "word/_rels/document.xml.rels":
+                        singleton = _SINGLETON_DOCUMENT_RELATIONSHIP_TYPES.get(
+                            rel.attrib.get("Type", "")
+                        )
+                        if singleton is not None:
+                            if singleton in seen_singleton_types:
+                                errors.append(
+                                    f"{rels_name}: duplicate {singleton} relationship "
+                                    f"({seen_singleton_types[singleton]} and {rid})"
+                                )
+                            else:
+                                seen_singleton_types[singleton] = rid
                     rel_type = rel.attrib.get("Type", "")
                     target = rel.attrib.get("Target", "")
                     target_mode = rel.attrib.get("TargetMode")
@@ -713,6 +749,17 @@ def _direct_rpr_children_by_run(
     return signatures
 
 
+def _rpr_property_names(rpr_block: str) -> str:
+    """Property names in an rPr block (``b, i, rFonts``), never its XML."""
+
+    names = sorted({
+        match.group(1)
+        for match in re.finditer(r"<w:([A-Za-z][\w]*)\b", rpr_block)
+        if match.group(1) != "rPr"
+    })
+    return ", ".join(names) if names else "no properties"
+
+
 def _verify_contracted_rpr_deletions_only(
     before_paragraph: str,
     after_paragraph: str,
@@ -831,7 +878,10 @@ def _verify_target_header_footer_preserved(src_docx: Path, new_docx: Path) -> No
         raise RuntimeError("INVARIANT FAIL: relationship subset changed")
 
     def _targets(rels_xml: str) -> set[str]:
-        root = ET.fromstring(prepare_xml_text_for_utf8(rels_xml).encode("utf-8"))
+        root = parse_untrusted_xml(
+            prepare_xml_text_for_utf8(rels_xml),
+            "word/_rels/document.xml.rels",
+        )
         targets: set[str] = set()
         for rel in root.findall(f"{{{PKG_REL_NS}}}Relationship"):
             rel_type = rel.attrib.get("Type", "")
@@ -1014,7 +1064,10 @@ def verify_phase2_invariants(
         if expected_parts:
             with zipfile.ZipFile(new_docx, "r") as z_after:
                 rels_xml = z_after.read("word/_rels/document.xml.rels")
-                rels_root = ET.fromstring(rels_xml)
+                rels_root = parse_untrusted_xml(
+                    rels_xml,
+                    "word/_rels/document.xml.rels (output)",
+                )
                 relationships = {
                     rel.attrib.get("Id"): rel
                     for rel in rels_root.findall('.//{*}Relationship')
@@ -1113,6 +1166,11 @@ def verify_phase2_invariants(
     for paragraph_index, (before_paragraph, after_paragraph) in enumerate(
         zip(before_paragraphs, after_paragraphs)
     ):
+        if before_paragraph == after_paragraph:
+            # Byte-identical paragraphs cannot have lost run formatting;
+            # skipping them removes most of the verification cost on large
+            # targets where only classified paragraphs change.
+            continue
         allowed_properties = rpr_contract.get(paragraph_index, set())
         _verify_contracted_rpr_deletions_only(
             before_paragraph,
@@ -1137,10 +1195,10 @@ def verify_phase2_invariants(
             after_count = after_set.get(block, 0)
             if after_count < count:
                 raise RuntimeError(
-                    "INVARIANT FAIL: non-font run formatting was lost. "
-                    f"A normalized rPr block appeared {count}x before but "
-                    f"{after_count}x after in paragraph {paragraph_index}.\n"
-                    f"Block: {block[:200]}"
+                    "INVARIANT FAIL: non-font run formatting was lost in paragraph "
+                    f"{paragraph_index}: a run-property set "
+                    f"({_rpr_property_names(block)}) appeared {count}x before but "
+                    f"{after_count}x after."
                 )
         raise RuntimeError(
             "INVARIANT FAIL: uncontracted run formatting was added, changed, "

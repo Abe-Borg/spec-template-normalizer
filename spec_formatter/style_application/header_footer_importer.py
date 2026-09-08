@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import html
 import posixpath
@@ -18,6 +19,10 @@ from .core.ooxml_namespaces import (
     serialize_package_relationships,
 )
 from .core.ooxml_text import prepare_xml_text_for_utf8, read_xml_text
+from .core.registry import (
+    MAX_HEADER_FOOTER_MEDIA_BYTES,
+    MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES,
+)
 from .core.opc_paths import (
     is_safe_package_part_name,
     relationship_part_name_for_owner,
@@ -25,6 +30,17 @@ from .core.opc_paths import (
     resolve_internal_relationship_target,
 )
 from .core.section_mapping import choose_section_sources
+from .core.section_numbers import (
+    LABELED_SECTION_RE as _LABELED_SECTION_RE,
+    SECTION_NUMBER_BOUNDARY,
+    SECTION_NUMBER_PATTERN,
+    SECTION_NUMBER_RE,
+    canonical_section_number as _canonical_section_number,
+    render_section_number_like as _render_numeric_like,
+    section_number_display_form,
+)
+from .core.untrusted_xml import UntrustedXmlError, parse_untrusted_xml
+from .core.errors import EngineError
 from .core.sectpr_tools import (
     canonical_sectpr_order_index,
     child_tag_name,
@@ -83,11 +99,28 @@ def _resolve_media_filename(media_item: Dict[str, Any]) -> str | None:
 
 
 def _resolve_media_bytes(media_item: Dict[str, Any]) -> bytes | None:
-    for key in ("content_base64", "base64", "data", "data_base64"):
-        val = media_item.get(key)
-        if isinstance(val, str) and val:
-            return base64.b64decode(val)
-    return None
+    """Decode the one captured media payload key, strictly.
+
+    The extractor writes ``data_base64`` and shared-profile preflight validates
+    only that key, so accepting other spellings here would let a payload skip
+    every preflight limit. Non-strict base64 is rejected as well.
+    """
+
+    val = media_item.get("data_base64")
+    if val is None:
+        return None
+    if not isinstance(val, str) or not val:
+        raise ValueError("Captured header/footer media data_base64 must be a non-empty string")
+    max_encoded_size = 4 * ((MAX_HEADER_FOOTER_MEDIA_BYTES + 2) // 3)
+    if len(val) > max_encoded_size:
+        raise ValueError(
+            "Captured header/footer media exceeds the "
+            f"{MAX_HEADER_FOOTER_MEDIA_BYTES}-byte decoded media limit"
+        )
+    try:
+        return base64.b64decode(val, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Captured header/footer media is invalid base64: {exc}") from exc
 
 
 def _remove_existing_hf_files(
@@ -98,7 +131,7 @@ def _remove_existing_hf_files(
     rels_path = target_extract_dir / "word" / "_rels" / "document.xml.rels"
     if not rels_path.is_file():
         return set(), set()
-    root = ET.fromstring(rels_path.read_bytes())
+    root = parse_untrusted_xml(rels_path.read_bytes(), "word/_rels/document.xml.rels")
     part_names: set[str] = set()
     for rel in root.findall(f"{{{PKG_REL_NS}}}Relationship"):
         rel_type = rel.attrib.get("Type", "")
@@ -195,8 +228,11 @@ def _media_original_package_targets(media_item: Dict[str, Any]) -> set[str]:
 
 def _relationship_ids_referenced_by_part(xml_content: str) -> set[str]:
     try:
-        root = ET.fromstring(prepare_xml_text_for_utf8(xml_content).encode("utf-8"))
-    except ET.ParseError as exc:
+        root = parse_untrusted_xml(
+            prepare_xml_text_for_utf8(xml_content),
+            "header/footer part",
+        )
+    except UntrustedXmlError as exc:
         raise ValueError(f"Malformed header/footer XML: {exc}") from exc
     relationship_attributes = {
         f"{{{R_NS}}}id",
@@ -228,8 +264,11 @@ def _validate_part_relationship_references(
             f"{part_name} contains relationship references but has no relationships part"
         )
     try:
-        root = ET.fromstring(prepare_xml_text_for_utf8(rels_xml).encode("utf-8"))
-    except ET.ParseError as exc:
+        root = parse_untrusted_xml(
+            prepare_xml_text_for_utf8(rels_xml),
+            f"relationships of {part_name}",
+        )
+    except UntrustedXmlError as exc:
         raise ValueError(f"Malformed relationships XML for {part_name}: {exc}") from exc
     declared = {
         rel.attrib.get("Id", "")
@@ -255,6 +294,9 @@ def _write_hf_parts(
     written_media: set[str] = {
         p.name.casefold() for p in media_out.iterdir() if p.is_file()
     } if media_out.exists() else set()
+    # The same limits shared-profile preflight enforces, re-checked at the
+    # write site so no bytes reach the target package unless they pass here.
+    total_media_bytes = 0
 
     for kind, entry in entries:
         part_name = entry.get("part_name")
@@ -305,6 +347,17 @@ def _write_hf_parts(
             payload = _resolve_media_bytes(media_item)
             if not filename or payload is None:
                 continue
+            if len(payload) > MAX_HEADER_FOOTER_MEDIA_BYTES:
+                raise ValueError(
+                    f"Captured media in {part_name} decodes to {len(payload)} bytes; "
+                    f"limit is {MAX_HEADER_FOOTER_MEDIA_BYTES} bytes"
+                )
+            total_media_bytes += len(payload)
+            if total_media_bytes > MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES:
+                raise ValueError(
+                    "Captured header/footer media exceeds the total "
+                    f"{MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES}-byte limit"
+                )
             new_name = _allocate_unique_media_name(part_name, idx, filename, payload, written_media)
             media_part_name = f"word/media/{new_name}"
             out_rel = relationship_target_for_part(part_name, media_part_name)
@@ -356,8 +409,9 @@ def _write_hf_parts(
                     f"Invalid rels_part_name for {part_name}: {rels_name!r}"
                 )
             if target_by_rid or target_by_original:
-                rels_root = ET.fromstring(
-                    prepare_xml_text_for_utf8(rels_xml).encode("utf-8")
+                rels_root = parse_untrusted_xml(
+                    prepare_xml_text_for_utf8(rels_xml),
+                    f"relationships of {part_name}",
                 )
                 matched_rids: set[str] = set()
                 matched_targets: set[str] = set()
@@ -424,7 +478,7 @@ def _rebuild_document_rels(target_extract_dir: Path, part_to_type: Dict[str, str
     if not rels_path.exists():
         raise FileNotFoundError(f"Missing required file: {rels_path}")
 
-    root = ET.fromstring(rels_path.read_bytes())
+    root = parse_untrusted_xml(rels_path.read_bytes(), "word/_rels/document.xml.rels")
     for rel in list(root.findall(f"{{{PKG_REL_NS}}}Relationship")):
         rel_type = rel.attrib.get("Type", "")
         if rel_type.endswith("/header") or rel_type.endswith("/footer"):
@@ -644,7 +698,7 @@ def _rewire_document_sectpr(target_extract_dir: Path, registry: Dict[str, Any], 
         updated_xml = replace_nth_sectpr_block(updated_xml, idx, updated_sectpr)
 
     updated_xml = prepare_xml_text_for_utf8(updated_xml)
-    ET.fromstring(updated_xml.encode("utf-8"))
+    parse_untrusted_xml(updated_xml, "word/document.xml")
     doc_path.write_text(updated_xml, encoding="utf-8")
     log.append(f"Rewired sectPr header/footer references in {len(sectprs)} sections")
 
@@ -659,7 +713,7 @@ def _ensure_content_types(
     if not ct_path.exists():
         return
 
-    root = ET.fromstring(ct_path.read_bytes())
+    root = parse_untrusted_xml(ct_path.read_bytes(), "[Content_Types].xml")
     imported_parts = {name.casefold() for name in part_to_type}
     for node in list(root.findall(f"{{{CT_NS}}}Override")):
         part_name = node.attrib.get("PartName", "")
@@ -757,17 +811,12 @@ def import_headers_footers(target_extract_dir: Path, registry: Dict[str, Any], l
 
 
 _WT_PATTERN = re.compile(r"(<w:t\b[^>]*>)([\s\S]*?)(</w:t>)")
-_SECTION_NUMBER_PATTERN = r"\d{2}(?:[ \t\u00a0]*\d{2}){2}"
-_LABELED_SECTION_RE = re.compile(
-    rf"\bSECTION\s+(?P<number>{_SECTION_NUMBER_PATTERN})(?!\d)",
-    flags=re.IGNORECASE,
-)
 _LABELED_DIVISION_RE = re.compile(
     r"\bDIVISION\s+(?P<number>\d{2})(?!\d)",
     flags=re.IGNORECASE,
 )
 _SECTION_FILENAME_RE = re.compile(
-    rf"(?<!\d)(?P<number>{_SECTION_NUMBER_PATTERN})\s+"
+    rf"(?<![A-Za-z0-9.])(?P<number>{SECTION_NUMBER_PATTERN}){SECTION_NUMBER_BOUNDARY}\s+"
     r"(?P<title>[^\r\n<>]+?)\.docx\b",
     flags=re.IGNORECASE,
 )
@@ -802,18 +851,20 @@ def _textbox_texts(xml_text: str) -> List[str]:
     ]
 
 
-def _canonical_section_number(value: str) -> str:
-    digits = re.sub(r"\D", "", value or "")
-    return digits if len(digits) == 6 else ""
-
-
 def _bounded_text_ranges(text: str, token: str) -> List[Tuple[int, int]]:
+    """Every occurrence of ``token`` not glued to a letter or digit.
+
+    Underscores and punctuation are legitimate neighbours (a footer filename
+    such as ``233100_Metal Ducts.docx``), letters and digits are not
+    (``METAL`` inside ``METALS`` or ``SHEETMETAL``).
+    """
+
     if not token:
         return []
     return [
         match.span()
         for match in re.finditer(
-            rf"(?<![\w]){re.escape(token)}(?![\w])",
+            rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])",
             text,
         )
     ]
@@ -1095,27 +1146,6 @@ def _infer_header_footer_tokens(
                     "imported header/footer shells"
                 )
     return inferred
-
-
-def _render_numeric_like(source_form: str, target_numeric: str) -> str:
-    digit_groups = list(re.finditer(r"\d+", source_form))
-    if (
-        not digit_groups
-        or sum(len(match.group(0)) for match in digit_groups)
-        != len(target_numeric)
-    ):
-        return target_numeric
-    pieces: List[str] = []
-    source_cursor = 0
-    target_cursor = 0
-    for match in digit_groups:
-        pieces.append(source_form[source_cursor:match.start()])
-        group_length = len(match.group(0))
-        pieces.append(target_numeric[target_cursor:target_cursor + group_length])
-        source_cursor = match.end()
-        target_cursor += group_length
-    pieces.append(source_form[source_cursor:])
-    return "".join(pieces)
 
 
 def _replace_visible_ranges(
@@ -1457,11 +1487,138 @@ def _validate_inferred_patch_postconditions(
 
 
 def _extract_numeric_from_section_id(value: str) -> str:
-    m = re.search(r"SECTION\s+([\d\s]+)", value or "", flags=re.IGNORECASE)
-    if m:
-        return re.sub(r"\s+", " ", m.group(1)).strip()
-    digits = re.findall(r"\d+", value or "")
-    return " ".join(digits).strip()
+    return section_number_display_form(value)
+
+
+def _title_match_forms(title: str) -> Tuple[str, ...]:
+    """The case variants an architect title may take in its header/footer."""
+
+    from .core.token_utils import smart_title_case
+
+    forms: List[str] = []
+    for form in (smart_title_case(title), title.upper(), title):
+        if form and form not in forms:
+            forms.append(form)
+    return tuple(forms)
+
+
+def _matching_section_number_ranges(
+    visible_text: str,
+    canonical: str,
+) -> List[Tuple[int, int, str]]:
+    """Bounded section numbers in ``visible_text`` with the given canonical form.
+
+    Every spacing of the same number is found (``23 31 00``, ``233100``,
+    ``23 3100``) because the shared grammar canonicalises each match; digits
+    that are part of a longer run or identifier never match.
+    """
+
+    if not canonical:
+        return []
+    return [
+        (match.start("number"), match.end("number"), match.group("number"))
+        for match in SECTION_NUMBER_RE.finditer(visible_text)
+        if _canonical_section_number(match.group("number")) == canonical
+    ]
+
+
+def _host_visible_text(paragraph_xml: str) -> str:
+    """Visible text of a paragraph excluding drawings, text boxes, and history."""
+
+    return _w_text(strip_out_of_scope_subtrees(paragraph_xml))
+
+
+def _host_visible_texts(part_xml: str) -> List[str]:
+    return [
+        _host_visible_text(block)
+        for _start, _end, block in iter_paragraph_xml_blocks(part_xml)
+    ]
+
+
+def _replace_host_visible_ranges(
+    paragraph_xml: str,
+    edit_builder: Callable[[str], List[Tuple[int, int, str]]],
+) -> tuple[str, bool]:
+    """Apply every ``(start, end, replacement)`` the builder reports.
+
+    The builder receives the host-visible text of the paragraph with its
+    out-of-scope subtrees protected, so text boxes and drawings are never
+    edited or counted here. Edits are applied right-to-left so that earlier
+    offsets stay valid while each one is written back through the ``w:t``
+    node map.
+    """
+
+    changed = False
+
+    def _edit(protected_xml: str) -> str:
+        nonlocal changed
+        updated = protected_xml
+        edits = edit_builder(_w_text(protected_xml))
+        for start, end, replacement in sorted(edits, reverse=True):
+            updated, did_change = _replace_visible_ranges(
+                updated,
+                [(start, end)],
+                replacement,
+            )
+            changed = changed or did_change
+        return updated
+
+    return edit_preserving_out_of_scope_subtrees(paragraph_xml, _edit), changed
+
+
+def _validate_explicit_token_postconditions(
+    part_name: str,
+    updated_xml: str,
+    *,
+    source_canonical: str,
+    target_section_numeric: str,
+    arch_title_forms: Tuple[str, ...],
+    target_title_forms: Tuple[str, ...],
+) -> None:
+    """Prove no architect token survived in a part the patcher just touched.
+
+    Mirrors ``_validate_inferred_patch_postconditions`` for the explicit
+    (non-inferred) path. A residual architect section number anywhere in the
+    part, including a text box that no corroborated mirrored shell covered,
+    fails closed: shipping the architect's section number in a target's
+    header is never acceptable. A residual title is checked in host text
+    only, and only when the target title does not itself contain the
+    architect title as a phrase (``METAL DUCTS`` -> ``METAL DUCTS AND
+    ACCESSORIES`` legitimately keeps the words).
+    """
+
+    host_text = "\n".join(_host_visible_texts(updated_xml))
+    if source_canonical and source_canonical != target_section_numeric:
+        if _matching_section_number_ranges(host_text, source_canonical):
+            raise EngineError(
+                "header_footer_token_residual",
+                "Architect SECTION number remained in imported header/footer "
+                f"part {part_name} after token substitution",
+            )
+        textbox_text = "\n".join(_textbox_texts(updated_xml))
+        if _matching_section_number_ranges(textbox_text, source_canonical):
+            raise EngineError(
+                "header_footer_token_residual",
+                "Architect SECTION number remained in a text box of imported "
+                f"header/footer part {part_name}; the text box is not part of "
+                "a corroborated mirrored shell, so it cannot be patched safely",
+            )
+    if not arch_title_forms:
+        return
+    overlap = any(
+        _bounded_text_ranges(target_form, source_form)
+        for source_form in arch_title_forms
+        for target_form in target_title_forms
+    )
+    if overlap:
+        return
+    for form in arch_title_forms:
+        if _bounded_text_ranges(host_text, form):
+            raise EngineError(
+                "header_footer_token_residual",
+                "Architect SectionTitle remained in imported header/footer "
+                f"part {part_name} after token substitution",
+            )
 
 
 def patch_header_footer_tokens(
@@ -1471,33 +1628,21 @@ def patch_header_footer_tokens(
     log: List[str],
     part_names: List[str] | None = None,
 ) -> None:
-    from .core.token_utils import apply_case_pattern, detect_case_pattern, smart_title_case
+    """Replace architect section tokens in just-imported header/footer parts.
+
+    The substitution fails closed. Completeness is judged against the slots
+    actually present in the imported parts: if they carry the architect's
+    section number the target must supply a recognisable SectionID, and if
+    they carry the architect's title the target must supply a SectionTitle.
+    No part is modified until both checks pass, and every patched part is
+    re-read to prove no architect token survived.
+    """
+
+    from .core.token_utils import apply_case_pattern, detect_case_pattern
 
     word_dir = target_extract_dir / "word"
     if not word_dir.exists():
         return
-
-    def _replace_host_visible_text(
-        paragraph_xml: str,
-        old_text: str,
-        new_text: str,
-    ) -> tuple[str, bool]:
-        changed = False
-
-        def _edit(protected_xml: str) -> str:
-            nonlocal changed
-            visible = _w_text(protected_xml)
-            start = visible.find(old_text)
-            if start < 0:
-                return protected_xml
-            updated, changed = _replace_visible_ranges(
-                protected_xml,
-                [(start, start + len(old_text))],
-                new_text,
-            )
-            return updated
-
-        return edit_preserving_out_of_scope_subtrees(paragraph_xml, _edit), changed
 
     if part_names is None:
         part_paths = [
@@ -1522,11 +1667,12 @@ def patch_header_footer_tokens(
         source_tokens.get("SectionID_numeric")
         or _extract_numeric_from_section_id(source_tokens.get("SectionID", ""))
     )
-    expected_source_section = _canonical_section_number(arch_id_numeric)
+    source_canonical = _canonical_section_number(arch_id_numeric)
+    arch_title_forms = _title_match_forms(arch_title) if arch_title else ()
     inferred = (
         _infer_header_footer_tokens(
             part_xml_by_path,
-            expected_section_numeric=expected_source_section or None,
+            expected_section_numeric=source_canonical or None,
         )
         if part_xml_by_path
         else None
@@ -1538,8 +1684,7 @@ def patch_header_footer_tokens(
     )
     target_title_raw = target_tokens.get("SectionTitle", "")
     if inferred is not None:
-        explicit_section_numeric = _canonical_section_number(arch_id_numeric)
-        if arch_id_numeric and explicit_section_numeric != inferred.section_numeric:
+        if arch_id_numeric and source_canonical != inferred.section_numeric:
             raise ValueError(
                 "Explicit architect SectionID conflicts with imported header/footer shell"
             )
@@ -1555,13 +1700,40 @@ def patch_header_footer_tokens(
         or _extract_numeric_from_section_id(target_tokens.get("SectionID", ""))
     )
     target_section_numeric = _canonical_section_number(target_id_numeric)
-    target_title_for_patch = target_title_raw or target_title_display
+    target_title_for_patch = (target_title_raw or target_title_display).strip()
+
+    # Completeness relative to the slots present in the imported parts. This
+    # runs before any part is modified so a failure leaves every byte intact.
+    number_slots = sum(
+        len(_matching_section_number_ranges(_w_text(xml_text), source_canonical))
+        for xml_text in part_xml_by_path.values()
+    )
+    title_slots = sum(
+        len(_bounded_text_ranges(_w_text(xml_text), form))
+        for xml_text in part_xml_by_path.values()
+        for form in arch_title_forms
+    )
+    if number_slots and not target_section_numeric:
+        raise EngineError(
+            "header_footer_target_section_id_required",
+            "Imported header/footer parts carry the architect SECTION number; "
+            "token substitution requires a recognisable target SectionID",
+        )
+    if title_slots and not target_title_for_patch:
+        raise EngineError(
+            "header_footer_target_section_title_required",
+            "Imported header/footer parts carry the architect SectionTitle; "
+            "token substitution requires a target SectionTitle",
+        )
     if inferred is not None and (
-        not target_section_numeric or not target_title_for_patch.strip()
+        not target_section_numeric or not target_title_for_patch
     ):
-        raise ValueError(
+        raise EngineError(
+            "header_footer_target_section_id_required"
+            if not target_section_numeric
+            else "header_footer_target_section_title_required",
             "Imported header/footer token substitution requires a complete "
-            "target SectionID and SectionTitle"
+            "target SectionID and SectionTitle",
         )
     if inferred is not None:
         log.append(
@@ -1578,6 +1750,34 @@ def patch_header_footer_tokens(
         )
     else:
         inferred_target_title_aliases = ()
+    target_title_forms = tuple(
+        dict.fromkeys(
+            apply_case_pattern(target_title_for_patch, detect_case_pattern(form))
+            for form in arch_title_forms
+        )
+    ) if target_title_for_patch else ()
+
+    def title_edits(visible: str) -> List[Tuple[int, int, str]]:
+        edits: List[Tuple[int, int, str]] = []
+        for form in arch_title_forms:
+            replacement = apply_case_pattern(
+                target_title_for_patch,
+                detect_case_pattern(form),
+            )
+            edits.extend(
+                (start, end, replacement)
+                for start, end in _bounded_text_ranges(visible, form)
+            )
+        return edits
+
+    def number_edits(visible: str) -> List[Tuple[int, int, str]]:
+        return [
+            (start, end, _render_numeric_like(source_form, target_section_numeric))
+            for start, end, source_form in _matching_section_number_ranges(
+                visible,
+                source_canonical,
+            )
+        ]
 
     for part_path, original_part_xml in part_xml_by_path.items():
         part_xml = original_part_xml
@@ -1587,55 +1787,20 @@ def patch_header_footer_tokens(
         cursor = 0
         for start, end, paragraph_xml in paragraph_matches:
             updated_chunks.append(part_xml[cursor:start])
-
-            analysis_xml = strip_out_of_scope_subtrees(paragraph_xml)
-            visible_norm = _w_text(analysis_xml)
             new_paragraph = paragraph_xml
-
-            if visible_norm and arch_title and target_title_display:
-                match_forms = [smart_title_case(arch_title), arch_title.upper(), arch_title]
-                seen_forms = set()
-                for form in match_forms:
-                    if not form or form in seen_forms:
-                        continue
-                    seen_forms.add(form)
-                    if form in visible_norm:
-                        pattern = detect_case_pattern(form)
-                        replacement = apply_case_pattern(target_title_raw or target_title_display, pattern)
-                        new_paragraph, changed = _replace_host_visible_text(
-                            new_paragraph,
-                            form,
-                            replacement,
-                        )
-                        modified = modified or changed
-                        break
-
-            if arch_id_numeric and target_id_numeric:
-                canonical_target = _canonical_section_number(target_id_numeric)
-                for src_variant, dst_variant in (
-                    (
-                        arch_id_numeric,
-                        _render_numeric_like(arch_id_numeric, canonical_target)
-                        if canonical_target
-                        else target_id_numeric,
-                    ),
-                    (
-                        re.sub(r"\s+", "", arch_id_numeric),
-                        canonical_target
-                        or re.sub(r"\s+", "", target_id_numeric),
-                    ),
-                ):
-                    if not src_variant:
-                        continue
-                    if src_variant in visible_norm:
-                        new_paragraph, changed = _replace_host_visible_text(
-                            new_paragraph,
-                            src_variant,
-                            dst_variant,
-                        )
-                        modified = modified or changed
-                        break
-
+            if _host_visible_text(paragraph_xml):
+                if arch_title_forms and target_title_for_patch:
+                    new_paragraph, changed = _replace_host_visible_ranges(
+                        new_paragraph,
+                        title_edits,
+                    )
+                    modified = modified or changed
+                if source_canonical and target_section_numeric:
+                    new_paragraph, changed = _replace_host_visible_ranges(
+                        new_paragraph,
+                        number_edits,
+                    )
+                    modified = modified or changed
             updated_chunks.append(new_paragraph)
             cursor = end
 
@@ -1668,6 +1833,14 @@ def patch_header_footer_tokens(
                 ),
                 title_aliases=inferred_target_title_aliases,
             )
+        _validate_explicit_token_postconditions(
+            part_path.name,
+            part_xml,
+            source_canonical=source_canonical,
+            target_section_numeric=target_section_numeric,
+            arch_title_forms=arch_title_forms,
+            target_title_forms=target_title_forms,
+        )
 
         if modified:
             part_path.write_text(prepare_xml_text_for_utf8(part_xml), encoding="utf-8")
@@ -1708,6 +1881,6 @@ def remap_header_footer_numids(
         updated = re.sub(r'(<w:numId\b[^>]*w:val=")(\d+)"', _replace, xml)
         if replacements:
             updated = prepare_xml_text_for_utf8(updated)
-            ET.fromstring(updated.encode("utf-8"))
+            parse_untrusted_xml(updated, part_name)
             path.write_text(updated, encoding="utf-8")
             log.append(f"Remapped {replacements} direct numbering reference(s) in {part_name}")

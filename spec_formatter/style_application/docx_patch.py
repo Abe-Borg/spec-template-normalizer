@@ -4,10 +4,10 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import zipfile
-import xml.etree.ElementTree as ET
 from typing import Dict, List, Set, Union
 
 from .core.ooxml_text import prepare_xml_text_for_utf8
+from .core.untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .core.opc_paths import (
     is_safe_header_footer_part_name,
     is_safe_package_part_name,
@@ -62,9 +62,9 @@ def validate_xml_wellformedness(replacements: Dict[str, bytes]) -> List[str]:
         if not (name.endswith(".xml") or name.endswith(".rels") or name == "[Content_Types].xml"):
             continue
         try:
-            ET.fromstring(content)
-        except ET.ParseError as exc:
-            errors.append(f"{name}: XML parse error: {exc}")
+            parse_untrusted_xml(content, name)
+        except UntrustedXmlError as exc:
+            errors.append(str(exc))
     return errors
 
 
@@ -202,7 +202,11 @@ def patch_docx(
         if out_docx.exists():
             out_docx.unlink()
 
-        with zipfile.ZipFile(out_docx, "w") as zout:
+        # New XML parts are deflated; a 200 KB imported numbering part used to
+        # ship stored at 0% compression. New media stays stored because image
+        # formats are already compressed. Existing entries keep their own
+        # compression type, so a source package round-trips as it was.
+        with zipfile.ZipFile(out_docx, "w", compression=zipfile.ZIP_DEFLATED) as zout:
             # preserve archive comment if any
             zout.comment = zin.comment
 
@@ -222,4 +226,12 @@ def patch_docx(
 
             # Add any new parts that didn't exist in source
             for new_name in new_parts:
-                zout.writestr(new_name, rep_bytes[new_name])
+                zout.writestr(
+                    new_name,
+                    rep_bytes[new_name],
+                    compress_type=(
+                        zipfile.ZIP_STORED
+                        if new_name.startswith("word/media/")
+                        else zipfile.ZIP_DEFLATED
+                    ),
+                )

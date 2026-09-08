@@ -6,11 +6,11 @@ remain unchanged during Phase 2 processing.
 """
 
 import hashlib
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict
 
+from .untrusted_xml import parse_untrusted_xml
 from .ooxml_text import read_xml_text
 from .ooxml_namespaces import PKG_REL_NS
 from .opc_paths import (
@@ -41,7 +41,10 @@ def snapshot_headers_footers(extract_dir: Path) -> Dict[str, str]:
     document_rels = extract_dir / "word" / "_rels" / "document.xml.rels"
     if not document_rels.is_file():
         return hashes
-    root = ET.fromstring(document_rels.read_bytes())
+    root = parse_untrusted_xml(
+        document_rels.read_bytes(),
+        "word/_rels/document.xml.rels",
+    )
     for rel in root.findall(f"{{{PKG_REL_NS}}}Relationship"):
         rel_type = rel.attrib.get("Type", "")
         if not rel_type.endswith(("/header", "/footer")):

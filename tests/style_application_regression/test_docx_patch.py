@@ -290,3 +290,45 @@ class TestPatchDocxHeaderFooterSupport:
         with zipfile.ZipFile(out, "r") as zf:
             assert "word/header1.xml" not in zf.namelist()
             assert "word/_rels/header1.xml.rels" not in zf.namelist()
+
+
+class TestPatchDocxCompression:
+    def test_new_xml_parts_are_deflated_media_is_stored_and_existing_keep_their_type(
+        self, tmp_path
+    ):
+        src = tmp_path / "input.docx"
+        out = tmp_path / "output.docx"
+        with zipfile.ZipFile(src, "w") as zf:
+            zf.writestr(
+                "word/document.xml",
+                b"<w:document" + _W_NS + b"/>",
+                compress_type=zipfile.ZIP_STORED,
+            )
+            zf.writestr(
+                "word/styles.xml",
+                b"<w:styles" + _W_NS + b"/>",
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+
+        numbering = b"<w:numbering" + _W_NS + b">" + b"<w:num/>" * 2000 + b"</w:numbering>"
+        patch_docx(
+            src_docx=src,
+            out_docx=out,
+            replacements={
+                "word/document.xml": b"<w:document" + _W_NS + b"><w:body/></w:document>",
+                "word/numbering.xml": numbering,
+                "word/media/image1.png": b"\x89PNG" + bytes(range(256)) * 4,
+            },
+        )
+
+        with zipfile.ZipFile(out, "r") as zf:
+            by_name = {info.filename: info for info in zf.infolist()}
+            # Existing entries keep their own compression type.
+            assert by_name["word/document.xml"].compress_type == zipfile.ZIP_STORED
+            assert by_name["word/styles.xml"].compress_type == zipfile.ZIP_DEFLATED
+            # An appended XML part is deflated; appended media stays stored.
+            assert by_name["word/numbering.xml"].compress_type == zipfile.ZIP_DEFLATED
+            assert by_name["word/numbering.xml"].compress_size < len(numbering) // 10
+            assert by_name["word/media/image1.png"].compress_type == zipfile.ZIP_STORED
+            assert zf.read("word/numbering.xml") == numbering
+

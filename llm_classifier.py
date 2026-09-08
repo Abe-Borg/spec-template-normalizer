@@ -24,6 +24,11 @@ from spec_formatter.role_contract import (
 )
 
 
+# A cost guard, not a context-window limit: every current model accepts far
+# more than this, but a template whose slim bundle exceeds it is almost
+# certainly not a template (a whole project manual, say) and would cost a
+# great deal to classify. Measured with the API's token counter when the
+# client offers one; a 4-chars-per-token estimate is the fallback.
 MAX_SINGLE_PASS_INPUT_TOKENS = 150_000
 DEFAULT_RESPONSE_ATTEMPTS = 2
 
@@ -35,8 +40,52 @@ _STRUCTURED_OUTPUT_COMPILATION_ERRORS = frozenset(
 )
 
 def estimate_tokens(text: str) -> int:
-    """Rough token estimate (1 token ≈ 4 chars)."""
+    """Rough token estimate (1 token ≈ 4 chars); the fallback for the cost guard."""
     return len(text) // 4
+
+
+class ClassificationRefused(ValueError):
+    """The model refused the request (``stop_reason == "refusal"``).
+
+    Terminal: regenerating the same request would not change the outcome,
+    and no server-side fallback is used because the profile manifest records
+    the model that produced the classification.
+    """
+
+
+def _count_input_tokens(client: Any, model: str, system: str, user_message: str) -> Optional[int]:
+    """Return the API's own count for the request, or ``None`` when unavailable.
+
+    The count endpoint is free and exact; a client (or test double) without
+    it, or a transport failure, falls back to the estimate rather than
+    blocking classification.
+    """
+
+    count_tokens = getattr(getattr(client, "messages", None), "count_tokens", None)
+    if count_tokens is None:
+        return None
+    try:
+        response = count_tokens(
+            model=model,
+            system=_cached_system_blocks(system),
+            messages=[{"role": "user", "content": user_message}],
+        )
+    except Exception as exc:  # transport or auth problems surface on the real call
+        print(f"Token count unavailable ({type(exc).__name__}); using the estimate.")
+        return None
+    value = getattr(response, "input_tokens", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _check_input_cost_guard(input_tokens: int, *, measured: bool) -> None:
+    if input_tokens > MAX_SINGLE_PASS_INPUT_TOKENS:
+        how = "measures" if measured else "is approximately"
+        raise ValueError(
+            f"Document classification input {how} {input_tokens:,} tokens, exceeding the "
+            f"safe single-pass limit ({MAX_SINGLE_PASS_INPUT_TOKENS:,}). This is a cost "
+            "guard: analyze a template that contains one specification section, not a "
+            "whole manual; no partial classification was produced."
+        )
 
 
 def _strip_code_fences(text: str) -> str:
@@ -224,6 +273,26 @@ def _is_structured_output_compilation_error(error: Exception) -> bool:
     return any(marker in normalized for marker in _STRUCTURED_OUTPUT_COMPILATION_ERRORS)
 
 
+def _cached_system_blocks(system: Any) -> Any:
+    """Mark the byte-stable system prompt for prompt caching.
+
+    The master prompt (about 1,600 tokens) is identical for every attempt on
+    a template, so a single cached text block lets regeneration attempts and
+    targeted patches reuse it. A caller that already supplies content blocks
+    is passed through unchanged.
+    """
+
+    if not isinstance(system, str):
+        return system
+    return [
+        {
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
 def _call_api(
     client: Any,
     system: str,
@@ -273,7 +342,7 @@ def _call_api(
                 max_tokens=max_tokens,
                 thinking={"type": "adaptive"},
                 output_config=output_config,
-                system=system,
+                system=_cached_system_blocks(system),
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
                 raw = stream.get_final_text()
@@ -284,7 +353,7 @@ def _call_api(
                         "completing its JSON (stop_reason=max_tokens)"
                     )
                 if stop_reason == "refusal":
-                    raise ValueError(
+                    raise ClassificationRefused(
                         "LLM refused the template-classification request "
                         "(stop_reason=refusal)"
                     )
@@ -384,21 +453,27 @@ def _request_json_response(
                 last_error or ValueError("prior response was not usable")
             )
         )
-        raw = _call_api(
-            client,
-            system,
-            prompt,
-            model,
-            response_schema=response_schema,
-            response_format_state=response_format_state,
-        )
         try:
+            # The request sits inside the try so a response that stopped at
+            # the output-token limit (stop_reason=max_tokens, a ValueError)
+            # enters the same bounded regeneration as malformed JSON instead
+            # of killing the analysis. A refusal is terminal and re-raised.
+            raw = _call_api(
+                client,
+                system,
+                prompt,
+                model,
+                response_schema=response_schema,
+                response_format_state=response_format_state,
+            )
             parsed = _parse_response(raw)
             return (
                 response_transform(parsed)
                 if response_transform is not None
                 else parsed
             )
+        except ClassificationRefused:
+            raise
         except ValueError as exc:
             last_error = exc
             if attempt + 1 < max_attempts:
@@ -757,6 +832,51 @@ def _repair_role_exemplar_mismatches(
     return corrections
 
 
+def _repair_style_based_on(instructions: dict, slim_bundle: dict) -> int:
+    """Set each created style's ``basedOn`` from its exemplar's source pStyle.
+
+    The exemplar paragraph's ``pStyle`` is known from the slim bundle, so a
+    wrong or missing ``basedOn`` from the model is a deterministic repair,
+    not a validation failure. A paragraph without a source style keeps
+    whatever the model proposed for ``validate_instructions`` to judge
+    against the document's default style. Each repair is recorded in the
+    instruction notes, which the classification audit embeds.
+    """
+
+    paragraphs = slim_bundle.get("paragraphs", [])
+    if not isinstance(paragraphs, list):
+        return 0
+    style_by_index: Dict[int, Optional[str]] = {}
+    for paragraph in paragraphs:
+        if isinstance(paragraph, dict) and isinstance(paragraph.get("paragraph_index"), int):
+            source_style = paragraph.get("pStyle")
+            style_by_index[paragraph["paragraph_index"]] = (
+                source_style if isinstance(source_style, str) and source_style else None
+            )
+
+    repairs = 0
+    notes = instructions.setdefault("notes", [])
+    if not isinstance(notes, list):
+        notes = instructions["notes"] = []
+    for style_def in instructions.get("create_styles", []) or []:
+        if not isinstance(style_def, dict):
+            continue
+        exemplar_index = style_def.get("derive_from_paragraph_index")
+        if not isinstance(exemplar_index, int) or exemplar_index not in style_by_index:
+            continue
+        source_style = style_by_index[exemplar_index]
+        if source_style is None or style_def.get("basedOn") == source_style:
+            continue
+        previous = style_def.get("basedOn")
+        style_def["basedOn"] = source_style
+        repairs += 1
+        notes.append(
+            f"Deterministic repair: basedOn of style {style_def.get('styleId')!s} "
+            f"set to exemplar pStyle {source_style!r} (was {previous!r})"
+        )
+    return repairs
+
+
 def _build_patch_prompt(
     slim_bundle: dict,
     instructions: dict,
@@ -867,7 +987,7 @@ def classify_document(
     master_prompt: str,
     run_instruction: str,
     api_key: str,
-    model: str = "claude-opus-4-8",
+    model: str = "claude-opus-5",
     max_patch_attempts: int = 3,
     max_response_attempts: int = DEFAULT_RESPONSE_ATTEMPTS,
 ) -> dict:
@@ -901,15 +1021,16 @@ def classify_document(
         ValueError: If the LLM response is not valid JSON or fails validation
                     after all patch attempts are exhausted.
     """
-    paragraphs = slim_bundle.get("paragraphs", [])
-    bundle_json = json.dumps(slim_bundle, indent=2)
-    input_tokens = estimate_tokens(master_prompt + run_instruction + bundle_json)
-    if input_tokens > MAX_SINGLE_PASS_INPUT_TOKENS:
-        raise ValueError(
-            f"Document classification input is approximately {input_tokens:,} tokens, exceeding the "
-            f"safe single-pass limit ({MAX_SINGLE_PASS_INPUT_TOKENS:,}). Reduce the template or use a model "
-            "with a larger context window; no partial classification was produced."
-        )
+    # Compact, key-sorted JSON is what the request sends, so the cost guard
+    # measures exactly that (and the input is about a third smaller than the
+    # old indent=2 layout). The estimate runs first so an obviously oversized
+    # bundle never creates a client or makes a request; the API's own count
+    # then replaces the estimate for the real decision.
+    bundle_json = json.dumps(slim_bundle, separators=(",", ":"), sort_keys=True)
+    _check_input_cost_guard(
+        estimate_tokens(master_prompt + run_instruction + bundle_json),
+        measured=False,
+    )
 
     import anthropic
     import httpx
@@ -926,6 +1047,9 @@ def classify_document(
         max_retries=0,
     )
     user_message = f"{run_instruction}\n\nSlim bundle:\n{bundle_json}"
+    measured_tokens = _count_input_tokens(client, model, master_prompt, user_message)
+    if measured_tokens is not None:
+        _check_input_cost_guard(measured_tokens, measured=True)
 
     instructions = _request_json_response(
         client,
@@ -959,6 +1083,13 @@ def classify_document(
     repairs = _repair_strong_signal_mismatches(instructions, slim_bundle)
     if repairs:
         print(f"Auto-repaired {repairs} strong-signal style mismatch(es)")
+
+    # basedOn is never the model's decision: it must be the exemplar
+    # paragraph's source pStyle. Repair it locally instead of failing the
+    # whole analysis after every retry.
+    based_on_repairs = _repair_style_based_on(instructions, slim_bundle)
+    if based_on_repairs:
+        print(f"Auto-repaired {based_on_repairs} style basedOn value(s) from exemplar pStyle")
 
     # Attempt validation; if coverage mismatch, try targeted patching
     for patch_attempt in range(max_patch_attempts + 1):

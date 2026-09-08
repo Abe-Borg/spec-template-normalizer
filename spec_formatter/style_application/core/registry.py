@@ -19,6 +19,7 @@ from xml.sax.saxutils import escape as _sax_escape
 
 from spec_formatter.role_contract import ALLOWED_ROLES
 
+from .untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .ooxml_namespaces import W_NS
 from .ooxml_text import prepare_xml_text_for_utf8
 from .opc_paths import (
@@ -30,7 +31,8 @@ from .section_mapping import choose_section_sources
 
 
 PHASE1_BUNDLE_FORMAT = "spec-template-normalizer.phase1"
-PHASE1_MANIFEST_VERSION = 1
+# Manifest version 2 requires producer.engine_fingerprint (see engine_identity.py).
+PHASE1_MANIFEST_VERSION = 2
 PHASE1_MANIFEST_FILENAME = "phase1_bundle_manifest.json"
 PHASE1_REQUIRED_ARTIFACT_IDS = (
     "style_registry",
@@ -295,7 +297,7 @@ def _require_exact_keys(raw: Dict[str, Any], expected: Set[str], context: str) -
 def _validate_manifest_producer(raw: Any) -> None:
     if not isinstance(raw, dict):
         raise ValueError("manifest.producer must be an object")
-    required = {"name", "version", "run_id"}
+    required = {"name", "version", "run_id", "engine_fingerprint"}
     allowed = required | {"classifier", "prompts"}
     missing = required - set(raw)
     unexpected = set(raw) - allowed
@@ -598,8 +600,8 @@ def validate_phase1_bundle_directory(
         if path is None:
             continue
         try:
-            xml_roots[artifact_id] = _ET.fromstring(path.read_bytes())
-        except _ET.ParseError as exc:
+            xml_roots[artifact_id] = parse_untrusted_xml(path.read_bytes(), artifact_id)
+        except UntrustedXmlError as exc:
             raise ValueError(f"Bundle artifact {artifact_id} is not well-formed XML: {exc}") from exc
     source_ids = {
         node.attrib.get(f"{{{W_NS}}}styleId")

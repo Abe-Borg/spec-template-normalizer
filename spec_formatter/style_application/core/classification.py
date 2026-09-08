@@ -3,6 +3,7 @@ Phase 2 classification: applying LLM classifications to paragraphs,
 building slim bundles for LLM input, and boilerplate filtering.
 """
 
+import functools
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from spec_formatter.numbering_roles import (
     role_from_numbering_catalog,
     role_from_numbering_signature,
 )
+from spec_formatter.resources import target_prompt_dir
 from spec_formatter.role_contract import BODY_HIERARCHY_ROLES, ROLE_FALLBACKS
 
 from .xml_helpers import (
@@ -37,10 +39,13 @@ from .style_import import (
     ensure_explicit_numpr_from_current_style,
 )
 from .ooxml_text import read_xml_text, write_xml_text
+from .section_numbers import LABELED_SECTION_RE, SECTION_HEADING_RE
+from .untrusted_xml import UntrustedXmlError, parse_untrusted_xml
+from .errors import EngineError
 
 
 def _load_prompt_text(filename: str) -> str:
-    prompt_path = Path(__file__).parent / "prompts" / filename
+    prompt_path = target_prompt_dir() / filename
     return prompt_path.read_text(encoding="utf-8")
 
 
@@ -129,14 +134,14 @@ _BOILERPLATE_RX = [(re.compile(pat, flags=re.MULTILINE), tag) for pat, tag in BO
 
 _PART_RX = re.compile(r"^\s*PART\s+[123]\b", re.IGNORECASE)
 _ARTICLE_RX = re.compile(r"^\s*\d{1,2}\.\d{1,3}\b")
-_SECTION_ID_RX = re.compile(
-    r"^\s*SECTION\s+(?:\d{6,}|\d{2}(?:[ \t\u00a0]+\d{2}){2,})\b",
-    re.IGNORECASE,
-)
 _END_OF_SECTION_RX = re.compile(r"^\s*END\s+OF\s+SECTION\s*", re.IGNORECASE)
 _ALL_CAPS_RX = re.compile(r"^[^a-z]*[A-Z][^a-z]*$")
 _EDITORIAL_COMMENT_STYLE_IDS = frozenset({"CMT"})
 LLM_IGNORED_REASON = "non_csi_content"
+# The direct paragraph-layout overrides strip_conflicting_direct_ppr removes.
+# A replacement style "has replacement pPr" when its effective (basedOn-
+# resolved) paragraph properties supply at least one of them.
+_DIRECT_PPR_OVERRIDE_PROPERTIES = frozenset({"spacing", "ind", "jc", "numPr"})
 _FORMAT_ONLY_PROTECTED_PPR_PROPERTIES = frozenset({
     "pStyle",
     "numPr",
@@ -155,18 +160,101 @@ _MARKER_RX = [
 ]
 
 
+_HEADING_SEPARATORS = " \t\u00a0-\u2010\u2011\u2012\u2013\u2014\u2015:"
+_SENTENCE_TERMINAL_RX = re.compile(r"[.!?;]$")
+_HEADING_MAX_WORDS = 12
+_ROMAN_AMBIGUOUS_LETTERS = frozenset("ivx")
+_ALPHA_MARKER_RXS = (
+    (re.compile(r"^\s*([A-Za-z])\.\s+"), "dot"),
+    (re.compile(r"^\s*([a-z])\)\s+"), "paren"),
+    (re.compile(r"^\s*\(([a-z])\)\s+"), "parens"),
+)
+
+
+def _heading_remainder_ok(remainder: str) -> bool:
+    """Whether the text after a PART/ARTICLE marker is shaped like a heading.
+
+    Headings are short, start with a capital letter or a digit, and do not
+    end like a sentence. Prose that merely begins with a decimal number or the
+    word PART (``1.5 times the pipe diameter shall be maintained.``,
+    ``PART 1 of the Contract Documents shall govern.``) fails those tests and
+    is left for the model instead of being locked in as a wrong role.
+    ``1.01 SUMMARY``, ``PART 1 - GENERAL``, and ``1.1 General requirements``
+    all pass.
+    """
+
+    remainder = remainder.strip()
+    if not remainder:
+        return True
+    if not (remainder[0].isupper() or remainder[0].isdigit()):
+        return False
+    if _SENTENCE_TERMINAL_RX.search(remainder):
+        return False
+    return len(remainder.split()) <= _HEADING_MAX_WORDS
+
+
+def _match_marker_heading(
+    pattern: "re.Pattern[str]",
+    text: str,
+) -> Optional[re.Match[str]]:
+    match = pattern.match(text)
+    if match is None:
+        return None
+    remainder = text[match.end():].strip(_HEADING_SEPARATORS)
+    return match if _heading_remainder_ok(remainder) else None
+
+
+def _match_part_heading(text: str) -> Optional[re.Match[str]]:
+    return _match_marker_heading(_PART_RX, text)
+
+
+def _match_article_heading(text: str) -> Optional[re.Match[str]]:
+    return _match_marker_heading(_ARTICLE_RX, text)
+
+
 def _match_section_header(text: str) -> Optional[re.Match[str]]:
     """Match a section header without consuming sentence-form cross-references."""
 
-    match = _SECTION_ID_RX.match(text)
+    match = SECTION_HEADING_RE.match(text)
     if match is None:
         return None
-    remainder = text[match.end():].strip(
-        " \t\u00a0-\u2010\u2011\u2012\u2013\u2014\u2015:"
-    )
+    remainder = text[match.end():].strip(_HEADING_SEPARATORS)
     if remainder and not _ALL_CAPS_RX.fullmatch(remainder):
         return None
+    # ``SECTION 23 05 00 AND SECTION 23 07 00 APPLY`` names two sections; it
+    # is a cross-reference, not the header of this section.
+    if LABELED_SECTION_RE.search(remainder):
+        return None
     return match
+
+
+def _alpha_marker(text: str) -> Optional[Tuple[str, str]]:
+    """Return ``(style, letter)`` for a typed single-letter list marker."""
+
+    for pattern, style in _ALPHA_MARKER_RXS:
+        match = pattern.match(text or "")
+        if match is not None:
+            return style, match.group(1)
+    return None
+
+
+def _roman_ambiguous_marker_is_unresolved(text: str, prev_text: str) -> bool:
+    """``i.``/``v.``/``x.`` (any case) may be roman numerals, not letters.
+
+    Such a marker is treated as an alphabetic level only when the previous
+    paragraph carries the preceding letter in the same marker style
+    (``H.`` before ``I.``, ``u)`` before ``v)``); otherwise it is left for the
+    model, which sees the surrounding hierarchy.
+    """
+
+    marker = _alpha_marker(text)
+    if marker is None or marker[1].lower() not in _ROMAN_AMBIGUOUS_LETTERS:
+        return False
+    previous = _alpha_marker(prev_text)
+    if previous is None:
+        return True
+    style, letter = marker
+    return previous != (style, chr(ord(letter) - 1))
 
 
 def _table_ranges(document_xml_text: str) -> List[Tuple[int, int]]:
@@ -294,7 +382,7 @@ def _build_numbering_catalog(numbering_xml_text: str) -> Dict[str, Any]:
     """Parse just enough numbering.xml to resolve a rendered list signature."""
     if not numbering_xml_text.strip():
         return {"nums": {}, "abstracts": {}}
-    root = ET.fromstring(numbering_xml_text)
+    root = parse_untrusted_xml(numbering_xml_text, "word/numbering.xml")
     abstracts: Dict[str, Dict[str, Any]] = {}
     nums: Dict[str, Dict[str, Any]] = {}
 
@@ -565,13 +653,15 @@ def _deterministic_role_for_paragraph(paragraph: Dict[str, Any], prev_text: str 
     if _END_OF_SECTION_RX.match(text):
         return "END_OF_SECTION"
     if _PART_RX.match(text):
-        return "PART"
+        return "PART" if _match_part_heading(text) else None
     if _ARTICLE_RX.match(text):
-        return "ARTICLE"
+        return "ARTICLE" if _match_article_heading(text) else None
     if prev_text and _match_section_header(prev_text) and _ALL_CAPS_RX.match(text):
         return "SectionTitle"
 
     marker_type = paragraph.get("marker_type")
+    if _roman_ambiguous_marker_is_unresolved(text, prev_text):
+        return None
     if marker_type == "upper_alpha":
         return "PARAGRAPH"
     if marker_type == "number":
@@ -986,17 +1076,17 @@ def _validate_disposition_payload(
 def _bundle_unresolved_indices(bundle: Dict[str, Any]) -> Set[int]:
     raw = bundle.get("paragraphs", [])
     if not isinstance(raw, list):
-        raise ValueError("bundle paragraphs must be a list")
+        raise EngineError("classification_invalid_payload", "bundle paragraphs must be a list")
     indices: Set[int] = set()
     for item in raw:
         if not isinstance(item, dict) or not isinstance(
             item.get("paragraph_index"),
             int,
         ):
-            raise ValueError("bundle contains an invalid unresolved paragraph")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid unresolved paragraph")
         idx = item["paragraph_index"]
         if idx in indices:
-            raise ValueError(f"duplicate unresolved paragraph_index={idx}")
+            raise EngineError("classification_invalid_payload", f"duplicate unresolved paragraph_index={idx}")
         indices.add(idx)
     return indices
 
@@ -1009,30 +1099,30 @@ def _bundle_deterministic_dispositions(
     allowed = set(allowed_roles)
     for item in bundle.get("deterministic_classifications", []):
         if not isinstance(item, dict):
-            raise ValueError("bundle contains an invalid deterministic classification")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid deterministic classification")
         idx = item.get("paragraph_index")
         role = item.get("csi_role")
         if not isinstance(idx, int) or role not in allowed:
-            raise ValueError("bundle contains an invalid deterministic classification")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid deterministic classification")
         if idx in deterministic:
-            raise ValueError(f"duplicate deterministic classification for paragraph_index={idx}")
+            raise EngineError("classification_invalid_payload", f"duplicate deterministic classification for paragraph_index={idx}")
         deterministic[idx] = role
 
     deterministic_ignored: Dict[int, str] = {}
     for item in bundle.get("deterministic_ignored_paragraphs", []):
         if not isinstance(item, dict):
-            raise ValueError("bundle contains an invalid deterministic ignored disposition")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid deterministic ignored disposition")
         idx = item.get("paragraph_index")
         reason = item.get("reason")
         if not isinstance(idx, int) or not isinstance(reason, str) or not reason.strip():
-            raise ValueError("bundle contains an invalid deterministic ignored disposition")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid deterministic ignored disposition")
         if idx in deterministic_ignored:
-            raise ValueError(f"duplicate deterministic ignored disposition for paragraph_index={idx}")
+            raise EngineError("classification_invalid_payload", f"duplicate deterministic ignored disposition for paragraph_index={idx}")
         deterministic_ignored[idx] = reason.strip()
 
     overlap = set(deterministic) & set(deterministic_ignored)
     if overlap:
-        raise ValueError(
+        raise EngineError("classification_invalid_payload", 
             "bundle has conflicting deterministic dispositions for paragraph "
             f"indices: {sorted(overlap)[:20]}"
         )
@@ -1048,7 +1138,7 @@ def validate_phase2_llm_payload(bundle: Dict[str, Any], classifications: Dict[st
     )
     missing = sorted(unresolved - set(classified) - set(ignored))
     if missing:
-        raise ValueError(f"missing coverage for paragraph indices: {missing[:20]}")
+        raise EngineError("classification_coverage_incomplete", f"missing coverage for paragraph indices: {missing[:20]}")
 
 
 def coerce_to_final_classifications(
@@ -1064,7 +1154,7 @@ def coerce_to_final_classifications(
     deterministic_indices = set(deterministic) | set(deterministic_ignored)
     bundle_overlap = deterministic_indices & unresolved
     if bundle_overlap:
-        raise ValueError(
+        raise EngineError("classification_invalid_payload", 
             "bundle paragraph appears in both unresolved and deterministic "
             f"dispositions: {sorted(bundle_overlap)[:20]}"
         )
@@ -1080,7 +1170,7 @@ def coerce_to_final_classifications(
     if incoming_indices <= unresolved:
         missing_unresolved = sorted(unresolved - incoming_indices)
         if missing_unresolved:
-            raise ValueError(f"missing coverage for paragraph indices: {missing_unresolved[:20]}")
+            raise EngineError("classification_coverage_incomplete", f"missing coverage for paragraph indices: {missing_unresolved[:20]}")
         merged = dict(deterministic)
         merged.update(incoming)
         merged_ignored = dict(deterministic_ignored)
@@ -1089,21 +1179,21 @@ def coerce_to_final_classifications(
         for idx, expected in deterministic.items():
             actual = incoming.get(idx)
             if actual != expected:
-                raise ValueError(
+                raise EngineError("classification_deterministic_override", 
                     f"deterministic override attempted at paragraph_index={idx}: "
                     f"expected {expected!r}, got {actual!r}"
                 )
         for idx, expected in deterministic_ignored.items():
             actual = incoming_ignored.get(idx)
             if actual != expected:
-                raise ValueError(
+                raise EngineError("classification_deterministic_override", 
                     f"deterministic ignored override attempted at paragraph_index={idx}: "
                     f"expected {expected!r}, got {actual!r}"
                 )
         merged = incoming
         merged_ignored = incoming_ignored
     else:
-        raise ValueError("payload is neither unresolved-only nor valid final coverage")
+        raise EngineError("classification_coverage_incomplete", "payload is neither unresolved-only nor valid final coverage")
 
     notes = classifications.get("notes", []) if isinstance(classifications, dict) else []
     return {
@@ -1362,6 +1452,27 @@ def _resolve_application_policy(
     return policy
 
 
+@functools.lru_cache(maxsize=16)
+def _parsed_style_elements(styles_xml_text: str) -> Dict[str, "ET.Element"]:
+    """``styles.xml`` parsed once per distinct text and keyed by styleId.
+
+    Replacement-property resolution used to re-parse the whole part for every
+    replacement style; the parsed map is read-only afterwards.
+    """
+
+    try:
+        styles_root = parse_untrusted_xml(styles_xml_text, "word/styles.xml")
+    except UntrustedXmlError as exc:
+        raise ValueError(
+            "Could not parse styles.xml while resolving replacement properties"
+        ) from exc
+    return {
+        style_element.attrib.get(_wq("styleId")): style_element
+        for style_element in styles_root.findall(_wq("style"))
+        if style_element.attrib.get(_wq("styleId"))
+    }
+
+
 def _style_replacement_properties(
     styles_xml_text: str,
     style_id: str,
@@ -1369,17 +1480,7 @@ def _style_replacement_properties(
 ) -> Set[str]:
     """Return WML properties supplied anywhere in a style's basedOn chain."""
 
-    try:
-        styles_root = ET.fromstring(styles_xml_text)
-    except ET.ParseError as exc:
-        raise ValueError(
-            "Could not parse styles.xml while resolving replacement properties"
-        ) from exc
-    style_map = {
-        style_element.attrib.get(_wq("styleId")): style_element
-        for style_element in styles_root.findall(_wq("style"))
-        if style_element.attrib.get(_wq("styleId"))
-    }
+    style_map = _parsed_style_elements(styles_xml_text)
     properties: Set[str] = set()
     visited: Set[str] = set()
     current = style_id
@@ -1528,6 +1629,9 @@ def apply_phase2_classifications(
 
     blocks = list(iter_paragraph_xml_blocks(doc_text))
     para_blocks = [b[2] for b in blocks]
+    # Kept by identity: a block object that is still the original needs no
+    # second text extraction when the body-text invariant is checked.
+    original_blocks = list(para_blocks)
 
     report = ApplyReport(requested=0)
 
@@ -1576,7 +1680,6 @@ def apply_phase2_classifications(
         ignored_indices.add(idx)
     report.ignored = len(ignored_indices)
 
-    style_xml_by_id = _build_style_xml_map(styles_xml_text)
     replacement_style_ids = {
         arch_style_registry.get(item.get("csi_role"))
         for item in items
@@ -1627,7 +1730,10 @@ def apply_phase2_classifications(
 
     # Contract normalization is per paragraph: Format-only may remove only
     # properties actually supplied by that paragraph's effective architect
-    # style, while Canadian mode retains its legacy broader mutation contract.
+    # style. Canadian mode deliberately replaces jc/ind/spacing/numPr on every
+    # converted paragraph: it retargets each paragraph to the architect's
+    # list-level indents, so keeping a target's direct indent would fight the
+    # imported numbering. CLAUDE.md invariant 5 is scoped to Format-only.
     contract_before = [
         _normalize_paragraph_for_contract(
             p,
@@ -1661,7 +1767,13 @@ def apply_phase2_classifications(
             continue
 
         pb = para_blocks[idx]
-        style_xml = style_xml_by_id.get(style_id, "")
+        # Resolved through the full basedOn chain and limited to paragraph
+        # properties: a character-spacing <w:spacing> inside the style's rPr
+        # must not count, and an <w:ind> inherited from a parent style must.
+        has_replacement_ppr = bool(
+            ppr_properties_by_style.get(style_id, set())
+            & _DIRECT_PPR_OVERRIDE_PROPERTIES
+        )
         role_spec = role_specs.get(role) if role_specs else None
         provenance = role_spec.get("numbering_provenance") if isinstance(role_spec, dict) else None
         if role_specs is not None and not isinstance(role_spec, dict):
@@ -1711,26 +1823,26 @@ def apply_phase2_classifications(
                     pb,
                     numbering_source_styles_xml,
                 )
-                if _style_has_replacement_ppr(style_xml):
+                if has_replacement_ppr:
                     pb = strip_conflicting_direct_ppr(pb, preserve_numpr=True)
                     report.stripped_direct_ppr += 1
                 else:
                     report.preserved_direct_ppr += 1
                 report.preserved_automatic_numbering += 1
-            elif _style_has_replacement_ppr(style_xml):
+            elif has_replacement_ppr:
                 pb = strip_conflicting_direct_ppr(pb)
                 report.stripped_direct_ppr += 1
             else:
                 pb = _strip_direct_numpr_only(pb)
                 report.preserved_direct_ppr += 1
         elif provenance == "none":
-            if _style_has_replacement_ppr(style_xml):
+            if has_replacement_ppr:
                 pb = strip_conflicting_direct_ppr(pb)
                 report.stripped_direct_ppr += 1
             else:
                 pb = _strip_direct_numpr_only(pb)
                 report.preserved_direct_ppr += 1
-        elif _style_has_replacement_ppr(style_xml):
+        elif has_replacement_ppr:
             pb = strip_conflicting_direct_ppr(pb)
             report.stripped_direct_ppr += 1
         else:
@@ -1817,7 +1929,10 @@ def apply_phase2_classifications(
             )
 
     if application_policy.preserve_target_numbering:
-        text_after = [paragraph_text_from_block(p) for p in para_blocks]
+        text_after = [
+            text_before[idx] if p is original_blocks[idx] else paragraph_text_from_block(p)
+            for idx, p in enumerate(para_blocks)
+        ]
         if text_before != text_after:
             changed = next(
                 idx
@@ -1890,17 +2005,3 @@ class ApplyReport:
     )
 
 
-def _build_style_xml_map(styles_xml_text: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for match in re.finditer(r'(<w:style\b[^>]*w:styleId="([^"]+)"[^>]*>[\s\S]*?</w:style>)', styles_xml_text):
-        out[match.group(2)] = match.group(1)
-    return out
-
-
-def _style_has_replacement_ppr(style_block_xml: str) -> bool:
-    if not style_block_xml:
-        return False
-    return any(
-        tag in style_block_xml
-        for tag in ("<w:spacing", "<w:ind", "<w:jc", "<w:numPr")
-    )

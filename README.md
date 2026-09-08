@@ -55,7 +55,9 @@ the `SPEC_FORMATTER_DISABLE_UPDATE_CHECK` environment variable.
 
 ## Install from source (developers)
 
-Python 3.10 or newer is required.
+Python 3.10 or newer is required; CI imports the application on 3.10 and runs
+the full test suite on 3.11. `requirements.txt` lists only the direct runtime
+dependencies and lets pip resolve the rest.
 
 ```powershell
 python -m venv venv
@@ -101,14 +103,21 @@ stable source suffix so neither output can overwrite the other. Failed reruns
 therefore cannot make an older output appear current. `run.json` records the
 mode, application/profile contract versions, template and target hashes, model
 and prompt fingerprints, cache identity, output hashes, disposition counts,
-numbering checks, durations, a `diagnostics` rollup, and errors. API keys and
-document text are never written to run metadata.
+numbering checks, durations, a `diagnostics` rollup, and errors. Each target
+record (and its `audit.json`) also names the `stage` at which processing
+stopped and, when the engine failed on a known condition, a stable
+`error_code` with a fixed remediation sentence (for example
+`header_footer_target_section_id_required` or `canadian_target_hierarchy`);
+the closed sets are listed in CLAUDE.md. API keys and document text are never
+written to run metadata.
 
 `diagnostics.jsonl` is the detailed, structured diagnostics stream: one JSON
 object per phase event (`seq`, `ts`, `level`, `component`, `event`, and a
 `fields` object of counts/timings such as per-phase `duration_ms`, styles
-imported, numbering remaps, and paragraphs modified). It complements the
-human-readable `run.log`. Diagnostics carry only numbers and short structural
+imported, numbering remaps, and paragraphs modified). Engine phase events also
+carry `fields.t_ms`, the monotonic time at which the phase started, so events
+from different targets can be ordered truthfully even though their `ts` is
+the time the run folded them in. It complements the human-readable `run.log`. Diagnostics carry only numbers and short structural
 identifiers -- never document text or secrets -- and the verbosity is set with
 `diagnostics_level` (`debug`/`info`/`warning`/`error`, default `info`) or the
 `SPEC_FORMATTER_DIAGNOSTICS_LEVEL` environment variable, which overrides it.
@@ -201,8 +210,20 @@ Inno Setup installer. On Windows, from the repo root:
 The app folder is written to `dist\SpecificationFormatter\` and the installer to
 `dist\installer\SpecificationFormatterSetup.exe`. Releases are normally built and
 published automatically by `.github/workflows/release.yml` on a `vX.Y.Z` tag — see
-[docs/RELEASE_WINDOWS.md](docs/RELEASE_WINDOWS.md) for the full runbook. The
-legacy `build_app.ps1` one-file script is retained for quick local smoke builds.
+[docs/RELEASE_WINDOWS.md](docs/RELEASE_WINDOWS.md) for the full runbook. That
+workflow runs the full test suite on Windows before it builds anything, so a tag
+on a failing tree never publishes an installer.
+
+The PyInstaller spec is the only build path; the earlier one-file
+`build_app.ps1` script is gone because it omitted `LICENSE` and
+`THIRD_PARTY_NOTICES.md`, which must accompany a binary distribution, and it
+bypassed the version guard. A local smoke build is the same three commands
+above. To verify one without opening the GUI, run the frozen executable with
+`--version` (prints the version) or `--selfcheck` (imports every bundled
+module, reads the bundled prompts and notice files through the same resource
+root the pipeline uses, and exits non-zero on any failure). The self-check
+writes its result to the file named by `SPEC_FORMATTER_SELFCHECK_OUT` because
+the windowed executable has no console.
 
 ## Headless API
 
@@ -233,6 +254,25 @@ print(result.diagnostics_path)  # diagnostics.jsonl for this run
 Target inputs may be individual DOCX paths or folders. Folder expansion is
 non-recursive. Multi-file runs are independent: one corrupt target is reported
 as a failure without discarding valid outputs from other targets.
+
+Target classification requests share one process-wide limiter, so a batch of
+targets, each split into several chunks, never opens more than a bounded
+number of API streams at once. The default is 4 concurrent requests; set the
+`SPEC_FORMATTER_MAX_CONCURRENT_REQUESTS` environment variable (1 to 64) to
+change it. Transient failures (rate limits, connection errors, 5xx responses)
+are retried a bounded number of times, honouring a `retry-after` header when
+one is sent; an invalid key, a bad request, or a model refusal fails the target
+immediately instead of retrying.
+
+Both classifiers send their byte-stable prompt prefix as a cached system
+block, and the target classifier sends compact JSON, so repeated chunks and
+regeneration attempts reuse the cached prefix and input is about a third
+smaller. The `classify` phase event in `diagnostics.jsonl` records
+`requests`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and
+`cache_creation_input_tokens` for each target, so cache reuse is visible per
+run. When two overlapping chunks disagree about a paragraph, the classifier
+re-asks once about the whole overlap window and fails closed if the answer
+still leaves a paragraph without a single disposition.
 `output_dir` is the output **root**; `result.output_dir` remains a
 backward-compatible alias of the concrete `result.run_dir`.
 
@@ -281,9 +321,15 @@ alongside portable source-derived styles. Strict validation rejects missing,
 altered, or unlisted profile files.
 
 Profiles live under a versioned cache namespace (`contract-v<version>`). A
-cache hit also requires the exact source hash, producer version, classifier
-identity, and prompt hashes, so a wire-contract change cannot silently reuse an
-older profile.
+cache hit also requires the exact source hash, producer version, engine
+fingerprint (a committed digest of the analysis engine's source), classifier
+identity, and prompt hashes, so neither a wire-contract change nor a change to
+the engine's repair or capture logic can silently reuse an older profile. After
+a fresh analysis, older profiles of the same template beyond the newest two
+are removed from the cache. The architect template is analysed with
+`claude-opus-5` and targets are classified with `claude-sonnet-5`; no
+server-side model fallback is enabled, so the model a run records is the model
+that produced it.
 
 Formal JSON contracts remain in `schemas/`. The template-environment registry
 is a bounded, normalized representation; use its exact `source_styles.xml` and
@@ -310,6 +356,12 @@ only in proven `SECTION`, `DIVISION`, standalone-title, and same-section
 filename slots. This includes mirrored DrawingML/VML text boxes. The patch
 preserves the architect's number separators and every non-text OOXML byte, and
 fails closed when the source shell or target section identity is ambiguous.
+Completeness is judged against the slots actually present in the imported
+parts: if they carry the architect's section number the target must supply a
+recognisable `SectionID`, if they carry the architect's title the target must
+supply a `SectionTitle`, and every patched part is re-read to prove that no
+architect section number or title survived. A target that cannot fill a slot
+fails instead of publishing a header that still names the architect's section.
 
 ## Safety guarantees
 
@@ -320,8 +372,10 @@ fails closed when the source shell or target section identity is ambiguous.
   a 1,000:1 compression ratio. Header/footer media is capped at 16 MiB per
   asset and 64 MiB total.
 - Internal relationship targets must resolve inside the package. External
-  targets are recorded but never fetched, and classifier input is capped at an
-  estimated 150,000 tokens.
+  targets are recorded but never fetched. Architect classifier input is capped
+  at 150,000 tokens as a cost guard (measured with the API's token counter,
+  with a size estimate as the fallback); the cap is not a context-window
+  limit, and a template that exceeds it is refused before any request.
 - Architect and target inputs are read-only; outputs are separate files.
 - Template profiles are reused only after manifest, size, checksum, source hash,
   producer-version, prompt/model fingerprint, and cache-contract validation.
@@ -335,7 +389,12 @@ fails closed when the source shell or target section identity is ambiguous.
   preserves every pre-existing target numbering definition.
 - Canadian conversion edits only recognized leading numbering markers in
   classified paragraphs and verifies that substantive text and protected OOXML
-  remain unchanged.
+  remain unchanged. When it fails closed, the detailed message names the
+  paragraph by its nearest SECTION number and heading ordinal (for example
+  `Paragraph 143 (Section 21 13 13, heading 5)`), and a failure in the
+  architect template's numbering contract starts with `Architect template:`.
+  Run artifacts still record only the stable error code and remediation
+  sentence.
 - Short generated temporary paths avoid carrying user-controlled deep paths
   into Windows staging.
 - Every output is fully validated before atomic publication into its run folder.

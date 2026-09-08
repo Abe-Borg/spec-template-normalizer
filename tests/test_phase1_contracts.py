@@ -12,8 +12,8 @@ from docx_decomposer import (
     validate_instructions,
     build_style_registry_dict,
 )
-from gui import _load_prompt_file
 from llm_classifier import _parse_response
+from phase1_pipeline import load_prompt_file
 
 
 def _bundle() -> dict:
@@ -98,10 +98,16 @@ def test_exemplar_rejection(field, value, match):
         validate_instructions(data, slim_bundle=b)
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
 def test_sectiontitle_naming_consistency():
-    assert "SectionName" not in Path("master_prompt.txt").read_text(encoding="utf-8")
-    assert "SectionName" not in Path("run_instruction_prompt.txt").read_text(encoding="utf-8")
-    assert "SectionName" not in Path("instructions.json").read_text(encoding="utf-8")
+    assert "SectionName" not in (REPO_ROOT / "master_prompt.txt").read_text(encoding="utf-8")
+    assert "SectionName" not in (REPO_ROOT / "run_instruction_prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "SectionName" not in (FIXTURES / "instructions.json").read_text(encoding="utf-8")
 
 
 def test_rpr_hints_and_whitespace_run_handling():
@@ -126,7 +132,7 @@ def test_rpr_hints_and_whitespace_run_handling():
 def test_prompt_loader_missing_file_error(tmp_path: Path):
     missing = tmp_path / "master_prompt.txt"
     with pytest.raises(FileNotFoundError, match="Missing required prompt file"):
-        _load_prompt_file(missing)
+        load_prompt_file(missing)
 
 
 def test_template_registry_contains_raw_style_xml(tmp_path: Path):

@@ -43,6 +43,7 @@ def _install_fake_bundle_validator(monkeypatch: pytest.MonkeyPatch) -> None:
             producer={
                 "name": "spec-template-normalizer",
                 "version": pipeline.template_analysis.PIPELINE_VERSION,
+                "engine_fingerprint": pipeline.template_analysis.ENGINE_SOURCE_DIGEST,
                 "classifier": {
                     "provider": "anthropic",
                     "model": pipeline.template_analysis.DEFAULT_MODEL,
@@ -1562,3 +1563,397 @@ def test_processor_exception_records_processing_stage(tmp_path: Path) -> None:
 
     assert result.success is False
     assert result.stage == "processing"
+
+
+def test_cached_profile_with_a_stale_engine_fingerprint_is_not_reused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt_dir = Path(pipeline.__file__).resolve().parents[1]
+    producer = {
+        "name": "spec-template-normalizer",
+        "version": pipeline.template_analysis.PIPELINE_VERSION,
+        "engine_fingerprint": pipeline.template_analysis.ENGINE_SOURCE_DIGEST,
+        "classifier": {
+            "provider": "anthropic",
+            "model": pipeline.template_analysis.DEFAULT_MODEL,
+        },
+        "prompts": pipeline._prompt_fingerprints(prompt_dir)
+        if hasattr(pipeline, "_prompt_fingerprints")
+        else {
+            "master_prompt_sha256": hashlib.sha256(
+                (prompt_dir / "master_prompt.txt").read_text(encoding="utf-8").encode("utf-8")
+            ).hexdigest(),
+            "run_instruction_sha256": hashlib.sha256(
+                (prompt_dir / "run_instruction_prompt.txt").read_text(encoding="utf-8").encode("utf-8")
+            ).hexdigest(),
+        },
+    }
+    current = SimpleNamespace(producer=dict(producer))
+    stale = SimpleNamespace(producer={**producer, "engine_fingerprint": "deadbeefdeadbeef"})
+    common = dict(
+        model=pipeline.template_analysis.DEFAULT_MODEL,
+        prompt_dir=prompt_dir,
+        classifier=None,
+    )
+
+    assert pipeline._manifest_matches_current_engine(current, **common) is True
+    assert pipeline._manifest_matches_current_engine(stale, **common) is False
+
+
+def test_stale_profiles_for_one_template_are_pruned_to_the_newest_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    calls, analyzer, _config_loader, _processor = _fake_dependencies(monkeypatch)
+    cache_dir = tmp_path / "profile-cache"
+    messages: list[str] = []
+
+    profiles = [
+        pipeline.prepare_template_profile(
+            architect,
+            cache_dir,
+            "key",
+            force_analysis=True,
+            analyzer=analyzer,
+            progress=messages.append,
+        )
+        for _ in range(3)
+    ]
+
+    namespace = cache_dir / pipeline._PROFILE_CACHE_NAMESPACE
+    remaining = sorted(p.name for p in namespace.glob("*.phase1"))
+    assert len(calls["analyzer"]) == 3
+    assert len(remaining) == 2
+    # The profile just selected is always kept, and so is the next newest.
+    assert profiles[-1].bundle_dir.name in remaining
+    assert profiles[-2].bundle_dir.name in remaining
+    assert profiles[0].bundle_dir.name not in remaining
+    assert any("Removed 1 older cached profile" in line for line in messages)
+    assert not any(profiles[0].bundle_dir.name in line for line in messages)
+
+
+def test_profile_provenance_is_captured_at_selection_not_revalidated_at_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    validator = pipeline.template_analysis.validate_bundle_directory
+    validations: list[Path] = []
+
+    def counting_validator(bundle_dir, *, expected_source_sha256):
+        validations.append(Path(bundle_dir))
+        return validator(bundle_dir, expected_source_sha256=expected_source_sha256)
+
+    monkeypatch.setattr(pipeline.template_analysis, "validate_bundle_directory", counting_validator)
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    assert result.template_profile.provenance is not None
+    assert result.template_profile.provenance["producer"]["name"] == "spec-template-normalizer"
+    # One validation when the fresh profile is selected; none while writing run.json.
+    assert len(validations) == 1
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["template_profile"]["producer"]["name"] == "spec-template-normalizer"
+    assert manifest["template_profile"]["reused"] is False
+
+
+def test_publication_failure_still_writes_a_failed_manifest_with_target_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+
+    def failing_writer(**_kwargs):
+        raise OSError("disk full while writing audits")
+
+    monkeypatch.setattr(pipeline, "_write_run_artifacts", failing_writer)
+
+    with pytest.raises(OSError) as raised:
+        _run_with_fakes(
+            architect,
+            [target],
+            tmp_path / "formatted",
+            analyzer=analyzer,
+            config_loader=config_loader,
+            processor=processor,
+        )
+
+    run_dir = raised.value.run_dir
+    manifest_path = raised.value.manifest_path
+    assert run_dir.is_dir() and manifest_path == run_dir / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["failure_phase"] == "publication"
+    assert "disk full" not in manifest_path.read_text(encoding="utf-8")
+    record = manifest["targets"][0]
+    assert record["success"] is True
+    assert record["stage"] == "complete"
+    assert record["output_path"] == str(run_dir / "target_FORMATTED.docx")
+    assert (run_dir / "target_FORMATTED.docx").is_file()
+    # The fallback audit and summary describe the same outcome as the
+    # target record; they used to claim not_started / all failed.
+    audit = json.loads(Path(record["audit_path"]).read_text(encoding="utf-8"))
+    assert audit["success"] is True
+    assert audit["stage"] == "complete"
+    assert audit["output"]["path"] == record["output_path"]
+    expected_counts = {"styled": 1, "ignored": 2, "out_of_scope": 3, "unresolved": 0}
+    assert audit["disposition_counts"] == expected_counts
+    assert record["disposition_counts"] == expected_counts
+    assert record["numbering_checks"] == {"preserved": True, "checked": 1}
+    assert manifest["summary"] == {
+        "targets": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "dispositions": expected_counts,
+    }
+    assert "RUN FAILED DURING PUBLICATION" in (run_dir / "run.log").read_text(encoding="utf-8")
+    assert not (run_dir / ".staging").exists()
+
+
+def test_staging_directory_is_removed_when_the_run_ends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    observed: list[bool] = []
+    original = pipeline._atomic_write_bytes
+
+    def observing_write(path, payload):
+        original(path, payload)
+        observed.append((path.parent / ".staging").is_dir())
+
+    monkeypatch.setattr(pipeline, "_atomic_write_bytes", observing_write)
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    assert observed and all(observed)
+    assert not (result.run_dir / ".staging").exists()
+    assert sorted(p.name for p in result.run_dir.iterdir() if p.name.startswith(".")) == []
+
+
+def test_cached_profile_rejection_message_carries_no_raw_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    cache_dir = tmp_path / "profile-cache"
+    first = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+        cache_dir=cache_dir,
+    )
+    private = r"C:\\Users\\Private\\secret-bundle"
+    validator = pipeline.template_analysis.validate_bundle_directory
+
+    def rejecting_validator(bundle_dir, *, expected_source_sha256):
+        if Path(bundle_dir) == first.template_profile.bundle_dir:
+            raise ValueError(f"manifest tampered at {private}")
+        return validator(bundle_dir, expected_source_sha256=expected_source_sha256)
+
+    monkeypatch.setattr(pipeline.template_analysis, "validate_bundle_directory", rejecting_validator)
+    messages: list[str] = []
+
+    _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+        cache_dir=cache_dir,
+        progress=messages.append,
+    )
+
+    rejection = [line for line in messages if "Ignoring an invalid cached template profile" in line]
+    assert rejection
+    assert all(private not in line and "tampered" not in line for line in rejection)
+
+
+def test_run_artifacts_prefer_the_engine_error_code_over_classified_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS
+
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+    raw_detail = "Paragraph 412 begins with ambiguous decimal text 'CONFIDENTIAL CLAUSE'"
+
+    def coded_processor(**kwargs) -> BatchResult:
+        return BatchResult(
+            filename=Path(kwargs["docx_path"]).name,
+            success=False,
+            output_path=None,
+            log=["FAILED: " + raw_detail],
+            error=raw_detail,
+            duration_seconds=0.01,
+            stage="disposition_verification",
+            error_code="classification_coverage_incomplete",
+            safe_error=ERROR_REMEDIATIONS["classification_coverage_incomplete"],
+        )
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=coded_processor,
+    )
+
+    item = result.targets[0]
+    assert item.success is False
+    assert item.error_code == "classification_coverage_incomplete"
+    manifest_text = result.manifest_path.read_text(encoding="utf-8")
+    audit_text = item.audit_path.read_text(encoding="utf-8")
+    assert "CONFIDENTIAL CLAUSE" not in manifest_text
+    assert "CONFIDENTIAL CLAUSE" not in audit_text
+    manifest = json.loads(manifest_text)
+    record = manifest["targets"][0]
+    assert record["error_code"] == "classification_coverage_incomplete"
+    assert record["error"] == ERROR_REMEDIATIONS["classification_coverage_incomplete"]
+    assert record["stage"] == "disposition_verification"
+    audit = json.loads(audit_text)
+    assert audit["error_code"] == "classification_coverage_incomplete"
+    assert audit["error"] == record["error"]
+
+
+def test_target_error_diagnostic_falls_back_to_text_classification_without_a_code() -> None:
+    from spec_formatter.pipeline import TargetFormatResult, _target_error_diagnostic
+
+    coded = TargetFormatResult(
+        source_path=Path("t.docx"), success=False, output_path=None, log=(),
+        error="detail with CONFIDENTIAL text", duration_seconds=0.0,
+        error_code="canadian_target_hierarchy",
+    )
+    uncoded = TargetFormatResult(
+        source_path=Path("t.docx"), success=False, output_path=None, log=(),
+        error="detail with CONFIDENTIAL text", duration_seconds=0.0,
+    )
+    unknown = TargetFormatResult(
+        source_path=Path("t.docx"), success=False, output_path=None, log=(),
+        error="detail with CONFIDENTIAL text", duration_seconds=0.0,
+        error_code="not_a_real_code",
+    )
+
+    assert _target_error_diagnostic(coded, ()).code == "canadian_target_hierarchy"
+    assert "CONFIDENTIAL" not in _target_error_diagnostic(coded, ()).message
+    assert _target_error_diagnostic(uncoded, ()).code == "untrusted_error"
+    assert _target_error_diagnostic(unknown, ()).code == "untrusted_error"
+
+
+def test_package_exports_every_name_the_gui_imports() -> None:
+    import spec_formatter
+
+    for name in (
+        "SafeErrorDiagnostic",
+        "safe_error_diagnostic",
+        "collect_target_specs",
+        "prepare_template_profile",
+        "format_specifications",
+        "default_template_cache_dir",
+    ):
+        assert name in spec_formatter.__all__
+        assert getattr(spec_formatter, name) is getattr(pipeline, name)
+
+
+class _InlineExecutor:
+    """A ThreadPoolExecutor stand-in whose futures are complete before submit returns.
+
+    It makes the completion race deterministic: every ``done`` signal is queued
+    (and drained by the submission loop) before the completion loop starts.
+    """
+
+    def __init__(self, max_workers=None):
+        self.max_workers = max_workers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # pragma: no cover - surfaced by the pipeline
+            future.set_exception(exc)
+        return future
+
+
+def test_completion_signals_drained_during_submission_are_not_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target that finishes before the completion loop starts is still collected.
+
+    ``report`` drains the signal queue from the owner thread, so a target that
+    completes while the next one is being queued has its ``done`` signal
+    consumed early. The run used to block forever waiting for a signal that
+    would never be queued again.
+    """
+
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    targets = [
+        _write_input(tmp_path / f"target{index}.docx", f"target{index}-original".encode())
+        for index in range(3)
+    ]
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    monkeypatch.setattr(pipeline, "ThreadPoolExecutor", _InlineExecutor)
+    outcome: dict = {}
+
+    def run() -> None:
+        try:
+            outcome["result"] = _run_with_fakes(
+                architect,
+                targets,
+                tmp_path / "formatted",
+                analyzer=analyzer,
+                config_loader=config_loader,
+                processor=processor,
+            )
+        except BaseException as exc:  # pragma: no cover - reported below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+
+    assert not worker.is_alive(), "the run hung waiting for an already-drained completion"
+    assert "error" not in outcome, outcome.get("error")
+    result = outcome["result"]
+    assert result.success and len(result.targets) == 3
+    assert [item.success for item in result.targets] == [True, True, True]
+    assert result.manifest_path.is_file()

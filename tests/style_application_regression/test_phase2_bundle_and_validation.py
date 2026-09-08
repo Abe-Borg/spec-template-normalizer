@@ -543,6 +543,11 @@ def test_preclassify_markers():
         "SECTION 012900 - PAYMENT PROCEDURES",
         "SECTION 01 29 00",
         "SECTION 01\u00a029\u00a000 - PAYMENT PROCEDURES",
+        # Mixed grouping and MasterFormat level-4 numbers share the one
+        # section-number grammar with the token extractor and patcher.
+        "SECTION 23 0500",
+        "SECTION 23 05 00.13",
+        "SECTION 230500.13 - COMMON MOTOR REQUIREMENTS",
     ],
 )
 def test_section_header_number_formats_are_preclassified(text):
@@ -552,6 +557,24 @@ def test_section_header_number_formats_are_preclassified(text):
     )
 
     assert out == {0: "SectionID"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SECTION 2305001",
+        "SECTION 23050013",
+        "SECTION 230500.1",
+        "SECTION 230500A",
+    ],
+)
+def test_malformed_section_numbers_are_not_preclassified(text):
+    out = preclassify_paragraphs(
+        [{"paragraph_index": 0, "text": text, "in_table": False}],
+        ["SectionID", "SectionTitle", "PART"],
+    )
+
+    assert out == {}
 
 
 def test_combined_section_header_without_template_role_is_preserved_unclassified(
@@ -651,6 +674,94 @@ def test_single_digit_article_marker_is_deterministic():
         }],
         ["PART", "ARTICLE", "PARAGRAPH"],
     ) == {4: "ARTICLE"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1.5 times the pipe diameter shall be maintained.",
+        "2.4 m minimum clearance.",
+        "PART 1 of the Contract Documents shall govern.",
+        "1.02 The Contractor shall submit product data for every item listed "
+        "in the schedule below before ordering.",
+    ],
+)
+def test_prose_beginning_with_a_marker_is_left_for_the_model(text):
+    # A text-only PART/ARTICLE hit becomes a deterministic classification the
+    # model cannot override, so prose that merely starts with a decimal number
+    # or the word PART must stay unresolved.
+    assert preclassify_paragraphs(
+        [{"paragraph_index": 3, "text": text, "in_table": False}],
+        ["PART", "ARTICLE", "PARAGRAPH"],
+    ) == {}
+
+
+@pytest.mark.parametrize(
+    ("text", "role"),
+    [
+        ("1.01 SUMMARY", "ARTICLE"),
+        ("1.1 General requirements", "ARTICLE"),
+        ("3.2 Installation of 2-inch piping", "ARTICLE"),
+        ("PART 1 - GENERAL", "PART"),
+        ("PART 2 PRODUCTS", "PART"),
+        ("PART 3", "PART"),
+    ],
+)
+def test_heading_shaped_markers_stay_deterministic(text, role):
+    assert preclassify_paragraphs(
+        [{"paragraph_index": 3, "text": text, "in_table": False}],
+        ["PART", "ARTICLE", "PARAGRAPH"],
+    ) == {3: role}
+
+
+def test_section_header_naming_two_sections_is_a_cross_reference():
+    assert preclassify_paragraphs(
+        [{
+            "paragraph_index": 0,
+            "text": "SECTION 23 05 00 AND SECTION 23 07 00 APPLY",
+            "in_table": False,
+        }],
+        ["SectionID", "SectionTitle", "PART"],
+    ) == {}
+
+
+def test_roman_ambiguous_single_letter_markers_need_the_preceding_letter():
+    roles = ["PARAGRAPH", "SUBPARAGRAPH", "SUBSUBPARAGRAPH"]
+
+    def paragraphs(*texts):
+        return [
+            {
+                "paragraph_index": index,
+                "text": text,
+                "in_table": False,
+                "marker_type": (
+                    "upper_alpha" if text[0].isupper() else "lower_alpha"
+                ),
+            }
+            for index, text in enumerate(texts)
+        ]
+
+    # H. then I.: the letter sequence corroborates an alphabetic level.
+    assert preclassify_paragraphs(paragraphs("H. Alpha", "I. Next"), roles) == {
+        0: "PARAGRAPH",
+        1: "PARAGRAPH",
+    }
+    assert preclassify_paragraphs(paragraphs("h. alpha", "i. next"), roles) == {
+        0: "SUBSUBPARAGRAPH",
+        1: "SUBSUBPARAGRAPH",
+    }
+    # I., V., or X. without the preceding letter may be a roman numeral.
+    assert preclassify_paragraphs(paragraphs("A. Alpha", "I. Roman"), roles) == {
+        0: "PARAGRAPH",
+    }
+    assert preclassify_paragraphs(paragraphs("v. alone"), roles) == {}
+    assert preclassify_paragraphs(paragraphs("X. alone"), roles) == {}
+    # A different marker style or case does not corroborate.
+    assert preclassify_paragraphs(paragraphs("h. lower", "I. Upper"), roles) == {
+        0: "SUBSUBPARAGRAPH",
+    }
+    # Other single letters are never ambiguous.
+    assert preclassify_paragraphs(paragraphs("J. Alone"), roles) == {0: "PARAGRAPH"}
 
 
 def test_automatic_numbering_precedes_uppercase_section_cross_reference():

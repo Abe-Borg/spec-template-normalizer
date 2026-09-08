@@ -24,6 +24,7 @@ try:
     )
     from phase1_pipeline import (
         DEFAULT_MODEL,
+        ENGINE_SOURCE_DIGEST,
         PIPELINE_VERSION,
         Phase1Result,
         run_phase1,
@@ -38,6 +39,7 @@ finally:
 __all__ = [
     "BundleManifest",
     "DEFAULT_MODEL",
+    "ENGINE_SOURCE_DIGEST",
     "PIPELINE_VERSION",
     "Phase1Result",
     "load_bundle_manifest",

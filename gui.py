@@ -51,15 +51,21 @@ def _font(size: int, weight: str = "normal", family: str = UI_FONT) -> ctk.CTkFo
     return ctk.CTkFont(family=family, size=size, weight=weight)
 
 
-def _load_prompt_file(path: Path) -> str:
-    """Compatibility helper retained for the template-engine contract tests."""
+# The GUI no longer exposes template-reuse or worker-count knobs; every run
+# reuses a compatible cached profile and formats up to three targets at once.
+# FormatWorker keeps its parameters so headless callers can still choose.
+DEFAULT_REUSE_TEMPLATE_ANALYSIS = True
+DEFAULT_MAX_WORKERS = 3
+KEYRING_UNAVAILABLE_STATUS = (
+    "Could not save the API key to the system keyring; it will not be remembered."
+)
 
-    if not path.exists():
-        raise FileNotFoundError(f"Missing required prompt file: {path}")
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception as exc:
-        raise RuntimeError(f"Failed reading prompt file {path}: {exc}") from exc
+
+def preview_architect_exclusion(architect_value: str) -> Optional[Path]:
+    """The architect path to exclude from folder discovery in the preview."""
+
+    value = (architect_value or "").strip()
+    return Path(value) if value else None
 
 
 def discover_target_docx(folder: Path) -> list[Path]:
@@ -210,7 +216,9 @@ class FormatWorker(threading.Thread):
         self.architect_template = architect_template
         self.target_inputs = target_inputs
         self.output_dir = output_dir
-        self.api_key = api_key
+        # Stripped once here so the value the pipeline uses and the value the
+        # error redaction searches for are the same string.
+        self.api_key = (api_key or "").strip()
         self.reuse_template_analysis = reuse_template_analysis
         self.max_workers = max_workers
         self.conversion_mode = conversion_mode
@@ -271,8 +279,8 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Specification Formatter")
-        self.geometry("980x1000")
-        self.minsize(820, 780)
+        self.geometry("980x930")
+        self.minsize(820, 720)
         self.configure(fg_color=COLORS["bg"])
 
         self.architect_var = ctk.StringVar()
@@ -286,8 +294,6 @@ class App(ctk.CTk):
         # Pre-check "Remember" only when the shown key came from storage; an env
         # override is ephemeral and must not silently overwrite the saved key.
         self.remember_key_var = ctk.BooleanVar(value=bool(stored_key) and not env_key)
-        self.reuse_var = ctk.BooleanVar(value=True)
-        self.workers_var = ctk.StringVar(value="3")
         self.conversion_mode_var = ctk.StringVar(value=FORMAT_ONLY)
         self.mode_controls: list[ctk.CTkRadioButton] = []
         self.run_affecting_controls: list[object] = []
@@ -308,6 +314,9 @@ class App(ctk.CTk):
         self._update_dialog: Optional[ctk.CTkToplevel] = None
 
         self._build_ui()
+        # The target preview excludes the architect from folder discovery, so
+        # it must be re-rendered whenever the architect changes.
+        self.architect_var.trace_add("write", lambda *_args: self._refresh_target_preview())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_events)
         # Silent once-a-day update check, shortly after the window paints.
@@ -727,7 +736,10 @@ class App(ctk.CTk):
             text = "No target specifications selected. Add files or a folder."
         else:
             try:
-                targets = collect_target_specs(self.target_inputs)
+                targets = collect_target_specs(
+                    self.target_inputs,
+                    exclude_discovered=preview_architect_exclusion(self.architect_var.get()),
+                )
                 lines = [f"{len(targets)} target specification(s)"]
                 lines.extend(f"  • {item.name}" for item in targets[:6])
                 if len(targets) > 6:
@@ -741,8 +753,15 @@ class App(ctk.CTk):
     def _toggle_key(self) -> None:
         self.api_entry.configure(show="" if self.show_key_var.get() else "•")
 
-    def _append_log(self, message: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
+    def _append_log(
+        self,
+        message: str,
+        occurred_at: Optional[datetime] = None,
+    ) -> None:
+        event_time = occurred_at or datetime.now()
+        if event_time.tzinfo is not None:
+            event_time = event_time.astimezone()
+        timestamp = event_time.strftime("%H:%M:%S")
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"[{timestamp}] {message.rstrip()}\n")
         self.log_box.see("end")
@@ -807,8 +826,8 @@ class App(ctk.CTk):
             target_inputs=tuple(self.target_inputs),
             output_root=Path(output),
             conversion_mode=conversion_mode,
-            reuse_template_analysis=self.reuse_var.get(),
-            max_workers=int(self.workers_var.get()),
+            reuse_template_analysis=DEFAULT_REUSE_TEMPLATE_ANALYSIS,
+            max_workers=DEFAULT_MAX_WORKERS,
         )
         api_key = self.api_key_var.get()
         self.last_result = None
@@ -829,7 +848,7 @@ class App(ctk.CTk):
         self.status_label.configure(text="Checking files", text_color=COLORS["secondary"])
         self.progress.start()
         if self.remember_key_var.get():
-            secrets.save_api_key(self.api_key_var.get())
+            self._remember_api_key()
         self.worker = FormatWorker(
             architect_template=active_run.architect_template,
             target_inputs=active_run.target_inputs,
@@ -868,7 +887,10 @@ class App(ctk.CTk):
                     self._handle_error(payload)
         except queue.Empty:
             pass
-        self.after(100, self._poll_events)
+        finally:
+            # Re-arm unconditionally: a rendering error must never leave the
+            # pump dead with the controls locked and the spinner running.
+            self.after(100, self._poll_events)
 
     def _finish_busy_state(self) -> None:
         self.progress.stop()
@@ -978,9 +1000,22 @@ class App(ctk.CTk):
 
     def _on_remember_key_toggled(self) -> None:
         if self.remember_key_var.get():
-            secrets.save_api_key(self.api_key_var.get())
+            self._remember_api_key()
         else:
             secrets.clear_api_key()
+
+    def _remember_api_key(self) -> None:
+        """Save the key to the OS keyring, or say so when that is impossible."""
+
+        if secrets.save_api_key(self.api_key_var.get()):
+            return
+        # No usable keyring backend (or it refused the write): leave the box
+        # unchecked so the user is not led to believe the key is remembered.
+        self.remember_key_var.set(False)
+        self.status_label.configure(
+            text=KEYRING_UNAVAILABLE_STATUS,
+            text_color=COLORS["muted"],
+        )
 
     # ------------------------------------------------------------------
     # Help / informational dialogs

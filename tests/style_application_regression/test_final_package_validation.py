@@ -762,3 +762,53 @@ def test_final_invariant_rejects_rpr_moved_after_run_text(tmp_path):
             conversion_mode="format_only",
             allowed_rpr_properties_by_paragraph={0: {"b"}},
         )
+
+
+def test_duplicate_singleton_document_relationship_fails_validation(tmp_path):
+    docx = tmp_path / "duplicate-theme.docx"
+    parts = _parts()
+    parts["word/_rels/document.xml.rels"] = (
+        f'<Relationships xmlns="{PKG_REL_NS}">'
+        f'<Relationship Id="rId1" Type="{R_NS}/styles" Target="styles.xml"/>'
+        f'<Relationship Id="rId2" Type="{R_NS}/numbering" Target="numbering.xml"/>'
+        f'<Relationship Id="rId3" Type="{R_NS}/styles" Target="styles.xml"/>'
+        "</Relationships>"
+    )
+    _write_docx(docx, parts)
+
+    with pytest.raises(Exception, match="duplicate styles relationship \\(rId1 and rId3\\)"):
+        validate_docx_package(docx)
+
+
+def test_run_property_verification_skips_byte_identical_paragraphs(tmp_path, monkeypatch):
+    from spec_formatter.style_application import phase2_invariants as inv
+
+    calls = {"count": 0}
+    real = inv._verify_contracted_rpr_deletions_only
+
+    def counting(*args, **kwargs):
+        calls["count"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(inv, "_verify_contracted_rpr_deletions_only", counting)
+    same = (
+        f'<w:document xmlns:w="{W_NS}"><w:body>'
+        '<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>A</w:t></w:r></w:p>'
+        '<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>B</w:t></w:r></w:p>'
+        "<w:sectPr/></w:body></w:document>"
+    )
+    # A paragraph-property change leaves the text and run formatting intact
+    # but makes the second paragraph differ byte-for-byte.
+    changed = same.replace(
+        '<w:p><w:r><w:rPr><w:i/>',
+        '<w:p><w:pPr><w:pStyle w:val="Body"/></w:pPr><w:r><w:rPr><w:i/>',
+    )
+    parts = _parts()
+    parts["word/document.xml"] = same
+    docx = tmp_path / "source.docx"
+    _write_docx(docx, parts)
+
+    inv.verify_phase2_invariants(docx, same.encode("utf-8"))
+    assert calls["count"] == 0
+    inv.verify_phase2_invariants(docx, changed.encode("utf-8"))
+    assert calls["count"] == 1

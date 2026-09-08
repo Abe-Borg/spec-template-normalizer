@@ -910,3 +910,87 @@ def test_architect_counter_start_and_restart_are_validated_from_numbering_xml():
                 restart='<w:lvlRestart w:val="1"/>',
             ),
         )
+
+
+def test_target_messages_locate_paragraphs_by_section_and_heading():
+    with pytest.raises(ValueError) as excinfo:
+        plan_csi_to_canadian(
+            _document(
+                _paragraph("SECTION 21 13 13"),
+                _paragraph("PART 1 GENERAL"),
+                _paragraph("A. First"),
+                _paragraph("C. Gap"),
+            ),
+            _styles(),
+            _classifications("SectionID", "PART", "PARAGRAPH", "PARAGRAPH"),
+            _canadian_role_specs("PARAGRAPH"),
+        )
+    message = str(excinfo.value)
+    assert message.startswith(
+        "Paragraph 3 (Section 21 13 13, heading 3) has non-contiguous PARAGRAPH"
+    )
+    # Only the section number and counts are reported, never heading text.
+    assert "GENERAL" not in message
+    assert "First" not in message
+
+    numpr = '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr>'
+    classifications = {
+        "classifications": [
+            {"paragraph_index": 0, "csi_role": "SectionID"},
+            {"paragraph_index": 1, "csi_role": "PARAGRAPH"},
+            {"paragraph_index": 3, "csi_role": "PARAGRAPH"},
+        ],
+        "notes": [],
+    }
+    with pytest.raises(ValueError, match="Unconverted paragraph 2 shares") as excinfo:
+        plan_csi_to_canadian(
+            _document(
+                _paragraph("SECTION 21 13 13"),
+                _paragraph("First", numpr),
+                _paragraph("Filtered boilerplate item", numpr),
+                _paragraph("Third", numpr),
+            ),
+            _styles(),
+            classifications,
+            _canadian_role_specs("PARAGRAPH"),
+            numbering_xml=_source_numbering("7"),
+        )
+    assert str(excinfo.value).endswith(
+        "It is paragraph 2 (Section 21 13 13, after heading 1)."
+    )
+
+
+def test_paragraphs_before_any_section_line_say_so():
+    with pytest.raises(ValueError, match=r"^Paragraph 0 \(before any SECTION line, heading 1\)"):
+        plan_csi_to_canadian(
+            _document(_paragraph("1. Orphan")),
+            _styles(),
+            _classifications("SUBPARAGRAPH"),
+            _canadian_role_specs("SUBPARAGRAPH"),
+        )
+
+
+def test_architect_contract_failures_are_prefixed_with_architect_template():
+    kwargs = {
+        "document_xml": _document(_paragraph("A. Scope")),
+        "styles_xml": _styles(),
+        "classifications": _classifications("PARAGRAPH"),
+    }
+    with pytest.raises(
+        ValueError,
+        match=r"^Architect template: role PARAGRAPH numbering starts at '5'",
+    ):
+        plan_csi_to_canadian(
+            **kwargs,
+            role_specs=_canadian_role_specs("PARAGRAPH"),
+            architect_numbering_xml=_architect_numbering(start="5"),
+        )
+
+    role_specs = _canadian_role_specs("PARAGRAPH")
+    role_specs["PARAGRAPH"]["numbering_pattern"]["numFmt"] = "lowerLetter"
+    with pytest.raises(ValueError) as excinfo:
+        plan_csi_to_canadian(**kwargs, role_specs=role_specs)
+    assert str(excinfo.value).startswith(
+        "Architect template: role PARAGRAPH is not Canadian numeric numbering"
+    )
+    assert excinfo.value.code == "canadian_architect_contract"

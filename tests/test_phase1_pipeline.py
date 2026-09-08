@@ -9,11 +9,11 @@ from pathlib import Path
 
 import pytest
 
-import docx_decomposer
 import phase1_pipeline
 from docx_decomposer import extract_docx
 from phase1_bundle import validate_bundle_directory
 from phase1_pipeline import run_phase1
+from spec_formatter.style_application import docx_decomposer as package_decomposer
 
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -288,7 +288,8 @@ def test_zip_part_size_metadata_limit_removes_partial_extract(
     with zipfile.ZipFile(source, "w") as package:
         package.writestr("word/partial.txt", b"ok")
         package.writestr("word/oversized.bin", b"12345")
-    monkeypatch.setattr(docx_decomposer, "MAX_PACKAGE_PART_BYTES", 4)
+    # The limits live in the one shared extraction loop.
+    monkeypatch.setattr(package_decomposer, "MAX_PACKAGE_PART_BYTES", 4)
 
     with pytest.raises(ValueError, match="per-part limit is 4"):
         extract_docx(source, extract_dir)
@@ -305,7 +306,7 @@ def test_zip_compression_ratio_limit_removes_partial_extract(
     with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_DEFLATED) as package:
         package.writestr("word/partial.txt", os.urandom(64))
         package.writestr("word/compression-bomb.bin", b"0" * 4096)
-    monkeypatch.setattr(docx_decomposer, "MAX_COMPRESSION_RATIO", 2)
+    monkeypatch.setattr(package_decomposer, "MAX_COMPRESSION_RATIO", 2)
 
     with pytest.raises(ValueError, match="suspicious compression ratio"):
         extract_docx(source, extract_dir)

@@ -6,8 +6,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-import gui
 import pytest
+
+# gui.py imports customtkinter (and therefore tkinter) at module scope. Linux
+# CI images ship Python without tkinter, so the GUI tests skip there; the
+# Windows CI job is authoritative for this module.
+pytest.importorskip("customtkinter")
+
+import gui  # noqa: E402
 from spec_formatter.pipeline import CSI_TO_CANADIAN, FORMAT_ONLY
 from spec_formatter.style_application.core.csi_to_canadian import (
     CanadianConversionReport,
@@ -378,3 +384,128 @@ def test_poll_events_uses_captured_progress_timestamp_and_accepts_legacy_string(
         ("Processing target", occurred_at),
         ("legacy progress", None),
     ]
+
+
+def test_poll_events_rearms_after_render_error():
+    """A rendering failure must never leave the event pump dead.
+
+    The pump is the only path that unlocks the controls and stops the spinner,
+    so it re-arms itself in a ``finally`` block even when handling one event
+    raises.  The remaining events stay queued for the next poll.
+    """
+
+    events: queue.Queue = queue.Queue()
+    events.put(("progress", {"message": "first", "occurred_at": None}))
+    events.put(("progress", {"message": "second", "occurred_at": None}))
+    scheduled: list[tuple] = []
+    logged: list[str] = []
+
+    def failing_append_log(message, occurred_at=None):
+        logged.append(message)
+        raise TypeError("unexpected keyword argument")
+
+    app = SimpleNamespace(
+        events=events,
+        status_label=_FakeWidget(),
+        _append_log=failing_append_log,
+        _handle_complete=lambda _payload: None,
+        _handle_error=lambda _payload: None,
+        _poll_events=lambda: None,
+        after=lambda *args: scheduled.append(args),
+    )
+
+    with pytest.raises(TypeError):
+        gui.App._poll_events(app)
+
+    assert logged == ["first"]
+    assert scheduled == [(100, app._poll_events)]
+    assert events.get_nowait() == (
+        "progress",
+        {"message": "second", "occurred_at": None},
+    )
+
+
+def test_format_worker_strips_the_api_key_once(monkeypatch):
+    received = {}
+
+    def fake_format_specifications(**kwargs):
+        received.update(kwargs)
+        raise ValueError("boom  key-with-spaces  boom")
+
+    monkeypatch.setattr(gui, "format_specifications", fake_format_specifications)
+    monkeypatch.setattr(gui, "default_template_cache_dir", lambda: Path("cache"))
+    events: queue.Queue = queue.Queue()
+    worker = gui.FormatWorker(
+        architect_template=Path("architect.docx"),
+        target_inputs=(Path("target.docx"),),
+        output_dir=Path("formatted"),
+        api_key="  key-with-spaces  ",
+        reuse_template_analysis=True,
+        max_workers=2,
+        conversion_mode=FORMAT_ONLY,
+        events=events,
+    )
+
+    worker.run()
+
+    assert worker.api_key == "key-with-spaces"
+    assert received["api_key"] == "key-with-spaces"
+    kind, payload = events.get_nowait()
+    assert kind == "error"
+    assert "key-with-spaces" not in payload["message"]
+
+
+def test_target_preview_excludes_the_architect_from_folder_discovery(monkeypatch):
+    captured = {}
+
+    def fake_collect(inputs, *, exclude_discovered=None):
+        captured["inputs"] = tuple(inputs)
+        captured["exclude"] = exclude_discovered
+        return (Path("a.docx"),)
+
+    monkeypatch.setattr(gui, "collect_target_specs", fake_collect)
+    box = _FakeLogBox()
+    box.delete = lambda *_args: None
+    app = SimpleNamespace(
+        target_box=box,
+        target_inputs=[Path("specs")],
+        architect_var=SimpleNamespace(get=lambda: "  C:/templates/Architect.docx  "),
+    )
+
+    gui.App._refresh_target_preview(app)
+
+    assert captured["inputs"] == (Path("specs"),)
+    assert captured["exclude"] == Path("C:/templates/Architect.docx")
+    assert gui.preview_architect_exclusion("") is None
+
+
+def test_keyring_save_failure_unchecks_remember_and_reports(monkeypatch):
+    monkeypatch.setattr(gui.secrets, "save_api_key", lambda _key: False)
+    remembered = {"value": True}
+    status = _FakeWidget()
+    app = SimpleNamespace(
+        remember_key_var=SimpleNamespace(
+            get=lambda: remembered["value"],
+            set=lambda value: remembered.__setitem__("value", value),
+        ),
+        api_key_var=SimpleNamespace(get=lambda: "k"),
+        status_label=status,
+    )
+
+    gui.App._remember_api_key(app)
+
+    assert remembered["value"] is False
+    assert status.configurations[-1]["text"] == gui.KEYRING_UNAVAILABLE_STATUS
+
+    monkeypatch.setattr(gui.secrets, "save_api_key", lambda _key: True)
+    remembered["value"] = True
+    gui.App._remember_api_key(app)
+    assert remembered["value"] is True
+
+
+def test_window_geometry_matches_the_pre_merge_layout():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+    assert 'self.geometry("980x930")' in source
+    assert "self.minsize(820, 720)" in source
+    assert "reuse_var" not in source and "workers_var" not in source
+

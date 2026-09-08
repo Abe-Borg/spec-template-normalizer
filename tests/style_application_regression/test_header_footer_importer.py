@@ -66,7 +66,7 @@ def test_import_headers_footers_replaces_parts_and_refs(tmp_path):
                     "media": [
                         {
                             "path": "media/logo.png",
-                            "content_base64": base64.b64encode(b"png").decode("ascii"),
+                            "data_base64": base64.b64encode(b"png").decode("ascii"),
                         }
                     ],
                 }
@@ -155,7 +155,7 @@ def test_hf_media_import_does_not_overwrite_existing_body_media(tmp_path):
                 "rid": "rId10",
                 "xml": '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
                 "rels_xml": '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>',
-                "media": [{"path": "media/image1.png", "content_base64": base64.b64encode(b"header").decode("ascii")}],
+                "media": [{"path": "media/image1.png", "data_base64": base64.b64encode(b"header").decode("ascii")}],
             }]
         },
         "page_layout": {"default_section": {"header_refs": {"default": "rId10"}}},
@@ -183,7 +183,7 @@ def test_hf_media_allocation_is_case_insensitive(tmp_path):
                 "xml": '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
                 "media": [{
                     "path": "media/logo.png",
-                    "content_base64": base64.b64encode(payload).decode("ascii"),
+                    "data_base64": base64.b64encode(payload).decode("ascii"),
                 }],
             }],
         },
@@ -228,7 +228,7 @@ def test_conflicting_image_mime_uses_override_without_duplicate_default(tmp_path
                     "rel_id": "rIdImage",
                     "target": "media/logo.png",
                     "content_type": "image/x-custom-png",
-                    "content_base64": base64.b64encode(b"custom").decode("ascii"),
+                    "data_base64": base64.b64encode(b"custom").decode("ascii"),
                 }],
             }],
         },
@@ -1008,3 +1008,277 @@ def test_import_rewires_self_closing_or_missing_body_sectpr(tmp_path, sectpr_xml
     out = doc_path.read_text(encoding="utf-8")
     assert out.count("<w:sectPr") == 1
     assert "headerReference" in out
+
+
+_W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+
+
+def _write_part(word_dir: Path, name: str, root_tag: str, *paragraph_texts: str) -> Path:
+    body = "".join(
+        f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>" for text in paragraph_texts
+    )
+    path = word_dir / name
+    path.write_text(f"<w:{root_tag} {_W_NS}>{body}</w:{root_tag}>", encoding="utf-8")
+    return path
+
+
+def _visible(path: Path) -> str:
+    return "".join(
+        re.findall(r"<w:t\b[^>]*>([\s\S]*?)</w:t>", path.read_text(encoding="utf-8"))
+    )
+
+
+def test_title_only_target_against_two_slot_footer_fails_closed(tmp_path):
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+    footer = _write_part(word_dir, "footer1.xml", "ftr", "METAL DUCTS", "SECTION 23 31 00")
+    header = _write_part(word_dir, "header1.xml", "hdr", "METAL DUCTS")
+    footer_bytes = footer.read_bytes()
+    header_bytes = header.read_bytes()
+    log: list[str] = []
+
+    with pytest.raises(ValueError, match="requires a recognisable target SectionID"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={"SectionTitle": "METAL DUCTS", "SectionID": "SECTION 23 31 00"},
+            target_tokens={"SectionTitle": "AIR TERMINALS"},
+            log=log,
+            part_names=["word/header1.xml", "word/footer1.xml"],
+        )
+
+    # No part is modified when completeness fails, not even the header whose
+    # only slot the target could have filled.
+    assert footer.read_bytes() == footer_bytes
+    assert header.read_bytes() == header_bytes
+    assert not any("Patched tokens" in line for line in log)
+
+
+def test_number_only_target_against_title_slot_fails_closed(tmp_path):
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+    footer = _write_part(word_dir, "footer1.xml", "ftr", "Metal Ducts 23 31 00")
+    footer_bytes = footer.read_bytes()
+
+    with pytest.raises(ValueError, match="requires a target SectionTitle"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={"SectionTitle": "METAL DUCTS", "SectionID": "SECTION 23 31 00"},
+            target_tokens={"SectionID": "SECTION 23 37 00"},
+            log=[],
+            part_names=["word/footer1.xml"],
+        )
+
+    assert footer.read_bytes() == footer_bytes
+
+
+def test_completeness_is_relative_to_the_slots_actually_present(tmp_path):
+    # The imported parts carry only a title slot, so a title-only target is
+    # complete even though the architect profile also exposes a SectionID.
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+    header = _write_part(word_dir, "header1.xml", "hdr", "METAL DUCTS")
+
+    patch_header_footer_tokens(
+        target_extract_dir=tmp_path,
+        source_tokens={"SectionTitle": "METAL DUCTS", "SectionID": "SECTION 23 31 00"},
+        target_tokens={"SectionTitle": "AIR TERMINALS"},
+        log=[],
+        part_names=["word/header1.xml"],
+    )
+
+    assert _visible(header) == "AIR TERMINALS"
+
+
+def test_every_spacing_of_the_architect_number_is_replaced_in_source_shape(tmp_path):
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+    footer = _write_part(
+        word_dir,
+        "footer1.xml",
+        "ftr",
+        "SECTION 23 31 00",
+        "233100_Metal Ducts.docx",
+        "Metal Ducts / 23 3100 / Page",
+        "SECTION 01 23 31 00 is unrelated and 1233100 is not a section number",
+    )
+
+    patch_header_footer_tokens(
+        target_extract_dir=tmp_path,
+        source_tokens={"SectionTitle": "METAL DUCTS", "SectionID": "SECTION 233100"},
+        target_tokens={"SectionTitle": "AIR TERMINALS", "SectionID": "SECTION 23 37 00"},
+        log=[],
+        part_names=["word/footer1.xml"],
+    )
+
+    visible = _visible(footer)
+    assert "SECTION 23 37 00" in visible
+    assert "233700_Air Terminals.docx" in visible
+    assert "Air Terminals / 23 3700 / Page" in visible
+    assert "SECTION 01 23 31 00 is unrelated and 1233100" in visible
+    assert "23 31 00" not in visible.replace("01 23 31 00", "")
+    assert "233100" not in visible.replace("1233100", "")
+
+
+def test_title_replacement_is_word_bounded_and_covers_every_occurrence(tmp_path):
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+    header = _write_part(
+        word_dir,
+        "header1.xml",
+        "hdr",
+        "GENERAL",
+        "GENERALLY APPLICABLE NOTES",
+        "General - GENERAL - 23 31 00",
+    )
+
+    patch_header_footer_tokens(
+        target_extract_dir=tmp_path,
+        source_tokens={"SectionTitle": "GENERAL", "SectionID": "SECTION 23 31 00"},
+        target_tokens={"SectionTitle": "PIPING", "SectionID": "SECTION 23 37 00"},
+        log=[],
+        part_names=["word/header1.xml"],
+    )
+
+    visible = _visible(header)
+    assert visible.startswith("PIPING")
+    assert "GENERALLY APPLICABLE NOTES" in visible
+    assert "Piping - PIPING - 23 37 00" in visible
+    assert "GENERAL " not in visible and not visible.endswith("GENERAL")
+
+
+def test_target_title_that_extends_the_architect_title_is_accepted(tmp_path):
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+    header = _write_part(word_dir, "header1.xml", "hdr", "GENERAL REQUIREMENTS")
+
+    patch_header_footer_tokens(
+        target_extract_dir=tmp_path,
+        source_tokens={"SectionTitle": "GENERAL REQUIREMENTS"},
+        target_tokens={"SectionTitle": "GENERAL REQUIREMENTS FOR HVAC"},
+        log=[],
+        part_names=["word/header1.xml"],
+    )
+
+    assert _visible(header) == "GENERAL REQUIREMENTS FOR HVAC"
+
+
+def test_residual_architect_number_in_uncorroborated_textbox_fails_closed(tmp_path):
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+    header = word_dir / "header1.xml"
+    header.write_text(
+        f"<w:hdr {_W_NS}>"
+        "<w:p><w:r><w:t>METAL DUCTS 23 31 00</w:t></w:r></w:p>"
+        "<w:p><w:r><w:drawing><w:txbxContent><w:p><w:r>"
+        "<w:t>SECTION 23 31 00</w:t></w:r></w:p></w:txbxContent></w:drawing>"
+        "</w:r></w:p></w:hdr>",
+        encoding="utf-8",
+    )
+    original = header.read_bytes()
+
+    with pytest.raises(ValueError, match="remained in a text box"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={"SectionTitle": "METAL DUCTS", "SectionID": "SECTION 23 31 00"},
+            target_tokens={"SectionTitle": "AIR TERMINALS", "SectionID": "SECTION 23 37 00"},
+            log=[],
+            part_names=["word/header1.xml"],
+        )
+
+    assert header.read_bytes() == original
+
+
+def test_residual_number_postcondition_guards_the_write(tmp_path, monkeypatch):
+    from spec_formatter.style_application import header_footer_importer as hf
+
+    word_dir = tmp_path / "word"
+    word_dir.mkdir(parents=True)
+    footer = _write_part(word_dir, "footer1.xml", "ftr", "SECTION 23 31 00")
+    original = footer.read_bytes()
+
+    # Simulate an edit that silently leaves the architect number in place.
+    monkeypatch.setattr(
+        hf,
+        "_replace_host_visible_ranges",
+        lambda paragraph_xml, _builder: (paragraph_xml, True),
+    )
+    with pytest.raises(ValueError, match="SECTION number remained"):
+        patch_header_footer_tokens(
+            target_extract_dir=tmp_path,
+            source_tokens={"SectionID": "SECTION 23 31 00"},
+            target_tokens={"SectionID": "SECTION 23 37 00"},
+            log=[],
+            part_names=["word/footer1.xml"],
+        )
+
+    assert footer.read_bytes() == original
+
+
+def _media_registry(media_items):
+    return {
+        "headers_footers": {
+            "headers": [
+                {
+                    "part_name": "word/header1.xml",
+                    "rid": "rId10",
+                    "xml": '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+                    "media": media_items,
+                }
+            ],
+        },
+        "page_layout": {"default_section": {"header_refs": {"default": "rId10"}}},
+    }
+
+
+def test_media_write_site_rejects_invalid_base64(tmp_path):
+    extract = _seed_extract(tmp_path)
+    registry = _media_registry([{"path": "media/logo.png", "data_base64": "not base64!!"}])
+
+    with pytest.raises(ValueError, match="invalid base64"):
+        import_headers_footers(extract, registry, [])
+
+
+def test_media_write_site_ignores_legacy_payload_keys(tmp_path):
+    # Only data_base64 is validated by shared-profile preflight, so any other
+    # spelling must not become a way to smuggle bytes past its limits.
+    extract = _seed_extract(tmp_path)
+    registry = _media_registry(
+        [{"path": "media/logo.png", "content_base64": base64.b64encode(b"png").decode("ascii")}]
+    )
+
+    result = import_headers_footers(extract, registry, [])
+
+    assert result.media_names == set()
+    media_dir = extract / "word" / "media"
+    assert not media_dir.exists() or not any(media_dir.iterdir())
+
+
+def test_media_write_site_enforces_per_asset_limit(tmp_path, monkeypatch):
+    from spec_formatter.style_application import header_footer_importer as hf
+
+    monkeypatch.setattr(hf, "MAX_HEADER_FOOTER_MEDIA_BYTES", 8)
+    extract = _seed_extract(tmp_path)
+    registry = _media_registry(
+        [{"path": "media/logo.png", "data_base64": base64.b64encode(b"x" * 9).decode("ascii")}]
+    )
+
+    with pytest.raises(ValueError, match="media limit|limit is 8 bytes"):
+        import_headers_footers(extract, registry, [])
+    assert not (extract / "word" / "media" / "logo.png").exists()
+
+
+def test_media_write_site_enforces_running_total_limit(tmp_path, monkeypatch):
+    from spec_formatter.style_application import header_footer_importer as hf
+
+    monkeypatch.setattr(hf, "MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES", 10)
+    extract = _seed_extract(tmp_path)
+    registry = _media_registry(
+        [
+            {"path": "media/a.png", "data_base64": base64.b64encode(b"x" * 6).decode("ascii")},
+            {"path": "media/b.png", "data_base64": base64.b64encode(b"y" * 6).decode("ascii")},
+        ]
+    )
+
+    with pytest.raises(ValueError, match="total 10-byte limit"):
+        import_headers_footers(extract, registry, [])
+

@@ -31,6 +31,7 @@ from llm_classifier import (
     compute_coverage,
 )
 from paragraph_rules import is_classifiable_paragraph
+from spec_formatter.resources import architect_prompt_dir
 from phase1_bundle import (
     BundleArtifacts,
     ProducerIdentity,
@@ -40,11 +41,17 @@ from phase1_bundle import (
     stage_phase1_bundle,
     write_classification_audit,
 )
-from phase1_validator import validate_style_registry, validate_template_registry
+from engine_identity import ENGINE_SOURCE_DIGEST
+from phase1_validator import validate_phase1_contracts
 
 
-PIPELINE_VERSION = "2.3.0"
-DEFAULT_MODEL = "claude-opus-4-8"
+# 2.4.0: manifest version 2 with the committed engine fingerprint, Opus 5 as
+# the architect classifier, and cross-registry validation in production.
+# 2.5.0: architect analysis shares the target engine's visible-text, section
+# break, and package extraction helpers (profiles may differ for documents
+# with tracked changes or revision-marked section properties).
+PIPELINE_VERSION = "2.5.0"
+DEFAULT_MODEL = "claude-opus-5"
 ProgressCallback = Callable[[str], None]
 Classifier = Callable[..., Dict[str, Any]]
 
@@ -106,6 +113,18 @@ def _snapshot_source(source: Path, destination: Path) -> None:
         )
 
 
+
+def load_prompt_file(path: Path) -> str:
+    """Read one required prompt file, failing with a stable path-bearing message."""
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing required prompt file: {path}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed reading prompt file {path}: {exc}") from exc
+
 def run_phase1(
     source_docx: Path,
     output_root: Path,
@@ -132,9 +151,9 @@ def run_phase1(
     if not output_root.is_dir():
         raise NotADirectoryError(f"Output root is not a directory: {output_root}")
 
-    prompt_dir = Path(prompt_dir) if prompt_dir is not None else Path(__file__).resolve().parent
-    master_prompt = (prompt_dir / "master_prompt.txt").read_text(encoding="utf-8")
-    run_instruction = (prompt_dir / "run_instruction_prompt.txt").read_text(encoding="utf-8")
+    prompt_dir = Path(prompt_dir) if prompt_dir is not None else architect_prompt_dir()
+    master_prompt = load_prompt_file(prompt_dir / "master_prompt.txt")
+    run_instruction = load_prompt_file(prompt_dir / "run_instruction_prompt.txt")
     classifier_is_injected = classifier is not None
     classify = classifier or classify_document
 
@@ -195,8 +214,7 @@ def run_phase1(
             source_sha256=identity.sha256,
         )
         template_registry = extract_arch_template_registry(extract_dir, snapshot_path)
-        validate_style_registry(style_registry)
-        validate_template_registry(template_registry)
+        validate_phase1_contracts(style_registry, template_registry)
 
         style_registry_path = artifact_dir / "arch_style_registry.json"
         style_registry_path.write_text(
@@ -233,6 +251,7 @@ def run_phase1(
             ),
             master_prompt_sha256=_sha256_text(master_prompt),
             run_instruction_sha256=_sha256_text(run_instruction),
+            engine_fingerprint=ENGINE_SOURCE_DIGEST,
         )
         artifacts = BundleArtifacts(
             style_registry=style_registry_path,

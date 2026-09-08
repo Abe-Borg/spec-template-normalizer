@@ -12,26 +12,33 @@ import json
 import os
 import queue
 import re
+import shutil
 import tempfile
 import threading
 import time
 import uuid
 import warnings
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+from . import __version__ as APPLICATION_VERSION
 from . import diagnostics as diag
 from . import template_analysis
+from .resources import TARGET_PROMPT_FILES, architect_prompt_dir, target_prompt_dir
 from .style_application.batch_runner import (
     BatchResult,
     SharedConfig,
     load_and_validate_shared_config,
     process_single_file,
 )
-from .style_application.core.application_policy import APPLICATION_POLICY_VERSION
+from .style_application.core.application_policy import (
+    APPLICATION_POLICY_VERSION,
+    application_policy_for_mode,
+)
+from .style_application.core.errors import remediation_for as engine_remediation_for
 from .style_application.core.csi_to_canadian import (
     CSI_TO_CANADIAN,
     FORMAT_ONLY,
@@ -46,6 +53,9 @@ TemplateClassifier = Callable[..., dict[str, Any]]
 TemplateAnalyzer = Callable[..., template_analysis.Phase1Result]
 TargetProcessor = Callable[..., BatchResult]
 
+# Upper-cased suffixes of formatter outputs, used to exclude earlier outputs
+# from folder discovery. ``_PHASE2_FORMATTED`` is the pre-unification engine
+# name and stays here so legacy outputs are still skipped.
 _FORMATTED_SUFFIXES = (
     "_FORMATTED.DOCX",
     "_CANADIAN_FORMATTED.DOCX",
@@ -54,7 +64,9 @@ _FORMATTED_SUFFIXES = (
 _MAX_WORKERS = 6
 _RUN_MANIFEST_VERSION = 2
 _RUN_AUDIT_VERSION = 2
-_PROFILE_CONTRACT_VERSION = "2"
+# Contract 3: manifest version 2 with the committed engine fingerprint.
+_PROFILE_CONTRACT_VERSION = "3"
+_PROFILE_CACHE_KEEP = 2
 _PROFILE_CACHE_NAMESPACE = f"contract-v{_PROFILE_CONTRACT_VERSION}"
 _MAX_OUTPUT_COMPONENT_UTF16_UNITS = 240
 
@@ -70,11 +82,19 @@ def _empty_audit_summary() -> dict[str, int]:
 
 @dataclass(frozen=True)
 class TemplateProfile:
-    """Validated internal template profile selected for a formatting run."""
+    """Validated internal template profile selected for a formatting run.
+
+    ``provenance`` is captured from the manifest at selection time so the run
+    manifest can record it without re-validating the bundle after the DOCX
+    files, audits, and logs have already been published. It is optional so
+    callers and test doubles that construct a profile directly keep working;
+    without it the provenance is resolved by validating the bundle again.
+    """
 
     bundle_dir: Path
     source_sha256: str
     reused: bool
+    provenance: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +118,9 @@ class TargetFormatResult:
     # Structured, redaction-safe phase-timing/count events for this target,
     # folded into the run-wide diagnostics recorder before publication.
     diagnostics: tuple[dict[str, Any], ...] = ()
+    # Stable engine error code (core/errors.py) when the failure carried one;
+    # run.json and audit.json prefer it over classifying ``error`` text.
+    error_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -421,6 +444,7 @@ def _manifest_matches_current_engine(
     return (
         producer.get("name") == "spec-template-normalizer"
         and producer.get("version") == template_analysis.PIPELINE_VERSION
+        and producer.get("engine_fingerprint") == template_analysis.ENGINE_SOURCE_DIGEST
         and producer.get("classifier")
         == {"provider": expected_provider, "model": expected_model}
         and producer.get("prompts") == prompt_hashes
@@ -500,11 +524,19 @@ def _find_cached_profile(
                 classifier=classifier,
             ):
                 continue
-            return TemplateProfile(candidate, source_sha256, reused=True)
+            return TemplateProfile(
+                candidate,
+                source_sha256,
+                reused=True,
+                provenance=_provenance_from_manifest(manifest),
+            )
         except Exception as exc:
+            # The rejection reason can carry a filesystem path or bundle
+            # detail; only its safe form reaches the progress log.
             _emit(
                 progress,
-                f"Ignoring an invalid cached template profile ({candidate.name}): {exc}",
+                "Ignoring an invalid cached template profile: "
+                f"{safe_error_diagnostic(exc).message}",
             )
     return None
 
@@ -529,7 +561,7 @@ def prepare_template_profile(
     effective_prompt_dir = (
         Path(prompt_dir).resolve()
         if prompt_dir is not None
-        else Path(__file__).resolve().parents[1]
+        else architect_prompt_dir()
     )
 
     # Injected classifiers are primarily an offline/test extension. Their
@@ -581,7 +613,69 @@ def prepare_template_profile(
         classifier=classifier,
     ):
         raise ValueError("Template analysis produced an incompatible profile bundle.")
-    return TemplateProfile(phase1_result.bundle_dir, source_sha256, reused=False)
+    _prune_stale_profiles(
+        cache_root,
+        source_sha256,
+        selected=Path(phase1_result.bundle_dir),
+        progress=progress,
+    )
+    return TemplateProfile(
+        phase1_result.bundle_dir,
+        source_sha256,
+        reused=False,
+        provenance=_provenance_from_manifest(manifest),
+    )
+
+
+def _provenance_from_manifest(manifest: Any) -> dict[str, Any]:
+    """The manifest facts the run manifest records about a selected profile."""
+
+    producer = getattr(manifest, "producer", {})
+    return {
+        "bundle_id": getattr(manifest, "bundle_id", None),
+        "created_utc": getattr(manifest, "created_utc", None),
+        "producer": dict(producer) if isinstance(producer, Mapping) else {},
+    }
+
+
+def _prune_stale_profiles(
+    cache_root: Path,
+    source_sha256: str,
+    *,
+    selected: Path,
+    progress: Optional[ProgressCallback],
+    keep: int = _PROFILE_CACHE_KEEP,
+) -> int:
+    """Remove older profiles of one template beyond the newest ``keep``.
+
+    Runs only after a fresh profile has been published and validated. The
+    just-selected profile is never removed, only siblings for the same
+    source hash are considered, and the log records counts, never names.
+    """
+
+    pattern = f"*--{source_sha256[:12]}--*.phase1"
+    try:
+        candidates = [
+            item for item in cache_root.glob(pattern)
+            if item.is_dir() and item.resolve() != selected.resolve()
+        ]
+    except OSError:
+        return 0
+    candidates.sort(
+        key=lambda item: (item.stat().st_mtime_ns, item.name),
+        reverse=True,
+    )
+    stale = candidates[max(keep - 1, 0):]
+    removed = 0
+    for item in stale:
+        try:
+            shutil.rmtree(item)
+        except OSError:
+            continue
+        removed += 1
+    if removed:
+        _emit(progress, f"Removed {removed} older cached profile(s) for this template.")
+    return removed
 
 
 def _safe_filename_fragment(value: str) -> str:
@@ -613,11 +707,32 @@ def _create_run_directory(output_root: Path, conversion_mode: str) -> tuple[str,
     raise FileExistsError("Could not allocate a unique formatter run directory.")
 
 
+_STAGING_DIR_NAME = ".staging"
+
+
+def _staging_partial(destination: Path, prefix: str, suffix: str) -> Path:
+    """A partial-file path in the destination folder's ``.staging`` directory.
+
+    Keeping partial files in one sub-directory (on the same filesystem, so
+    ``os.replace`` stays atomic) means a hard kill leaves them out of the
+    run folder's listing, and the run removes the directory when it ends.
+    Nothing ever sweeps other run directories: they are immutable history.
+    """
+
+    staging = destination.parent / _STAGING_DIR_NAME
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging / f"{prefix}-{uuid.uuid4().hex[:12]}{suffix}"
+
+
+def _remove_staging_dir(run_dir: Path) -> None:
+    shutil.rmtree(run_dir / _STAGING_DIR_NAME, ignore_errors=True)
+
+
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    """Durably stage *payload* beside *path*, then publish it atomically."""
+    """Durably stage *payload* under ``.staging``, then publish it atomically."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.parent / f".meta-{uuid.uuid4().hex[:12]}.tmp"
+    partial = _staging_partial(path, "meta", ".tmp")
     try:
         with partial.open("xb") as writer:
             writer.write(payload)
@@ -643,7 +758,7 @@ def _publish_output(source: Path, destination: Path) -> str:
     """Copy from short staging, then atomically publish inside the run folder."""
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    partial = destination.parent / f".publish-{uuid.uuid4().hex[:12]}.tmp.docx"
+    partial = _staging_partial(destination, "publish", ".tmp.docx")
     digest = hashlib.sha256()
     try:
         with source.open("rb") as reader, partial.open("xb") as writer:
@@ -788,9 +903,9 @@ def _sha256_text_file(path: Path) -> Optional[str]:
 
 
 def _target_prompt_fingerprints() -> dict[str, str]:
-    prompt_root = Path(__file__).parent / "style_application" / "core" / "prompts"
+    prompt_root = target_prompt_dir()
     fingerprints: dict[str, str] = {}
-    for filename in ("phase2_master_prompt.txt", "phase2_run_instruction.txt"):
+    for filename in TARGET_PROMPT_FILES:
         digest = _sha256_text_file(prompt_root / filename)
         if digest is not None:
             fingerprints[f"{Path(filename).stem}_sha256"] = digest
@@ -820,6 +935,11 @@ _EVENT_TIMESTAMP_RX = re.compile(
 _TARGET_EVENT_RX = re.compile(r"^(Target .+?: )(.*)$")
 _SAFE_REDACTION_RX = re.compile(
     r"^\[(?:document content omitted|untrusted detail omitted; sha256=[0-9a-f]{12})\]$"
+)
+# The per-target disposition summary reported after each target completes.
+# It carries counts only, so it is safe to persist verbatim in ``run.log``.
+_AUDIT_SUMMARY_LINE_RX = re.compile(
+    r"^audit styled=\d+, ignored=\d+, out_of_scope=\d+, unresolved=\d+$"
 )
 
 _KNOWN_SAFE_ERROR_MESSAGES = {
@@ -1021,6 +1141,8 @@ def _is_safe_operational_line(line: str) -> bool:
         return True
     if re.match(r"^numId \d+ -> \d+ \(abstractNum \d+ -> \d+\)$", candidate):
         return True
+    if _AUDIT_SUMMARY_LINE_RX.fullmatch(candidate):
+        return True
     return candidate.startswith(_SAFE_OPERATIONAL_PREFIXES)
 
 
@@ -1107,13 +1229,27 @@ def safe_error_diagnostic(
     )
 
 
+def _target_error_diagnostic(
+    item: TargetFormatResult,
+    secrets: Sequence[str],
+) -> Optional[SafeErrorDiagnostic]:
+    """Prefer the engine's stable code and remediation over classified text."""
+
+    code = getattr(item, "error_code", None)
+    if isinstance(code, str) and code:
+        remediation = engine_remediation_for(code)
+        if remediation:
+            return SafeErrorDiagnostic(code=code, message=remediation)
+    return safe_error_diagnostic(item.error, secrets)
+
+
 def _plan_output_paths(
     targets: Sequence[Path],
     output_dir: Path,
     conversion_mode: str = FORMAT_ONLY,
 ) -> dict[Path, Path]:
     conversion_mode = validate_conversion_mode(conversion_mode)
-    suffix = "_CANADIAN_FORMATTED.docx" if conversion_mode == CSI_TO_CANADIAN else "_FORMATTED.docx"
+    suffix = application_policy_for_mode(conversion_mode).output_suffix
     stem_counts: dict[str, int] = {}
     for target in targets:
         key = target.stem.casefold()
@@ -1262,6 +1398,7 @@ def _format_one_target(
                 output_path=None,
                 log=processor_log,
                 error=result.error or "Target formatting failed.",
+                error_code=getattr(result, "error_code", None),
                 duration_seconds=result.duration_seconds,
                 conversion_report=conversion_report,
                 source_sha256=snapshot_sha256,
@@ -1315,15 +1452,20 @@ def _format_one_target(
 
 
 def _profile_provenance(profile: TemplateProfile) -> dict[str, Any]:
-    manifest = template_analysis.validate_bundle_directory(
-        profile.bundle_dir,
-        expected_source_sha256=profile.source_sha256,
-    )
-    producer = getattr(manifest, "producer", {})
+    provenance = getattr(profile, "provenance", None)
+    if not isinstance(provenance, Mapping):
+        # A profile constructed without captured provenance (an older caller
+        # or a test double): resolve it from the bundle now.
+        manifest = template_analysis.validate_bundle_directory(
+            profile.bundle_dir,
+            expected_source_sha256=profile.source_sha256,
+        )
+        provenance = _provenance_from_manifest(manifest)
+    producer = provenance.get("producer", {})
     return {
         "bundle_dir": str(profile.bundle_dir),
-        "bundle_id": getattr(manifest, "bundle_id", profile.bundle_dir.name),
-        "created_utc": getattr(manifest, "created_utc", None),
+        "bundle_id": provenance.get("bundle_id") or profile.bundle_dir.name,
+        "created_utc": provenance.get("created_utc"),
         "source_sha256": profile.source_sha256,
         "reused": profile.reused,
         "contract_version": _PROFILE_CONTRACT_VERSION,
@@ -1368,6 +1510,70 @@ def _write_diagnostics_log(
     return diagnostics_path
 
 
+def _target_audit_path(run_dir: Path, index: int, item: TargetFormatResult) -> Path:
+    identity = (
+        item.source_sha256
+        or hashlib.sha256(str(item.source_path).encode("utf-8")).hexdigest()
+    )[:12]
+    return run_dir / f"target-{index:04d}-{identity}.audit.json"
+
+
+def _target_audit_payload(
+    *,
+    run_id: str,
+    conversion_mode: str,
+    item: TargetFormatResult,
+    secrets: Sequence[str],
+) -> dict[str, Any]:
+    """The per-target ``audit.json`` record.
+
+    Shared by normal publication and by the publication-failure fallback, so
+    a target that ran always gets the same truthful audit whichever path
+    writes it.
+    """
+
+    error_diagnostic = _target_error_diagnostic(item, secrets)
+    conversion = (
+        _normalize_audit_details(item.conversion_report.as_dict())
+        if item.conversion_report is not None
+        else None
+    )
+    return {
+        "schema_version": _RUN_AUDIT_VERSION,
+        "run_id": run_id,
+        "conversion_mode": conversion_mode,
+        "source": {
+            "path": str(item.source_path),
+            "sha256": item.source_sha256,
+        },
+        "output": (
+            {
+                "path": str(item.output_path),
+                "sha256": item.output_sha256,
+            }
+            if item.output_path is not None
+            else None
+        ),
+        "success": item.success,
+        "stage": item.stage,
+        "duration_seconds": round(item.duration_seconds, 6),
+        "error_code": (
+            error_diagnostic.code if error_diagnostic is not None else None
+        ),
+        "error": (
+            error_diagnostic.message if error_diagnostic is not None else None
+        ),
+        "disposition_counts": dict(item.audit_summary),
+        "numbering_checks": _redact_json(item.numbering_checks, secrets),
+        "application_audit": _redact_json(item.audit, secrets),
+        "conversion_report": _redact_json(conversion, secrets),
+        "diagnostics": _redact_json(
+            [diag.sanitize_event(event) for event in item.diagnostics],
+            secrets,
+        ),
+    }
+
+
 def _write_run_artifacts(
     *,
     run_id: str,
@@ -1389,51 +1595,16 @@ def _write_run_artifacts(
 
     audited_results: list[TargetFormatResult] = []
     for index, item in enumerate(targets, start=1):
-        error_diagnostic = safe_error_diagnostic(item.error, secrets)
-        identity = (item.source_sha256 or hashlib.sha256(
-            str(item.source_path).encode("utf-8")
-        ).hexdigest())[:12]
-        audit_path = run_dir / f"target-{index:04d}-{identity}.audit.json"
-        conversion = (
-            _normalize_audit_details(item.conversion_report.as_dict())
-            if item.conversion_report is not None
-            else None
+        audit_path = _target_audit_path(run_dir, index, item)
+        _atomic_write_json(
+            audit_path,
+            _target_audit_payload(
+                run_id=run_id,
+                conversion_mode=conversion_mode,
+                item=item,
+                secrets=secrets,
+            ),
         )
-        audit_payload = {
-            "schema_version": _RUN_AUDIT_VERSION,
-            "run_id": run_id,
-            "conversion_mode": conversion_mode,
-            "source": {
-                "path": str(item.source_path),
-                "sha256": item.source_sha256,
-            },
-            "output": (
-                {
-                    "path": str(item.output_path),
-                    "sha256": item.output_sha256,
-                }
-                if item.output_path is not None
-                else None
-            ),
-            "success": item.success,
-            "stage": item.stage,
-            "duration_seconds": round(item.duration_seconds, 6),
-            "error_code": (
-                error_diagnostic.code if error_diagnostic is not None else None
-            ),
-            "error": (
-                error_diagnostic.message if error_diagnostic is not None else None
-            ),
-            "disposition_counts": dict(item.audit_summary),
-            "numbering_checks": _redact_json(item.numbering_checks, secrets),
-            "application_audit": _redact_json(item.audit, secrets),
-            "conversion_report": _redact_json(conversion, secrets),
-            "diagnostics": _redact_json(
-                [diag.sanitize_event(event) for event in item.diagnostics],
-                secrets,
-            ),
-        }
-        _atomic_write_json(audit_path, audit_payload)
         audited_results.append(replace(item, audit_path=audit_path))
 
     total_counts = _empty_audit_summary()
@@ -1483,7 +1654,7 @@ def _write_run_artifacts(
     profile_metadata = _profile_provenance(profile)
     target_records: list[dict[str, Any]] = []
     for item in audited_results:
-        error_diagnostic = safe_error_diagnostic(item.error, secrets)
+        error_diagnostic = _target_error_diagnostic(item, secrets)
         target_records.append(
             {
                 "source_path": str(item.source_path),
@@ -1574,10 +1745,19 @@ def _write_initialization_failure_artifacts(
     error: Exception,
     secrets: Sequence[str],
     recorder: diag.DiagnosticsRecorder,
+    failure_phase: str = "initialization",
+    results: Optional[Sequence[TargetFormatResult]] = None,
 ) -> Path:
-    """Persist a complete failed-run record when preparation cannot finish."""
+    """Persist a complete failed-run record when a run cannot finish.
+
+    Used for initialization failures (no target ran) and for publication
+    failures (the DOCX files may exist but the audits or manifest could not
+    be written); ``results`` supplies truthful per-target outcomes for the
+    latter.
+    """
 
     finished_utc = _utc_now()
+    results_by_path = {Path(item.source_path): item for item in (results or ())}
     error_diagnostic = safe_error_diagnostic(error, secrets)
     if error_diagnostic is None:  # pragma: no cover - ``error`` is concrete
         error_diagnostic = SafeErrorDiagnostic(
@@ -1600,40 +1780,73 @@ def _write_initialization_failure_artifacts(
             :12
         ]
         audit_path = run_dir / f"target-{index:04d}-{identity}.audit.json"
-        audit_payload = {
-            "schema_version": _RUN_AUDIT_VERSION,
-            "run_id": run_id,
-            "conversion_mode": conversion_mode,
-            "phase": "not_started",
-            "stage": "not_started",
-            "source": {"path": str(target), "sha256": source_hash},
-            "output": None,
-            "success": False,
-            "duration_seconds": 0.0,
-            "error_type": type(error).__name__,
-            "error_code": error_diagnostic.code,
-            "error": error_diagnostic.message,
-            "disposition_counts": _empty_audit_summary(),
-            "numbering_checks": {},
-            "application_audit": {},
-            "conversion_report": None,
-        }
-        _atomic_write_json(audit_path, audit_payload)
-        target_records.append(
-            {
-                "source_path": str(target),
-                "source_sha256": source_hash,
-                "success": False,
+        outcome = results_by_path.get(Path(target))
+        if outcome is None:
+            audit_payload = {
+                "schema_version": _RUN_AUDIT_VERSION,
+                "run_id": run_id,
+                "conversion_mode": conversion_mode,
+                "phase": "not_started",
                 "stage": "not_started",
-                "output_path": None,
-                "output_sha256": None,
-                "audit_path": str(audit_path),
+                "source": {"path": str(target), "sha256": source_hash},
+                "output": None,
+                "success": False,
                 "duration_seconds": 0.0,
                 "error_type": type(error).__name__,
                 "error_code": error_diagnostic.code,
                 "error": error_diagnostic.message,
                 "disposition_counts": _empty_audit_summary(),
                 "numbering_checks": {},
+                "application_audit": {},
+                "conversion_report": None,
+            }
+            _atomic_write_json(audit_path, audit_payload)
+            target_records.append(
+                {
+                    "source_path": str(target),
+                    "source_sha256": source_hash,
+                    "success": False,
+                    "stage": "not_started",
+                    "output_path": None,
+                    "output_sha256": None,
+                    "audit_path": str(audit_path),
+                    "duration_seconds": 0.0,
+                    "error_type": type(error).__name__,
+                    "error_code": error_diagnostic.code,
+                    "error": error_diagnostic.message,
+                    "disposition_counts": _empty_audit_summary(),
+                    "numbering_checks": {},
+                }
+            )
+            continue
+        # A target that ran keeps its truthful audit: the same record the
+        # normal publication path writes, so run.json, the audit, and the
+        # summary below agree about its outcome.
+        _atomic_write_json(
+            audit_path,
+            _target_audit_payload(
+                run_id=run_id,
+                conversion_mode=conversion_mode,
+                item=outcome,
+                secrets=secrets,
+            ),
+        )
+        target_error = _target_error_diagnostic(outcome, secrets)
+        target_records.append(
+            {
+                "source_path": str(target),
+                "source_sha256": outcome.source_sha256 or source_hash,
+                "success": bool(outcome.success),
+                "stage": getattr(outcome, "stage", None) or "processing",
+                "output_path": str(outcome.output_path) if outcome.output_path else None,
+                "output_sha256": outcome.output_sha256,
+                "audit_path": str(audit_path),
+                "duration_seconds": round(float(outcome.duration_seconds), 6),
+                "error_type": None,
+                "error_code": target_error.code if target_error else None,
+                "error": target_error.message if target_error else None,
+                "disposition_counts": _normalize_audit_summary(outcome.audit_summary),
+                "numbering_checks": _redact_json(outcome.numbering_checks, secrets),
             }
         )
 
@@ -1643,7 +1856,7 @@ def _write_initialization_failure_artifacts(
         for event in events
     ]
     log_lines.append(
-        "RUN FAILED DURING INITIALIZATION "
+        f"RUN FAILED DURING {failure_phase.upper()} "
         f"[{error_diagnostic.code}]: {error_diagnostic.message}"
     )
     _atomic_write_bytes(
@@ -1653,13 +1866,19 @@ def _write_initialization_failure_artifacts(
 
     diagnostics_path = _write_diagnostics_log(run_dir, recorder, secrets)
 
+    succeeded = sum(1 for record in target_records if record["success"])
+    total_counts = _empty_audit_summary()
+    for record in target_records:
+        for key in total_counts:
+            total_counts[key] += record["disposition_counts"].get(key, 0)
+
     manifest_path = run_dir / "run.json"
     manifest = {
         "schema_version": _RUN_MANIFEST_VERSION,
         "run_id": run_id,
         "conversion_mode": conversion_mode,
         "status": "failed",
-        "failure_phase": "initialization",
+        "failure_phase": failure_phase,
         "started_utc": _iso_utc(started_utc),
         "finished_utc": _iso_utc(finished_utc),
         "duration_seconds": round((finished_utc - started_utc).total_seconds(), 6),
@@ -1687,9 +1906,9 @@ def _write_initialization_failure_artifacts(
         "error": error_diagnostic.message,
         "summary": {
             "targets": len(target_records),
-            "succeeded": 0,
-            "failed": len(target_records),
-            "dispositions": _empty_audit_summary(),
+            "succeeded": succeeded,
+            "failed": len(target_records) - succeeded,
+            "dispositions": total_counts,
         },
         "targets": target_records,
     }
@@ -1737,7 +1956,15 @@ def format_specifications(
 
     started_utc = _utc_now()
     events: list[str] = []
-    pending_events: queue.SimpleQueue[tuple[datetime, str]] = queue.SimpleQueue()
+    # One signal queue carries both progress events and target completions,
+    # so the completion loop blocks on it instead of polling at 20 Hz. FIFO
+    # order guarantees a worker's progress events are published before its
+    # completion is handled.
+    pending_events: queue.SimpleQueue[tuple[Any, ...]] = queue.SimpleQueue()
+    # Completion signals a drain has already consumed. ``report`` drains from
+    # the owner thread at any time, so a target that finishes while another
+    # is being queued or published must not lose its signal.
+    finished_futures: set[Future[TargetFormatResult]] = set()
     event_order_lock = threading.Lock()
     event_owner_thread = threading.get_ident()
     last_event_at: Optional[datetime] = None
@@ -1760,17 +1987,34 @@ def format_specifications(
             if last_event_at is not None and event_time < last_event_at:
                 event_time = last_event_at
             last_event_at = event_time
-            pending_events.put((event_time, message))
+            pending_events.put(("event", event_time, message))
         return event_time
 
-    def drain_reported_events(*, emit_callbacks: bool = True) -> None:
-        """Publish queued events from the calling thread in occurrence order."""
+    def drain_reported_events(
+        *,
+        emit_callbacks: bool = True,
+        block: bool = False,
+    ) -> list[Future[TargetFormatResult]]:
+        """Publish queued events from the calling thread in occurrence order.
 
+        Returns the target futures whose completion signals were drained.
+        With ``block`` the first wait is blocking, so the completion loop
+        sleeps until a worker reports progress or finishes.
+        """
+
+        finished: list[Future[TargetFormatResult]] = []
+        first = True
         while True:
             try:
-                event_time, message = pending_events.get_nowait()
+                item = pending_events.get() if block and first else pending_events.get_nowait()
             except queue.Empty:
-                return
+                return finished
+            first = False
+            if item[0] == "done":
+                finished_futures.add(item[1])
+                finished.append(item[1])
+                continue
+            _kind, event_time, message = item
             events.append(f"{_iso_utc(event_time)} {message}")
             if emit_callbacks:
                 _emit(progress, message)
@@ -1878,6 +2122,7 @@ def format_specifications(
             setattr(exc, "manifest_path", manifest_path)
         except Exception:  # pragma: no cover - unusual immutable exception type
             pass
+        _remove_staging_dir(run_dir)
         raise
     results_by_target: dict[Path, TargetFormatResult] = {}
 
@@ -1906,19 +2151,27 @@ def format_specifications(
                     ),
                 )
                 futures[future] = (index + 1, target)
+                future.add_done_callback(
+                    lambda done_future: pending_events.put(("done", done_future))
+                )
                 # A fast worker can start before ``submit`` returns. Publish
                 # its queued event before submitting another target.
                 drain_reported_events()
 
             completed = 0
-            pending = set(futures)
-            while pending:
-                drain_reported_events()
-                done, pending = wait(
-                    pending,
-                    timeout=0.05,
-                    return_when=FIRST_COMPLETED,
-                )
+            outstanding = set(futures)
+            while outstanding:
+                # A completion may already have been drained, by the
+                # submission loop or by ``report`` while another target was
+                # being published, so block only when none is waiting.
+                if not (finished_futures & outstanding):
+                    drain_reported_events(block=True)
+                done = [
+                    future
+                    for future in futures
+                    if future in outstanding and future in finished_futures
+                ]
+                outstanding.difference_update(done)
                 for future in done:
                     target_number, target = futures[future]
                     try:
@@ -1971,7 +2224,6 @@ def format_specifications(
                     report(
                         f"{status} {completed} of {len(targets)}: {target.name}"
                     )
-                drain_reported_events()
             drain_reported_events()
 
     ordered_results = tuple(results_by_target[target] for target in targets)
@@ -1990,22 +2242,56 @@ def format_specifications(
     # guarantee that UI completion is emitted only after artifacts publish.
     drain_reported_events(emit_callbacks=False)
     finished_utc = _utc_now()
-    audited_results, manifest_path, diagnostics_path = _write_run_artifacts(
-        run_id=run_id,
-        conversion_mode=conversion_mode,
-        output_root=destination,
-        run_dir=run_dir,
-        architect=architect,
-        profile=profile,
-        template_model=template_model,
-        target_model=target_model,
-        started_utc=started_utc,
-        finished_utc=finished_utc,
-        targets=ordered_results,
-        events=events,
-        secrets=(normalized_api_key,),
-        recorder=recorder,
-    )
+    try:
+        audited_results, manifest_path, diagnostics_path = _write_run_artifacts(
+            run_id=run_id,
+            conversion_mode=conversion_mode,
+            output_root=destination,
+            run_dir=run_dir,
+            architect=architect,
+            profile=profile,
+            template_model=template_model,
+            target_model=target_model,
+            started_utc=started_utc,
+            finished_utc=finished_utc,
+            targets=ordered_results,
+            events=events,
+            secrets=(normalized_api_key,),
+            recorder=recorder,
+        )
+    except Exception as exc:
+        # The DOCX files may already be published; the run directory must
+        # still end with a manifest that says what happened.
+        recorder.error("pipeline", "publication_failed", error_type=type(exc).__name__.lower())
+        manifest_path = None
+        try:
+            manifest_path = _write_initialization_failure_artifacts(
+                run_id=run_id,
+                conversion_mode=conversion_mode,
+                output_root=destination,
+                run_dir=run_dir,
+                architect=architect,
+                targets=targets,
+                template_model=template_model,
+                target_model=target_model,
+                started_utc=started_utc,
+                events=events,
+                error=exc,
+                secrets=(normalized_api_key,),
+                recorder=recorder,
+                failure_phase="publication",
+                results=ordered_results,
+            )
+        except Exception:  # pragma: no cover - the disk itself is failing
+            pass
+        try:
+            setattr(exc, "run_dir", run_dir)
+            setattr(exc, "manifest_path", manifest_path)
+        except Exception:  # pragma: no cover - unusual immutable exception type
+            pass
+        _remove_staging_dir(run_dir)
+        raise
+    _remove_staging_dir(run_dir)
     run_result = FormatRunResult(
         template_profile=profile,
         output_dir=run_dir,

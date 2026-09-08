@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
-from ooxml_text import prepare_xml_text_for_utf8, read_xml_text
+from spec_formatter.style_application.core.ooxml_text import prepare_xml_text_for_utf8, read_xml_text
 from docx_decomposer import extract_document_sectpr_blocks
 
 

@@ -16,10 +16,14 @@ __all__ = [
     "CSI_TO_CANADIAN",
     "FORMAT_ONLY",
     "FormatRunResult",
+    "SafeErrorDiagnostic",
     "TargetFormatResult",
     "TemplateProfile",
+    "collect_target_specs",
     "default_template_cache_dir",
     "format_specifications",
+    "prepare_template_profile",
+    "safe_error_diagnostic",
 ]
 
 

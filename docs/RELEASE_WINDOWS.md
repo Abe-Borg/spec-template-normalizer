@@ -13,11 +13,13 @@ them directly. This runbook covers cutting a release.
 | Updater | `spec_formatter/updates.py` | Fetches `latest.json`, compares versions, downloads + SHA-256-verifies the installer, launches it. |
 | GUI wiring | `gui.py` | Footer "Check for Updates" button, daily auto-check on launch, the update dialog. |
 | Frozen entry | `packaging/windows/app_entry.py` | PyInstaller entry point; `--version` / `--selfcheck` flags for CI. |
+| Resource root | `spec_formatter/resources.py` | Resolves the bundled prompts, `LICENSE`, and notices under `sys._MEIPASS` in the frozen app and under the repo root otherwise; the pipeline and `--selfcheck` both use it. |
 | PyInstaller spec | `packaging/windows/specification-formatter.spec` | One-folder build → `dist/SpecificationFormatter/`. |
 | Installer | `packaging/windows/installer.iss` | Inno Setup → `dist/installer/SpecificationFormatterSetup.exe`. |
 | Manifest maker | `packaging/windows/make_manifest.py` | Computes the installer SHA-256 → `latest.json`. |
 | Version guard | `packaging/windows/check_release_version.py` | Fails the build if the tag ≠ `__version__`. |
 | Workflow | `.github/workflows/release.yml` | Builds on every relevant PR; builds **and publishes** on a `v*` tag. |
+| Action pins | `.github/dependabot.yml` | Weekly PRs that move the workflows' commit-SHA action pins to new releases. |
 
 The updater reads `https://github.com/abe-borg/spec-template-normalizer/releases/latest/download/latest.json`.
 GitHub only serves the newest **non-prerelease** release at `releases/latest`, so
@@ -46,11 +48,15 @@ release candidates never auto-offer themselves to stable installs.
    GitHub **pre-release** and is not offered to stable users.
 
 4. **Let CI do the rest.** `release.yml` runs on the tag:
+   - runs the full test suite on Windows first (the `test` job); the build
+     and publish jobs depend on it, so a tag on a red tree never publishes;
    - guards that the tag matches `__version__` (a half-bumped tag fails loudly
      here rather than shipping an installer stuck in a perpetual "update
      available" loop);
    - builds the one-folder app with PyInstaller and runs the frozen exe's
-     `--selfcheck` (catches a missing hidden import before release);
+     `--selfcheck` (catches a missing hidden import or a bundled prompt,
+     `LICENSE`, or notices file that the resource root cannot find, before
+     release);
    - compiles the Inno Setup installer;
    - generates `latest.json` (installer SHA-256 + the download URL);
    - the tag-only `publish` job attaches `SpecificationFormatterSetup.exe` and
@@ -92,6 +98,15 @@ $env:SPEC_FORMATTER_UPDATE_URL = "https://.../your-test-latest.json"
 
 Both the manifest URL and the installer `url` must be `https://` — the updater
 refuses plaintext (the manifest is the root of trust for the installer hash).
+That guarantee survives redirects: `urllib` follows them silently and the
+production manifest URL (`releases/latest/download/latest.json`) is itself a
+redirect, so the updater also checks the URL it was finally served from and
+refuses a hop off `https://`. The installer download is capped at 512 MiB
+(both the announced `Content-Length` and the bytes actually read), streams to
+a uniquely named `.part` file opened exclusively, is verified with the same
+`verify_sha256` routine the tests use, and only then is renamed into place.
+A launch-time throttle timestamp that is missing, malformed, or of a
+different timezone awareness than the current clock never blocks the check.
 
 ## Environment variables
 
@@ -100,6 +115,7 @@ refuses plaintext (the manifest is the root of trust for the installer hash).
 | `SPEC_FORMATTER_UPDATE_URL` | Override the manifest URL (testing / a fork's releases). Must be https. |
 | `SPEC_FORMATTER_DISABLE_UPDATE_CHECK` | Set truthy to turn off update checks entirely. `0`/`false`/`no`/`off`/empty keep checks on. |
 | `SPEC_FORMATTER_SELFCHECK_OUT` | Path the frozen `--selfcheck` writes its result to (used by CI, since the windowed exe has no stdout). |
+| `SPEC_FORMATTER_MAX_CONCURRENT_REQUESTS` | Maximum concurrent target-classification API requests across all targets and chunks (default 4, clamped to 1 to 64). |
 
 ## Building locally (optional)
 

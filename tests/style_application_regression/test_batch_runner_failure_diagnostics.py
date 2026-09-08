@@ -210,9 +210,22 @@ def test_batch_result_preserves_late_numbering_checkpoint_without_publishing_doc
         batch_runner,
         "apply_phase2_classifications",
         lambda **_kwargs: SimpleNamespace(
+            # Mirror every ``ApplyReport`` attribute the shared application
+            # path reads while recording the ``apply_classifications`` phase.
+            # A missing attribute aborts the target inside that phase with the
+            # wrong stage, so the stub must stay complete.
             requested=1,
             modified=1,
+            invalid_indices=[],
             skipped_sectpr=[],
+            unmapped_roles=[],
+            missing_style_ids=set(),
+            stripped_direct_ppr=0,
+            preserved_direct_ppr=0,
+            preserved_automatic_numbering=0,
+            suppressed_architect_numbering=0,
+            stripped_run_fonts=0,
+            ignored=0,
             allowed_rpr_properties_by_paragraph={},
             numbering_checks={
                 "policy": CSI_TO_CANADIAN,
@@ -396,3 +409,186 @@ def test_missing_target_api_key_reports_classification_preflight_stage(
     assert result.error == (
         "Anthropic API key is required when unresolved paragraphs exist."
     )
+
+
+def _seed_verification_kwargs(tmp_path: Path, classifications: dict) -> dict:
+    extract_dir = _seed_extract(tmp_path)
+    kwargs = _application_kwargs(tmp_path, extract_dir)
+    kwargs["classifications"] = classifications
+    return kwargs
+
+
+@pytest.mark.parametrize(
+    ("classifications", "match"),
+    [
+        (
+            {"classifications": [], "ignored_paragraphs": []},
+            "missing coverage",
+        ),
+        (
+            {
+                "classifications": [
+                    {"paragraph_index": 0, "csi_role": "PARAGRAPH"},
+                    {"paragraph_index": 0, "csi_role": "PARAGRAPH"},
+                ],
+                "ignored_paragraphs": [],
+            },
+            "[Dd]uplicate",
+        ),
+        (
+            {
+                "classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}],
+                "ignored_paragraphs": [{"paragraph_index": 0, "reason": "editorial"}],
+            },
+            "both|overlap|[Dd]uplicate",
+        ),
+        (
+            {
+                "classifications": [
+                    {"paragraph_index": 0, "csi_role": "PARAGRAPH"},
+                    {"paragraph_index": 7, "csi_role": "PARAGRAPH"},
+                ],
+                "ignored_paragraphs": [],
+            },
+            "not classifiable",
+        ),
+    ],
+)
+def test_shared_application_path_reverifies_disposition_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    classifications: dict,
+    match: str,
+) -> None:
+    kwargs = _seed_verification_kwargs(tmp_path, classifications)
+    monkeypatch.setattr(
+        batch_runner,
+        "apply_environment_to_target",
+        lambda **_kwargs: pytest.fail("application must not start"),
+    )
+
+    with pytest.raises(ApplicationStageError, match=match) as raised:
+        batch_runner._apply_classified_target(**kwargs)
+
+    assert raised.value.stage == "disposition_verification"
+    assert not (tmp_path / "output").exists()
+
+
+def test_shared_application_path_rejects_deterministic_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    extract_dir = _seed_extract(tmp_path)
+    kwargs = _application_kwargs(tmp_path, extract_dir)
+    kwargs["bundle"] = {
+        "paragraphs": [],
+        "deterministic_classifications": [
+            {"paragraph_index": 0, "csi_role": "PARAGRAPH"}
+        ],
+        "deterministic_ignored_paragraphs": [],
+        "filter_report": {"paragraphs_out_of_scope": []},
+    }
+    kwargs["classifications"] = {
+        "classifications": [{"paragraph_index": 0, "csi_role": "ARTICLE"}],
+        "ignored_paragraphs": [],
+    }
+    kwargs["arch_registry"] = {"PARAGRAPH": "Body", "ARTICLE": "Body"}
+    monkeypatch.setattr(
+        batch_runner,
+        "apply_environment_to_target",
+        lambda **_kwargs: pytest.fail("application must not start"),
+    )
+
+    with pytest.raises(ApplicationStageError, match="override") as raised:
+        batch_runner._apply_classified_target(**kwargs)
+
+    assert raised.value.stage == "disposition_verification"
+
+
+def test_classification_audit_does_not_clamp_an_overfull_payload() -> None:
+    bundle, classifications = _bundle_and_classifications()
+    classifications["classifications"].append(
+        {"paragraph_index": 0, "csi_role": "PARAGRAPH"}
+    )
+
+    summary, _audit = batch_runner._classification_audit(bundle, classifications)
+
+    assert summary["unresolved"] == -1
+
+
+def test_classifier_usage_becomes_classify_phase_diagnostics_not_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    extract_dir = _seed_extract(tmp_path)
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source package")
+
+    class FakeDecomposer:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def extract(self, *, output_dir: Path) -> Path:
+            del output_dir
+            return extract_dir
+
+    monkeypatch.setattr(batch_runner, "DocxDecomposer", FakeDecomposer)
+    monkeypatch.setattr(
+        batch_runner,
+        "build_phase2_slim_bundle",
+        lambda *_args, **_kwargs: {
+            "paragraphs": [{"paragraph_index": 0}],
+            "deterministic_classifications": [],
+            "deterministic_ignored_paragraphs": [],
+        },
+    )
+    monkeypatch.setattr(
+        batch_runner,
+        "classify_target_document",
+        lambda **_kwargs: {
+            "classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}],
+            "ignored_paragraphs": [],
+            "notes": [],
+            "usage": {
+                "requests": 2,
+                "input_tokens": 1200,
+                "cache_read_input_tokens": 700,
+                "cache_creation_input_tokens": 400,
+                "bogus": "text that must never reach diagnostics",
+            },
+        },
+    )
+    seen_payloads = []
+
+    def fake_apply(**kwargs):
+        seen_payloads.append(kwargs["classifications"])
+        return (
+            tmp_path / "out.docx",
+            None,
+            {"styled": 1, "ignored": 0, "out_of_scope": 0, "unresolved": 0},
+            {},
+            {},
+        )
+
+    monkeypatch.setattr(batch_runner, "_apply_classified_target", fake_apply)
+
+    result = batch_runner.process_single_file(
+        docx_path=source,
+        arch_registry={"PARAGRAPH": "Body"},
+        env_registry={},
+        arch_styles_xml="<w:styles/>",
+        available_roles=["PARAGRAPH"],
+        api_key="key",
+        output_dir=tmp_path / "output",
+    )
+
+    assert result.success is True
+    assert "usage" not in seen_payloads[0]
+    classify_events = [e for e in result.diagnostics if e.get("event") == "classify"]
+    assert classify_events, result.diagnostics
+    fields = classify_events[-1]["fields"]
+    assert fields["requests"] == 2
+    assert fields["cache_read_input_tokens"] == 700
+    assert fields["cache_creation_input_tokens"] == 400
+    assert "bogus" not in fields
+

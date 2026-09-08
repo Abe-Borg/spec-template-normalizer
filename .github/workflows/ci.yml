@@ -5,7 +5,9 @@
 #                           No network, no clock, no display -- a fast, always-green
 #                           gate that proves spec_formatter/updates.py and the
 #                           packaging scripts round-trip correctly. Also runs on
-#                           Python 3.9 to enforce the source floor.
+#                           Python 3.10, the source floor, and imports the
+#                           application there so a 3.11-only construct cannot
+#                           slip in.
 #   * suite    (windows) -- runs the full test suite on the primary GUI platform
 #                           (Windows, per CLAUDE.md), which is where tkinter and the
 #                           frozen app actually run.
@@ -31,12 +33,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11"]
+        python-version: ["3.10", "3.11"]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install test deps
@@ -45,15 +47,21 @@ jobs:
           pip install pytest
       - name: Run hermetic updater tests
         run: python -m pytest tests/test_updates.py -q
+      - name: Import the application on this interpreter
+        # Proves the whole codebase, not only the updater, still runs on the
+        # source floor declared in CLAUDE.md and README.md.
+        run: |
+          pip install -r requirements.txt
+          python -c "import spec_formatter.pipeline, phase1_pipeline"
 
   suite:
     name: Full test suite (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
       - name: Install dev deps

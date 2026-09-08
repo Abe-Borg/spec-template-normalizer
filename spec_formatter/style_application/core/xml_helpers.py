@@ -9,6 +9,31 @@ import html
 import re
 from typing import Dict, Any, Callable, Generator, Iterable, List, Optional, Tuple
 
+_QUALIFIED_NAME_RE = re.compile(r"[A-Za-z_][\w.-]*:[A-Za-z_][\w.-]*")
+_TAG_NAME_RE = re.compile(r"<\s*(?P<close>/)?\s*(?P<name>[A-Za-z_][\w.:-]*)(?=\s|/?>)")
+_SELF_CLOSING_RE = re.compile(r"/\s*>$")
+_NAME_TERMINATORS = frozenset(" \t\r\n/>")
+
+
+def element_is_mentioned(xml_text: str, qualified_name: str) -> bool:
+    """Cheap pre-check: does ``<qualified_name`` occur as a tag start at all?
+
+    Tokenizing a paragraph is the engine's dominant cost, and most paragraphs
+    contain no drawing, text box, or revision subtree, so every scanner asks
+    this first and skips the tokenizer when the answer is no.
+    """
+
+    probe = f"<{qualified_name}"
+    cursor = 0
+    while True:
+        start = xml_text.find(probe, cursor)
+        if start < 0:
+            return False
+        after = start + len(probe)
+        if after >= len(xml_text) or xml_text[after] in _NAME_TERMINATORS:
+            return True
+        cursor = after
+
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 OUT_OF_SCOPE_SUBTREE_NAMES = (
     "w:drawing",
@@ -40,8 +65,10 @@ def iter_element_xml_blocks(
     an outer paragraph at a text-box paragraph's closing tag.  Both paired and
     self-closing elements are supported.
     """
-    if not re.fullmatch(r"[A-Za-z_][\w.-]*:[A-Za-z_][\w.-]*", qualified_name):
+    if not _QUALIFIED_NAME_RE.fullmatch(qualified_name):
         raise ValueError(f"Invalid qualified XML element name: {qualified_name!r}")
+    if not element_is_mentioned(xml_text, qualified_name):
+        return
 
     depth = 0
     outer_start: Optional[int] = None
@@ -88,15 +115,12 @@ def iter_element_xml_blocks(
         end = tag_end + 1
         token = xml_text[start:end]
         cursor = end
-        name_match = re.match(
-            r"<\s*(?P<close>/)?\s*(?P<name>[A-Za-z_][\w.:-]*)(?=\s|/?>)",
-            token,
-        )
+        name_match = _TAG_NAME_RE.match(token)
         if name_match is None or name_match.group("name") != qualified_name:
             continue
 
         is_close = bool(name_match.group("close"))
-        is_self_closing = not is_close and bool(re.search(r"/\s*>$", token))
+        is_self_closing = not is_close and bool(_SELF_CLOSING_RE.search(token))
 
         if is_close:
             if depth == 0:
@@ -242,6 +266,8 @@ def iter_paragraph_xml_blocks(document_xml_text: str) -> Generator[Tuple[int, in
 def _remove_element_blocks(xml_text: str, qualified_names: Iterable[str]) -> str:
     ranges = []
     for name in qualified_names:
+        if not element_is_mentioned(xml_text, name):
+            continue
         ranges.extend((start, end) for start, end, _block in iter_element_xml_blocks(xml_text, name))
     if not ranges:
         return xml_text
@@ -272,6 +298,8 @@ def strip_out_of_scope_subtrees(xml_text: str) -> str:
 def _protect_out_of_scope_subtrees(xml_text: str) -> Tuple[str, List[Tuple[str, str]]]:
     ranges = []
     for name in OUT_OF_SCOPE_SUBTREE_NAMES:
+        if not element_is_mentioned(xml_text, name):
+            continue
         ranges.extend(
             (start, end)
             for start, end, _block in iter_element_xml_blocks(xml_text, name)

@@ -69,6 +69,7 @@ hiddenimports += _h
 # imports -- bundle them explicitly so a frozen run can never miss one.
 hiddenimports += [
     "gui",
+    "engine_identity",
     "phase1_pipeline",
     "phase1_bundle",
     "phase1_validator",
@@ -76,7 +77,6 @@ hiddenimports += [
     "llm_classifier",
     "paragraph_rules",
     "arch_env_extractor",
-    "ooxml_text",
 ]
 
 # Prompt payloads that ship at the bundle root (they live at the repo root, not
