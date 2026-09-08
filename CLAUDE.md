@@ -346,7 +346,10 @@ Return the source-to-final style-ID map to every body/header/footer consumer.
 `phase1_pipeline.py` snapshots and analyzes the architect. `phase1_bundle.py`
 creates and validates the complete bundle. Root `docx_decomposer.py` builds the
 architect slim bundle, derives portable styles without changing the source,
-and emits role metadata. `llm_classifier.py`, `paragraph_rules.py`,
+and emits role metadata; it reuses the package's namespace constants,
+visible-text extraction, structural element scanner, UTF-8 text helpers,
+and package extraction loop instead of carrying its own copies (there is no
+root `ooxml_text.py`). `llm_classifier.py`, `paragraph_rules.py`,
 `arch_env_extractor.py`, and `phase1_validator.py` own architect classification,
 signals, shell capture, and cross-contract validation respectively.
 
@@ -387,6 +390,11 @@ DOCX input and relationship metadata are untrusted.
 
 - Reject absolute, traversal, duplicate, and symbolic-link package members.
 - Limits: 10,000 package entries; 512 MiB total uncompressed; 128 MiB per part; compression ratio at most 1,000.
+- The bounded, containment-checked ZIP loop exists once:
+  `spec_formatter/style_application/docx_decomposer.extract_package_members()`.
+  Root `docx_decomposer.extract_docx()` calls it for the architect; the
+  limits above are module constants there and nowhere else, so a test that
+  lowers a limit patches that module.
 - Parse and validate relationship parts. Resolve internal targets only inside the package root.
 - Never dereference external relationship targets, local paths, UNC paths, URLs, or encoded traversal.
 - Reject malformed relationship XML and broken required relationship metadata.
@@ -438,6 +446,18 @@ it) or `attach_engine_error(exc, code)` when the exception type must stay
 cause, `BatchResult.error_code`/`safe_error` and `TargetFormatResult.error_code`
 carry it, and `_write_run_artifacts` prefers it over classifying `error`
 text. Adding a code is a contract change: list it here.
+
+The developer detail follows two conventions so a failure can be found in
+Word. Canadian architect-contract failures start with `Architect template:`
+and name the role. Target-side Canadian messages name the paragraph index
+and append a locator built by `_paragraph_locator()` in
+`core/csi_to_canadian.py`: `(Section 21 13 13, heading 5)` is the number on
+the nearest preceding SectionID paragraph and the paragraph's ordinal among
+the PART and numbered-role headings after that SECTION line (`after heading
+5` for a non-heading paragraph, `before any SECTION line` when none
+precedes it). Locators carry section numbers and counts only, never body
+text. Run-property invariant failures in `phase2_invariants.py` likewise
+report property names and counts, never XML.
 
 Current codes: `header_footer_target_section_id_required`,
 `header_footer_target_section_title_required`, `header_footer_token_residual`,

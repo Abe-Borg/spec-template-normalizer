@@ -377,7 +377,12 @@ fails instead of publishing a header that still names the architect's section.
   preserves every pre-existing target numbering definition.
 - Canadian conversion edits only recognized leading numbering markers in
   classified paragraphs and verifies that substantive text and protected OOXML
-  remain unchanged.
+  remain unchanged. When it fails closed, the detailed message names the
+  paragraph by its nearest SECTION number and heading ordinal (for example
+  `Paragraph 143 (Section 21 13 13, heading 5)`), and a failure in the
+  architect template's numbering contract starts with `Architect template:`.
+  Run artifacts still record only the stable error code and remediation
+  sentence.
 - Short generated temporary paths avoid carrying user-controlled deep paths
   into Windows staging.
 - Every output is fully validated before atomic publication into its run folder.

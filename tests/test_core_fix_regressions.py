@@ -248,3 +248,29 @@ def test_end_of_section_variants_are_structural_signals(text: str) -> None:
     )
     assert "END_OF_SECTION" in expected
     assert hits["END_OF_SECTION"] == [4]
+
+
+def test_root_decomposer_reuses_the_package_helpers() -> None:
+    import docx_decomposer as root
+    from spec_formatter.style_application import docx_decomposer as package
+    from spec_formatter.style_application.core import ooxml_namespaces, xml_helpers
+
+    assert root.W_NS == ooxml_namespaces.W_NS
+    assert root.extract_package_members is package.extract_package_members
+    # The package limits live only in the shared loop; the root module
+    # no longer carries copies that could drift.
+    assert not hasattr(root, "MAX_PACKAGE_ENTRIES")
+    paragraph = (
+        "<w:p><w:r><w:del><w:r><w:t>gone</w:t></w:r></w:del>"
+        "<w:moveFrom><w:r><w:t>moved</w:t></w:r></w:moveFrom>"
+        "<w:t>kept</w:t></w:r><w:r><w:tab/><w:t>text</w:t></w:r></w:p>"
+    )
+    assert root.paragraph_text_from_block(paragraph) == "kept text"
+    assert root.paragraph_text_from_block(paragraph) == xml_helpers.paragraph_text_from_block(paragraph)
+    # A revision-marked sectPr is not a section break.
+    assert root.paragraph_contains_sectpr(
+        "<w:p><w:pPr><w:pPrChange w:id=\"1\"><w:pPr><w:sectPr/></w:pPr></w:pPrChange>"
+        "<w:sectPrChange w:id=\"2\"/></w:pPr></w:p>"
+    ) is False
+    assert root.paragraph_contains_sectpr("<w:p><w:pPr><w:sectPr/></w:pPr></w:p>") is True
+

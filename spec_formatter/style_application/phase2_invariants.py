@@ -749,6 +749,17 @@ def _direct_rpr_children_by_run(
     return signatures
 
 
+def _rpr_property_names(rpr_block: str) -> str:
+    """Property names in an rPr block (``b, i, rFonts``), never its XML."""
+
+    names = sorted({
+        match.group(1)
+        for match in re.finditer(r"<w:([A-Za-z][\w]*)\b", rpr_block)
+        if match.group(1) != "rPr"
+    })
+    return ", ".join(names) if names else "no properties"
+
+
 def _verify_contracted_rpr_deletions_only(
     before_paragraph: str,
     after_paragraph: str,
@@ -1184,10 +1195,10 @@ def verify_phase2_invariants(
             after_count = after_set.get(block, 0)
             if after_count < count:
                 raise RuntimeError(
-                    "INVARIANT FAIL: non-font run formatting was lost. "
-                    f"A normalized rPr block appeared {count}x before but "
-                    f"{after_count}x after in paragraph {paragraph_index}.\n"
-                    f"Block: {block[:200]}"
+                    "INVARIANT FAIL: non-font run formatting was lost in paragraph "
+                    f"{paragraph_index}: a run-property set "
+                    f"({_rpr_property_names(block)}) appeared {count}x before but "
+                    f"{after_count}x after."
                 )
         raise RuntimeError(
             "INVARIANT FAIL: uncontracted run formatting was added, changed, "

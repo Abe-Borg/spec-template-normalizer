@@ -90,78 +90,94 @@ class DocxDecomposer:
         output_dir.mkdir(parents=True, exist_ok=False)
         try:
             print(f"Extracting {self.docx_path} to {output_dir}...")
-            with zipfile.ZipFile(self.docx_path, "r") as archive:
-                entries = archive.infolist()
-                if len(entries) > MAX_PACKAGE_ENTRIES:
-                    raise ValueError(
-                        f"DOCX package has {len(entries)} entries; "
-                        f"limit is {MAX_PACKAGE_ENTRIES}"
-                    )
-
-                total_size = sum(entry.file_size for entry in entries)
-                if total_size > MAX_PACKAGE_UNCOMPRESSED_BYTES:
-                    raise ValueError(
-                        f"DOCX package expands to {total_size} bytes; "
-                        f"limit is {MAX_PACKAGE_UNCOMPRESSED_BYTES}"
-                    )
-
-                seen_names: Set[str] = set()
-                for entry in entries:
-                    # orig_filename preserves crafted backslashes that
-                    # ZipInfo.filename may normalize or truncate.
-                    _safe_package_member_path(output_dir, entry.orig_filename)
-                    destination = _safe_package_member_path(output_dir, entry.filename)
-
-                    normalized_name = entry.filename.casefold()
-                    if normalized_name in seen_names:
-                        raise ValueError(
-                            f"DOCX package contains duplicate member: {entry.filename!r}"
-                        )
-                    seen_names.add(normalized_name)
-
-                    unix_mode = (entry.external_attr >> 16) & 0xFFFF
-                    if stat.S_ISLNK(unix_mode):
-                        raise ValueError(
-                            f"DOCX package contains a symbolic link: {entry.filename!r}"
-                        )
-                    if entry.file_size > MAX_PACKAGE_PART_BYTES:
-                        raise ValueError(
-                            f"DOCX package member {entry.filename!r} is "
-                            f"{entry.file_size} bytes; per-part limit is "
-                            f"{MAX_PACKAGE_PART_BYTES}"
-                        )
-                    if entry.file_size and entry.compress_size == 0:
-                        raise ValueError(
-                            "DOCX package member has invalid compressed size: "
-                            f"{entry.filename!r}"
-                        )
-                    if (
-                        entry.compress_size
-                        and entry.file_size / entry.compress_size > MAX_COMPRESSION_RATIO
-                    ):
-                        raise ValueError(
-                            "DOCX package member has suspicious compression ratio: "
-                            f"{entry.filename!r}"
-                        )
-
-                    if entry.is_dir():
-                        destination.mkdir(parents=True, exist_ok=True)
-                        continue
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    with archive.open(entry, "r") as source, destination.open("xb") as target:
-                        shutil.copyfileobj(source, target, length=1024 * 1024)
-
-            missing_parts = [
-                part
-                for part in REQUIRED_PACKAGE_PARTS
-                if not (output_dir / Path(*part.split("/"))).is_file()
-            ]
-            if missing_parts:
-                raise ValueError(f"DOCX package is missing required parts: {missing_parts}")
+            entry_count = extract_package_members(self.docx_path, output_dir)
         except Exception:
             shutil.rmtree(output_dir, ignore_errors=True)
             raise
 
         self.extract_dir = output_dir
-        print(f"Extraction complete: {len(entries)} items extracted")
+        print(f"Extraction complete: {entry_count} items extracted")
         return output_dir
+
+
+def extract_package_members(docx_path: Path, output_dir: Path) -> int:
+    """Extract every member of ``docx_path`` into the existing ``output_dir``.
+
+    This is the one bounded, containment-checked ZIP loop shared by the target
+    engine and the architect analysis (root ``docx_decomposer.extract_docx``).
+    Entry count, total and per-part size, compression ratio, duplicate and
+    unsafe member names, and symbolic links all fail closed, and the required
+    package parts must be present afterwards. The caller owns the directory
+    and removes it when this raises. Returns the number of entries processed.
+    """
+
+    output_dir = Path(output_dir)
+    with zipfile.ZipFile(docx_path, "r") as archive:
+        entries = archive.infolist()
+        if len(entries) > MAX_PACKAGE_ENTRIES:
+            raise ValueError(
+                f"DOCX package has {len(entries)} entries; "
+                f"limit is {MAX_PACKAGE_ENTRIES}"
+            )
+
+        total_size = sum(entry.file_size for entry in entries)
+        if total_size > MAX_PACKAGE_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"DOCX package expands to {total_size} bytes; "
+                f"limit is {MAX_PACKAGE_UNCOMPRESSED_BYTES}"
+            )
+
+        seen_names: Set[str] = set()
+        for entry in entries:
+            # orig_filename preserves crafted backslashes that
+            # ZipInfo.filename may normalize or truncate.
+            _safe_package_member_path(output_dir, entry.orig_filename)
+            destination = _safe_package_member_path(output_dir, entry.filename)
+
+            normalized_name = entry.filename.casefold()
+            if normalized_name in seen_names:
+                raise ValueError(
+                    f"DOCX package contains duplicate member: {entry.filename!r}"
+                )
+            seen_names.add(normalized_name)
+
+            unix_mode = (entry.external_attr >> 16) & 0xFFFF
+            if stat.S_ISLNK(unix_mode):
+                raise ValueError(
+                    f"DOCX package contains a symbolic link: {entry.filename!r}"
+                )
+            if entry.file_size > MAX_PACKAGE_PART_BYTES:
+                raise ValueError(
+                    f"DOCX package member {entry.filename!r} is "
+                    f"{entry.file_size} bytes; per-part limit is "
+                    f"{MAX_PACKAGE_PART_BYTES}"
+                )
+            if entry.file_size and entry.compress_size == 0:
+                raise ValueError(
+                    "DOCX package member has invalid compressed size: "
+                    f"{entry.filename!r}"
+                )
+            if (
+                entry.compress_size
+                and entry.file_size / entry.compress_size > MAX_COMPRESSION_RATIO
+            ):
+                raise ValueError(
+                    "DOCX package member has suspicious compression ratio: "
+                    f"{entry.filename!r}"
+                )
+
+            if entry.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(entry, "r") as source, destination.open("xb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+
+    missing_parts = [
+        part
+        for part in REQUIRED_PACKAGE_PARTS
+        if not (output_dir / Path(*part.split("/"))).is_file()
+    ]
+    if missing_parts:
+        raise ValueError(f"DOCX package is missing required parts: {missing_parts}")
+    return len(entries)

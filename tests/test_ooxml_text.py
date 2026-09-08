@@ -5,7 +5,10 @@ import pytest
 
 from arch_env_extractor import _read_xml_part
 from docx_decomposer import build_slim_bundle
-from ooxml_text import decode_xml_bytes, prepare_xml_text_for_utf8
+from spec_formatter.style_application.core.ooxml_text import (
+    decode_xml_bytes,
+    prepare_xml_text_for_utf8,
+)
 
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"

@@ -30,8 +30,6 @@ import json
 import posixpath
 import re
 import shutil
-import stat
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
@@ -44,12 +42,17 @@ from paragraph_rules import (
     RE_SECTION_WITH_TITLE,
     compute_skip_reason,
     detect_numbering_role,
-    detect_role_signal,
     infer_expected_roles,
     is_classifiable_paragraph,
     is_role_candidate_paragraph,
 )
-from ooxml_text import prepare_xml_text_for_utf8, read_xml_text
+from spec_formatter.style_application.core.ooxml_namespaces import W_NS
+from spec_formatter.style_application.core.ooxml_text import prepare_xml_text_for_utf8, read_xml_text
+from spec_formatter.style_application.core.xml_helpers import (
+    iter_element_xml_blocks as _iter_element_xml_blocks,
+    paragraph_text_from_block as _visible_paragraph_text,
+)
+from spec_formatter.style_application.docx_decomposer import extract_package_members
 from spec_formatter.role_contract import (
     ALLOWED_ROLES,
     NUMBERED_BODY_ROLES,
@@ -61,7 +64,7 @@ from spec_formatter.role_contract import (
 # Utilities
 # -----------------------------
 
-W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+# W_NS is the package-wide constant (spec_formatter.style_application.core.ooxml_namespaces).
 PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 def sha256_bytes(b: bytes) -> str:
@@ -256,34 +259,6 @@ def verify_stability(extract_dir: Path, snap: StabilitySnapshot) -> None:
 # DOCX extraction (workspace only)
 # -----------------------------
 
-MAX_PACKAGE_ENTRIES = 10_000
-MAX_PACKAGE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
-MAX_PACKAGE_PART_BYTES = 128 * 1024 * 1024
-MAX_COMPRESSION_RATIO = 1_000
-
-
-def _safe_package_member_path(extract_dir: Path, member_name: str) -> Path:
-    if not member_name or "\x00" in member_name or "\\" in member_name:
-        raise ValueError(f"Unsafe DOCX package member name: {member_name!r}")
-    if member_name.startswith(("/", "//")) or re.match(r"^[A-Za-z]:", member_name):
-        raise ValueError(f"Unsafe absolute DOCX package member: {member_name!r}")
-    parts = member_name.rstrip("/").split("/")
-    if any(part in {"", ".", ".."} for part in parts):
-        raise ValueError(f"Unsafe DOCX package member traversal: {member_name!r}")
-    reserved_windows_names = {"CON", "PRN", "AUX", "NUL"} | {
-        f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
-    }
-    for part in parts:
-        stem = part.split(".", 1)[0].upper()
-        if ":" in part or part.endswith((" ", ".")) or stem in reserved_windows_names:
-            raise ValueError(f"Unsafe Windows DOCX package member: {member_name!r}")
-    destination = (extract_dir / Path(*parts)).resolve()
-    root = extract_dir.resolve()
-    try:
-        destination.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"DOCX package member escapes extraction root: {member_name!r}") from exc
-    return destination
 
 
 def extract_docx(docx_path: Path, extract_dir: Path, *, overwrite: bool = False) -> None:
@@ -310,58 +285,8 @@ def extract_docx(docx_path: Path, extract_dir: Path, *, overwrite: bool = False)
     
     extract_dir.mkdir(parents=True, exist_ok=True)
     try:
-        with zipfile.ZipFile(docx_path, "r") as archive:
-            entries = archive.infolist()
-            if len(entries) > MAX_PACKAGE_ENTRIES:
-                raise ValueError(
-                    f"DOCX package has {len(entries)} entries; limit is {MAX_PACKAGE_ENTRIES}"
-                )
-            total_size = sum(entry.file_size for entry in entries)
-            if total_size > MAX_PACKAGE_UNCOMPRESSED_BYTES:
-                raise ValueError(
-                    f"DOCX package expands to {total_size} bytes; limit is {MAX_PACKAGE_UNCOMPRESSED_BYTES}"
-                )
-
-            seen_names: Set[str] = set()
-            for entry in entries:
-                # ZipInfo.filename may normalize backslashes; orig_filename is
-                # the only trustworthy value for rejecting a crafted archive.
-                raw_member_name = entry.orig_filename
-                _safe_package_member_path(extract_dir, raw_member_name)
-                normalized_name = entry.filename.casefold()
-                if normalized_name in seen_names:
-                    raise ValueError(f"DOCX package contains duplicate member: {entry.filename!r}")
-                seen_names.add(normalized_name)
-                destination = _safe_package_member_path(extract_dir, entry.filename)
-                unix_mode = (entry.external_attr >> 16) & 0xFFFF
-                if stat.S_ISLNK(unix_mode):
-                    raise ValueError(f"DOCX package contains a symbolic link: {entry.filename!r}")
-                if entry.file_size > MAX_PACKAGE_PART_BYTES:
-                    raise ValueError(
-                        f"DOCX package member {entry.filename!r} is {entry.file_size} bytes; "
-                        f"per-part limit is {MAX_PACKAGE_PART_BYTES}"
-                    )
-                if entry.file_size and entry.compress_size == 0:
-                    raise ValueError(f"DOCX package member has invalid compressed size: {entry.filename!r}")
-                if entry.compress_size and entry.file_size / entry.compress_size > MAX_COMPRESSION_RATIO:
-                    raise ValueError(f"DOCX package member has suspicious compression ratio: {entry.filename!r}")
-
-                if entry.is_dir():
-                    destination.mkdir(parents=True, exist_ok=True)
-                    continue
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(entry, "r") as source, destination.open("xb") as target:
-                    shutil.copyfileobj(source, target, length=1024 * 1024)
-
-        required_parts = [
-            extract_dir / "[Content_Types].xml",
-            extract_dir / "_rels" / ".rels",
-            extract_dir / "word" / "document.xml",
-            extract_dir / "word" / "styles.xml",
-        ]
-        missing_parts = [str(path.relative_to(extract_dir)) for path in required_parts if not path.is_file()]
-        if missing_parts:
-            raise ValueError(f"DOCX package is missing required parts: {missing_parts}")
+        # One shared, bounded, containment-checked ZIP loop for both engines.
+        extract_package_members(docx_path, extract_dir)
     except Exception:
         # Never leave a partially extracted tree that a later run could mistake
         # for a valid template.
@@ -638,59 +563,20 @@ def _mask_text_box_subtrees(p_xml: str) -> str:
 
 
 def paragraph_text_from_block(p_xml: str) -> str:
-    # Deleted/moved-from text, field instructions, and drawing/text-box content
-    # are not visible in-scope paragraph content for Phase 1 classification.
-    visible = _strip_out_of_scope_subtrees(p_xml)
-    visible = re.sub(r"<w:(?:del|moveFrom)\b[^>]*>[\s\S]*?</w:(?:del|moveFrom)>", "", visible)
-    visible = re.sub(r"<w:instrText\b[^>]*>[\s\S]*?</w:instrText>", "", visible)
-    # Tabs and explicit line breaks separate words in Word even though they do
-    # not live inside w:t nodes.  Keep non-breaking hyphens semantically a
-    # hyphen and omit optional soft hyphens.
-    separator_token = "\ue000"
-    no_break_hyphen_token = "\ue001"
-    # Empty OOXML controls may be serialized either as ``<w:tab/>`` or as a
-    # paired empty element such as ``<w:tab></w:tab>``.  Normalize both forms
-    # before collecting text so they have identical visible semantics.
-    visible = re.sub(
-        r"<w:(tab|br|cr)\b[^>]*>\s*</w:\1\s*>",
-        separator_token,
-        visible,
-    )
-    visible = re.sub(r"<w:(?:tab|br|cr)\b[^>]*/\s*>", separator_token, visible)
-    visible = re.sub(
-        r"<w:noBreakHyphen\b[^>]*>\s*</w:noBreakHyphen\s*>",
-        no_break_hyphen_token,
-        visible,
-    )
-    visible = re.sub(
-        r"<w:noBreakHyphen\b[^>]*/\s*>",
-        no_break_hyphen_token,
-        visible,
-    )
-    visible = re.sub(
-        r"<w:softHyphen\b[^>]*>\s*</w:softHyphen\s*>",
-        "",
-        visible,
-    )
-    visible = re.sub(r"<w:softHyphen\b[^>]*/\s*>", "", visible)
-    pieces = re.findall(
-        rf"<w:t\b[^>]*>([\s\S]*?)</w:t>|({separator_token})|({no_break_hyphen_token})",
-        visible,
-    )
-    if not pieces:
-        return ""
-    joined = html.unescape(
-        "".join(
-            text if text else (" " if separator else "\u2011")
-            for text, separator, _hyphen in pieces
-        )
-    )
-    joined = re.sub(r"\s+", " ", joined).strip()
-    return joined
+    """Visible in-scope text of a paragraph (the package's one implementation).
+
+    Deleted/moved-from text, field instructions, and drawing/text-box content
+    are removed structurally; the former root regex could close a ``w:del``
+    on a ``</w:moveFrom>`` tag.
+    """
+
+    return _visible_paragraph_text(p_xml)
 
 
 def paragraph_contains_sectpr(p_xml: str) -> bool:
-    return "<w:sectPr" in _mask_text_box_subtrees(p_xml)
+    # Structural: a ``<w:sectPrChange>`` revision element is not a section break.
+    masked = _mask_text_box_subtrees(p_xml)
+    return next(_iter_element_xml_blocks(masked, "w:sectPr"), None) is not None
 
 
 def paragraph_pstyle_from_block(p_xml: str) -> Optional[str]:

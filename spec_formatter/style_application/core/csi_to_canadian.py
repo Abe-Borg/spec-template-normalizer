@@ -9,12 +9,13 @@ with Canadian numeric signatures.
 
 from __future__ import annotations
 
+import bisect
 import html
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from spec_formatter.numbering_roles import (
     role_from_numbering_catalog,
@@ -36,6 +37,7 @@ from .classification import (
     _resolve_numbering_pattern,
 )
 from .ooxml_text import prepare_xml_text_for_utf8, read_xml_text, write_xml_text
+from .section_numbers import section_number_display_form
 from .sectpr_tools import extract_all_sectpr_blocks
 from .xml_helpers import (
     OUT_OF_SCOPE_SUBTREE_NAMES,
@@ -299,18 +301,20 @@ def _validate_canadian_role_contract(
 ) -> None:
     if not isinstance(spec, dict):
         raise EngineError("canadian_architect_contract", 
-            f"Canadian conversion requires a complete architect role contract for {role}."
+            f"Architect template: role {role} has no complete role contract; "
+            "Canadian conversion requires a strict analyzed profile."
         )
     provenance = spec.get("numbering_provenance")
     if provenance not in {"style_numpr", "direct_numpr"}:
         raise EngineError("canadian_architect_contract", 
-            "Canadian conversion requires true Word automatic numbering in the "
-            f"architect template for {role}; found {provenance!r}."
+            f"Architect template: role {role} must use true Word automatic "
+            f"numbering for Canadian conversion; found {provenance!r}."
         )
     pattern = spec.get("numbering_pattern")
     if not isinstance(pattern, dict):
         raise EngineError("canadian_architect_contract", 
-            f"Canadian conversion is missing the architect numbering pattern for {role}."
+            f"Architect template: role {role} has no numbering pattern; "
+            "Canadian conversion cannot proceed."
         )
     num_fmt = str(pattern.get("numFmt") or "")
     lvl_text = str(pattern.get("lvlText") or "")
@@ -318,17 +322,17 @@ def _validate_canadian_role_contract(
         value = pattern.get(key)
         if value is not None and str(value) != "1":
             raise EngineError("canadian_architect_contract", 
-                f"Architect role {role} starts at {value!r}; Canadian conversion "
+                f"Architect template: role {role} starts at {value!r}; Canadian conversion "
                 "requires numbering that starts at 1."
             )
     if pattern.get("lvlRestart") is not None:
         raise EngineError("canadian_architect_contract", 
-            f"Architect role {role} uses an explicit numbering restart rule that "
+            f"Architect template: role {role} uses an explicit numbering restart rule that "
             "Canadian conversion cannot yet prove safe."
         )
     if num_fmt != "decimal":
         raise EngineError("canadian_architect_contract", 
-            f"Architect role {role} is not Canadian numeric numbering "
+            f"Architect template: role {role} is not Canadian numeric numbering "
             f"(numFmt={num_fmt!r})."
         )
     if role == "PART":
@@ -346,7 +350,7 @@ def _validate_canadian_role_contract(
         expected = ".%n"
     if valid is None:
         raise EngineError("canadian_architect_contract", 
-            f"Architect role {role} does not demonstrate Canadian PageFormat "
+            f"Architect template: role {role} does not demonstrate Canadian PageFormat "
             f"numbering (lvlText={lvl_text!r}; expected a pattern like {expected!r})."
         )
 
@@ -397,21 +401,22 @@ def _validate_complete_article_hierarchy(
         lvl_text = str(pattern.get("lvlText") or "")
         expected_ilvl, expected_text = expected_levels[role]
         if ilvl != expected_ilvl or expected_text.fullmatch(lvl_text) is None:
-            raise EngineError("canadian_target_hierarchy", 
-                "Canadian article conversion requires a coherent PART/article/list "
-                f"hierarchy; architect role {role} has ilvl={ilvl!r}, "
-                f"lvlText={lvl_text!r}."
+            raise EngineError("canadian_architect_contract", 
+                f"Architect template: role {role} has ilvl={ilvl!r}, "
+                f"lvlText={lvl_text!r}; Canadian article conversion requires a "
+                "coherent PART/article/list hierarchy."
             )
         if not num_id:
-            raise EngineError("canadian_target_hierarchy", 
-                f"Architect role {role} is missing its Word numbering list identifier."
+            raise EngineError("canadian_architect_contract", 
+                f"Architect template: role {role} is missing its Word numbering list "
+                "identifier."
             )
         if reference_num_id is None:
             reference_num_id = num_id
         elif num_id != reference_num_id:
-            raise EngineError("canadian_target_hierarchy", 
-                "Canadian PART, article, and subordinate roles must share one Word "
-                "multilevel numbering list."
+            raise EngineError("canadian_architect_contract", 
+                "Architect template: Canadian PART, article, and subordinate roles "
+                "must share one Word multilevel numbering list."
             )
 
 
@@ -501,9 +506,78 @@ def _literal_counter(role: str, literal: _LiteralMarker) -> Tuple[Optional[int],
 
 _ROLE_LEVEL = ROLE_LEVEL
 
+#: Roles a designer counts as headings when locating a paragraph in Word.
+_LOCATOR_HEADING_ROLES = frozenset(NUMBERED_ROLES) | {"PART"}
 
-def _validate_source_sequence(evidence: list[_SourceEvidence]) -> None:
-    """Prove that regenerated counters preserve a canonical source sequence."""
+
+def _no_locator(index: int) -> str:
+    return ""
+
+
+def _paragraph_locator(
+    blocks: list,
+    role_by_index: Dict[int, str],
+) -> Callable[[int], str]:
+    """Return a describer that places a paragraph by SECTION number and heading.
+
+    Engine messages name paragraphs by their ``word/document.xml`` index,
+    which nobody can find in Word. The describer appends
+    `` (Section 21 13 13, heading 5)``: the number on the nearest preceding
+    SectionID paragraph and the 1-based ordinal of the paragraph among the
+    PART and numbered-role headings after that SECTION line. A paragraph
+    that is not itself a heading reports ``after heading 5`` (or ``before
+    its first heading``), and one ahead of every SECTION line says so.
+    Only the section number and counts are reported, never body text.
+    """
+
+    section_indices: list[int] = []
+    section_labels: list[str] = []
+    heading_indices: list[int] = []
+    for index in sorted(role_by_index):
+        role = role_by_index[index]
+        if role == "SectionID" and index < len(blocks):
+            number = section_number_display_form(
+                paragraph_text_from_block(blocks[index][2])
+            )
+            section_indices.append(index)
+            section_labels.append(
+                f"Section {number}" if number else "an unnumbered SECTION line"
+            )
+        elif role in _LOCATOR_HEADING_ROLES:
+            heading_indices.append(index)
+
+    def describe(index: int) -> str:
+        position = bisect.bisect_right(section_indices, index) - 1
+        if position >= 0:
+            section_index = section_indices[position]
+            label = section_labels[position]
+        else:
+            section_index = -1
+            label = "before any SECTION line"
+        first = bisect.bisect_right(heading_indices, section_index)
+        last = bisect.bisect_right(heading_indices, index)
+        ordinal = last - first
+        if ordinal and role_by_index.get(index) in _LOCATOR_HEADING_ROLES:
+            place = f"heading {ordinal}"
+        elif ordinal:
+            place = f"after heading {ordinal}"
+        else:
+            place = "before its first heading"
+        return f" ({label}, {place})"
+
+    return describe
+
+
+def _validate_source_sequence(
+    evidence: list[_SourceEvidence],
+    *,
+    describe: Callable[[int], str] = _no_locator,
+) -> None:
+    """Prove that regenerated counters preserve a canonical source sequence.
+
+    ``describe`` renders the SECTION/heading locator appended to a paragraph
+    index in every message (see :func:`_paragraph_locator`).
+    """
 
     source_kinds: Dict[str, set[str]] = {}
     for item in evidence:
@@ -530,7 +604,8 @@ def _validate_source_sequence(evidence: list[_SourceEvidence]) -> None:
             parent = "ARTICLE"
         if parent is not None and parent not in active:
             raise EngineError("canadian_target_hierarchy", 
-                f"Paragraph {item.paragraph_index} is {item.role} without a preceding "
+                f"Paragraph {item.paragraph_index}{describe(item.paragraph_index)} "
+                f"is {item.role} without a preceding "
                 f"{parent}; Canadian conversion cannot prove the hierarchy."
             )
 
@@ -544,7 +619,8 @@ def _validate_source_sequence(evidence: list[_SourceEvidence]) -> None:
             part_number = active.get("PART")
             if part_number is not None and parent_number != part_number:
                 raise EngineError("canadian_target_hierarchy", 
-                    f"Paragraph {item.paragraph_index} article {item.literal.marker!r} "
+                    f"Paragraph {item.paragraph_index}{describe(item.paragraph_index)} "
+                    f"article {item.literal.marker!r} "
                     f"does not belong to the active PART {part_number}."
                 )
 
@@ -552,7 +628,8 @@ def _validate_source_sequence(evidence: list[_SourceEvidence]) -> None:
         expected = 1 if previous is None else previous + 1
         if counter != expected:
             raise EngineError("canadian_target_hierarchy", 
-                f"Paragraph {item.paragraph_index} has non-contiguous {item.role} marker "
+                f"Paragraph {item.paragraph_index}{describe(item.paragraph_index)} "
+                f"has non-contiguous {item.role} marker "
                 f"{item.literal.marker!r}; expected counter {expected}. Canadian conversion "
                 "does not silently repair gaps or restarts."
             )
@@ -652,16 +729,20 @@ def _validate_automatic_source(
     numbering_root: Optional[ET.Element],
     numbering_catalog: Dict[str, Any],
     available_roles: set[str],
+    *,
+    describe: Callable[[int], str] = _no_locator,
 ) -> None:
+    where = describe(item.paragraph_index)
     if numbering_root is None or item.automatic_numpr is None:
         raise EngineError("canadian_numbering_unprovable", 
-            f"Paragraph {item.paragraph_index} uses automatic numbering, but the "
+            f"Paragraph {item.paragraph_index}{where} uses automatic numbering, but the "
             "target numbering.xml is unavailable."
         )
     pattern = item.automatic_pattern
     if not isinstance(pattern, dict):
         raise EngineError("canadian_numbering_unprovable", 
-            f"Paragraph {item.paragraph_index} automatic numbering cannot be resolved."
+            f"Paragraph {item.paragraph_index}{where} automatic numbering cannot be "
+            "resolved."
         )
     num_id = str(item.automatic_numpr["numId"])
     ilvl = str(item.automatic_numpr.get("ilvl", "0"))
@@ -684,7 +765,7 @@ def _validate_automatic_source(
     ) if inferred is not None else None
     if resolved != item.role:
         raise EngineError("canadian_numbering_unprovable", 
-            f"Paragraph {item.paragraph_index} is classified as {item.role}, but its "
+            f"Paragraph {item.paragraph_index}{where} is classified as {item.role}, but its "
             f"automatic numbering signature resolves to {inferred or 'no safe role'}"
             + (
                 f" (available-role fallback: {resolved})."
@@ -696,7 +777,7 @@ def _validate_automatic_source(
     _validate_numbering_start(
         level,
         override,
-        context=f"Paragraph {item.paragraph_index} source numbering",
+        context=f"Paragraph {item.paragraph_index}{where} source numbering",
         reject_override=True,
     )
 
@@ -708,7 +789,8 @@ def _validate_architect_numbering(
 ) -> None:
     if not numbering_xml.strip():
         raise EngineError("canadian_architect_contract", 
-            "Canadian conversion requires the architect template's numbering.xml."
+            "Architect template: numbering.xml is missing; Canadian conversion "
+            "requires the architect's numbering definitions."
         )
     root = parse_untrusted_xml(
         prepare_xml_text_for_utf8(numbering_xml),
@@ -723,7 +805,7 @@ def _validate_architect_numbering(
         _validate_numbering_start(
             level,
             override,
-            context=f"Architect role {role}",
+            context=f"Architect template: role {role} numbering",
             reject_override=False,
         )
 
@@ -939,6 +1021,7 @@ def plan_csi_to_canadian(
         for index, role in role_by_index.items()
         if index not in preserved_indices
     }
+    locate = _paragraph_locator(blocks, effective_role_by_index)
     roles_in_target = set(effective_role_by_index.values())
     used_numbered_roles = sorted(roles_in_target & NUMBERED_ROLES)
     for role in used_numbered_roles:
@@ -998,12 +1081,14 @@ def plan_csi_to_canadian(
 
         if literal is None and any_literal is not None:
             raise EngineError("canadian_target_hierarchy", 
-                f"Paragraph {index} is classified as {role} but starts with incompatible "
+                f"Paragraph {index}{locate(index)} is classified as {role} but starts "
+                "with incompatible "
                 f"marker {any_literal!r}."
             )
         if literal is not None and automatic:
             raise EngineError("canadian_target_hierarchy", 
-                f"Paragraph {index} has both automatic numbering and typed marker "
+                f"Paragraph {index}{locate(index)} has both automatic numbering and "
+                "typed marker "
                 f"{literal.marker!r}; remove the doubled numbering before conversion."
             )
 
@@ -1011,7 +1096,7 @@ def plan_csi_to_canadian(
             delimiter = _marker_markup_delimiter(analysis, role)
             if delimiter == "line_break":
                 raise EngineError("canadian_target_hierarchy", 
-                    f"Paragraph {index} uses a line break after typed marker "
+                    f"Paragraph {index}{locate(index)} uses a line break after typed marker "
                     f"{literal.marker!r}; only a normal space or Word list tab is safe."
                 )
             # A two-component article marker such as ``1.1`` is proven later
@@ -1020,7 +1105,7 @@ def plan_csi_to_canadian(
             # values and therefore still requires an actual Word list tab.
             if literal.family == "csc_dot_decimal" and delimiter != "tab":
                 raise EngineError("canadian_target_hierarchy", 
-                    f"Paragraph {index} begins with ambiguous decimal text "
+                    f"Paragraph {index}{locate(index)} begins with ambiguous decimal text "
                     f"{literal.marker!r}. A typed Canadian marker is converted only "
                     "when followed by a structural Word tab."
                 )
@@ -1030,7 +1115,7 @@ def plan_csi_to_canadian(
                 and not _has_heading_like_article_body(literal.body_text)
             ):
                 raise EngineError("canadian_target_hierarchy", 
-                    f"Paragraph {index} begins with ambiguous decimal text "
+                    f"Paragraph {index}{locate(index)} begins with ambiguous decimal text "
                     f"{literal.marker!r}. A spaced Canadian article marker must "
                     "be followed by heading-like text or a structural Word tab."
                 )
@@ -1069,7 +1154,8 @@ def plan_csi_to_canadian(
             edits.append(MarkerEdit(index, role, "automatic", "automatic", None, None))
         else:
             raise EngineError("canadian_target_hierarchy", 
-                f"Paragraph {index} is classified as numbered role {role}, but it has "
+                f"Paragraph {index}{locate(index)} is classified as numbered role {role}, "
+                "but it has "
                 "neither a recognized typed marker nor Word automatic numbering. "
                 "Canadian conversion will not insert an unproven list item."
             )
@@ -1084,6 +1170,7 @@ def plan_csi_to_canadian(
             numbering_root,
             numbering_catalog,
             set(role_specs),
+            describe=locate,
         )
         assert item.automatic_numpr is not None
         automatic_ids.setdefault(item.role, set()).add(item.automatic_numpr["numId"])
@@ -1115,9 +1202,9 @@ def plan_csi_to_canadian(
             raise EngineError("canadian_target_hierarchy", 
                 f"Unconverted paragraph {index} shares automatic source list "
                 f"numId={effective_numpr.get('numId')!r}; removing it would change "
-                "following counters."
+                f"following counters. It is paragraph {index}{locate(index)}."
             )
-    _validate_source_sequence(evidence)
+    _validate_source_sequence(evidence, describe=locate)
 
     pieces = []
     last = 0

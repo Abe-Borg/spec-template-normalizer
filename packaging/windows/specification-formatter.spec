@@ -77,7 +77,6 @@ hiddenimports += [
     "llm_classifier",
     "paragraph_rules",
     "arch_env_extractor",
-    "ooxml_text",
 ]
 
 # Prompt payloads that ship at the bundle root (they live at the repo root, not

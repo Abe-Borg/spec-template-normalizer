@@ -46,7 +46,10 @@ from phase1_validator import validate_phase1_contracts
 
 # 2.4.0: manifest version 2 with the committed engine fingerprint, Opus 5 as
 # the architect classifier, and cross-registry validation in production.
-PIPELINE_VERSION = "2.4.0"
+# 2.5.0: architect analysis shares the target engine's visible-text, section
+# break, and package extraction helpers (profiles may differ for documents
+# with tracked changes or revision-marked section properties).
+PIPELINE_VERSION = "2.5.0"
 DEFAULT_MODEL = "claude-opus-5"
 ProgressCallback = Callable[[str], None]
 Classifier = Callable[..., Dict[str, Any]]

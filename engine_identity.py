@@ -34,7 +34,7 @@ ENGINE_SOURCE_FILES: tuple[str, ...] = (
 
 #: First 16 hex digits of the SHA-256 over ENGINE_SOURCE_FILES. Update with
 #: ``python engine_identity.py`` whenever one of those files changes.
-ENGINE_SOURCE_DIGEST = "08daea8f8fe2c6d4"
+ENGINE_SOURCE_DIGEST = "4d7ab9864021f9b8"
 
 ENGINE_SOURCE_DIGEST_LENGTH = 16
 
