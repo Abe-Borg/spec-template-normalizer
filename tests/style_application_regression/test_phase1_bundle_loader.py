@@ -362,16 +362,10 @@ def test_strict_loader_rejects_unsupported_manifest_version(tmp_path):
         load_and_validate_shared_config(bundle)
 
 
-def test_legacy_bundle_requires_explicit_opt_in(tmp_path):
+def test_loose_registries_without_a_manifest_are_never_a_valid_handoff(tmp_path):
     bundle = _write_bundle(tmp_path / "legacy", include_manifest=False)
-    (bundle / "arch_styles_raw.xml").write_bytes((bundle / "portable_styles.xml").read_bytes())
-    (bundle / "source_styles.xml").unlink()
-    (bundle / "portable_styles.xml").unlink()
 
     with pytest.raises(FileNotFoundError, match="Strict Phase 1 bundle required"):
         load_and_validate_shared_config(bundle)
-
-    shared = load_and_validate_shared_config(bundle, allow_legacy_bundle=True)
-    assert shared.legacy_mode is True
-    assert shared.bundle_manifest is None
-    assert shared.role_specs is None
+    with pytest.raises(TypeError):
+        load_and_validate_shared_config(bundle, allow_legacy_bundle=True)  # type: ignore[call-arg]

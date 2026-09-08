@@ -292,10 +292,17 @@ discovery still excludes as legacy output.
 ### `spec_formatter/style_application/batch_runner.py`
 
 - Loads one validated profile and prepares/classifies targets.
-- `_apply_classified_target()` is the shared application path for single and
-  batch flows; do not duplicate environment/numbering/style sequencing.
+- `_apply_classified_target()` is the shared application path for
+  `process_single_file()` and the prepared-file path (`_prepare_file_for_batch`
+  / `_apply_batch_result`); do not duplicate environment/numbering/style
+  sequencing.
 - Captures target styles/numbering before shell mutation, applies the selected
   policy, produces audit/numbering checks, validates, and packages the result.
+- `load_and_validate_shared_config()` accepts only a complete `.phase1` bundle.
+  The retired `run_batch_concurrent` / `run_batch_api` entry points, the
+  Anthropic Batch API classifier, and the `allow_legacy_bundle` opt-in (which
+  referenced the retired `arch_styles_raw.xml`) were removed; the pipeline's
+  thread pool is the one concurrency implementation.
 
 ### `spec_formatter/style_application/core/classification.py`
 

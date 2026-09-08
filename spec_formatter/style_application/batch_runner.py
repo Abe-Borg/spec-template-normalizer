@@ -8,10 +8,9 @@ import re
 import os
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .. import diagnostics as diag
 from .arch_env_applier import apply_environment_to_target
@@ -29,12 +28,6 @@ from .core.csi_to_canadian import (
 from .core.classification import validate_phase2_final_payload
 from .core.errors import EngineError, attach_engine_error
 from .core.token_utils import extract_target_tokens
-from .core.batch_classifier import (
-    BatchClassificationError,
-    build_batch_requests,
-    reassemble_file_classifications,
-    submit_and_poll,
-)
 from .core.llm_classifier import classify_target_document
 from .core.ooxml_text import read_xml_text, write_xml_text
 from .core.registry import (
@@ -44,7 +37,6 @@ from .core.registry import (
     load_available_roles_from_registry,
     load_role_specs_from_registry,
     preflight_validate_registries,
-    resolve_arch_extract_root,
     validate_phase1_bundle_directory,
 )
 from .core.stability import snapshot_stability, verify_stability
@@ -236,36 +228,30 @@ def _check_numbering_module_needed(arch_styles_xml: str, needed_style_ids: List[
             )
 
 
-def load_and_validate_shared_config(
-    arch_path: Path,
-    *,
-    allow_legacy_bundle: bool = False,
-) -> SharedConfig:
+def load_and_validate_shared_config(arch_path: Path) -> SharedConfig:
+    """Load one strictly validated ``.phase1`` bundle as the shared config.
+
+    The complete bundle directory (with its manifest) is the only accepted
+    handoff. The old opt-in for loose legacy registries is gone: it referenced
+    the retired ``arch_styles_raw.xml`` artifact and had no production caller.
+    """
+
     requested_path = Path(arch_path)
     candidate_root = requested_path.parent if requested_path.is_file() else requested_path
     manifest_path = candidate_root / PHASE1_MANIFEST_FILENAME
 
-    bundle_manifest: Optional[Dict[str, Any]] = None
     legacy_mode = False
-    if manifest_path.exists():
-        bundle_manifest, artifact_paths = validate_phase1_bundle_directory(candidate_root)
-        arch_root = candidate_root
-        style_registry_path = artifact_paths["style_registry"]
-        template_registry_path = artifact_paths["template_registry"]
-        portable_styles_path = artifact_paths["portable_styles"]
-    else:
-        if not allow_legacy_bundle:
-            raise FileNotFoundError(
-                f"Strict Phase 1 bundle required: {manifest_path} was not found. "
-                "Regenerate the template with Phase 1, or explicitly call "
-                "load_and_validate_shared_config(..., allow_legacy_bundle=True) "
-                "for a trusted legacy bundle."
-            )
-        legacy_mode = True
-        arch_root = resolve_arch_extract_root(requested_path)
-        style_registry_path = arch_root / "arch_style_registry.json"
-        template_registry_path = arch_root / "arch_template_registry.json"
-        portable_styles_path = arch_root / "arch_styles_raw.xml"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Strict Phase 1 bundle required: {manifest_path} was not found. "
+            "Regenerate the template profile; loose legacy registries are not a "
+            "valid handoff."
+        )
+    bundle_manifest, artifact_paths = validate_phase1_bundle_directory(candidate_root)
+    arch_root = candidate_root
+    style_registry_path = artifact_paths["style_registry"]
+    template_registry_path = artifact_paths["template_registry"]
+    portable_styles_path = artifact_paths["portable_styles"]
 
     arch_registry = load_arch_style_registry(style_registry_path)
     # Legacy registries predate the numbering provenance contract. Passing
@@ -1275,181 +1261,6 @@ def _apply_batch_result(
             error_code=_safe_error_code(exc),
             safe_error=_safe_error_message(exc),
         )
-
-
-def run_batch_concurrent(
-    docx_paths: List[Path],
-    arch_registry: Dict[str, str],
-    env_registry: Dict[str, Any],
-    arch_styles_xml: str,
-    available_roles: List[str],
-    api_key: str,
-    output_dir: Path,
-    source_tokens: Optional[Dict[str, str]] = None,
-    arch_root: Optional[Path] = None,
-    max_workers: int = 3,
-    on_file_complete: Optional[Callable[[BatchResult], None]] = None,
-    role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
-    conversion_mode: str = FORMAT_ONLY,
-) -> List[BatchResult]:
-    conversion_mode = validate_conversion_mode(conversion_mode)
-    if not docx_paths:
-        return []
-
-    workers = max(1, min(max_workers, len(docx_paths)))
-    results: List[BatchResult] = []
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        if (
-            source_tokens is None
-            and arch_root is None
-            and role_specs is None
-            and conversion_mode == FORMAT_ONLY
-        ):
-            futures = {
-                executor.submit(
-                    process_single_file,
-                    docx_path,
-                    arch_registry,
-                    env_registry,
-                    arch_styles_xml,
-                    available_roles,
-                    api_key,
-                    output_dir,
-                ): docx_path
-                for docx_path in docx_paths
-            }
-        else:
-            futures = {
-                executor.submit(
-                    process_single_file,
-                    docx_path,
-                    arch_registry,
-                    env_registry,
-                    arch_styles_xml,
-                    available_roles,
-                    api_key,
-                    output_dir,
-                    source_tokens=source_tokens,
-                    arch_root=arch_root,
-                    role_specs=role_specs,
-                    conversion_mode=conversion_mode,
-                ): docx_path
-                for docx_path in docx_paths
-            }
-
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-            if on_file_complete:
-                on_file_complete(result)
-
-    return sorted(results, key=lambda item: item.filename)
-
-
-def run_batch_api(
-    docx_paths: List[Path],
-    arch_registry: Dict[str, str],
-    env_registry: Dict[str, Any],
-    arch_styles_xml: str,
-    available_roles: List[str],
-    api_key: str,
-    output_dir: Path,
-    source_tokens: Optional[Dict[str, str]] = None,
-    arch_root: Optional[Path] = None,
-    max_workers: int = 3,
-    poll_interval: int = 30,
-    on_file_complete: Optional[Callable[[BatchResult], None]] = None,
-    on_batch_poll: Optional[Callable[[str, str, Any], None]] = None,
-    model: str = "claude-sonnet-5",
-    role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
-    conversion_mode: str = FORMAT_ONLY,
-) -> List[BatchResult]:
-    conversion_mode = validate_conversion_mode(conversion_mode)
-    if not docx_paths:
-        return []
-
-    workers = max(1, min(max_workers, len(docx_paths)))
-    prepared_files: Dict[str, PreparedFile] = {}
-
-    with tempfile.TemporaryDirectory(prefix="phase2_batch_") as tmp_root:
-        tmp_base = Path(tmp_root)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(
-                    _prepare_file_for_batch,
-                    docx_path,
-                    available_roles,
-                    tmp_base,
-                    role_specs,
-                ): docx_path
-                for docx_path in docx_paths
-            }
-            for future in as_completed(futures):
-                prepared = future.result()
-                prepared_files[prepared.file_key] = prepared
-
-        file_bundles = {key: prepared.bundle for key, prepared in prepared_files.items()}
-        requests = build_batch_requests(file_bundles, available_roles, model)
-
-        raw_results = submit_and_poll(
-            requests=requests,
-            api_key=api_key,
-            poll_interval=poll_interval,
-            on_poll=on_batch_poll,
-        )
-
-        try:
-            per_file_classifications = reassemble_file_classifications(raw_results, file_bundles, available_roles)
-        except BatchClassificationError:
-            raise
-
-        results: List[BatchResult] = []
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            if (
-                source_tokens is None
-                and arch_root is None
-                and role_specs is None
-                and conversion_mode == FORMAT_ONLY
-            ):
-                futures = {
-                    executor.submit(
-                        _apply_batch_result,
-                        prepared,
-                        per_file_classifications[file_key],
-                        arch_registry,
-                        env_registry,
-                        arch_styles_xml,
-                        output_dir,
-                        available_roles=available_roles,
-                    ): file_key
-                    for file_key, prepared in prepared_files.items()
-                }
-            else:
-                futures = {
-                    executor.submit(
-                        _apply_batch_result,
-                        prepared,
-                        per_file_classifications[file_key],
-                        arch_registry,
-                        env_registry,
-                        arch_styles_xml,
-                        output_dir,
-                        source_tokens,
-                        arch_root,
-                        role_specs,
-                        conversion_mode,
-                        available_roles,
-                    ): file_key
-                    for file_key, prepared in prepared_files.items()
-                }
-            for future in as_completed(futures):
-                result = future.result()
-                results.append(result)
-                if on_file_complete:
-                    on_file_complete(result)
-
-        return sorted(results, key=lambda item: item.filename)
 
 
 def _build_file_key(docx_path: Path) -> str:
