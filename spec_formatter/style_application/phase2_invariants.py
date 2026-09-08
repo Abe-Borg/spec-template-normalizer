@@ -109,8 +109,18 @@ def _verify_format_only_body_invariants(
             f"({len(source_blocks)} -> {len(output_blocks)})"
         )
 
-    source_text = [paragraph_text_from_block(block) for block in source_blocks]
-    output_text = [paragraph_text_from_block(block) for block in output_blocks]
+    # Identical XML has identical visible text; extract only where the
+    # paragraph changed.
+    source_text: List[str] = []
+    output_text: List[str] = []
+    for source_block, output_block in zip(source_blocks, output_blocks):
+        if source_block == output_block:
+            text = paragraph_text_from_block(source_block)
+            source_text.append(text)
+            output_text.append(text)
+        else:
+            source_text.append(paragraph_text_from_block(source_block))
+            output_text.append(paragraph_text_from_block(output_block))
     if source_text != output_text:
         changed = next(
             idx
@@ -1145,6 +1155,11 @@ def verify_phase2_invariants(
     for paragraph_index, (before_paragraph, after_paragraph) in enumerate(
         zip(before_paragraphs, after_paragraphs)
     ):
+        if before_paragraph == after_paragraph:
+            # Byte-identical paragraphs cannot have lost run formatting;
+            # skipping them removes most of the verification cost on large
+            # targets where only classified paragraphs change.
+            continue
         allowed_properties = rpr_contract.get(paragraph_index, set())
         _verify_contracted_rpr_deletions_only(
             before_paragraph,

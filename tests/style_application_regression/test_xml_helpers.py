@@ -373,3 +373,34 @@ class TestParagraphNumprFromBlock:
             '</w:pPr></w:pPrChange></w:pPr></w:p>'
         )
         assert paragraph_numpr_from_block(p) == {"numId": "5", "ilvl": "1"}
+
+
+def test_element_mention_precheck_matches_the_structural_scanner():
+    from spec_formatter.style_application.core.xml_helpers import (
+        element_is_mentioned,
+        iter_element_xml_blocks,
+        paragraph_text_from_block,
+        strip_out_of_scope_subtrees,
+    )
+
+    plain = "<w:p><w:pPr><w:pStyle w:val=\"Body\"/></w:pPr><w:r><w:t>Plain text</w:t></w:r></w:p>"
+    with_drawing = (
+        "<w:p><w:r><w:drawing><w:txbxContent><w:p><w:r><w:t>BOX</w:t></w:r></w:p>"
+        "</w:txbxContent></w:drawing><w:t>Host</w:t></w:r></w:p>"
+    )
+    lookalike = "<w:p><w:r><w:drawingX/><w:t>Not a drawing</w:t></w:r></w:p>"
+
+    assert element_is_mentioned(plain, "w:drawing") is False
+    assert element_is_mentioned(with_drawing, "w:drawing") is True
+    assert element_is_mentioned(lookalike, "w:drawing") is False
+    assert element_is_mentioned("<w:p><w:pPrChange w:id=\"1\"/></w:p>", "w:pPrChange") is True
+    # ``<w:p`` must not be mistaken for ``<w:pPr`` and vice versa.
+    assert element_is_mentioned("<w:pPr/>", "w:p") is False
+
+    assert list(iter_element_xml_blocks(lookalike, "w:drawing")) == []
+    assert strip_out_of_scope_subtrees(plain) == plain
+    assert strip_out_of_scope_subtrees(lookalike) == lookalike
+    assert "BOX" not in strip_out_of_scope_subtrees(with_drawing)
+    assert paragraph_text_from_block(with_drawing) == "Host"
+    assert paragraph_text_from_block(plain) == "Plain text"
+

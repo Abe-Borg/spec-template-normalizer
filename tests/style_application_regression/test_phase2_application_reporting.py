@@ -879,3 +879,29 @@ def test_explicitly_ignored_paragraph_is_byte_exact(tmp_path):
     )[0]
     assert ignored_after == ignored_before
     assert report.ignored == 1
+
+
+def test_body_text_is_re_extracted_only_for_modified_paragraphs(tmp_path, monkeypatch):
+    from spec_formatter.style_application.core import classification as cls
+
+    extract = _seed_extract(tmp_path, STYLE_WITH_PPR)
+    real = cls.paragraph_text_from_block
+    calls = {"count": 0}
+
+    def counting(block):
+        calls["count"] += 1
+        return real(block)
+
+    monkeypatch.setattr(cls, "paragraph_text_from_block", counting)
+
+    apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+    )
+
+    # Two paragraphs extracted before application; only the classified one
+    # again afterwards (the untouched block is the same object).
+    assert calls["count"] == 3
+

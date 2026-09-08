@@ -722,3 +722,31 @@ def test_shared_body_and_shell_style_gets_distinct_safe_clones(tmp_path):
     assert "<w:numPr" not in body
     assert '<w:spacing w:before="120"' in body
     assert "<w:b" in body  # inherited run formatting was materialized before detach
+
+
+def test_style_block_index_handles_self_closing_styles_and_duplicates():
+    from spec_formatter.style_application.core.style_import import (
+        _extract_style_block,
+        _find_style_numpr_in_chain,
+        _style_block_index,
+    )
+
+    styles = (
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Normal"/>'
+        '<w:style w:type="paragraph" w:styleId="Base"><w:pPr><w:numPr>'
+        '<w:ilvl w:val="2"/><w:numId w:val="5"/></w:numPr></w:pPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Child"><w:basedOn w:val="Base"/></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Base"><w:name w:val="duplicate"/></w:style>'
+        "</w:styles>"
+    )
+
+    index = _style_block_index(styles)
+    assert set(index) == {"Normal", "Base", "Child"}
+    assert index["Normal"] == '<w:style w:type="paragraph" w:styleId="Normal"/>'
+    assert "<w:numPr>" in index["Base"]  # first occurrence wins
+    assert _extract_style_block(styles, "Child") == index["Child"]
+    assert _extract_style_block(styles, "Missing") is None
+    assert '<w:numId w:val="5"/>' in _find_style_numpr_in_chain(styles, "Child")
+    assert _find_style_numpr_in_chain(styles, "Normal") is None
+

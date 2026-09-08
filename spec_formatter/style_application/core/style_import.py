@@ -6,6 +6,7 @@ property materialization for cross-document portability.
 """
 
 import hashlib
+import functools
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -94,13 +95,33 @@ def _make_format_only_body_style_self_contained(style_block: str) -> str:
         out = re.sub(rf"<w:{tag}\b[^>]*>[\s\S]*?</w:{tag}>", "", out, flags=re.S)
     return out
 
+_STYLE_ID_ATTR_RE = re.compile(r'<w:style\b[^>]*?\sw:styleId="([^"]+)"')
+
+
+@functools.lru_cache(maxsize=16)
+def _style_block_index(styles_xml_text: str) -> Dict[str, str]:
+    """Every ``w:style`` block keyed by styleId, built in one structural pass.
+
+    Cached on the styles text itself: a formatting run reads the same
+    ``styles.xml`` string thousands of times (once per paragraph per basedOn
+    hop), and re-scanning it with a regex each time was the engine's
+    second-largest cost. The scan is structure-aware, so a self-closing
+    ``<w:style .../>`` cannot swallow the block that follows it. The first
+    occurrence of a duplicated ID wins, matching the old ``re.search``.
+    """
+
+    from .xml_helpers import iter_element_xml_blocks
+
+    index: Dict[str, str] = {}
+    for _start, _end, block in iter_element_xml_blocks(styles_xml_text, "w:style"):
+        match = _STYLE_ID_ATTR_RE.match(block)
+        if match is not None:
+            index.setdefault(match.group(1), block)
+    return index
+
+
 def _extract_style_block(styles_xml_text: str, style_id: str) -> Optional[str]:
-    m = re.search(
-        rf'(<w:style\b[^>]*w:styleId="{re.escape(style_id)}"[\s\S]*?</w:style>)',
-        styles_xml_text,
-        flags=re.S
-    )
-    return m.group(1) if m else None
+    return _style_block_index(styles_xml_text).get(style_id)
 
 def _extract_basedOn(style_block: str) -> Optional[str]:
     m = re.search(r'<w:basedOn\b[^>]*w:val="([^"]+)"', style_block)
@@ -110,6 +131,7 @@ def _extract_numpr_block(style_block: str) -> Optional[str]:
     m = re.search(r'(<w:numPr\b[^>]*>[\s\S]*?</w:numPr>)', style_block, flags=re.S)
     return m.group(1) if m else None
 
+@functools.lru_cache(maxsize=8192)
 def _find_style_numpr_in_chain(styles_xml_text: str, style_id: str, max_hops: int = 50) -> Optional[str]:
     seen = set()
     cur = style_id

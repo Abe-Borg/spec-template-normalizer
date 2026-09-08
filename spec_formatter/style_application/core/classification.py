@@ -3,6 +3,7 @@ Phase 2 classification: applying LLM classifications to paragraphs,
 building slim bundles for LLM input, and boilerplate filtering.
 """
 
+import functools
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -1450,12 +1451,13 @@ def _resolve_application_policy(
     return policy
 
 
-def _style_replacement_properties(
-    styles_xml_text: str,
-    style_id: str,
-    property_container: str,
-) -> Set[str]:
-    """Return WML properties supplied anywhere in a style's basedOn chain."""
+@functools.lru_cache(maxsize=16)
+def _parsed_style_elements(styles_xml_text: str) -> Dict[str, "ET.Element"]:
+    """``styles.xml`` parsed once per distinct text and keyed by styleId.
+
+    Replacement-property resolution used to re-parse the whole part for every
+    replacement style; the parsed map is read-only afterwards.
+    """
 
     try:
         styles_root = parse_untrusted_xml(styles_xml_text, "word/styles.xml")
@@ -1463,11 +1465,21 @@ def _style_replacement_properties(
         raise ValueError(
             "Could not parse styles.xml while resolving replacement properties"
         ) from exc
-    style_map = {
+    return {
         style_element.attrib.get(_wq("styleId")): style_element
         for style_element in styles_root.findall(_wq("style"))
         if style_element.attrib.get(_wq("styleId"))
     }
+
+
+def _style_replacement_properties(
+    styles_xml_text: str,
+    style_id: str,
+    property_container: str,
+) -> Set[str]:
+    """Return WML properties supplied anywhere in a style's basedOn chain."""
+
+    style_map = _parsed_style_elements(styles_xml_text)
     properties: Set[str] = set()
     visited: Set[str] = set()
     current = style_id
@@ -1616,6 +1628,9 @@ def apply_phase2_classifications(
 
     blocks = list(iter_paragraph_xml_blocks(doc_text))
     para_blocks = [b[2] for b in blocks]
+    # Kept by identity: a block object that is still the original needs no
+    # second text extraction when the body-text invariant is checked.
+    original_blocks = list(para_blocks)
 
     report = ApplyReport(requested=0)
 
@@ -1913,7 +1928,10 @@ def apply_phase2_classifications(
             )
 
     if application_policy.preserve_target_numbering:
-        text_after = [paragraph_text_from_block(p) for p in para_blocks]
+        text_after = [
+            text_before[idx] if p is original_blocks[idx] else paragraph_text_from_block(p)
+            for idx, p in enumerate(para_blocks)
+        ]
         if text_before != text_after:
             changed = next(
                 idx
