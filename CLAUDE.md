@@ -53,6 +53,8 @@ spec_formatter/pipeline.py
     canonical public orchestration, profile cache, isolated runs, manifests
 spec_formatter/diagnostics.py
     thread-safe, redaction-safe structured diagnostics recorder and rollup
+spec_formatter/resources.py
+    one root for shipped prompts and notices (sys._MEIPASS when frozen)
 spec_formatter/template_analysis.py
     namespaced facade over architect analysis and bundle validation
 spec_formatter/style_application/

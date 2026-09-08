@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from . import __version__ as APPLICATION_VERSION
 from . import diagnostics as diag
 from . import template_analysis
+from .resources import TARGET_PROMPT_FILES, architect_prompt_dir, target_prompt_dir
 from .style_application.batch_runner import (
     BatchResult,
     SharedConfig,
@@ -560,7 +561,7 @@ def prepare_template_profile(
     effective_prompt_dir = (
         Path(prompt_dir).resolve()
         if prompt_dir is not None
-        else Path(__file__).resolve().parents[1]
+        else architect_prompt_dir()
     )
 
     # Injected classifiers are primarily an offline/test extension. Their
@@ -902,9 +903,9 @@ def _sha256_text_file(path: Path) -> Optional[str]:
 
 
 def _target_prompt_fingerprints() -> dict[str, str]:
-    prompt_root = Path(__file__).parent / "style_application" / "core" / "prompts"
+    prompt_root = target_prompt_dir()
     fingerprints: dict[str, str] = {}
-    for filename in ("phase2_master_prompt.txt", "phase2_run_instruction.txt"):
+    for filename in TARGET_PROMPT_FILES:
         digest = _sha256_text_file(prompt_root / filename)
         if digest is not None:
             fingerprints[f"{Path(filename).stem}_sha256"] = digest

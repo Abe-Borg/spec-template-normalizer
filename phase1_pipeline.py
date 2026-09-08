@@ -31,6 +31,7 @@ from llm_classifier import (
     compute_coverage,
 )
 from paragraph_rules import is_classifiable_paragraph
+from spec_formatter.resources import architect_prompt_dir
 from phase1_bundle import (
     BundleArtifacts,
     ProducerIdentity,
@@ -150,7 +151,7 @@ def run_phase1(
     if not output_root.is_dir():
         raise NotADirectoryError(f"Output root is not a directory: {output_root}")
 
-    prompt_dir = Path(prompt_dir) if prompt_dir is not None else Path(__file__).resolve().parent
+    prompt_dir = Path(prompt_dir) if prompt_dir is not None else architect_prompt_dir()
     master_prompt = load_prompt_file(prompt_dir / "master_prompt.txt")
     run_instruction = load_prompt_file(prompt_dir / "run_instruction_prompt.txt")
     classifier_is_injected = classifier is not None

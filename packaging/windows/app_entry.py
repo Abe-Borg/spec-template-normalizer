@@ -50,25 +50,35 @@ def _print_version() -> int:
 def _check_prompt_resources() -> None:
     """Prove the frozen bundle can read every prompt the pipeline needs.
 
-    The architect prompts are shipped as data files next to the frozen
-    package and the phase-2 prompts are module constants loaded from package
-    data at import time. A build that imports cleanly but cannot find them
+    The architect prompts are shipped as data files at the bundle root and
+    the phase-2 prompts as package data; both are resolved through
+    ``spec_formatter.resources`` (``sys._MEIPASS`` in the frozen app), the
+    same helper the pipeline uses, so this check exercises the real
+    resolution path. A build that imports cleanly but cannot find them
     would only fail on the user's first real run, so read them here.
     """
 
-    from pathlib import Path
-
     import phase1_pipeline
+    from spec_formatter import resources
     from spec_formatter.style_application.core import classification
 
-    prompt_root = Path(phase1_pipeline.__file__).resolve().parent
-    for filename in ("master_prompt.txt", "run_instruction_prompt.txt"):
-        text = phase1_pipeline.load_prompt_file(prompt_root / filename)
+    if not resources.is_frozen():
+        raise RuntimeError("Self-check is running outside a PyInstaller bundle")
+    for filename in resources.ARCHITECT_PROMPT_FILES:
+        text = phase1_pipeline.load_prompt_file(
+            resources.architect_prompt_dir() / filename
+        )
         if not text.strip():
             raise RuntimeError(f"Bundled prompt file is empty: {filename}")
+    for filename in resources.TARGET_PROMPT_FILES:
+        if not (resources.target_prompt_dir() / filename).is_file():
+            raise RuntimeError(f"Bundled phase-2 prompt file is missing: {filename}")
     for name in ("PHASE2_MASTER_PROMPT", "PHASE2_RUN_INSTRUCTION"):
         if not str(getattr(classification, name, "")).strip():
             raise RuntimeError(f"Phase-2 prompt constant is empty: {name}")
+    for filename in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+        if not resources.resource_path(filename).is_file():
+            raise RuntimeError(f"Bundled notice file is missing: {filename}")
 
 
 def _selfcheck() -> int:

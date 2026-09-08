@@ -17,6 +17,7 @@ from spec_formatter.numbering_roles import (
     role_from_numbering_catalog,
     role_from_numbering_signature,
 )
+from spec_formatter.resources import target_prompt_dir
 from spec_formatter.role_contract import BODY_HIERARCHY_ROLES, ROLE_FALLBACKS
 
 from .xml_helpers import (
@@ -44,7 +45,7 @@ from .errors import EngineError
 
 
 def _load_prompt_text(filename: str) -> str:
-    prompt_path = Path(__file__).parent / "prompts" / filename
+    prompt_path = target_prompt_dir() / filename
     return prompt_path.read_text(encoding="utf-8")
 
 

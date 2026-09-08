@@ -13,6 +13,7 @@ them directly. This runbook covers cutting a release.
 | Updater | `spec_formatter/updates.py` | Fetches `latest.json`, compares versions, downloads + SHA-256-verifies the installer, launches it. |
 | GUI wiring | `gui.py` | Footer "Check for Updates" button, daily auto-check on launch, the update dialog. |
 | Frozen entry | `packaging/windows/app_entry.py` | PyInstaller entry point; `--version` / `--selfcheck` flags for CI. |
+| Resource root | `spec_formatter/resources.py` | Resolves the bundled prompts, `LICENSE`, and notices under `sys._MEIPASS` in the frozen app and under the repo root otherwise; the pipeline and `--selfcheck` both use it. |
 | PyInstaller spec | `packaging/windows/specification-formatter.spec` | One-folder build → `dist/SpecificationFormatter/`. |
 | Installer | `packaging/windows/installer.iss` | Inno Setup → `dist/installer/SpecificationFormatterSetup.exe`. |
 | Manifest maker | `packaging/windows/make_manifest.py` | Computes the installer SHA-256 → `latest.json`. |
@@ -53,8 +54,9 @@ release candidates never auto-offer themselves to stable installs.
      here rather than shipping an installer stuck in a perpetual "update
      available" loop);
    - builds the one-folder app with PyInstaller and runs the frozen exe's
-     `--selfcheck` (catches a missing hidden import or an unreadable bundled
-     prompt file before release);
+     `--selfcheck` (catches a missing hidden import or a bundled prompt,
+     `LICENSE`, or notices file that the resource root cannot find, before
+     release);
    - compiles the Inno Setup installer;
    - generates `latest.json` (installer SHA-256 + the download URL);
    - the tag-only `publish` job attaches `SpecificationFormatterSetup.exe` and
