@@ -762,3 +762,20 @@ def test_final_invariant_rejects_rpr_moved_after_run_text(tmp_path):
             conversion_mode="format_only",
             allowed_rpr_properties_by_paragraph={0: {"b"}},
         )
+
+
+def test_duplicate_singleton_document_relationship_fails_validation(tmp_path):
+    docx = tmp_path / "duplicate-theme.docx"
+    parts = _parts()
+    parts["word/_rels/document.xml.rels"] = (
+        f'<Relationships xmlns="{PKG_REL_NS}">'
+        f'<Relationship Id="rId1" Type="{R_NS}/styles" Target="styles.xml"/>'
+        f'<Relationship Id="rId2" Type="{R_NS}/numbering" Target="numbering.xml"/>'
+        f'<Relationship Id="rId3" Type="{R_NS}/styles" Target="styles.xml"/>'
+        "</Relationships>"
+    )
+    _write_docx(docx, parts)
+
+    with pytest.raises(Exception, match="duplicate styles relationship \\(rId1 and rId3\\)"):
+        validate_docx_package(docx)
+

@@ -350,6 +350,18 @@ def _resolve_relationship_target(owner_part: str, target: str) -> Optional[str]:
     return resolved
 
 
+# Word allows at most one of each of these relationships from the main
+# document part; a second one is what a string-appended wiring step produces
+# when it fails to see an existing entry.
+_SINGLETON_DOCUMENT_RELATIONSHIP_TYPES = {
+    f"{R_NS}/theme": "theme",
+    f"{R_NS}/settings": "settings",
+    f"{R_NS}/numbering": "numbering",
+    f"{R_NS}/styles": "styles",
+    f"{R_NS}/fontTable": "fontTable",
+}
+
+
 def validate_docx_package(docx_path: Path) -> None:
     """Fail closed when an emitted DOCX has broken OPC or Word references."""
     errors: List[str] = []
@@ -461,11 +473,24 @@ def validate_docx_package(docx_path: Path) -> None:
                     errors.append(f"{rels_name}: invalid Relationships root")
                     continue
                 seen_ids: set[str] = set()
+                seen_singleton_types: Dict[str, str] = {}
                 for rel in list(root):
                     if rel.tag != f"{{{PKG_REL_NS}}}Relationship":
                         errors.append(f"{rels_name}: unsupported relationship element")
                         continue
                     rid = rel.attrib.get("Id", "")
+                    if rels_name == "word/_rels/document.xml.rels":
+                        singleton = _SINGLETON_DOCUMENT_RELATIONSHIP_TYPES.get(
+                            rel.attrib.get("Type", "")
+                        )
+                        if singleton is not None:
+                            if singleton in seen_singleton_types:
+                                errors.append(
+                                    f"{rels_name}: duplicate {singleton} relationship "
+                                    f"({seen_singleton_types[singleton]} and {rid})"
+                                )
+                            else:
+                                seen_singleton_types[singleton] = rid
                     rel_type = rel.attrib.get("Type", "")
                     target = rel.attrib.get("Target", "")
                     target_mode = rel.attrib.get("TargetMode")

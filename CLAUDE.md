@@ -330,8 +330,16 @@ DOCX input and relationship metadata are untrusted.
   through `core/untrusted_xml.parse_untrusted_xml()`, which also wraps parse
   errors with the part name. Never call `ET.fromstring` on package bytes
   directly.
-- Header/footer media limits: 16 MiB per asset and 64 MiB total.
-- Preserve content types from `[Content_Types].xml` where available.
+- Header/footer media limits: 16 MiB per asset and 64 MiB total. They are
+  enforced in shared-profile preflight and again at the write site in
+  `header_footer_importer._write_hf_parts`; only the `data_base64` payload
+  key is accepted, decoded with strict base64 validation.
+- Preserve content types from `[Content_Types].xml` where available. Content
+  types and document relationships are wired by parsing the part (matching
+  `Override` part names case-insensitively and relationships by Type URI) and
+  re-serializing it, never by string insertion before a closing tag. The final
+  package validator rejects a second theme, settings, numbering, styles, or
+  fontTable relationship from the main document part.
 
 Any new extractor must have adversarial tests for containment, external targets, malformed XML, symlinks/reparse behavior, and size bounds.
 

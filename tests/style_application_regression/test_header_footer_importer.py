@@ -66,7 +66,7 @@ def test_import_headers_footers_replaces_parts_and_refs(tmp_path):
                     "media": [
                         {
                             "path": "media/logo.png",
-                            "content_base64": base64.b64encode(b"png").decode("ascii"),
+                            "data_base64": base64.b64encode(b"png").decode("ascii"),
                         }
                     ],
                 }
@@ -155,7 +155,7 @@ def test_hf_media_import_does_not_overwrite_existing_body_media(tmp_path):
                 "rid": "rId10",
                 "xml": '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
                 "rels_xml": '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>',
-                "media": [{"path": "media/image1.png", "content_base64": base64.b64encode(b"header").decode("ascii")}],
+                "media": [{"path": "media/image1.png", "data_base64": base64.b64encode(b"header").decode("ascii")}],
             }]
         },
         "page_layout": {"default_section": {"header_refs": {"default": "rId10"}}},
@@ -183,7 +183,7 @@ def test_hf_media_allocation_is_case_insensitive(tmp_path):
                 "xml": '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
                 "media": [{
                     "path": "media/logo.png",
-                    "content_base64": base64.b64encode(payload).decode("ascii"),
+                    "data_base64": base64.b64encode(payload).decode("ascii"),
                 }],
             }],
         },
@@ -228,7 +228,7 @@ def test_conflicting_image_mime_uses_override_without_duplicate_default(tmp_path
                     "rel_id": "rIdImage",
                     "target": "media/logo.png",
                     "content_type": "image/x-custom-png",
-                    "content_base64": base64.b64encode(b"custom").decode("ascii"),
+                    "data_base64": base64.b64encode(b"custom").decode("ascii"),
                 }],
             }],
         },
@@ -1212,4 +1212,73 @@ def test_residual_number_postcondition_guards_the_write(tmp_path, monkeypatch):
         )
 
     assert footer.read_bytes() == original
+
+
+def _media_registry(media_items):
+    return {
+        "headers_footers": {
+            "headers": [
+                {
+                    "part_name": "word/header1.xml",
+                    "rid": "rId10",
+                    "xml": '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>',
+                    "media": media_items,
+                }
+            ],
+        },
+        "page_layout": {"default_section": {"header_refs": {"default": "rId10"}}},
+    }
+
+
+def test_media_write_site_rejects_invalid_base64(tmp_path):
+    extract = _seed_extract(tmp_path)
+    registry = _media_registry([{"path": "media/logo.png", "data_base64": "not base64!!"}])
+
+    with pytest.raises(ValueError, match="invalid base64"):
+        import_headers_footers(extract, registry, [])
+
+
+def test_media_write_site_ignores_legacy_payload_keys(tmp_path):
+    # Only data_base64 is validated by shared-profile preflight, so any other
+    # spelling must not become a way to smuggle bytes past its limits.
+    extract = _seed_extract(tmp_path)
+    registry = _media_registry(
+        [{"path": "media/logo.png", "content_base64": base64.b64encode(b"png").decode("ascii")}]
+    )
+
+    result = import_headers_footers(extract, registry, [])
+
+    assert result.media_names == set()
+    media_dir = extract / "word" / "media"
+    assert not media_dir.exists() or not any(media_dir.iterdir())
+
+
+def test_media_write_site_enforces_per_asset_limit(tmp_path, monkeypatch):
+    from spec_formatter.style_application import header_footer_importer as hf
+
+    monkeypatch.setattr(hf, "MAX_HEADER_FOOTER_MEDIA_BYTES", 8)
+    extract = _seed_extract(tmp_path)
+    registry = _media_registry(
+        [{"path": "media/logo.png", "data_base64": base64.b64encode(b"x" * 9).decode("ascii")}]
+    )
+
+    with pytest.raises(ValueError, match="media limit|limit is 8 bytes"):
+        import_headers_footers(extract, registry, [])
+    assert not (extract / "word" / "media" / "logo.png").exists()
+
+
+def test_media_write_site_enforces_running_total_limit(tmp_path, monkeypatch):
+    from spec_formatter.style_application import header_footer_importer as hf
+
+    monkeypatch.setattr(hf, "MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES", 10)
+    extract = _seed_extract(tmp_path)
+    registry = _media_registry(
+        [
+            {"path": "media/a.png", "data_base64": base64.b64encode(b"x" * 6).decode("ascii")},
+            {"path": "media/b.png", "data_base64": base64.b64encode(b"y" * 6).decode("ascii")},
+        ]
+    )
+
+    with pytest.raises(ValueError, match="total 10-byte limit"):
+        import_headers_footers(extract, registry, [])
 

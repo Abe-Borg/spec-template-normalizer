@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import html
 import posixpath
@@ -18,6 +19,10 @@ from .core.ooxml_namespaces import (
     serialize_package_relationships,
 )
 from .core.ooxml_text import prepare_xml_text_for_utf8, read_xml_text
+from .core.registry import (
+    MAX_HEADER_FOOTER_MEDIA_BYTES,
+    MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES,
+)
 from .core.opc_paths import (
     is_safe_package_part_name,
     relationship_part_name_for_owner,
@@ -93,11 +98,28 @@ def _resolve_media_filename(media_item: Dict[str, Any]) -> str | None:
 
 
 def _resolve_media_bytes(media_item: Dict[str, Any]) -> bytes | None:
-    for key in ("content_base64", "base64", "data", "data_base64"):
-        val = media_item.get(key)
-        if isinstance(val, str) and val:
-            return base64.b64decode(val)
-    return None
+    """Decode the one captured media payload key, strictly.
+
+    The extractor writes ``data_base64`` and shared-profile preflight validates
+    only that key, so accepting other spellings here would let a payload skip
+    every preflight limit. Non-strict base64 is rejected as well.
+    """
+
+    val = media_item.get("data_base64")
+    if val is None:
+        return None
+    if not isinstance(val, str) or not val:
+        raise ValueError("Captured header/footer media data_base64 must be a non-empty string")
+    max_encoded_size = 4 * ((MAX_HEADER_FOOTER_MEDIA_BYTES + 2) // 3)
+    if len(val) > max_encoded_size:
+        raise ValueError(
+            "Captured header/footer media exceeds the "
+            f"{MAX_HEADER_FOOTER_MEDIA_BYTES}-byte decoded media limit"
+        )
+    try:
+        return base64.b64decode(val, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Captured header/footer media is invalid base64: {exc}") from exc
 
 
 def _remove_existing_hf_files(
@@ -271,6 +293,9 @@ def _write_hf_parts(
     written_media: set[str] = {
         p.name.casefold() for p in media_out.iterdir() if p.is_file()
     } if media_out.exists() else set()
+    # The same limits shared-profile preflight enforces, re-checked at the
+    # write site so no bytes reach the target package unless they pass here.
+    total_media_bytes = 0
 
     for kind, entry in entries:
         part_name = entry.get("part_name")
@@ -321,6 +346,17 @@ def _write_hf_parts(
             payload = _resolve_media_bytes(media_item)
             if not filename or payload is None:
                 continue
+            if len(payload) > MAX_HEADER_FOOTER_MEDIA_BYTES:
+                raise ValueError(
+                    f"Captured media in {part_name} decodes to {len(payload)} bytes; "
+                    f"limit is {MAX_HEADER_FOOTER_MEDIA_BYTES} bytes"
+                )
+            total_media_bytes += len(payload)
+            if total_media_bytes > MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES:
+                raise ValueError(
+                    "Captured header/footer media exceeds the total "
+                    f"{MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES}-byte limit"
+                )
             new_name = _allocate_unique_media_name(part_name, idx, filename, payload, written_media)
             media_part_name = f"word/media/{new_name}"
             out_rel = relationship_target_for_part(part_name, media_part_name)

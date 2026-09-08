@@ -472,3 +472,87 @@ class TestApplyFontTableValidation:
         apply_font_table(extract, registry, log)
 
         assert not any("WARNING" in m and "malformed" in m for m in log)
+
+
+# ---------------------------------------------------------------------------
+# Part D — parsed content-type and relationship wiring
+# ---------------------------------------------------------------------------
+
+from spec_formatter.style_application.arch_env_applier import (  # noqa: E402
+    _ensure_theme_in_content_types,
+    _ensure_theme_in_rels,
+)
+
+
+class TestParsedPlumbingWiring:
+    def test_existing_override_is_matched_case_insensitively(self, tmp_path):
+        extract = _setup_extract_dir(tmp_path)
+        ct_path = extract / "[Content_Types].xml"
+        ct_path.write_text(
+            _CONTENT_TYPES_XML.replace(
+                "</Types>",
+                '<Override PartName="/WORD/THEME/Theme1.XML" '
+                'ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/></Types>',
+            ),
+            encoding="utf-8",
+        )
+        log = []
+
+        _ensure_theme_in_content_types(extract, log)
+
+        ct = ct_path.read_text(encoding="utf-8")
+        assert ct.count("theme+xml") == 1
+        assert log == []
+
+    def test_existing_relationship_is_matched_by_type_uri(self, tmp_path):
+        extract = _setup_extract_dir(tmp_path)
+        rels_path = extract / "word" / "_rels" / "document.xml.rels"
+        rels_path.write_text(
+            _RELS_XML.replace(
+                "</Relationships>",
+                '<Relationship Id="rId9" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" '
+                'Target="theme/custom-theme.xml"/></Relationships>',
+            ),
+            encoding="utf-8",
+        )
+        log = []
+
+        _ensure_theme_in_rels(extract, log)
+
+        rels = rels_path.read_text(encoding="utf-8")
+        assert rels.count("relationships/theme") == 1
+        assert log == []
+
+    def test_appended_entries_are_prefix_free_and_parseable(self, tmp_path):
+        import xml.etree.ElementTree as ET
+
+        extract = _setup_extract_dir(tmp_path)
+        log = []
+
+        _ensure_theme_in_content_types(extract, log)
+        _ensure_theme_in_rels(extract, log)
+
+        ct = (extract / "[Content_Types].xml").read_text(encoding="utf-8")
+        rels = (extract / "word" / "_rels" / "document.xml.rels").read_text(encoding="utf-8")
+        assert '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' in ct
+        assert '<Override PartName="/word/theme/theme1.xml"' in ct
+        assert '<Relationship Id="rId2" ' in rels
+        assert "ns0" not in ct and "ns0" not in rels
+        ET.fromstring(ct.encode("utf-8"))
+        ET.fromstring(rels.encode("utf-8"))
+        assert log == [
+            "Added theme1.xml to [Content_Types].xml",
+            "Added theme relationship (rId2) to document.xml.rels",
+        ]
+
+    def test_doctype_in_content_types_is_rejected(self, tmp_path):
+        extract = _setup_extract_dir(tmp_path)
+        (extract / "[Content_Types].xml").write_text(
+            '<!DOCTYPE Types [<!ENTITY x "y">]>' + _CONTENT_TYPES_XML,
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="DOCTYPE/ENTITY"):
+            _ensure_theme_in_content_types(extract, [])
+

@@ -39,8 +39,18 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import xml.etree.ElementTree as ET
+
 from .core.registry import _check_xml_fragment
-from .core.ooxml_text import read_xml_text, write_xml_text
+from .core.ooxml_namespaces import (
+    CT_NS,
+    PKG_REL_NS,
+    R_NS,
+    serialize_content_types,
+    serialize_package_relationships,
+)
+from .core.ooxml_text import prepare_xml_text_for_utf8, read_xml_text, write_xml_text
+from .core.untrusted_xml import parse_untrusted_xml
 from .core.section_mapping import choose_section_sources
 from .core.sectpr_tools import (
     CANONICAL_SECTPR_ORDER,
@@ -171,57 +181,115 @@ def apply_theme(
     
     write_xml_text(theme_path, theme_xml)
 
-def _ensure_theme_in_content_types(extract_dir: Path, log: List[str]) -> None:
-    """Ensure [Content_Types].xml has an entry for theme1.xml."""
+_CT_OVERRIDE_TYPES = {
+    "/word/theme/theme1.xml": "application/vnd.openxmlformats-officedocument.theme+xml",
+    "/word/settings.xml": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"
+    ),
+    "/word/fontTable.xml": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"
+    ),
+}
+_DOCUMENT_REL_TYPES = {
+    "theme/theme1.xml": f"{R_NS}/theme",
+    "settings.xml": f"{R_NS}/settings",
+    "fontTable.xml": f"{R_NS}/fontTable",
+}
+
+
+def _ensure_override_in_content_types(
+    extract_dir: Path,
+    part_name: str,
+    log: List[str],
+    label: str,
+) -> None:
+    """Ensure [Content_Types].xml carries an Override for ``part_name``.
+
+    The part is parsed (DOCTYPE-safe), matched case-insensitively on
+    ``PartName`` as OPC consumers do, appended through ElementTree, and
+    written back with the prefix-stable content-types serializer, so this
+    no longer depends on the file's exact spelling of ``</Types>`` or on
+    which importer last rewrote it.
+    """
+
     ct_path = extract_dir / "[Content_Types].xml"
     if not ct_path.exists():
         return
-    
     ct_xml = read_xml_text(ct_path)
-    
-    # Check if theme override already exists
-    if 'PartName="/word/theme/theme1.xml"' in ct_xml:
+    if not ct_xml.strip():
         return
-    
-    # Add override for theme
-    theme_override = (
-        '<Override PartName="/word/theme/theme1.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>'
+    root = parse_untrusted_xml(prepare_xml_text_for_utf8(ct_xml), "[Content_Types].xml")
+    if root.tag != f"{{{CT_NS}}}Types":
+        raise ValueError("Invalid [Content_Types].xml root element")
+    wanted = part_name.casefold()
+    for node in root.findall(f"{{{CT_NS}}}Override"):
+        if node.attrib.get("PartName", "").casefold() == wanted:
+            return
+    ET.SubElement(
+        root,
+        f"{{{CT_NS}}}Override",
+        {"PartName": part_name, "ContentType": _CT_OVERRIDE_TYPES[part_name]},
     )
-    
-    # Insert before </Types>
-    if "</Types>" in ct_xml:
-        ct_xml = ct_xml.replace("</Types>", f"  {theme_override}\n</Types>")
-        write_xml_text(ct_path, ct_xml)
-        log.append("Added theme1.xml to [Content_Types].xml")
+    ct_path.write_bytes(serialize_content_types(root))
+    log.append(f"Added {label} to [Content_Types].xml")
 
-def _ensure_theme_in_rels(extract_dir: Path, log: List[str]) -> None:
-    """Ensure word/_rels/document.xml.rels has a relationship for theme."""
+
+def _ensure_relationship_in_document_rels(
+    extract_dir: Path,
+    target: str,
+    log: List[str],
+    label: str,
+) -> None:
+    """Ensure word/_rels/document.xml.rels relates the document to ``target``.
+
+    Matching is by relationship Type URI (the canonical identity of the
+    part), not by a quoted substring of the Target attribute.
+    """
+
     rels_path = extract_dir / "word" / "_rels" / "document.xml.rels"
     if not rels_path.exists():
         return
-    
     rels_xml = read_xml_text(rels_path)
-    
-    # Check if theme relationship exists
-    if 'Target="theme/theme1.xml"' in rels_xml:
+    if not rels_xml.strip():
         return
-    
-    # Find highest rId
-    rids = re.findall(r'Id="rId(\d+)"', rels_xml)
-    max_rid = max(int(r) for r in rids) if rids else 0
-    new_rid = f"rId{max_rid + 1}"
-    
-    theme_rel = (
-        f'<Relationship Id="{new_rid}" '
-        f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" '
-        f'Target="theme/theme1.xml"/>'
+    root = parse_untrusted_xml(
+        prepare_xml_text_for_utf8(rels_xml),
+        "word/_rels/document.xml.rels",
     )
-    
-    if "</Relationships>" in rels_xml:
-        rels_xml = rels_xml.replace("</Relationships>", f"  {theme_rel}\n</Relationships>")
-        write_xml_text(rels_path, rels_xml)
-        log.append(f"Added theme relationship ({new_rid}) to document.xml.rels")
+    if root.tag != f"{{{PKG_REL_NS}}}Relationships":
+        raise ValueError("Invalid document.xml.rels root element")
+    rel_type = _DOCUMENT_REL_TYPES[target]
+    relationships = root.findall(f"{{{PKG_REL_NS}}}Relationship")
+    if any(node.attrib.get("Type", "") == rel_type for node in relationships):
+        return
+    existing_ids = {node.attrib.get("Id", "") for node in relationships}
+    numeric_rids = [
+        int(match.group(1))
+        for rid in existing_ids
+        if (match := re.fullmatch(r"rId(\d+)", rid))
+    ]
+    next_rid = (max(numeric_rids) if numeric_rids else 0) + 1
+    while f"rId{next_rid}" in existing_ids:
+        next_rid += 1
+    new_rid = f"rId{next_rid}"
+    ET.SubElement(
+        root,
+        f"{{{PKG_REL_NS}}}Relationship",
+        {"Id": new_rid, "Type": rel_type, "Target": target},
+    )
+    rels_path.write_bytes(serialize_package_relationships(root))
+    log.append(f"Added {label} relationship ({new_rid}) to document.xml.rels")
+
+
+def _ensure_theme_in_content_types(extract_dir: Path, log: List[str]) -> None:
+    """Ensure [Content_Types].xml has an entry for theme1.xml."""
+    _ensure_override_in_content_types(extract_dir, "/word/theme/theme1.xml", log, "theme1.xml")
+
+
+def _ensure_theme_in_rels(extract_dir: Path, log: List[str]) -> None:
+    """Ensure word/_rels/document.xml.rels has a relationship for theme."""
+    _ensure_relationship_in_document_rels(extract_dir, "theme/theme1.xml", log, "theme")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Settings plumbing helpers
@@ -237,50 +305,13 @@ _MINIMAL_SETTINGS_XML = (
 
 def _ensure_settings_in_content_types(extract_dir: Path, log: List[str]) -> None:
     """Ensure [Content_Types].xml has an entry for settings.xml."""
-    ct_path = extract_dir / "[Content_Types].xml"
-    if not ct_path.exists():
-        return
+    _ensure_override_in_content_types(extract_dir, "/word/settings.xml", log, "settings.xml")
 
-    ct_xml = read_xml_text(ct_path)
-
-    if 'PartName="/word/settings.xml"' in ct_xml:
-        return
-
-    settings_override = (
-        '<Override PartName="/word/settings.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>'
-    )
-
-    if "</Types>" in ct_xml:
-        ct_xml = ct_xml.replace("</Types>", f"  {settings_override}\n</Types>")
-        write_xml_text(ct_path, ct_xml)
-        log.append("Added settings.xml to [Content_Types].xml")
 
 def _ensure_settings_in_rels(extract_dir: Path, log: List[str]) -> None:
     """Ensure word/_rels/document.xml.rels has a relationship for settings."""
-    rels_path = extract_dir / "word" / "_rels" / "document.xml.rels"
-    if not rels_path.exists():
-        return
+    _ensure_relationship_in_document_rels(extract_dir, "settings.xml", log, "settings")
 
-    rels_xml = read_xml_text(rels_path)
-
-    if 'Target="settings.xml"' in rels_xml:
-        return
-
-    rids = re.findall(r'Id="rId(\d+)"', rels_xml)
-    max_rid = max(int(r) for r in rids) if rids else 0
-    new_rid = f"rId{max_rid + 1}"
-
-    settings_rel = (
-        f'<Relationship Id="{new_rid}" '
-        f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" '
-        f'Target="settings.xml"/>'
-    )
-
-    if "</Relationships>" in rels_xml:
-        rels_xml = rels_xml.replace("</Relationships>", f"  {settings_rel}\n</Relationships>")
-        write_xml_text(rels_path, rels_xml)
-        log.append(f"Added settings relationship ({new_rid}) to document.xml.rels")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Font table plumbing helpers
@@ -288,50 +319,12 @@ def _ensure_settings_in_rels(extract_dir: Path, log: List[str]) -> None:
 
 def _ensure_font_table_in_content_types(extract_dir: Path, log: List[str]) -> None:
     """Ensure [Content_Types].xml has an entry for fontTable.xml."""
-    ct_path = extract_dir / "[Content_Types].xml"
-    if not ct_path.exists():
-        return
+    _ensure_override_in_content_types(extract_dir, "/word/fontTable.xml", log, "fontTable.xml")
 
-    ct_xml = read_xml_text(ct_path)
-
-    if 'PartName="/word/fontTable.xml"' in ct_xml:
-        return
-
-    font_override = (
-        '<Override PartName="/word/fontTable.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/>'
-    )
-
-    if "</Types>" in ct_xml:
-        ct_xml = ct_xml.replace("</Types>", f"  {font_override}\n</Types>")
-        write_xml_text(ct_path, ct_xml)
-        log.append("Added fontTable.xml to [Content_Types].xml")
 
 def _ensure_font_table_in_rels(extract_dir: Path, log: List[str]) -> None:
     """Ensure word/_rels/document.xml.rels has a relationship for fontTable."""
-    rels_path = extract_dir / "word" / "_rels" / "document.xml.rels"
-    if not rels_path.exists():
-        return
-
-    rels_xml = read_xml_text(rels_path)
-
-    if 'Target="fontTable.xml"' in rels_xml:
-        return
-
-    rids = re.findall(r'Id="rId(\d+)"', rels_xml)
-    max_rid = max(int(r) for r in rids) if rids else 0
-    new_rid = f"rId{max_rid + 1}"
-
-    font_rel = (
-        f'<Relationship Id="{new_rid}" '
-        f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" '
-        f'Target="fontTable.xml"/>'
-    )
-
-    if "</Relationships>" in rels_xml:
-        rels_xml = rels_xml.replace("</Relationships>", f"  {font_rel}\n</Relationships>")
-        write_xml_text(rels_path, rels_xml)
-        log.append(f"Added fontTable relationship ({new_rid}) to document.xml.rels")
+    _ensure_relationship_in_document_rels(extract_dir, "fontTable.xml", log, "fontTable")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Settings/compat application
