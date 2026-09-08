@@ -1,820 +1,462 @@
 # Specification Formatter: implementation and validation handoff
 
-**Prepared:** 2026-09-08  
-**Repository:** `C:\Github-Repos\spec-template-normalizer`  
-**Baseline inspected:** `b66258a`  
-**Status:** Implementation plan; application changes have not been made.  
+**Prepared:** 2026-09-08
+**Revised:** 2026-09-08, after implementation review and reproduction on the supported runtime.
+**Repository:** `spec-template-normalizer`
+**Baseline inspected:** `b66258a`; revision verified against `b156679`
+**Status:** Implementation plan. No application changes have been made.
 **Audience:** Coding agents capable of independent investigation, implementation, adversarial testing, and integration review.
 
-**Reading guide:** Start with sections 1-3 for decisions and invariants. Sections 4-8 specify the initial implementation. Sections 9-11 define conditional optimization work. Sections 12-14 contain integration checks, agent assignments, and required handoff artifacts.
+**Reading guide:** Section 0 records what this revision changed and why. Sections 1-3 hold the decisions, verified evidence, and invariants. Section 4 is the initial deliverable and can be implemented on its own. Sections 5-7 are the conditional follow-on work and the gate that decides whether any of it happens. Sections 8-11 cover integration, working arrangement, and handoff.
 
-## 1. Executive decision and scope
+## 0. What this revision changed
 
-Implement the confirmed XML rejection fix, complete model-usage accounting, correct misleading engineering guidance, and build the evidence needed to make further optimization decisions. Preserve the current document-transformation contracts and model defaults while doing this work.
+The first draft was correct in its findings and wrong in its proportions. It made supporting work mandatory, and its headline W1 recipe omitted a condition that its own detailed requirements supplied. Both are corrected here.
 
-Do not treat the earlier review brief as an approved backlog. Several of its proposals have incomplete correctness arguments, and some suspected problems are already addressed in the implementation. This plan supersedes its recommendations for this work, while retaining its useful architectural context.
+| Area | First draft | This revision | Why |
+|---|---|---|---|
+| W1 design | Decode bytes, scan the decoded text, re-encode, parse | Keep the existing byte prescan and add an Expat `StartDoctypeDeclHandler` validator over the same immutable payload | Decode-first is defeated by BOM-less UTF-16 unless the NUL rule in the old §5.3.4 is also applied; the validator makes rejection encoding-independent by construction instead of by discipline |
+| W1 as replacement | Implied the byte scan would be replaced | Union: nothing is removed | An Expat-only guard silently relaxes declaration-shaped text in comments and CDATA and changes two existing rejection messages; both are verified below |
+| W0 | A separate work package with a baseline report and ownership assignment | Folded into W1 as ordinary verification | One focused fix does not need a preparatory phase |
+| W2 | A complete request ledger across both classifiers | Two items: record architect response usage, and preserve observed usage when either classifier fails | The rest needs a demonstrated purpose |
+| W3 | Build the analyzer and evaluation harness | Gated behind inspecting existing spend first | The draft required evidence before optimizing but not before instrumenting |
+| Corpus | 12-20 documents across several templates | Existing fixtures plus a few representative hard cases | Gold labels need owner adjudication; that is a scheduling commitment, not an agent deliverable |
+| Delegation | Four agents, per-agent report templates, reviewer questionnaire | One implementing agent and an independent review | The coordination machinery was larger than the work it governed |
+| Evidence | Reproduction on Python 3.14.6 / Expat 2.8.1, with a caveat about supported versions | Reproduced on Python 3.11.15 / Expat 2.6.1 | Closes the environment gap in the original investigation |
 
-The initial deliverable is a small series of independently reviewable changes:
+Deferred work is unchanged in substance: W5-W8 remain conditional, and the correctness argument that rejects the review brief's cache key (§7.2) is retained in full.
 
-1. Encoding-independent rejection of prohibited XML declarations at the shared untrusted-parser boundary.
-2. Accurate, privacy-preserving usage accounting for architect and target classification, including unsuccessful work.
-3. Offline workload analysis and an evaluation harness that separates character savings, token savings, dollar estimates, and classification quality.
-4. Documentation and validation updates reflecting the actual implementation and the limits of the evidence.
+## 1. Decision and scope
 
-Payload changes are conditional on evaluation. Target-classification caching, architect-classification replay, model/effort changes, and broader deterministic rules are later decisions, not automatic follow-on implementation tasks.
+Ship the confirmed XML rejection fix first and on its own. Then look at existing spend before building anything to measure it. Then decide on a small accounting patch. Everything else stays conditional.
+
+**Sequence:**
+
+1. **W1 — encoding-independent rejection of prohibited XML declarations.** Independent, self-contained, verified defect. No dependency on anything else in this document.
+2. **Spend inspection.** Read the provider's existing usage reporting for recent real runs. Minutes of work. Decides whether §6 and §7 are worth anything.
+3. **W2 (reduced) — record architect response usage, and preserve observed usage when either classifier fails.** Worth doing for honest run diagnostics regardless of what spend shows, but sized by it.
+4. **W4 — documentation corrections**, alongside whichever of the above ship.
+5. **W3, W5, W6, W7, W8 — conditional.** Implement only against a demonstrated purpose. A measured decision to leave them unimplemented is a complete outcome, not unfinished work.
 
 ### 1.1 Authorization and handoff boundaries
 
-- The owner requested this Markdown plan. Creating this plan does not itself authorize this planning agent to implement application changes.
-- An implementing agent must follow the owner's instructions in its own session. When assigned this plan for implementation, complete the unconditional work without repeatedly asking about routine design choices.
-- Use offline fixtures and fake provider responses by default. Do not infer permission to send private specifications to a provider, incur evaluation charges, publish releases, or merge changes from this document alone. Follow any explicit authorization already supplied by the owner.
-- Do not change the original review brief in Downloads. Preserve it as historical evidence; record corrections in repository documentation or an implementation report.
-- Do not force the historical `claude/magical-mccarthy-3m54f8` branch from the brief. Inspect the actual checkout and follow the owner's current branch instructions. If a new branch is appropriate and no name was requested, use a `codex/` prefix.
-- Do not clean unrelated files. At planning time the checkout contained three existing untracked `.pytest_tmp_header_token_final_edge*` directories. Their presence is not authorization to remove them.
+- Creating or revising this plan does not authorize application changes. An implementing agent follows the owner's instructions in its own session.
+- Use offline fixtures and fake provider responses by default. Do not infer permission to send private specifications to a provider, incur evaluation charges, publish releases, or merge from this document alone.
+- Do not modify the original review brief in Downloads. Preserve it as historical evidence; record corrections here or in an implementation report.
+- Do not clean unrelated files. Untracked `.pytest_tmp_*` directories in a working checkout are not authorization to remove them.
+- Inspect the actual checkout and follow the owner's current branch instructions rather than any branch name carried over from the brief.
 
-### 1.2 Work package decisions
+## 2. Verified evidence
 
-| ID | Work package | Decision | Dependency | Expected risk |
-|---|---|---|---|---|
-| W0 | Establish baseline and ownership | Required | None | Low |
-| W1 | Harden the shared XML guard | Implement | W0 | Moderate: encoding compatibility |
-| W2 | Complete model-usage accounting | Implement | W0 | Moderate: retry, failure, and concurrency paths |
-| W3 | Workload measurement and evaluation harness | Implement offline capability; live evaluation needs suitable authorization | W0; consume W2 when ready | Low for offline tooling |
-| W4 | Correct documentation and review assumptions | Implement | W1/W2 findings; can draft alongside them | Low |
-| W5 | Reduce classification payload | Evaluate first; merge only supported changes | W2 + W3 | Moderate: model behavior |
-| W6 | Target-classification cache | Deferred unless measured repetition justifies it | W2 + W3; settle W5 request representation first | High: stale classifications |
-| W7 | Separate architect response cache from profile cache | Deferred; no initial implementation | W2 + evidence of expensive invalidations | High: replay semantics |
-| W8 | Effort/model/chunk/deterministic-rule tuning | Deferred; one experiment at a time | W3 | High: classification quality |
-| W9 | Integration and acceptance | Required | Every package selected for the release | Moderate |
+Everything in this table was checked against the code at revision time. Line references are navigation aids; locate the current function before editing.
 
-Completion of W0-W4 and W9 is a valid, complete initial implementation. A measured decision to leave W5-W8 unchanged is an acceptable outcome, not unfinished work.
-
-## 2. Evidence and corrections to preserve
-
-The planning review read the brief, selectively inspected source at `b66258a`, and ran one small in-memory XML reproduction with bytecode writing disabled. It did not run the full test suite, process real specifications, measure production costs, or establish a complete security audit.
-
-| Observation | Evidence at the inspected baseline | Consequence |
+| Observation | Evidence | Consequence |
 |---|---|---|
-| UTF-16 bytes bypass the declaration guard | `core/untrusted_xml.py::parse_untrusted_xml`; small entity payload accepted and expanded to 16 characters | W1 is warranted as a rejection-contract fix |
-| Decoded text containing the same declaration is rejected | Same in-memory reproduction | Raw-byte and text callers currently have different protection |
-| Local reproduction used Python 3.14.6 / Expat 2.8.1 | Runtime output during the review | Do not confuse this environment with supported Python 3.10 or Windows CI's Python 3.11 |
-| End-to-end exploitability is not established | Header/footer helpers accept raw bytes, but earlier shell helpers may decode and reject the same parts first | Trace actual paths; distinguish helper bypass from application-level exploit |
-| Architect response usage is not accumulated | Root `llm_classifier.py::_call_api` reads final text and stop reason, but not response usage | Add accounting without changing classification instructions |
-| Target usage is returned only on successful completion | Target classifier attaches `result["usage"]` after chunk collection/merge; runner reads it after return | Failed calls can consume tokens that never reach persisted accounting |
-| Current diagnostics summary does not total tokens | `spec_formatter/diagnostics.py::DiagnosticsRecorder.summary` totals events and phase durations | Recording fields alone will not produce a run cost profile |
-| Target classification depends on template role definitions | `build_phase2_slim_bundle(..., role_specs=...)`; `_numbering_role_candidates` and counter-conflict checks consume those definitions | Available role names alone cannot identify cache compatibility |
-| Style lookup already has memoization | `_style_block_index` and `_find_style_numpr_in_chain` in `core/style_import.py`; `_parsed_style_elements` in `core/classification.py` | Do not add another cache based on the brief's performance suspicion |
-| There are target and chunk thread pools | `pipeline.py` and target `core/llm_classifier.py` both instantiate `ThreadPoolExecutor` | Document the two levels accurately; do not rewrite concurrency as part of this work |
-| The target prompt explicitly permits indentation evidence | `core/prompts/phase2_master_prompt.txt` also says "Do NOT reference formatting" | Clarify evidence versus output instructions before removing hints |
-| Reported payload savings are character measurements | Brief measures JSON character lengths on a small constructed sample | Do not label them measured token, cost, or accuracy improvements |
-
-The source-file names below are relative to the repository root. Line numbers from the historical brief are navigation aids only; locate current functions before editing.
-
-### 2.1 Important qualification on the security finding
-
-Modern Expat has entity-amplification countermeasures. Accepting a small internal entity proves that the application-level prohibition is bypassable; it does not prove unlimited expansion or a practical denial of service in the shipped application. Fix the explicit prohibition independently of the severity assessment. Document the actual Python/Expat versions used for both the reproduction and packaged validation.
-
-Do not run an unbounded billion-laughs payload to demonstrate the issue. Tiny inputs and assertions that prohibited content never reaches the parsing operation are sufficient.
-
-### 2.2 Additional correction discovered while preparing this plan
-
-The brief describes retry behavior as though both classifiers share the same policy. At this baseline, target classification has a `retry-after`-aware transport policy, while root `_call_api` uses its own bounded exponential sleeps. W2 must instrument the actual policies without silently unifying or changing them. A retry-policy redesign would require its own concrete failure evidence and review.
+| The declaration guard is bypassable by encoding | `core/untrusted_xml.py` matches `<!(?:DOCTYPE\|ENTITY)` against raw bytes; UTF-16 encodes `<!DOCTYPE` as `<\x00!\x00D\x00...` and does not match. A tiny entity payload was accepted and expanded to 16 characters | W1 is warranted as a rejection-contract fix |
+| Reproduced on the supported runtime | Python 3.11.15 / Expat 2.6.1 — the Windows CI version. UTF-16 LE with BOM and UTF-16 BE both accepted and expanded; UTF-8 and `str` inputs correctly rejected | Closes the environment gap; the original draft had only Python 3.14.6 / Expat 2.8.1 |
+| Decode-first alone does not close it | BOM-less UTF-16 without an XML declaration: `decode_xml_bytes` sniffs it as UTF-8, returns NUL-interleaved text the text regex cannot match, re-encoding round-trips to the original bytes, and Expat re-detects UTF-16 and expands | The NUL rule is part of the design, not a caveat. §4.2 avoids the question entirely |
+| Raw-byte callers exist and read untrusted input | `header_footer_importer.py:134,481,716` pass `read_bytes()` from the extracted target package; `phase2_invariants.py:426` passes `zf.read(name)` for every XML part in a package; `core/registry.py:603` passes `path.read_bytes()` | Establishes exposure. Earlier decoding gates may still front-run particular application paths; trace before claiming a specific end-to-end exploit |
+| End-to-end denial of service is not established | Modern Expat has amplification countermeasures | Fix the prohibition independently of severity. Do not run an unbounded payload to demonstrate it |
+| Architect response usage is not accumulated | Root `llm_classifier.py::_call_api` reads `get_final_text()` and `stop_reason`, never `.usage`, and raises on `max_tokens`/`refusal` *after* the final message is in hand | The counts exist at that moment and are discarded. This is the seam for W2 |
+| Target usage is returned only on success | `core/llm_classifier.py` calls `_record_usage` correctly before the refusal and `max_tokens` raises, but `result["usage"] = dict(usage_totals)` sits on the success path | A refusal, exhausted regeneration, or merge failure drops every observed count |
+| Diagnostics totals are computed over filtered events | `diagnostics.py` drops events below `_min_level` before storing them; `summary()` rolls up `snapshot()` | Emitting usage as INFO events and rolling them up there loses all totals at WARNING |
+| Target classification depends on template role definitions | `build_phase2_slim_bundle(..., role_specs=...)`; `role_specs` drives deterministic matching in `core/classification.py:503,569` | Role *names* alone cannot identify cache compatibility. See §7.2 |
+| Style lookup already has memoization | `@functools.lru_cache(maxsize=16)` on `_style_block_index` (`core/style_import.py`) and `_parsed_style_elements` (`core/classification.py`) | Do not add another cache on the brief's performance suspicion |
+| Two concurrency levels exist | `pipeline.py` runs a target pool; `core/llm_classifier.py` runs a chunk pool; a process-wide `BoundedSemaphore` caps open streams | Document both accurately; do not rewrite concurrency as part of this work |
+| The classifiers differ specifically in `Retry-After` handling | Target honours a numeric `retry-after` header (`_retry_after_seconds`); architect `_call_api` uses fixed exponential sleeps. Both set `max_retries=0` with identical timeouts | Instrument the actual policies. Do not unify them; the delta is narrow and a redesign needs its own evidence |
+| Boolean rejection already exists target-side | `_usage_numbers` skips `bool` and non-`int` values | Existing behaviour to preserve in any shared contract, not new work |
+| The token-count guard transmits document text | `_count_input_tokens` sends the system prompt and the full user message, which carries the slim bundle | An offline dry run must not call the count endpoint. The count is free and is not billed generation usage |
+| The target prompt is ambiguous about formatting | `core/prompts/phase2_master_prompt.txt` permits indentation as evidence (line 42) and says "Do NOT reference formatting" (line 57) | Clarify evidence versus output instructions before removing hints. Prompt edits belong in W5 |
+| Reported payload savings are character measurements | The brief measured JSON character lengths on a small constructed sample | Do not label them token, cost, or accuracy improvements |
+| The suite is green | `1049 passed, 3 skipped in 11.57s` | The brief's figure is current. Confirm in the implementing environment rather than assuming it stays so |
 
 ## 3. Non-negotiable invariants
 
-Read the current `CLAUDE.md` before implementation. Retain these contracts throughout all work packages:
+Read `CLAUDE.md` before implementation. Retain these throughout.
 
 1. Architect and target source files remain immutable. Process private snapshots and publish new outputs only.
-2. In `format_only`, preserve target body text and effective numbering semantics. Do not describe this as requiring byte-identical entire DOCX packages; presentation and package serialization legitimately change.
-3. In `csi_to_canadian`, retain the existing supported conversion boundary and rejection behavior.
+2. In `format_only`, preserve target body text and effective numbering semantics. This does not mean byte-identical DOCX packages; presentation and package serialization legitimately change.
+3. In `csi_to_canadian`, retain the existing supported conversion boundary and rejection behaviour.
 4. Every classifiable paragraph has exactly one styled or ignored disposition. Keep deterministic-override rejection, coverage checks, and current out-of-scope treatment.
 5. Keep source-derived styles, collision-safe style IDs, effective inheritance resolution, protected subtrees, and target numbering ownership.
 6. Keep the single shared application path and the immutable application policy. Do not add a second formatter implementation for caching, evaluation, or error handling.
-7. Keep strict profile validation and committed engine identity. Do not weaken cache invalidation to avoid the cost of this change series.
+7. Keep strict profile validation and the committed engine identity. Do not weaken cache invalidation to avoid the cost of a change.
 8. Keep per-run isolation, atomic output publication, source rechecks, and independent per-target failure handling.
-9. Persist only code-defined identifiers, counts, booleans, safe timing values, and existing approved provenance in diagnostics. Never persist prompts, responses, paragraph text, API keys, HTTP bodies, or arbitrary provider objects there.
-10. Preserve public and injected seams where practical. New optional parameters and additive result fields must have safe defaults. Do not require existing injected classifiers to emit usage.
-11. Python 3.10 remains the source floor; Windows remains the primary platform. Do not introduce newer syntax or dependencies accidentally.
-12. Do not change model defaults, effort, retry ceilings, concurrency limits, or chunk overlap in a telemetry/security patch.
+9. Persist only code-defined identifiers, counts, booleans, safe timing values, and existing approved provenance in diagnostics. Never persist prompts, responses, paragraph text, API keys, HTTP bodies, or arbitrary provider objects.
+10. Preserve public and injected seams where practical. New optional parameters and additive result fields need safe defaults. Do not require existing injected classifiers to emit usage.
+11. Python 3.10 remains the source floor; Windows remains the primary platform.
+12. Do not change model defaults, effort, retry ceilings, concurrency limits, or chunk overlap in a security or telemetry patch.
 
-## 4. W0 — establish baseline and assign ownership
+## 4. W1 — encoding-independent rejection of prohibited XML declarations
 
-### Tasks
+This is the initial deliverable and stands alone.
 
-1. Record the actual commit, current branch, working-tree changes, interpreter, Expat version, and installed dependency versions relevant to the selected work.
-2. Read `CLAUDE.md`, the application policy, current test guidance, and any applicable repository instructions. Resolve conflicts in favor of the owner's current task instructions.
-3. Run the existing suite in the implementing environment before editing. Record failures and skips rather than assuming the brief's `1049 passed, 3 skipped` is current.
-4. Reproduce the tiny UTF-16 helper bypass using synthetic data. Record whether it still exists on the actual starting commit.
-5. Identify injected classifier/analyzer/processor call signatures and tests that use strict fakes. These determine how telemetry must be threaded without breaking callers.
-6. Assign one integration owner for shared files: `spec_formatter/pipeline.py`, `spec_formatter/diagnostics.py`, `README.md`, `CLAUDE.md`, and `engine_identity.py`.
-7. Use separate commits or worktrees for independent work. Do not have agents concurrently overwrite the same shared file.
+### 4.1 Intended behaviour
 
-### Baseline commands
+Every untrusted XML entry through `parse_untrusted_xml` rejects a DOCTYPE or ENTITY declaration before entity expansion, regardless of whether the caller supplied bytes or text and regardless of encoding. Valid supported OOXML still parses with correct Unicode content. Unsupported or malformed encodings fail predictably. **Every rejection the current guard performs is still performed, with the same error type and message.**
 
-Run from the repository root using the intended interpreter. Resolve the interpreter explicitly if the shell's `python` is ambiguous.
+### 4.2 Design: union guard
+
+Keep the existing byte prescan. Add an Expat validator. Parse the same immutable payload with all three steps.
+
+```python
+payload = data.encode("utf-8") if isinstance(data, str) else data
+
+# 1. Existing conservative prescan - unchanged, nothing removed.
+if _DOCTYPE_RE.search(payload):
+    raise UntrustedXmlError(f"{context}: DOCTYPE/ENTITY declarations are not allowed ...")
+
+# 2. Expat rejects a real declaration in any encoding it can auto-detect.
+#    StartDoctypeDeclHandler fires as Expat begins the document-type
+#    declaration, before any entity is expanded.
+# 3. Then parse that same payload with ElementTree.
+```
+
+Three properties make this the right shape:
+
+1. **One immutable payload** feeds the prescan, the validator, and the parse. The old draft's requirement that "the representation that is checked and the representation that is parsed must be equivalent" becomes true by construction rather than something an implementer must argue. There is no second encoding interpretation to keep in sync.
+2. **Nothing is removed**, so the current conservative screening policy survives intact — including declaration-shaped text inside comments and CDATA, which the plan already required preserving for this patch.
+3. **`UntrustedXmlError` handling is untouched.** It stays a `ValueError` subclass, keeps the part-name context, and keeps its existing message for every case that reaches it today.
+
+Both the validator and `ElementTree` use the same Expat build, so they cannot disagree about encoding detection or well-formedness.
+
+### 4.3 Two designs that do not work, with evidence
+
+Record both in the implementation report so neither is reintroduced.
+
+**Decode-first is insufficient on its own.** Decoding with the shared helper, scanning the decoded text, then re-encoding and parsing is defeated by BOM-less UTF-16 with no XML declaration: the sniff falls through to UTF-8, the decoded text is NUL-interleaved so the text regex cannot match, re-encoding round-trips to the original bytes, and Expat re-detects UTF-16 and expands the entity. Rejecting XML-invalid literal NULs closes it, which is why that rule is load-bearing rather than a test case. §4.2 removes the need for the rule entirely.
+
+**Expat-only, replacing the byte scan, is a regression.** Measured across nine cases:
+
+| Case | Today (byte scan) | Expat only | Union (§4.2) |
+|---|---|---|---|
+| Real doctype, UTF-8 | REJECT | REJECT | REJECT |
+| Doctype after a prolog comment | REJECT | REJECT | REJECT |
+| `<!doctype html>` lowercase | REJECT | **ExpatError** | REJECT |
+| `<!ENTITY` in element content | REJECT | **ExpatError** | REJECT |
+| DOCTYPE-shaped text inside a COMMENT | REJECT | **accept** | REJECT |
+| DOCTYPE-shaped text inside CDATA | REJECT | **accept** | REJECT |
+| DOCTYPE-shaped text escaped as content | accept | accept | accept |
+| Real doctype, UTF-16 with BOM | **accept** | REJECT | REJECT |
+| Real doctype, BOM-less UTF-16 LE | **accept** | REJECT | REJECT |
+
+Replacing the scan silently relaxes two cases the plan requires preserving, and changes two more from `UntrustedXmlError: DOCTYPE/ENTITY` to a wrapped parse error — which fails the existing parametrized test in `tests/style_application_regression/test_untrusted_xml.py`. Only the union is correct on all nine.
+
+Note that `<w:p>...<!ENTITY a "b"></w:p>` is not well-formed XML at all; the current guard is deliberately stricter than well-formedness requires, and the union keeps that intent. A later cleanup must not drop it as redundant.
+
+### 4.4 Files
+
+Primary:
+
+- `spec_formatter/style_application/core/untrusted_xml.py`
+- `tests/style_application_regression/test_untrusted_xml.py`
+
+`core/ooxml_text.py` needs no change under this design. Touch it only if a separate defect is found there, and say so explicitly.
+
+Trace and exercise callers in `header_footer_importer.py` (`_remove_existing_hf_files`, `_rebuild_document_rels`, `_ensure_content_types`), `phase2_invariants.py::validate_docx_package`, `core/registry.py` bundle-artifact loading, `docx_patch.py::validate_xml_wellformedness`, and `arch_env_applier.py` content-type and relationship preparation.
+
+### 4.5 Test matrix
+
+Use tiny payloads. Do not run an unbounded amplification payload.
+
+| Case | Expected |
+|---|---|
+| Valid UTF-8 XML bytes, with and without BOM | Correct root and text |
+| Valid UTF-16 LE/BE with BOM and matching declarations | Correct root and text |
+| BOM-less UTF-16 LE/BE, with and without declarations | Correct parse or documented rejection; never unchecked expansion |
+| Declared single-byte encoding with non-ASCII text (e.g. windows-1252) | Characters preserved |
+| Already-decoded text carrying a non-UTF-8 declaration | Correct safe handling |
+| Tiny DOCTYPE plus internal entity in each supported encoding | `UntrustedXmlError` before expansion |
+| External SYSTEM/PUBLIC declarations | Rejected without filesystem or network dereference |
+| Every existing case in the current parametrized rejection test | Same exception type and message as today |
+| Declaration-shaped text inside comments and CDATA | Still rejected; conservative policy unchanged |
+| UTF-32 variants | Documented behaviour; Expat does not support UTF-32 and `ET.fromstring` already rejects it today, so raw UTF-32 bytes are no regression |
+| Truncated data, unknown encoding, literal NUL, invalid Unicode | Predictable wrapped failure |
+| Valid escaped text, comments, namespaces, non-ASCII attributes | No regression |
+
+A focused assertion that a prohibited payload never reaches the parse call is justified here, because "before expansion" is the security contract rather than an implementation detail. Pair it with behaviour-level tests.
+
+### 4.6 Reachability evidence
+
+1. Build minimal synthetic packages carrying prohibited declarations in `word/_rels/document.xml.rels` and `[Content_Types].xml`.
+2. Exercise both the direct helper callers and the normal application and package-validation paths.
+3. Trace shell application order. Theme, settings, and font-table helpers may already decode or reject parts before header/footer import. Record those earlier gates rather than claiming every raw-byte site is independently exploitable.
+4. Include a valid package with non-UTF-8 parts as a positive control.
+5. Confirm failing targets publish no partial DOCX and that source hashes are unchanged.
+6. Cover bundle-artifact parsing separately from the target package path.
+
+Keep the confirmed bypass of a stated prohibition distinct from a demonstrated denial of service. Neither distinction is a reason to delay the fix.
+
+### 4.7 Performance
+
+Measured on the sanitized corpus regression, which is the only realistic parse workload in the repository.
+
+- Actual volume for one corpus run: **109 `parse_untrusted_xml` calls, 0.29 MB total, median part 943 B, p90 3.2 KB, largest 31 KB.**
+- Added cost of the Expat validator at that size distribution: about 40% of parse time at the median, 33% at p90, 23% at the largest part. The percentage is worst on small parts because parser construction dominates.
+- Absolute cost: **roughly 6 ms added per corpus run**, against a run that makes model calls taking seconds.
+
+Two honest caveats. These fixtures are small, and real specification sections are considerably larger; the cost scales with parse volume and stays near a quarter of parse time, so even a 1 MB `document.xml` adds single-digit milliseconds. And this is a fixture-level measurement, not an application-wide result — confirm by timing the corpus regression before and after the change, which is cheap once implemented.
+
+### 4.8 Verification and acceptance
+
+Ordinary verification, not a separate phase:
 
 ```powershell
-git --no-optional-locks status --short
 git rev-parse HEAD
 python --version
 python -c "import pyexpat; print(pyexpat.EXPAT_VERSION)"
 python -m pytest -q
 ```
 
-Implementation tests may create test-owned temporary files. That is different from the read-only planning review; use the authorization and filesystem rules of the implementation session. Never remove unrelated temporary directories to get a cleaner baseline.
-
-### Acceptance
-
-- A concise baseline report identifies actual failures, skips, and environment limitations.
-- The agent can explain the distinction between architect analysis, target classification, and shared application.
-- No unrelated changes have been overwritten or cleaned up.
-
-## 5. W1 — make prohibited XML rejection encoding-independent
-
-### 5.1 Intended behavior
-
-Every untrusted XML entry through `parse_untrusted_xml` must reject a DOCTYPE or ENTITY declaration before entity expansion, regardless of whether the caller supplied bytes or text and regardless of a supported input encoding. Valid supported OOXML must still parse with correct Unicode content. Unsupported or malformed encodings must fail predictably.
-
-Prefer one central fix over hand-patching the currently known callers. A caller list cannot provide lasting protection when new raw-byte calls are added later.
-
-### 5.2 Primary files
-
-- `spec_formatter/style_application/core/untrusted_xml.py`
-- `spec_formatter/style_application/core/ooxml_text.py`, only if existing decoding behavior needs a small shared correction
-- `tests/style_application_regression/test_untrusted_xml.py`
-- `tests/style_application_regression/test_ooxml_text.py`
-- `tests/test_ooxml_text.py`
-
-Trace and exercise callers in:
-
-- `header_footer_importer.py::_remove_existing_hf_files`, `_rebuild_document_rels`, `_ensure_content_types`
-- `phase2_invariants.py::validate_docx_package`
-- `core/registry.py` bundle-artifact loading
-- `docx_patch.py::validate_xml_wellformedness`
-- `arch_env_applier.py` content-type and relationship preparation
-
-### 5.3 Design requirements
-
-1. Reuse the shared encoding-aware helpers rather than inventing a second BOM/XML-declaration decoder.
-2. A suitable default design is: decode bytes using the shared policy; scan the resulting text for prohibited declarations; prepare a truthful UTF-8 declaration; parse only the checked, canonical representation.
-3. The representation that is checked and the representation that is parsed must be equivalent. Do not decode and check one representation, then hand the original bytes back to an auto-detecting parser.
-4. Guard against encoding disagreement. For example, BOM-less UTF-16 bytes can decode under an incorrect codec to a Python string containing literal NULs and later be auto-detected differently if re-encoded. Reject XML-invalid literal NUL characters and test these cases explicitly. Do not assume "decode first" alone is a complete proof.
-5. Handle text inputs with an existing non-UTF-8 XML declaration correctly. Python `str` is already decoded; a stale declaration must not cause its newly encoded bytes to be misinterpreted.
-6. Treat malformed bytes, unknown codecs, invalid Unicode, and unsupported encodings as errors. Keep `UntrustedXmlError` a `ValueError` subclass and retain useful part context without exposing source content through public diagnostics.
-7. Do not silently broaden the parser's supported encoding set through arbitrary Python codec names. Establish the existing supported behavior, and either retain it safely or explicitly reject unsupported cases. Document intentional compatibility changes.
-8. Preserve the current conservative declaration-screening policy for this patch. Do not combine it with a redesign to accept declaration-shaped literals inside comments or CDATA. Such behavior can be assessed separately.
-9. Retain XML syntax validation. Canonicalization must not turn structurally malformed XML into accepted content or repair mismatched document structure.
-10. Avoid a new runtime dependency unless the shared-helper approach cannot meet these requirements. If a dependency is necessary, explain the reason, test the frozen build, update direct runtime requirements, and regenerate notices through the existing process.
-
-### 5.4 Required test matrix
-
-| Case | Expected result |
-|---|---|
-| Valid UTF-8 XML bytes, with and without BOM | Correct root and text |
-| Valid UTF-16 LE/BE with BOM and matching declarations | Correct root and text |
-| BOM-less UTF-16 LE/BE with XML declarations | Correct decode or deliberate documented rejection; never bypass the guard |
-| BOM-less UTF-16 without declarations | Explicitly test detection/rejection; never reinterpret unchecked content |
-| UTF-32 variants supported by the shared reader | Correct canonical parse or documented rejection; never unchecked expansion |
-| Existing supported declared single-byte encoding with non-ASCII text | Preserve characters |
-| Already-decoded text with UTF-16 declaration | Correct safe handling |
-| Tiny DOCTYPE plus internal entity in each supported encoding | `UntrustedXmlError` before expansion |
-| External SYSTEM/PUBLIC declarations | Rejected without filesystem or network dereference |
-| Existing uppercase/lowercase declaration-screening fixtures | Current rejection contract retained |
-| Truncated encoded data, unknown encoding, literal NUL, invalid Unicode | Predictable wrapped failure |
-| BOM/declaration disagreement | No unchecked alternate interpretation; supported policy documented |
-| Entity/DOCTYPE-shaped content currently conservatively rejected | No accidental relaxation in this patch |
-| Valid escaped text, comments, namespaces, and non-ASCII attributes | No unrelated regression |
-
-Use tiny payloads. A focused spy asserting that a prohibited input does not reach the underlying parse call is justified here because "before parsing" is the security contract, not incidental implementation detail. Pair that assertion with behavior-level tests.
-
-### 5.5 Reachability and integration evidence
-
-1. Construct minimal synthetic packages with prohibited declarations in `word/_rels/document.xml.rels` and `[Content_Types].xml`.
-2. Exercise both direct helper callers and normal application/package-validation paths.
-3. Trace shell application order. Theme/settings/font-table helpers may already decode or reject parts before header/footer import. Record these earlier gates rather than claiming every listed raw-byte site is exploitable.
-4. Include a valid package with non-UTF-8 parts as a positive control, not only malicious inputs.
-5. Confirm failing targets do not publish partial DOCX outputs and source hashes remain unchanged.
-6. Cover bundle-artifact parsing independently of the target package path. Integrity validation does not remove the need for parser safety.
-
-### 5.6 Acceptance and rollback
-
-- The original tiny bypass fails for bytes and text.
-- Equivalent valid text retains its Unicode content across supported encodings.
-- Existing error handling, package validation, both application modes, and corpus regressions remain intact.
-- The implementation report separates helper-level rejection, reachable application paths, and any unresolved severity questions.
-- The change is an isolated commit. If compatibility regresses, revise the canonicalization approach; do not silently restore acceptance of prohibited declarations.
-
-## 6. W2 — complete usage accounting without changing classification behavior
-
-### 6.1 Problem to solve
-
-The current architect path has no response-usage accounting. The target path collects usage from completed responses but returns it only after successful chunk processing and merge. A refusal, exhausted regeneration, or a later failure can therefore consume tokens without those counts reaching the run artifacts. Existing run diagnostics summarize timing and events rather than token totals.
-
-The required outcome is a trustworthy account of **observed usage**, including unsuccessful work, with explicit uncertainty when a provider response does not expose final usage. This is not a billing reconciliation system, and it must not invent zero-cost claims for interrupted requests.
-
-### 6.2 Files and integration seams
-
-| Layer | Files/functions | Required responsibility |
-|---|---|---|
-| Small shared usage contract | A focused module such as `spec_formatter/llm_usage.py` if warranted | Normalize known numeric fields, maintain thread-safe counts, expose immutable snapshots |
-| Architect provider boundary | Root `llm_classifier.py::_call_api` | Record each stream attempt and final response usage before stop-reason handling |
-| Architect regeneration and coverage patches | `_request_json_response`, `classify_document` | Carry one call-scoped collector through every request, including targeted patches |
-| Architect orchestration | `phase1_pipeline.py::run_phase1`; `spec_formatter/template_analysis.py` | Preserve instruction schema and propagate telemetry through supported seams |
-| Profile preparation | `pipeline.py::prepare_template_profile` | Distinguish fresh analysis, cache reuse, and failed analysis; retain observed usage on failure |
-| Target provider boundary | Target `core/llm_classifier.py::classify_target_document` | Record every chunk, regeneration, and overlap re-ask; preserve counts if a worker or merge fails |
-| Target orchestration | `style_application/batch_runner.py` | Publish telemetry in success and failure results without changing classification dispositions |
-| Run artifacts | `pipeline.py`, `diagnostics.py` | Aggregate architect and targets exactly once; persist totals independent of log verbosity |
-
-Use a small typed or explicitly validated contract. Do not build a general observability framework.
-
-### 6.3 Accounting semantics to define before coding
-
-| Field/concept | Definition |
-|---|---|
-| `requests_attempted` | Number of actual model stream/create invocations, including transport retries and grammar fallback requests |
-| `responses_completed` | Number of requests for which the final message was obtained; includes refusals and output-limit responses |
-| `responses_with_usage` | Completed responses with at least one valid recognized usage field; this alone does not prove complete accounting |
-| `input_tokens` | Sum of valid provider-reported uncached input tokens under the provider's current usage contract |
-| `output_tokens` | Sum of valid provider-reported output tokens, including billed thinking tokens where the provider includes them |
-| `cache_read_input_tokens` | Provider-reported input tokens read from cache |
-| `cache_creation_input_tokens` | Provider-reported cache-write input tokens |
-| `usage_complete` | Whether all usage necessary for the reported scope is known; false for requests lacking required final counters |
-| `requests_with_unknown_usage` | Requests for which final billable usage cannot be established from observed provider metadata |
-| `transport_retries` | Additional transport attempts, distinct from JSON regeneration |
-| `regenerations` | Re-requests for unusable JSON, validation failure, or output-limit responses under existing policies |
-| `coverage_patch_requests` | Architect targeted requests for missing dispositions |
-| `overlap_reask_requests` | Target overlap-conflict requests |
-
-These are proposed names; the integration owner may align them with repository conventions before implementation. Publish a stable field table in the engineering guide. Do not leave ambiguous meanings such as whether "requests" means attempted or successful responses.
-
-Additional rules:
-
-- Missing usage is unknown, not zero. Accept zero only when it is reported or follows a documented provider contract, such as a known absent cache category in a complete current response.
-- Reject booleans as integer counters. Ignore/report as incomplete malformed, negative, or unknown numeric fields without letting provider metadata alter document output.
-- Do not add uncached input counts to an already inclusive total. Verify the provider schema before writing a cost formula.
-- Token counting for the input-size guard is separate from model generation requests and billed response usage.
-- If cache writes are later split by TTL, the aggregate cache-creation field and its breakdown overlap; do not sum both as separate usage.
-- Preserve request purpose with fixed enums and numeric target/chunk/attempt identifiers. Do not use document titles, paragraph excerpts, response text, or arbitrary exception strings.
-- Do not sum nested phase timings as run wall-clock time. Request duration sums and elapsed run duration describe different things under concurrency.
-
-### 6.4 Recommended propagation design
-
-1. Create one bounded, run-scoped accounting path, with independent architect and per-target collectors or scopes. No module-global mutable counters.
-2. Thread an optional keyword-only collector/observer through production architect calls. Keep `classify_document` returning only the validated instruction object; do not insert telemetry into instruction JSON or its schema.
-3. Capture final usage immediately after obtaining the final message and before throwing for `refusal`, `max_tokens`, or other stop reasons.
-4. Record attempted requests even if opening or consuming the stream fails. Mark usage unknown if reliable final counts are unavailable. Do not manufacture a token estimate and present it as observed usage.
-5. Use `finally` or an equivalent reliable handoff to retain already observed counts when parsing, validation, style derivation, bundle publication, chunk merging, or later application fails.
-6. On the target path, wait for running chunk work to settle according to the existing executor behavior before finalizing that target's accounting. Otherwise a failing chunk can hide usage from siblings that finish later.
-7. Choose one authoritative contribution per request. Existing target `result["usage"]` may remain as a compatibility summary, but it must not be added again to request-level totals.
-8. Injected classifiers/analyzers that do not support telemetry must continue to work and report unavailable usage. Pass new arguments only through an explicit supported adapter/signature, not indiscriminately to every callable.
-9. Never detect unsupported keyword arguments by catching `TypeError` from a classifier and calling it again. That can repeat real requests and conceal an internal bug.
-10. Optional observers must not change successful document output or replace the primary classification exception. Do not expose a failing observer's arbitrary error text in logs. Keep programming errors visible through controlled tests and safe diagnostics.
-11. If adding result fields such as a usage snapshot to `Phase1Result` or `BatchResult`, use additive defaults. A successful result field alone is insufficient for the failure path; maintain the independent collector/handoff.
-
-### 6.5 Run summary and failure artifacts
-
-- Add a documented, additive usage summary under `run.json` diagnostics, grouped by architect/target stage and model. Include total observed counters and completeness status.
-- Preserve per-target usage in the existing target audit/diagnostics path, including failure results.
-- Account for architect failure in the initialization-failure artifact path before any target starts.
-- Report a reused architect profile as no new architect request for this run. Do not count the cost of its original creation again.
-- Report deterministic-only target classification as zero model requests with known zero usage for that stage.
-- Keep usage totals available at `warning` and `error` log levels. `DiagnosticsRecorder.summary()` currently uses stored, filtered events; merely adding INFO fields will lose totals when those events are suppressed. Accumulate validated usage independently of verbosity, or otherwise explicitly preserve this accounting contract.
-- Keep existing event count/log consistency assertions valid. Do not pretend suppressed usage events were written to `diagnostics.jsonl`.
-- Distinguish a complete observed total from a lower bound. Runs with unknown requests must be labeled incomplete.
-- Keep dollar estimates out of the formatter's initial runtime change. W3 can calculate optional estimates from a dated price table without hard-coding prices into production logic.
-
-### 6.6 Required tests
-
-Use provider fakes; no paid calls in the normal suite.
-
-| Scenario | Assertion |
-|---|---|
-| One architect response | Exact counters and one attempt/completion |
-| Architect malformed JSON then valid JSON | Both responses counted once |
-| Architect output limit then regeneration | Output-limit usage retained |
-| Architect terminal refusal | Usage retained; no extra request |
-| Architect targeted coverage patch | Initial and patch requests included |
-| Structured-output compiler fallback | Attempts distinguished; usage not invented for a response without counters |
-| Transport failure then success | Attempts and unknown-usage status truthful |
-| Final stream interruption | Failure remains primary; accounting marked incomplete |
-| Fresh analysis followed by style/bundle failure | Observed usage reaches failed run artifacts |
-| Reused profile | No historical creation usage charged to current run |
-| Strict legacy injected classifier/analyzer fake | Existing signature and return shape still work |
-| Multiple target chunks | Totals equal independently known fake responses |
-| Target refusal or exhausted regeneration | Observed usage survives target failure |
-| One chunk fails while another finishes | Late sibling usage retained; no double counting |
-| Overlap re-ask | Additional request included |
-| Merge/coverage failure after responses | Usage retained even though no classifications return |
-| Deterministic-only target | Zero model requests; client not constructed |
-| Missing/partial/malformed usage fields | No crash; no false completeness claim |
-| Parallel independent runs | No cross-run leakage of counts |
-| INFO/DEBUG/WARNING/ERROR verbosity | Same usage totals; event logs still obey verbosity |
-| Secret/body-text-shaped provider metadata | Excluded from every persisted artifact |
-| Same usage exposed through callback and compatibility result | Exactly one contribution |
-
-Primary test files:
-
-- `tests/test_llm_classifier_safety.py`
-- `tests/test_phase1_pipeline.py`
-- `tests/test_unified_pipeline.py`
-- `tests/test_diagnostics.py`
-- `tests/style_application_regression/test_llm_classifier.py`
-- `tests/style_application_regression/test_batch_runner_failure_diagnostics.py`
-- `tests/style_application_regression/test_batch_runner.py`
-
-Add a focused test module for the shared usage contract if a new module is created. Prefer assertions about totals, failure preservation, privacy, and behavior over snapshots of incidental helper calls.
-
-### 6.7 Compatibility, versioning, and acceptance
-
-- Changing root `llm_classifier.py` changes the committed engine fingerprint. Recompute it after integration and accept the existing cache invalidation rather than bypassing it.
-- Keep `.phase1` instruction/audit semantics unchanged. Usage belongs to the current run, not the semantic identity of a cached profile.
-- Additive diagnostics fields need documented compatibility handling; change manifest/audit version constants only if consumer assumptions actually change. Explain the decision in the PR.
-- Verify any new module is discoverable in the frozen Windows build.
-- Acceptance requires exact fake-provider totals on success and failure, stable classification results, no privacy regression, and no changes to request policy other than observation.
-
-## 7. W3 — build workload measurement and an evaluation harness
-
-### 7.1 Questions the evidence must answer
-
-1. How many paragraphs actually reach the target model in representative work?
-2. Which document structures account for unresolved paragraphs?
-3. What are the measured request characters, provider-reported tokens, observed cache reads/writes, retries, and elapsed durations?
-4. How much architect analysis is fresh versus reused, and how often does engine invalidation cause a new analysis?
-5. Are repeated target classifications common enough to justify a persistent cache?
-6. Do candidate payload or effort changes preserve the correct dispositions on difficult cases?
-
-Do not answer these questions using synthetic examples alone. Synthetic cases establish correctness boundaries; a representative, appropriately authorized corpus establishes workload relevance.
-
-### 7.2 Offline analyzer
-
-Create a developer-facing tool, for example `tools/analyze_classification_workload.py`, with a tested importable core. It must use production extraction and slim-bundle logic rather than recreating numbering or classification rules. Proposed tooling paths are new deliverables, not existing commands to invoke during baseline setup.
-
-Required behavior:
-
-- Accept explicit target files and a validated architect profile or explicit fixture role definitions.
-- Snapshot/extract through the existing bounded helpers into tool-owned temporary directories. Never unpack untrusted ZIPs with a new unchecked extraction loop.
-- Build the production target slim bundle with the actual `role_specs` and available roles.
-- Make no provider calls by default. A dry run must not transmit document text through a token-count endpoint either.
-- Produce a machine-readable counts report and a short Markdown explanation of the sample and limits. Keep document text and private source paths out of the default shareable report.
-- Use opaque fixture/document identifiers. Store any necessary mapping to owner files privately and separately, not in committed fixtures or public reports.
-- Preserve hashes/identities according to the existing privacy policy; do not assume a hash is anonymization for arbitrary short text.
-- Report skipped, failed, and empty documents as well as successful ones. Do not calculate savings only on the documents that happen to work.
-
-For each target/profile pair report at least:
-
-| Measurement | Definition |
-|---|---|
-| `classifiable_total` | Unique paragraph indices in the production classifiable universe |
-| `deterministic_classified` | Unique classifiable indices assigned a role locally |
-| `deterministic_ignored` | Unique classifiable indices ignored locally |
-| `unresolved_sent` | Unique unresolved indices before chunk overlap |
-| `unresolved_fraction` | `unresolved_sent / classifiable_total`; use not-applicable when the denominator is zero |
-| `out_of_scope` | Separately counted unique excluded paragraphs; do not add overlapping subtree reports into the classifiable denominator |
-| Request characters | Length of the actual serialized system/user/schema components, with each component identified |
-| Chunk count | Production chunk count, including small/large edge cases |
-| Paragraph presentations | Sum across chunks, including intentional overlap |
-| Field contribution | Explicitly defined serialization-size comparison; never describe character attribution as token attribution |
-| Candidate representation size | Characters under each evaluated wire representation, with no change to production defaults |
-
-Check the arithmetic `deterministic_classified + deterministic_ignored + unresolved_sent == classifiable_total`. Use the production index/disposition contract, not a raw count of `filter_report` entries.
-
-### 7.3 Corpus design
-
-Start with existing sanitized fixtures, then add small purpose-built synthetic cases for missing structures. Use real owner documents only when their use is authorized, and sanitize any new fixture before committing it.
-
-Cover at least these families:
-
-- Fully automatic numbering, including numbering inherited through style chains.
-- Typed markers with ordinary and deep hierarchy.
-- Unmarked continuation prose and genuinely ambiguous headings.
-- Repeated Canadian numeric markers where indentation and context matter.
-- Roman/alpha ambiguity, short cross-references, and heading-like requirement sentences.
-- Editorial/boilerplate content that should be ignored.
-- Tables, drawings, text boxes, section breaks, and tracked/protected structures under current ownership rules.
-- Mixed formatting, non-ASCII text, and supported XML encodings.
-- Different architect profiles exposing the same role names but different numbering definitions.
-- Large targets, chunk boundaries, gaps caused by deterministic filtering, and overlap disagreements.
-
-As a planning target, aim for approximately 12-20 distinct target documents across several architect templates, plus synthetic adversarial cases. This is a starting collection goal, not a statistical guarantee or a reason to fabricate representative documents. Report actual coverage and any absent family.
-
-Separate development and holdout documents by document/template family. Splitting neighboring paragraphs from the same document across those sets leaks context and exaggerates quality.
-
-### 7.4 Gold labels and correctness criteria
-
-- Gold labels require human/domain review for genuinely ambiguous material. A previous model response is not ground truth merely because it passed schema validation.
-- Record natural CSI role, effective role under the template's allowed fallback policy, ignore disposition where appropriate, and any genuinely unresolved labeling disagreement.
-- Keep paragraph indices tied to source document identity. A label file for different bytes must not be silently accepted.
-- Evaluate exact effective-role agreement, classified-versus-ignored errors, per-role confusion, document-level failures, deterministic override failures, and exact coverage.
-- Report rare/deep roles separately; high overall accuracy can hide a serious failure in a small category.
-- Separate deterministic decisions from model decisions. A higher deterministic resolution rate is not evidence of higher precision.
-- Treat every new wrong classified/ignored decision and every new invariant failure as a release blocker until understood. Do not trade correctness for a favorable average.
-- Label uncertain gold cases separately and exclude them from claimed definitive accuracy until adjudicated; still include them in qualitative review.
-
-### 7.5 Live evaluation runner, when authorized
-
-Create a developer tool such as `tools/evaluate_classification.py` only as much as needed to run controlled comparisons. Reuse the production request construction, validation, merge, and retry behavior. Avoid a second classifier implementation.
-
-Before live execution, require an explicit dataset, model/effort variant, maximum trial count, and spending/request limits appropriate to that session. An API key in the environment is not by itself an instruction to run a large paid experiment.
-
-Required controls:
-
-1. A no-network preview lists the trial matrix and estimated upper-bound exposure without dumping document content.
-2. A live run records every attempt, retry, refusal, and incomplete-usage condition through W2 accounting.
-3. Bound the number of trials and reserve conservatively for in-flight requests. Stop launching new work if the configured limit cannot accommodate another trial. Do not promise exact invoice enforcement where provider usage is unavailable.
-4. Use the same dataset and validation rules for baseline and candidate. Change one variable at a time.
-5. Record cache state and ordering. Cold and warm trials answer different questions; avoid giving one arm warm caches while presenting the comparison as otherwise identical.
-6. Use repeated trials where stochastic variation matters. State the number of repeats and observed variability; do not claim a single equal score proves equivalence.
-7. Keep raw prompts/responses out of default reports. Any diagnostic response retention must have a deliberate private location and retention policy suitable for the authorized corpus.
-8. Do not run paid or credential-dependent evaluations in normal CI.
-
-### 7.6 Cost calculations and reporting
-
-Keep measured, estimated, and unavailable quantities distinct. A recommended report has separate columns for characters, observed token categories, estimated dollars, accuracy, failures, and elapsed time.
-
-For a verified provider usage schema with disjoint token categories, the basic estimate is:
-
-```text
-estimated_cost =
-    uncached_input_tokens * input_rate
-  + cache_read_input_tokens * cache_read_rate
-  + cache_creation_input_tokens * applicable_cache_write_rate
-  + output_tokens * output_rate
-```
-
-Use rates per token, or divide per-million rates by one million. Include the rate source, retrieval date, model, provider/platform, and cache TTL. Do not apply a single cache-write multiplier if the experiment mixes TTLs.
-
-When any request has unknown usage, label the dollar result incomplete or a lower bound. The provider's invoice remains authoritative. Character estimates must not be substituted into the observed-token columns.
-
-Record saved API usage separately from developer effort, maintenance cost, and end-to-end wall time. A representation that saves tokens but increases retries or misclassifications is not a win.
-
-### 7.7 Tests and acceptance
-
-- Offline analysis makes no network calls, preserves source hashes, and uses production bundle construction.
-- Counts handle empty documents, deterministic-only documents, filtered gaps, duplicate report entries, and overlapping chunks correctly.
-- Dataset labels are rejected when source identity or indices do not match.
-- Report generation excludes document text and private paths by default.
-- Cost math is tested against small hand-calculated examples, including unknown usage and overlapping aggregate/breakdown fields.
-- Fake-provider experiments exercise trial limits and failure accounting without paid calls.
-- The final evidence report states which decisions can be made and which remain unsupported. If representative owner material or live authorization is unavailable, deliver the complete offline capability and name that precise limitation; do not fabricate a cost profile.
-
-## 8. W4 — align documentation with actual contracts and evidence
-
-### Required edits
-
-Update `CLAUDE.md` and `README.md` alongside the implementation. Keep the engineering detail; do not replace substantive guidance with a shorter generic summary.
-
-1. Document encoding-independent declaration rejection, supported encoding behavior, and the distinction between parser-contract failure and demonstrated application exploitability.
-2. Explain usage fields, observed versus unknown counts, failure accounting, profile reuse, deterministic-only work, and verbosity-independent totals.
-3. Describe concurrency accurately: one public target-processing orchestration path, with an internal chunk pool in the target classifier. The target request semaphore should not be described as covering root architect calls unless the code actually does so.
-4. Describe each classifier's actual retry behavior. Do not imply identical policies where they differ.
-5. State that the current inherited-style lookup already uses caches. Do not add speculative performance claims without profiling.
-6. Distinguish exact target body-text/numbering preservation from whole-package byte identity. Explain that ignored paragraph XML remaining unedited does not, by itself, prove unchanged rendered appearance when document defaults or the shell change.
-7. Distinguish zero LLM involvement from correct classification. Deterministic rules require adversarial tests and precision checks too.
-8. Explain that payload size measurements are not token or dollar measurements.
-9. Document that prompt-cache reads can be affected by concurrency, minimum prefix size, TTL, and prefix identity. Zero reads alone do not identify which factor caused a miss.
-10. Keep visual inspection of representative Word outputs in the validation checklist when classification, formatting, numbering, or shell behavior changes.
-11. Describe the evaluation tooling as developer tooling, not a new mandatory step in the normal user's GUI workflow.
-
-Do not edit production prompts merely to improve wording during W4. The target prompt's formatting-evidence ambiguity is a model-input change and belongs in W5 with evaluation. Documentation may identify the ambiguity before it is resolved.
-
-### Reference brief corrections
-
-The implementation report should explicitly close or qualify these historical claims:
-
-| Brief claim | Correct treatment |
-|---|---|
-| Omit empty/false fields with zero information loss | Define field defaults and evaluate; absence can differ from explicit false/null |
-| Target hash plus role names is enough for target cache reuse | Include template-dependent role definitions and exact classification inputs/contracts |
-| Style numbering lookup needs memoization | Existing caches already cover the suspected path; profile before further work |
-| Zero cache reads means prefix invalidation | Check concurrency, warm-up, TTL, and minimum size as well |
-| Only one thread pool exists | Distinguish one public runner from internal chunk concurrency |
-| Classification is intrinsically a poor use of high effort | Treat as a workload-specific hypothesis, not a general fact |
-| More deterministic resolution always improves quality | Require precision evidence and adversarial coverage |
-| Payload reductions are measured token savings | They are character reductions until measured with the actual tokenizer/provider |
-| Review verdict must have no hedging | State a clear verdict with explicit coverage and uncertainty |
-
-### Acceptance
-
-- Documentation matches shipped behavior and selected work packages.
-- Current limitations and deferred decisions are explicit.
-- API/model/pricing assertions that remain in documentation have current primary-source references.
-- No claim of full-suite success, production savings, or Word validation is copied from the brief without being reproduced for the actual implementation.
-
-## 9. W5 — evaluate payload improvements before changing the default
-
-### 9.1 Decision gate
-
-Proceed only after W3 can compare actual production inputs and W2 can measure request usage. A candidate may be prototyped behind an evaluation-only option. Do not ship an unevaluated representation as the default merely because it is smaller.
-
-Keep the full slim bundle as the local authority for validation and audit. Build a separate wire projection for the model; do not delete fields from the internal bundle or mutate shared paragraph dictionaries in place.
-
-### 9.2 Candidate sequence
-
-**Candidate A: remove duplicated role-list text from the user message.** The same role list already exists in the system block, but verify every production request/retry/re-ask path still includes it. Measure the modest saving and check difficult fallback cases. Treat even this as a prompt change, not a guaranteed behavioral no-op.
-
-**Candidate B: omit only fields with explicitly defined default semantics.** Use a per-field allowlist and documented default table. Never use a generic recursive truthiness filter: it can drop `False`, numeric zero, paragraph index zero, empty-but-meaningful collections, or counter values. Preserve all non-default numbering evidence and semantic-conflict information.
-
-**Candidate C: remove duplicated neighbor text only when its exact context is present.** Use paragraph identity and the actual wire text, not merely equal strings. A neighbor may be absent because deterministic filtering removed it, or its body and neighbor-preview truncation may differ. Preserve context at chunk boundaries, gaps, and overlap re-asks whenever equivalent context is not present.
-
-**Candidate D: resolve formatting-evidence instructions.** Separate these two concepts explicitly: formatting can be evidence for hierarchy where appropriate; the model returns roles/dispositions rather than formatting commands. Test indentation-dependent Canadian and unmarked-prose cases. Do not delete `pPr_hints`, `rPr_hints`, or indentation wholesale based on the ambiguous phrase "Do NOT reference formatting."
-
-Evaluate candidates independently before combining them. Keep the existing paragraph-text cap, output schema, effort, model, overlap, and retry policy fixed in these comparisons.
-
-### 9.3 Files and tests
-
-Likely files:
-
-- Target `core/llm_classifier.py::_build_user_message`, `_system_blocks`, chunk/re-ask construction
-- `core/prompts/phase2_master_prompt.txt` and `core/prompts/phase2_run_instruction.txt` if actual prompt changes are selected
-- `core/classification.py` only if a small explicit context identity is needed in the internal bundle
-- Target classifier/bundle tests and W3 evaluation cases
-- `README.md`, `CLAUDE.md`, and request/provenance identity code where applicable
-
-Required tests include preservation of paragraph index zero, explicit false flags, non-empty numbering metadata, inherited numbering, default omission semantics, non-mutating projection, filtered neighbor gaps, unequal preview truncation, duplicate paragraph text at different indices, chunk boundaries, and overlap re-asks.
-
-### 9.4 Acceptance gate
-
-Merge only candidates with:
-
-- No new invariant violations or classified/ignored errors in the regression corpus.
-- No unexplained new role errors in adjudicated holdout cases, with sample size and repetitions stated.
-- A demonstrated reduction in observed tokens or end-to-end cost worth the added complexity; character reduction alone is insufficient for a cost claim.
-- No material increase in retries, refusals, incomplete responses, or document-level failures.
-- Updated prompt/request fingerprints and explicit representation identity if a later cache depends on them.
-- A straightforward rollback to the previous request representation, preserving test evidence.
-
-An inconclusive evaluation means keep the production representation unchanged. Record the result rather than broadening the experiment opportunistically.
-
-## 10. W6 — target-classification caching, only if justified
-
-### 10.1 Why this is deferred
-
-The brief's suggested key omits template-dependent inputs. A persistent cache also adds invalidation, corruption, retention, concurrency, privacy, and provenance obligations. Implementing it before measuring repeated unresolved work could add substantial risk for little saving.
-
-Authorize implementation only when W3 shows recurring identical classification work with meaningful observed cost or latency, and when the request representation is sufficiently stable. If deterministic classification resolves nearly everything, defer the cache.
-
-### 10.2 Safe design direction if selected
-
-Cache model-derived classifications at a clearly defined boundary, preferably the LLM-only dispositions for an exact classification request plan. Rebuild the current target bundle and deterministic dispositions every run. Reapply current local validators, deterministic-override checks, and exact coverage checks before application.
-
-Do not cache formatted DOCX outputs or bypass source snapshots, run isolation, application policy, package validation, or output publication.
-
-The cache identity must cover all behavior-affecting inputs, including:
-
-1. Target source identity and paragraph-index universe.
-2. Exact template-derived role definitions relevant to classification, including numbering patterns, provenance, and counter constraints. Same role names are not sufficient.
-3. Actual unresolved paragraph data and all context/formatting/numbering evidence sent to the model.
-4. System and user instructions, role ordering as actually serialized, response schema, and wire-projection version.
-5. Provider/model identity, thinking/effort, output constraints, and any request options that affect classification.
-6. Chunking/overlap/re-ask strategy and the effective request plan, if caching combined document-level results.
-7. Classification preprocessing, deterministic rules, validation/merge semantics, and their compatible version/fingerprint.
-8. An explicit cache contract version and an immutable implementation identity suitable for a frozen build.
-
-Hash a canonical exact request representation plus the relevant local semantic contract. A source hash and model name alone are insufficient. Do not assume the existing five-file architect engine digest covers target preprocessing changes.
-
-Conversion mode may be omitted only after a test proves that, for the same source and profile inputs, it does not change the cached classification request or its interpretation. Reuse across modes is an optimization to prove, not an assumption based on a missing function parameter.
-
-### 10.3 Storage and behavior requirements
-
-- Use a versioned private cache namespace with bounded entry count/bytes and an explicit pruning policy.
-- Store only the validated data required for reuse. Do not persist prompts, paragraph text, raw responses, arbitrary notes, or free-form provider metadata by default.
-- If ignored reasons are model-authored strings, explicitly settle safe storage/normalization semantics before caching them; do not quietly change the classification contract to fit the cache.
-- Write atomically. Never publish partial entries. Test concurrent readers/writers and crash remnants.
-- Reject malformed, oversized, incompatible, or checksum-invalid entries. Treat ordinary cache corruption as a safe miss and perform fresh classification under normal policy; do not reuse partially validated data.
-- Checksums detect corruption; they do not authenticate a hostile writer with access to the cache. State the local cache trust boundary honestly.
-- Disable reuse for injected classifiers lacking a stable, explicit identity.
-- Report current-run cache hits/misses and zero new API requests for hits. Retain historical provenance separately if needed; never charge historical token usage to the current run.
-- Failure to store a new cache entry should not invalidate an otherwise correct formatting output unless an existing explicit product contract requires it.
-- Retain fresh per-run audits and manifests, even when classification is reused.
-
-### 10.4 Required cache tests
-
-| Change/scenario | Expected behavior |
-|---|---|
-| Same target, exact profile semantics and request contract | Reuse validated classifications |
-| Same role names, different template numbering patterns | Cache miss |
-| Same target, changed context/preprocessing or deterministic rule | Cache miss |
-| Changed system/user prompt, schema, model, effort, or wire projection | Cache miss |
-| Changed chunk plan or merge contract | Cache miss for combined results |
-| Switched mode with proven identical classification inputs | Hit may be allowed; application still follows selected mode |
-| Valid JSON containing wrong, duplicate, missing, or unknown indices | Reject entry |
-| Cache result attempts deterministic override | Reject entry |
-| Corrupt/partial/oversized entry | Safe miss; no output corruption |
-| Concurrent runs and pruning | No partial reads, lost selected entries, or cross-run writes |
-| Injected classifier without stable identity | No persistent reuse |
-| Cache hit and later application failure | Fresh failed run artifacts, truthful zero new model requests |
-
-### 10.5 Acceptance
-
-The cache must reduce measured repeated work, preserve every validator, and pass a two-template same-role-list regression that would fail under the original brief's proposed key. If that correctness argument or the economic case remains incomplete, do not implement the cache.
-
-## 11. W7 and W8 — deferred structural and quality changes
-
-### 11.1 Architect response replay cache
-
-Do not remove `ENGINE_SOURCE_DIGEST` from profile validation or replace it with a comment-stripping heuristic. The coarse digest is deliberately conservative.
-
-A future two-tier cache requires evidence that repeated architect analysis due to engine changes is materially expensive. Its design must distinguish:
-
-- The exact model request, including the derived slim bundle and request schema.
-- The model response before deterministic repairs.
-- Current deterministic repairs, coverage patching, validation, and profile derivation.
-- The current profile's complete engine identity and shell-capture behavior.
-
-The source file hash alone does not identify the model input: a change to the slim-bundle builder can change the request for identical DOCX bytes. Stored post-repair instructions cannot safely stand in for a pre-repair response after repair logic changes. Targeted coverage patches further complicate replay.
-
-If this work is selected later, specify a versioned replay transcript or equivalent validated raw-stage representation, its private-data handling, bounded storage, and how current validators rerun. Add tests for changed bundle construction, repair order, patch logic, prompt/schema, and invalid stored results. Continue deriving and validating profiles under the current full engine identity. Do not implement this tier merely to avoid one cache invalidation caused by W2.
-
-### 11.2 Effort or model changes
-
-Keep current defaults in the initial series. If W3 justifies experimentation, compare current settings against one lower-effort setting before considering a different model. Use the same adjudicated corpus and request representation, and account for retries and cache effects.
-
-No claim that classification inherently benefits or fails to benefit from reasoning effort should substitute for workload evidence. Do not disable thinking, introduce confidence-based cascades, or create a GUI model selector as part of this work.
-
-### 11.3 Deterministic-rule expansion
-
-Only add a rule for a concrete unresolved pattern that the corpus establishes and that has a defensible structural discriminator. Include close negative cases, especially cross-references, heading-shaped requirements, Roman/alpha ambiguity, and template-specific numbering conflicts.
-
-The acceptance metric is correct resolution with no known precision regression, not simply a lower unresolved percentage. Keep ambiguous material unresolved when it cannot be proven locally.
-
-### 11.4 Chunking and prompt-cache warm-up
-
-Do not enlarge chunks because a provider advertises a larger context window. Measure request sizes, output headroom, regeneration exposure, latency, and overlap cost. The present character-based chunk budget is an estimate, not proof of provider token fit.
-
-Do not serialize requests merely to create cache hits without measuring the latency tradeoff. Concurrent requests can miss before the first response begins; this is not by itself a correctness bug. Retain the current semaphore and executor behavior unless a separate experiment justifies a change.
-
-### 11.5 Performance and maintenance exclusions
-
-- Do not add another inherited-style cache without profiling current cache behavior.
-- Do not split large modules or rename the root/package classifier modules solely because the brief calls them large or confusing.
-- Do not bring back Batch API or retired public runners.
-- Do not alter GUI settings, updater behavior, licensing, or broad CI platform coverage without a task-specific reason.
-- Do not expand this project into a complete namespace/OOXML rewrite. New independent findings should receive their own reproduction, severity, scope, and owner decision where they exceed this plan.
-
-## 12. W9 — integration, validation, and release readiness
-
-### 12.1 Change sequence
-
-Recommended PR/commit sequence:
-
-| Sequence | Scope | Must stand on its own |
-|---|---|---|
-| PR 1 | W1 XML fix, adversarial tests, relevant documentation | Safe parser behavior; no telemetry or optimization changes |
-| PR 2 | W2 usage contract, architect/target propagation, summaries, tests/docs | Correct accounting without prompt/request-policy changes |
-| PR 3 | W3 offline analysis and evaluation tooling, W4 remaining corrections | No network by default; no changed production classification |
-| PR 4, only if warranted | W5 selected payload change and its evidence | Explicit quality/cost gate met |
-| Later independent work | W6/W7/W8 if selected | Separate evidence and compatibility review |
-
-An integration owner may split PR 2 into the shared contract, architect propagation, and target/rollup integration, but must not present partial success-only accounting as the finished outcome.
-
-### 12.2 Version and resource checklist
-
-| Surface | When to update |
-|---|---|
-| `engine_identity.py::ENGINE_SOURCE_DIGEST` | Any covered root source changes; compute after final integration |
-| `PIPELINE_VERSION` | If architect pipeline behavior/compatibility requires a version change; do not substitute it for the digest |
-| Profile contract/manifest versions | Only if consumer-visible profile assumptions change; W2 should normally avoid semantic bundle changes |
-| Run audit/manifest versions | Assess additive usage fields against readers; document compatibility decision |
-| Prompt fingerprints / wire representation identity | Any selected W5 request change |
-| `requirements.txt` | New or changed direct runtime dependency only |
-| `requirements-dev.txt` | Necessary development-only dependency; prefer existing standard library and pytest |
-| `THIRD_PARTY_NOTICES.md` | Regenerate through the existing build process if dependencies change; never hand-edit |
-| PyInstaller spec/resource handling | New dynamically imported runtime modules or resources not covered by current collection |
-| `README.md` and `CLAUDE.md` | Changed behavior, diagnostics, constraints, and validation requirements |
-| JSON schemas | Only actual contract changes; do not add usage to semantic instructions to avoid plumbing |
-
-The current PyInstaller spec collects `spec_formatter` submodules and explicitly names root modules. Verify the real build rather than assuming this covers every new import pattern.
-
-### 12.3 Focused test groups
-
-Use these existing paths as a starting point. Add the new work-package tests after they exist.
+Then reproduce the defect on the actual starting commit, implement the union guard, and run:
 
 ```powershell
 python -m pytest -q tests/style_application_regression/test_untrusted_xml.py tests/style_application_regression/test_ooxml_text.py tests/test_ooxml_text.py tests/style_application_regression/test_docx_patch.py tests/style_application_regression/test_final_package_validation.py
-python -m pytest -q tests/test_llm_classifier_safety.py tests/test_phase1_pipeline.py tests/test_diagnostics.py tests/test_unified_pipeline.py tests/style_application_regression/test_llm_classifier.py tests/style_application_regression/test_batch_runner_failure_diagnostics.py
-python -m pytest -q tests/test_engine_identity.py tests/test_resources.py
-```
-
-After final integration:
-
-```powershell
-python engine_identity.py
 python -m pytest -q
 python -m pytest -q tests/test_sanitized_format_only_corpus.py
 ```
 
-`python engine_identity.py` prints the computed digest; update the committed constant when required and rerun its focused test. Do not change the constant to suppress a failure without checking which covered files changed.
+Acceptance:
 
-The full suite already includes the corpus test in normal collection. A separate corpus invocation is useful for an explicit acceptance record or the repository's required workflow; do not repeatedly rerun everything when no new changes or failures justify it.
+- The original bypass fails for bytes and text, across the tested encodings.
+- Every existing rejection keeps its current exception type and message.
+- Valid content retains its Unicode across supported encodings.
+- Package validation, both application modes, and the corpus regression are unaffected.
+- Python and Expat versions are recorded for the parser results.
+- The change is one isolated commit. If compatibility regresses, revise the approach; never restore acceptance of prohibited declarations.
 
-### 12.4 Supported-runtime and Windows checks
+W1 does not touch `engine_identity.py`'s covered files, so it does not invalidate cached profiles.
 
-1. Run the full suite on Windows/Python 3.11, matching the existing authoritative CI gate.
-2. Run W1 and W2's relevant non-GUI tests on Python 3.10, not just an import check. The current Linux job installs runtime dependencies after its updater tests; a small focused step after that installation can cover the new shared-parser/usage behavior. Preserve pinned workflow actions and avoid unrelated CI redesign.
-3. Record Python and Expat versions for parser results. Success on the local Python 3.14 runtime alone is insufficient evidence for the supported floor.
-4. Confirm a frozen Windows app can import the new runtime code and load prompts as before. Use existing build/self-check procedures from `docs/RELEASE_WINDOWS.md`; do not invent release commands or publish a release automatically.
-5. If a dependency or frozen-import arrangement changes, complete the existing packaging validation and notices generation before calling the change release-ready.
+## 5. Spend inspection gate
 
-### 12.5 Document and visual acceptance
+Before building anything to measure cost, look at what is already known.
 
-- Exercise both application modes with offline classifier seams and representative fixtures.
-- Verify source hashes, text, numbering semantics, protected structures, collision-safe styles, relationships, package validity, and no partial output publication.
-- For W2 alone, unchanged requests and output behavior plus regression tests are the primary evidence; telemetry does not require a new visual format standard.
-- For any W1 encoding behavior or W5 classification change that affects resulting documents, inspect representative output in Word against the architect template and original target. Render every page of selected representative documents when formatting/shell behavior changes, as the repository guide requires.
-- Use disposable output copies for Word inspection; do not save originals or treat Word's automatic field updates as part of the formatter's output.
-- Check numbering/restarts, hierarchy depth, indents, headers/footers, page breaks, non-ASCII text, and content around filtered/protected paragraphs.
-- Record renderer/Word version, font availability, selected cases, and any inspection limitations. XML invariants and visual review complement each other; neither replaces the other.
+Read the provider's existing usage reporting for recent real runs and answer one question: **is architect and target classification spend material enough to justify optimization work?**
 
-### 12.6 Final acceptance checklist
+- If it is not, W3 and W5-W8 are closed. Record the figure and the date. W2 shrinks to §6, which is worth doing for honest diagnostics on its own.
+- If it is, W3 becomes justified, and §7 defines what it must produce.
 
-- [ ] W0 baseline and actual starting commit documented.
-- [ ] W1 rejects prohibited declarations consistently before expansion across tested encodings.
-- [ ] W1 preserves valid supported non-ASCII/encoded content and stable failure behavior.
-- [ ] W2 accounts for architect and target requests, retries, refusals, patches, and late failures.
-- [ ] Unknown usage remains explicitly unknown; no silent zero-cost claims.
-- [ ] Current-run totals exclude historical cache creation and do not double-count compatibility summaries.
-- [ ] Usage summaries remain available at all diagnostic verbosity levels.
-- [ ] No document text, secrets, raw responses, or arbitrary provider metadata enter artifacts.
-- [ ] Existing injected seams remain usable; no accidental duplicate request from compatibility handling.
-- [ ] Model, effort, retry, concurrency, and formatting defaults remain unchanged unless separately evaluated and selected.
-- [ ] W3 runs offline by default and reports honest denominators and uncertainty.
-- [ ] Documentation and relevant versions/digests/resources match the final implementation.
-- [ ] Focused and full tests pass in the required environments, with skips explained.
-- [ ] Required Word/visual checks are complete, or the report precisely identifies why release acceptance is pending.
-- [ ] Each conditional package has a clear implemented/deferred/rejected decision and evidence.
-- [ ] Unrelated user files and prior outputs remain untouched.
+This costs minutes. The first draft required an evaluation harness before establishing that optimization mattered, which inverted its own evidence-first principle.
 
-## 13. Agent delegation and handoff instructions
+## 6. W2 (reduced) — honest usage accounting
 
-This section describes how the owner or lead implementing agent can divide the work. It does not mean that agents were launched during preparation of this plan.
+Two items, both worth doing independently of what §5 shows, because both currently produce untruthful run artifacts:
 
-### 13.1 Suggested assignments
+1. **Record architect response usage.** `_call_api` obtains the final message and then raises for `max_tokens` and `refusal` without reading `.usage`. Capture usage immediately after the final message and before any stop-reason handling.
+2. **Preserve observed usage when either classifier fails.** Target-side counts are collected correctly but published only on the success path. Use `finally` or an equivalent reliable handoff so a refusal, exhausted regeneration, merge failure, or later application failure still carries what was observed into the failed run artifacts.
 
-| Agent | Bounded assignment | Primary ownership | Do not edit concurrently |
-|---|---|---|---|
-| Security agent | W1 implementation, encoding matrix, call-path trace | Shared XML helper, decoding helper if needed, XML tests | Telemetry, production prompts, shared docs without coordination |
-| Accounting agent | W2 usage contract and both classifier boundaries; coordinate integration seam | Usage module, root/target classifiers, dedicated usage tests | Shared pipeline/diagnostics unless assigned ownership |
-| Evaluation agent | W3 offline analyzer, corpus manifest, fake-provider evaluation/reporting | Developer tooling, sanitized evaluation fixtures, tooling tests | Production classifier defaults or cache behavior |
-| Integration/review lead | W0, shared propagation/rollup integration, W4, W9, final acceptance | Pipeline, diagnostics, shared docs, engine digest, focused CI additions | Agent-owned files until their changes are ready |
+A comprehensive request ledger, a shared usage module, per-request purpose enums, and cross-run aggregation need a demonstrated purpose from §5. If that purpose does not materialize, implement the two items above with the smallest sound contract and stop.
 
-If fewer agents are available, implement sequentially in the same order. Parallelism is useful only for independent files and evidence gathering. Do not create multiple competing usage schemas or multiple extraction/classification implementations.
+### 6.1 Semantics to settle before coding
 
-Before the accounting and integration agents code, agree on the collector/snapshot contract, completeness semantics, and the one authoritative aggregation path. Send short interface notes containing names/types/defaults and failure behavior. Reconcile changes through commits or explicit handoff, not by racing edits.
+Whatever the eventual size, these meanings must be unambiguous. Publish the field table in the engineering guide.
 
-### 13.2 Per-agent completion report
+| Concept | Definition |
+|---|---|
+| `requests_attempted` | Actual model stream/create invocations, including transport retries and grammar fallback requests |
+| `responses_completed` | Requests for which the final message was obtained; includes refusals and output-limit responses |
+| `responses_with_usage` | Completed responses carrying at least one valid recognized usage field; this alone does not prove complete accounting |
+| `input_tokens` | Valid provider-reported uncached input tokens under the provider's current usage contract |
+| `output_tokens` | Valid provider-reported output tokens, including billed thinking tokens where the provider includes them |
+| `cache_read_input_tokens` / `cache_creation_input_tokens` | Provider-reported cache read and cache write input tokens |
+| `usage_complete` | Whether all usage necessary for the reported scope is known; false when a request lacks required final counters |
+| `requests_with_unknown_usage` | Requests whose final billable usage cannot be established from observed metadata |
+| `transport_retries` / `regenerations` | Additional transport attempts, distinct from JSON regeneration under existing policies |
 
-Each agent must return:
+Rules:
 
-1. The concrete problem and resulting behavior.
-2. Confirmed evidence and any hypothesis disproved during implementation.
-3. Files changed and the reason for each change.
-4. Tests run, interpreter/platform, results, and relevant missing checks.
-5. Invariants touched and how preservation was demonstrated.
-6. Compatibility, fingerprint, dependency, schema, and documentation implications.
-7. Remaining risks, uncertainties, and any conditional work deliberately deferred.
-8. Commit(s) or a precise diff handoff for integration.
+- **Missing usage is unknown, not zero.** Accept zero only when reported or when a documented provider contract supplies it.
+- Rejecting booleans and non-integers as counters is **existing target-side behaviour to preserve**, not new work.
+- Do not add uncached input counts to an already inclusive total. Verify the provider schema before writing any cost formula.
+- The input-size token guard is separate from billed generation usage, and `_count_input_tokens` transmits document text — it must not run in an offline path.
+- Preserve request purpose with fixed enums and numeric identifiers. Never document titles, paragraph excerpts, response text, or exception strings.
+- Do not sum nested phase timings as run wall-clock time.
 
-Do not call work complete because a function works in isolation if failure artifacts, compatibility seams, or required integration checks remain untested.
+### 6.2 Propagation constraints
 
-### 13.3 Independent integration review questions
+- Thread an optional keyword-only collector through production calls. `classify_document` keeps returning only the validated instruction object; telemetry never enters instruction JSON or its schema.
+- Record attempted requests even when opening or consuming the stream fails, and mark usage unknown rather than manufacturing an estimate.
+- On the target path, let running chunk work settle per existing executor behaviour before finalizing that target's accounting, so a failing chunk cannot hide a sibling's usage.
+- Choose one authoritative contribution per request. The existing `result["usage"]` may remain a compatibility summary but must not be added again to request-level totals.
+- Injected classifiers without telemetry support must keep working and report usage unavailable. Pass new arguments only through an explicit supported signature. **Never detect an unsupported keyword by catching `TypeError` and calling again** — that can repeat a real paid request.
+- Observers must not change successful output or replace the primary classification exception.
+- **Totals must survive verbosity.** `DiagnosticsRecorder.summary()` rolls up level-filtered events, so usage emitted only as INFO events vanishes at WARNING. Accumulate validated usage independently of verbosity, and do not claim suppressed events were written to `diagnostics.jsonl`.
+- Report a reused architect profile as no new architect request. Never charge a historical creation's cost to the current run.
+- Report deterministic-only target classification as zero model requests with known zero usage.
+- Keep dollar estimates out of runtime code.
 
-The final reviewer should answer these from the diff and evidence, not from the implementation author's confidence:
+### 6.3 Tests
 
-- Can the XML parser interpret a different encoding/representation from the one screened for declarations?
-- Are valid non-ASCII inputs preserved, and are unsupported encodings rejected consistently?
+Provider fakes only; no paid calls in the suite. Cover: one architect response; malformed-then-valid JSON; output limit then regeneration; terminal refusal; targeted coverage patch; structured-output compiler fallback; transport failure then success; fresh analysis followed by style or bundle failure; reused profile; strict legacy injected fakes; multiple target chunks; target refusal or exhausted regeneration; one chunk failing while another finishes; overlap re-ask; merge failure after responses; deterministic-only target with no client constructed; missing or malformed usage fields; parallel runs; every verbosity level; and provider metadata shaped like secrets or body text.
+
+Primary files: `tests/test_llm_classifier_safety.py`, `tests/test_phase1_pipeline.py`, `tests/test_unified_pipeline.py`, `tests/test_diagnostics.py`, `tests/style_application_regression/test_llm_classifier.py`, `tests/style_application_regression/test_batch_runner_failure_diagnostics.py`, `tests/style_application_regression/test_batch_runner.py`.
+
+### 6.4 Cache-invalidation timing
+
+Changing root `llm_classifier.py` changes `ENGINE_SOURCE_DIGEST`, invalidating every cached architect profile and forcing a fresh paid analysis per template on the next run. Keep the conservative digest — do not weaken it with a comment-stripping heuristic. Where practical, land architect telemetry together with other already-planned changes to the covered engine files so one invalidation covers both. Do not invent changes merely to amortize it, and do not delay W1 for it. Recompute with `python engine_identity.py` after final integration and explain the decision in the PR.
+
+## 7. Conditional work
+
+None of this is authorized by this document. Each needs a demonstrated purpose from §5 and its own review.
+
+### 7.1 W3 — workload measurement and evaluation
+
+If §5 shows material spend, build a developer tool with a tested importable core that uses production extraction and slim-bundle logic rather than recreating numbering or classification rules.
+
+Required behaviour: accept explicit targets and a validated profile or fixture role definitions; snapshot through existing bounded helpers into tool-owned temporary directories, never a new unchecked ZIP loop; **make no provider calls by default, including the token-count endpoint**; produce a machine-readable counts report plus a short Markdown note on sample and limits; use opaque identifiers and keep document text and private paths out of shareable reports; report skipped, failed, and empty documents alongside successful ones.
+
+Report per target/profile: `classifiable_total`, `deterministic_classified`, `deterministic_ignored`, `unresolved_sent`, `unresolved_fraction` (not-applicable when the denominator is zero), `out_of_scope` counted separately, request characters by component, chunk count, paragraph presentations including overlap, and candidate representation sizes. Check that `deterministic_classified + deterministic_ignored + unresolved_sent == classifiable_total` using the production index and disposition contract, not raw `filter_report` entries.
+
+**Corpus:** start with existing sanitized fixtures plus a few purpose-built cases for structures they miss — automatic numbering inherited through style chains, typed markers at depth, unmarked continuation prose, repeated Canadian numeric markers, Roman/alpha ambiguity, cross-references, heading-shaped requirements, editorial boilerplate, and chunk-boundary and overlap disagreements. Expand only when a specific optimization justifies the owner's adjudication time. Gold labels for ambiguous CSI material require domain review by the owner; that is a scheduling commitment and the real constraint on this package, not a deliverable an agent can complete. Separate development and holdout material by document and template family.
+
+Keep measured, estimated, and unavailable quantities in separate columns. Character reduction is never a token or dollar measurement. When any request has unknown usage, label the dollar result a lower bound; the invoice remains authoritative.
+
+### 7.2 W6 — target-classification cache
+
+Retained in full, because it is the strongest correction to the review brief.
+
+**The brief's proposed key is incorrect, not merely coarse.** `role_specs` — the architect's portable numbering patterns — flows into `build_phase2_slim_bundle` and drives deterministic classification (`core/classification.py:503,569`). Two architect templates with identical role *names* but different numbering patterns produce different deterministic dispositions, a different unresolved set, and a different request. Keying on target hash plus role names would serve a wrong cached classification.
+
+If ever implemented, cache model-derived dispositions for an exact classification request plan. Rebuild the target bundle and deterministic dispositions every run, and reapply every local validator, deterministic-override check, and coverage check before application. Never cache formatted DOCX outputs or bypass source snapshots, run isolation, application policy, package validation, or publication.
+
+Cache identity must cover: target source identity and paragraph-index universe; exact template-derived role definitions including numbering patterns, provenance, and counter constraints; the actual unresolved paragraph data and all evidence sent to the model; system and user instructions, serialized role ordering, response schema, and wire-projection version; provider and model identity, effort, and output constraints; chunking, overlap, and re-ask strategy; classification preprocessing and merge semantics with a compatible fingerprint; and an explicit cache contract version. The five-file architect engine digest does not cover target preprocessing. Conversion mode may be omitted only after a test proves it changes neither the cached request nor its interpretation.
+
+Storage: versioned private namespace, bounded entries and bytes, explicit pruning, atomic writes, no partial entries. Treat corruption as a safe miss. Checksums detect corruption but do not authenticate a hostile local writer — state that boundary honestly. Disable reuse for injected classifiers without stable identity. Report zero new API requests on a hit and never charge historical usage to the current run.
+
+Acceptance requires a two-template, same-role-list regression that fails under the brief's proposed key. Without that correctness argument and an economic case, do not implement.
+
+### 7.3 W5, W7, W8
+
+- **W5 (payload reduction):** evaluate before changing any default. Keep the full slim bundle as local authority and build a separate wire projection; never mutate shared paragraph dictionaries. Candidates in order: remove the duplicated role list from the user message; omit only fields with explicitly defined default semantics via a per-field allowlist (never a recursive truthiness filter — it drops `False`, zero, paragraph index zero, and meaningful empty collections); remove duplicated neighbour text only where exact context is present; and resolve the formatting-evidence ambiguity in the prompt. Evaluate candidates independently. An inconclusive evaluation means keep production unchanged.
+- **W7 (architect replay cache):** do not remove `ENGINE_SOURCE_DIGEST` from profile validation or replace it with a heuristic. A source-file hash does not identify the model input, since a slim-bundle change alters the request for identical DOCX bytes, and stored post-repair instructions cannot stand in for a pre-repair response after repair logic changes. Do not implement this tier merely to avoid one invalidation caused by W2.
+- **W8 (effort, model, chunking, deterministic rules):** keep current defaults. One experiment at a time on the same adjudicated corpus. A new deterministic rule needs a concrete unresolved pattern, a defensible structural discriminator, and close negative cases; the metric is correct resolution with no precision regression, not a lower unresolved percentage. Do not enlarge chunks because a context window is larger, and do not serialize requests for cache hits without measuring latency.
+
+Also excluded: another inherited-style cache without profiling, splitting or renaming classifier modules, reviving the Batch API or retired runners, and altering GUI, updater, licensing, or CI platform coverage without a task-specific reason.
+
+## 8. W4 — documentation corrections
+
+Update `CLAUDE.md` and `README.md` alongside whatever ships. Keep the engineering detail; do not replace substantive guidance with a shorter summary.
+
+1. Document encoding-independent declaration rejection, the preserved conservative screening policy, and the distinction between a parser-contract failure and a demonstrated exploit.
+2. Explain usage fields, observed versus unknown counts, failure accounting, profile reuse, deterministic-only work, and verbosity-independent totals — scoped to what actually ships.
+3. Describe concurrency accurately: one public target orchestration path, an internal chunk pool in the target classifier, and a process-wide request semaphore that does not cover root architect calls.
+4. Describe each classifier's retry behaviour specifically: the target honours `Retry-After`; the architect uses fixed exponential backoff. Both disable SDK retries.
+5. State that inherited-style lookup already uses `lru_cache`. Do not add speculative performance claims without profiling.
+6. Distinguish exact body-text and numbering preservation from whole-package byte identity, and note that unedited ignored-paragraph XML does not by itself prove unchanged rendered appearance when the shell or document defaults change.
+7. Distinguish zero LLM involvement from correct classification.
+8. State that payload size measurements are not token or dollar measurements.
+9. Document that prompt-cache reads are affected by concurrency, minimum prefix size, TTL, and prefix identity; zero reads alone identifies no single cause.
+10. Keep visual inspection of representative Word output in the validation checklist for formatting, numbering, or shell changes.
+11. Describe any evaluation tooling as developer tooling, not a step in the GUI workflow.
+
+Do not edit production prompts for wording during W4; the formatting-evidence ambiguity is a model-input change belonging to W5.
+
+### Brief corrections to close in the implementation report
+
+| Brief claim | Correct treatment |
+|---|---|
+| Omit empty/false fields with zero information loss | Define field defaults and evaluate; absence can differ from explicit false or null |
+| Target hash plus role names suffices for cache reuse | Incorrect — include template-dependent role definitions and exact classification inputs (§7.2) |
+| Style numbering lookup needs memoization | Already cached; profile before further work |
+| Zero cache reads means prefix invalidation | Check concurrency, warm-up, TTL, and minimum size too |
+| Only one thread pool exists | One public runner plus internal chunk concurrency |
+| Classification is intrinsically a poor use of high effort | A workload-specific hypothesis, not a general fact |
+| More deterministic resolution always improves quality | Requires precision evidence and adversarial coverage |
+| Payload reductions are measured token savings | Character reductions until measured with the actual tokenizer |
+| A review verdict must have no hedging | State a clear verdict with explicit coverage and uncertainty |
+
+## 9. Integration and verification
+
+### 9.1 Change sequence
+
+| Sequence | Scope | Must stand on its own |
+|---|---|---|
+| PR 1 | W1 union guard, encoding matrix, documentation | Safe parser behaviour; no telemetry or optimization changes |
+| — | Spend inspection (§5) | A recorded figure and date; no code |
+| PR 2 | W2 reduced accounting and its tests and docs | Correct accounting with no prompt or request-policy change |
+| PR 3+ | Only what §5 justifies | Its own evidence and compatibility review |
+
+### 9.2 Version and resource checklist
+
+| Surface | When to update |
+|---|---|
+| `engine_identity.py::ENGINE_SOURCE_DIGEST` | Any covered root source changes; compute after final integration. W1 does not touch these files |
+| `PIPELINE_VERSION` | Only if architect pipeline compatibility requires it; not a substitute for the digest |
+| Profile contract / manifest versions | Only if consumer-visible profile assumptions change |
+| Run audit / manifest versions | Assess additive usage fields against readers; document the decision |
+| `requirements.txt` | New or changed direct runtime dependency only. Neither W1 nor reduced W2 adds one — both use the standard library |
+| `THIRD_PARTY_NOTICES.md` | Regenerate through the build process if dependencies change; never hand-edit |
+| PyInstaller spec | New dynamically imported runtime modules or resources |
+| `README.md`, `CLAUDE.md` | Changed behaviour, diagnostics, constraints, validation requirements |
+
+### 9.3 Runtime and platform checks
+
+1. Run the full suite on Windows / Python 3.11, the authoritative gate.
+2. Run W1's tests on Python 3.10 as well. The Linux CI job installs `requirements.txt` after its updater tests; a small focused step after that installation covers the new parser behaviour. Preserve pinned action SHAs and avoid unrelated CI redesign.
+3. Record Python and Expat versions with any parser result.
+4. Confirm a frozen Windows build imports the changed code and loads prompts as before, using `docs/RELEASE_WINDOWS.md`. Do not publish a release automatically.
+
+### 9.4 Document and visual acceptance
+
+Exercise both application modes with offline classifier seams and representative fixtures. Verify source hashes, body text, numbering semantics, protected structures, collision-safe styles, relationships, package validity, and no partial publication.
+
+For W1 and reduced W2, unchanged request and output behaviour plus regression tests are the primary evidence; telemetry needs no new visual standard. For any change that affects resulting documents, inspect representative output in Word against the architect template and original target, rendering every page when formatting or shell behaviour changes. Use disposable copies. Record the Word version, font availability, cases selected, and any limitation.
+
+### 9.5 Acceptance checklist
+
+- [ ] W1 rejects prohibited declarations before expansion across the tested encodings.
+- [ ] Every rejection the current guard performs still happens, with the same exception type and message.
+- [ ] Valid supported non-ASCII content is preserved and failure behaviour is stable.
+- [ ] Corpus regression timing recorded before and after W1.
+- [ ] Existing spend inspected and recorded, with a decision on §7.
+- [ ] Architect response usage is captured, and observed usage survives classifier failure.
+- [ ] Unknown usage stays explicitly unknown; no silent zero-cost claims.
+- [ ] Usage totals survive every diagnostic verbosity level.
+- [ ] No document text, secrets, raw responses, or arbitrary provider metadata in artifacts.
+- [ ] Injected seams still work with no duplicate request from compatibility handling.
+- [ ] Model, effort, retry, concurrency, and formatting defaults unchanged.
+- [ ] Documentation, versions, and digests match what shipped.
+- [ ] Focused and full suites pass in the required environments, with skips explained.
+- [ ] Each conditional package has an implemented, deferred, or rejected decision with evidence.
+- [ ] Unrelated files and prior outputs untouched.
+
+## 10. Working arrangement
+
+One implementing agent and one independent review are sufficient for W1 and for reduced W2. Implement sequentially. If more agents are ever warranted, keep them to independent files and evidence gathering, and never create competing usage schemas or a second extraction or classification implementation.
+
+A completion report should give the concrete problem and resulting behaviour, evidence confirmed and any hypothesis disproved, files changed with reasons, tests run with interpreter and platform, invariants touched and how preservation was shown, compatibility and fingerprint implications, remaining risks, and the commits.
+
+An independent reviewer should be able to answer these from the diff:
+
+- Can the parser interpret a representation different from the one screened?
+- Does every rejection the old guard performed still happen, with the same message?
+- Are valid non-ASCII inputs preserved and unsupported encodings rejected consistently?
 - Can a paid response occur before an exception that discards its observed usage?
 - Can a worker finish after the accounting snapshot was finalized?
 - Can the same request contribute through both a callback and a returned summary?
 - Can a reused profile import historical usage into a new run's totals?
 - Can logging verbosity remove cost information?
-- Can an injected fake or custom callable cause a second real invocation during argument fallback?
-- Did telemetry change prompt construction, model settings, retries, or validators unintentionally?
-- Are any reported savings only character counts or estimates presented as observations?
-- If payload changes were selected, were holdout quality, fallback roles, context gaps, and failed runs included?
-- If caching was selected, does a same-role-list/different-template case invalidate correctly?
-- Does the final documentation describe exactly what was implemented and tested?
+- Can an injected fake cause a second real invocation during argument fallback?
+- Did telemetry change prompt construction, model settings, retries, or validators?
+- Are any reported savings character counts presented as observations?
 
-## 14. Expected final handoff artifacts
+## 11. Handoff artifacts
 
-Deliver the following for the initial implementation:
+1. Reviewable commits or PRs for what actually shipped.
+2. `README.md` and `CLAUDE.md` updated for the parser contract, and for accounting if it ships.
+3. Focused adversarial parser tests and accounting regression tests.
+4. A short implementation report, suggested `docs/IMPLEMENTATION_REPORT_2026-09-08.md`, with actual results rather than copied baseline claims — including the recorded Python and Expat versions, corpus timing, the recorded spend figure, and a decision table for §7.
 
-1. Reviewable implementation commits/PRs for selected work packages.
-2. Updated `README.md` and `CLAUDE.md` with the new parser and accounting contracts.
-3. Focused adversarial and accounting regression tests.
-4. Offline workload/evaluation tooling with no-network defaults and example sanitized inputs.
-5. A Markdown implementation report, suggested location `docs/IMPLEMENTATION_REPORT_2026-09-08.md`, containing actual results rather than copied baseline claims.
-6. A workload/evaluation report when data is available, explicitly distinguishing measured, estimated, and unavailable results.
-7. A short decision table stating which of W5-W8 were implemented, deferred, or rejected and why.
+Do not deliver speculative code for conditional packages. The desired result is a safer parser, honest run diagnostics, and an evidence-based path to optimization that may correctly end in no optimization at all.
 
-Do not deliver speculative code for every conditional work package. The desired result is a safer parser, trustworthy accounting, and an evidence-based path to optimization while preserving the formatter's document contracts.
+## 12. References
 
-## 15. Primary references and freshness
+Recheck provider contracts before implementing live accounting or evaluation.
 
-These references support specific technical qualifications. Recheck provider contracts before implementing live accounting or evaluation behavior; model/API details may change.
+- [Expat XML security](https://libexpat.github.io/doc/xml-security/): amplification protections and the limits of a small entity-expansion reproduction. Consulted 2026-09-08.
+- [`xml.parsers.expat` — `StartDoctypeDeclHandler`](https://docs.python.org/3.11/library/pyexpat.html#xml.parsers.expat.xmlparser.StartDoctypeDeclHandler): fires as Expat begins the document-type declaration, which is the rejection point §4.2 relies on. Consulted 2026-09-08.
+- [Python XML processing and security](https://docs.python.org/3/library/xml.html): runtime and parser-version considerations. Consulted 2026-09-08.
+- [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching): usage categories, minimum prefix sizes, TTL behaviour. Consulted 2026-09-08.
+- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing): dated rates for optional cost estimates. Consulted 2026-09-08. Do not hard-code rates into the formatter.
 
-- [Expat XML security](https://libexpat.github.io/doc/xml-security/): amplification protections and the limits of interpreting a small entity-expansion reproduction. Consulted 2026-09-08.
-- [Python XML processing/security](https://docs.python.org/3/library/xml.html): runtime/parser-version considerations. Consulted during the review on 2026-09-08; also check the documentation for the supported interpreter versions.
-- [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching): usage categories, minimum prefix sizes, cache availability after response start, and TTL behavior. Consulted 2026-09-08.
-- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing): dated rates for optional evaluation cost estimates. Consulted 2026-09-08. Do not hard-code these rates into the formatter as part of W2.
-
-The original document `C:\Users\AbrahamBorg\Downloads\spec-template-nomalizer_REVIEW_BRIEF.md` remains contextual source material. Its instructions, historical branch name, measurements, and proposed optimizations are not independently verified authority.
+The original review brief in the owner's Downloads remains contextual source material. Its instructions, branch name, measurements, and proposed optimizations are not independently verified authority; §7.2 and the §8 table record where it is wrong.
