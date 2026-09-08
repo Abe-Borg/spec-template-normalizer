@@ -152,9 +152,13 @@ when in doubt the heuristics return nothing.
 
 The LLM selects roles/dispositions, not XML formatting. Role styles come from
 validated architect exemplars. Resolve paragraph formatting through the full
-architect `basedOn` chain, and remove a target direct property only when the
-effective architect style supplies that property. Never remove numbering,
-`sectPr`, tracked changes, or protected subtrees as generic formatting cleanup.
+architect `basedOn` chain. In Format-only, remove a target direct property only
+when the effective architect style supplies that property. Canadian conversion
+is broader by design: it replaces `jc`, `ind`, `spacing`, and `numPr` on every
+converted paragraph because it retargets each one to the architect's list-level
+indents, and a surviving target indent would fight the imported numbering. In
+both modes, never remove `sectPr`, tracked changes, or protected subtrees as
+generic formatting cleanup, and never remove numbering in Format-only.
 
 Never replace an existing target style ID, including `Normal`. Clone a
 conflicting architect style and its dependencies under deterministic private

@@ -19,7 +19,6 @@ from .arch_env_applier import apply_environment_to_target
 from .core.classification import apply_phase2_classifications, build_phase2_slim_bundle
 from .core.application_policy import ApplicationPolicy, application_policy_for_mode
 from .core.csi_to_canadian import (
-    CSI_TO_CANADIAN,
     FORMAT_ONLY,
     CanadianConversionReport,
     ConversionIssue,

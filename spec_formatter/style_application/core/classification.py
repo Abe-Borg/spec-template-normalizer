@@ -1713,7 +1713,10 @@ def apply_phase2_classifications(
 
     # Contract normalization is per paragraph: Format-only may remove only
     # properties actually supplied by that paragraph's effective architect
-    # style, while Canadian mode retains its legacy broader mutation contract.
+    # style. Canadian mode deliberately replaces jc/ind/spacing/numPr on every
+    # converted paragraph: it retargets each paragraph to the architect's
+    # list-level indents, so keeping a target's direct indent would fight the
+    # imported numbering. CLAUDE.md invariant 5 is scoped to Format-only.
     contract_before = [
         _normalize_paragraph_for_contract(
             p,
