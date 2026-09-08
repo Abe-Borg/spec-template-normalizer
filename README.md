@@ -55,7 +55,9 @@ the `SPEC_FORMATTER_DISABLE_UPDATE_CHECK` environment variable.
 
 ## Install from source (developers)
 
-Python 3.10 or newer is required.
+Python 3.10 or newer is required; CI imports the application on 3.10 and runs
+the full test suite on 3.11. `requirements.txt` lists only the direct runtime
+dependencies and lets pip resolve the rest.
 
 ```powershell
 python -m venv venv

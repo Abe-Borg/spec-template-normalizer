@@ -614,7 +614,9 @@ Before considering a formatter change complete:
 
 ## Platform and license
 
-Runtime is Python 3.9+ with Windows as the primary GUI platform. Core package processing is intended to remain portable.
+Runtime is Python 3.10+ with Windows as the primary GUI platform. CI imports
+the application on 3.10 (the floor) and runs the full suite on 3.11. Core
+package processing is intended to remain portable.
 
 Copyright 2025 Abraham Borg. Released under the PolyForm Noncommercial License
 1.0.0 (`LICENSE`): source-available, with noncommercial use, modification, and
@@ -632,5 +634,9 @@ environment markers evaluated for the target platform -- and reproduces each
 distribution's own license file. The Windows release workflow regenerates it
 from the real build environment before PyInstaller runs, so the shipped notices
 always match the shipped code. Do not maintain the dependency list by hand:
-`requirements.txt` pins only direct dependencies, so a hand-written list silently
-omits whatever pip resolves underneath them.
+`requirements.txt` pins only the direct runtime dependencies (`anthropic`,
+`customtkinter`, `httpx`, `keyring`), so a hand-written list silently omits
+whatever pip resolves underneath them. `requirements-dev.txt` adds the test
+tools and `requirements-build.txt` the Windows build tools, including
+`packaging`, which only the notices generator imports. Workflow actions are
+pinned to commit SHAs that `.github/dependabot.yml` keeps current.

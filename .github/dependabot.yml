@@ -1,0 +1,15 @@
+# Keeps the commit-SHA pins in .github/workflows/*.yml current. Every action
+# there is pinned to an immutable SHA with its version in a trailing comment;
+# Dependabot rewrites both when a new release appears. Python dependencies
+# are deliberately not managed here: requirements.txt is a short, hand-pinned
+# direct-dependency list that changes with the code that needs it.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

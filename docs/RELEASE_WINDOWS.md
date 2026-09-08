@@ -18,6 +18,7 @@ them directly. This runbook covers cutting a release.
 | Manifest maker | `packaging/windows/make_manifest.py` | Computes the installer SHA-256 → `latest.json`. |
 | Version guard | `packaging/windows/check_release_version.py` | Fails the build if the tag ≠ `__version__`. |
 | Workflow | `.github/workflows/release.yml` | Builds on every relevant PR; builds **and publishes** on a `v*` tag. |
+| Action pins | `.github/dependabot.yml` | Weekly PRs that move the workflows' commit-SHA action pins to new releases. |
 
 The updater reads `https://github.com/abe-borg/spec-template-normalizer/releases/latest/download/latest.json`.
 GitHub only serves the newest **non-prerelease** release at `releases/latest`, so
