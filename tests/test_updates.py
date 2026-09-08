@@ -14,7 +14,7 @@ import hashlib
 import io
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -581,3 +581,131 @@ def test_gui_schedules_auto_check_and_calls_checker() -> None:
     assert "_maybe_auto_check_for_updates" in src
     assert "updates.check_for_update" in src
     assert "_build_footer" in src
+
+
+# --------------------------------------------------------------------------
+# Hardening: https after redirects, size caps, unique temp files, tz-safe state
+# --------------------------------------------------------------------------
+
+
+class _RedirectedResponse(_FakeResponse):
+    def __init__(self, data: bytes, final_url: str):
+        super().__init__(data)
+        self._final_url = final_url
+
+    def geturl(self):
+        return self._final_url
+
+
+def test_fetch_manifest_rejects_a_redirect_off_https(monkeypatch) -> None:
+    payload = json.dumps({"schema": 1, "version": "9.9.9"}).encode()
+
+    def fake_urlopen(request, timeout=None):
+        return _RedirectedResponse(payload, "http://mirror.lan/latest.json")
+
+    monkeypatch.setattr(updates.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(UpdateError, match="redirected to a non-https"):
+        updates.fetch_manifest("https://github.com/x/y/releases/latest/download/latest.json")
+
+
+def test_fetch_manifest_accepts_an_https_redirect(monkeypatch) -> None:
+    payload = json.dumps({"schema": 1, "version": "9.9.9"}).encode()
+
+    def fake_urlopen(request, timeout=None):
+        return _RedirectedResponse(payload, "https://objects.githubusercontent.com/latest.json")
+
+    monkeypatch.setattr(updates.urllib.request, "urlopen", fake_urlopen)
+    assert updates.fetch_manifest("https://github.com/x/y/releases/latest/download/latest.json") == {
+        "schema": 1,
+        "version": "9.9.9",
+    }
+
+
+def test_download_rejects_a_redirect_off_https(tmp_path: Path) -> None:
+    payload = b"installer"
+    info = UpdateInfo(version="2.0.0", url=f"https://host/{_ASSET}", sha256=hashlib.sha256(payload).hexdigest())
+
+    def opener(url, *, timeout=None):
+        return _RedirectedResponse(payload, f"http://host/{_ASSET}")
+
+    with pytest.raises(UpdateError, match="redirected to a non-https"):
+        updates.download_installer(info, tmp_path, opener=opener)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_refuses_an_oversized_content_length(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(updates, "MAX_INSTALLER_BYTES", 100)
+    payload = b"x" * 200
+    info = UpdateInfo(version="2.0.0", url=f"https://host/{_ASSET}", sha256=hashlib.sha256(payload).hexdigest())
+
+    with pytest.raises(UpdateError, match="above the 100-byte limit"):
+        updates.download_installer(info, tmp_path, opener=_opener_for(payload))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_refuses_bytes_beyond_the_cap_without_a_content_length(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(updates, "MAX_INSTALLER_BYTES", 100)
+    payload = b"x" * 200
+    info = UpdateInfo(version="2.0.0", url=f"https://host/{_ASSET}", sha256=hashlib.sha256(payload).hexdigest())
+
+    with pytest.raises(UpdateError, match="exceeded the 100-byte limit"):
+        updates.download_installer(
+            info, tmp_path, opener=_opener_for(payload, content_length=False), chunk=64
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_uses_a_unique_exclusive_part_file_and_the_shared_verifier(
+    tmp_path: Path, monkeypatch
+) -> None:
+    payload = b"installer bytes" * 10
+    sha = hashlib.sha256(payload).hexdigest()
+    info = UpdateInfo(version="2.0.0", url=f"https://host/{_ASSET}", sha256=sha)
+    verified: list = []
+    real_verify = updates.verify_sha256
+
+    def spy_verify(path, expected, **kwargs):
+        verified.append((Path(path).name, expected))
+        return real_verify(path, expected, **kwargs)
+
+    monkeypatch.setattr(updates, "verify_sha256", spy_verify)
+    # A stale file under the old fixed temp name must not interfere.
+    (tmp_path / f"{_ASSET}.part").write_bytes(b"stale")
+
+    dest = updates.download_installer(info, tmp_path, opener=_opener_for(payload))
+
+    assert dest.read_bytes() == payload
+    assert verified and verified[0][0].endswith(".part") and verified[0][0] != f"{_ASSET}.part"
+    assert verified[0][1] == sha
+    remaining = sorted(p.name for p in tmp_path.iterdir())
+    assert remaining == sorted([_ASSET, f"{_ASSET}.part"])  # only the pre-existing stale file
+
+
+def test_download_failure_leaves_no_unique_part_file(tmp_path: Path) -> None:
+    info = UpdateInfo(version="2.0.0", url=f"https://host/{_ASSET}", sha256=_GOOD_SHA)
+
+    def opener(url, *, timeout=None):
+        return _BrokenResponse(b"x" * 10000, fail_after=2)
+
+    with pytest.raises(OSError):
+        updates.download_installer(info, tmp_path, opener=opener, chunk=1024)
+    assert [p for p in tmp_path.iterdir()] == []
+
+
+def test_should_auto_check_normalises_mixed_timezone_awareness() -> None:
+    aware_now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+    naive_now = datetime(2026, 9, 8, 12, 0)
+    recent_aware = {"last_check": (aware_now - timedelta(hours=1)).isoformat()}
+    recent_naive = {"last_check": (naive_now - timedelta(hours=1)).isoformat()}
+
+    assert updates.should_auto_check(recent_aware, now=naive_now) is False
+    assert updates.should_auto_check(recent_naive, now=aware_now) is False
+    assert updates.should_auto_check(
+        {"last_check": (naive_now - timedelta(days=2)).isoformat()}, now=aware_now
+    ) is True
+
+
+@pytest.mark.parametrize("bad", [123, {"nested": True}, ["list"], object()])
+def test_should_auto_check_tolerates_non_string_timestamps(bad) -> None:
+    assert updates.should_auto_check({"last_check": bad}, now=datetime(2026, 9, 8, 12, 0)) is True
+

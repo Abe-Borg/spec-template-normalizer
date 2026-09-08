@@ -95,6 +95,15 @@ $env:SPEC_FORMATTER_UPDATE_URL = "https://.../your-test-latest.json"
 
 Both the manifest URL and the installer `url` must be `https://` — the updater
 refuses plaintext (the manifest is the root of trust for the installer hash).
+That guarantee survives redirects: `urllib` follows them silently and the
+production manifest URL (`releases/latest/download/latest.json`) is itself a
+redirect, so the updater also checks the URL it was finally served from and
+refuses a hop off `https://`. The installer download is capped at 512 MiB
+(both the announced `Content-Length` and the bytes actually read), streams to
+a uniquely named `.part` file opened exclusively, is verified with the same
+`verify_sha256` routine the tests use, and only then is renamed into place.
+A launch-time throttle timestamp that is missing, malformed, or of a
+different timezone awareness than the current clock never blocks the check.
 
 ## Environment variables
 
