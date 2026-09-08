@@ -17,6 +17,7 @@ The first draft was correct in its findings and wrong in its proportions. It mad
 |---|---|---|---|
 | W1 design | Decode bytes, scan the decoded text, re-encode, parse | Keep the existing byte prescan and add an Expat `StartDoctypeDeclHandler` validator over the same immutable payload | Decode-first is defeated by BOM-less UTF-16 unless the NUL rule in the old §5.3.4 is also applied; the validator makes rejection encoding-independent by construction instead of by discipline |
 | W1 as replacement | Implied the byte scan would be replaced | Union: nothing is removed | An Expat-only guard silently relaxes declaration-shaped text in comments and CDATA and changes two existing rejection messages; both are verified below |
+| Decoded-text handling | Encode a `str` to UTF-8 and parse it | Normalize the declaration first with the existing `prepare_xml_text_for_utf8` | The shipped guard parses UTF-8 bytes back through a stale declaration: `windows-1252` yields mojibake and `utf-16` fails outright. Found in review of this plan; §4.3 records it |
 | W0 | A separate work package with a baseline report and ownership assignment | Folded into W1 as ordinary verification | One focused fix does not need a preparatory phase |
 | W2 | A complete request ledger across both classifiers | Two items: record architect response usage, and preserve observed usage when either classifier fails | The rest needs a demonstrated purpose |
 | W3 | Build the analyzer and evaluation harness | Gated behind inspecting existing spend first | The draft required evidence before optimizing but not before instrumenting |
@@ -56,6 +57,7 @@ Everything in this table was checked against the code at revision time. Line ref
 | Reproduced on the supported runtime | Python 3.11.15 / Expat 2.6.1 — the Windows CI version. UTF-16 LE with BOM and UTF-16 BE both accepted and expanded; UTF-8 and `str` inputs correctly rejected | Closes the environment gap; the original draft had only Python 3.14.6 / Expat 2.8.1 |
 | Decode-first alone does not close it | BOM-less UTF-16 without an XML declaration: `decode_xml_bytes` sniffs it as UTF-8, returns NUL-interleaved text the text regex cannot match, re-encoding round-trips to the original bytes, and Expat re-detects UTF-16 and expands | The NUL rule is part of the design, not a caveat. §4.2 avoids the question entirely |
 | Raw-byte callers exist and read untrusted input | `header_footer_importer.py:134,481,716` pass `read_bytes()` from the extracted target package; `phase2_invariants.py:426` passes `zf.read(name)` for every XML part in a package; `core/registry.py:603` passes `path.read_bytes()` | Establishes exposure. Earlier decoding gates may still front-run particular application paths; trace before claiming a specific end-to-end exploit |
+| A decoded `str` is parsed through its stale declaration | The guard encodes a `str` to UTF-8 and parses it with the original declaration still in place. A `windows-1252` declaration yields `'Ã©'` for `é`; a `utf-16` declaration fails outright. `read_xml_text` preserves declarations and OPC permits non-UTF-8 parts | A live defect, not only a design-sketch issue. §4.2 step 0 fixes it with the existing `prepare_xml_text_for_utf8` helper |
 | End-to-end denial of service is not established | Modern Expat has amplification countermeasures | Fix the prohibition independently of severity. Do not run an unbounded payload to demonstrate it |
 | Architect response usage is not accumulated | Root `llm_classifier.py::_call_api` reads `get_final_text()` and `stop_reason`, never `.usage`, and raises on `max_tokens`/`refusal` *after* the final message is in hand | The counts exist at that moment and are discarded. This is the seam for W2 |
 | Target usage is returned only on success | `core/llm_classifier.py` calls `_record_usage` correctly before the refusal and `max_tokens` raises, but `result["usage"] = dict(usage_totals)` sits on the success path | A refusal, exhausted regeneration, or merge failure drops every observed count |
@@ -100,7 +102,13 @@ Every untrusted XML entry through `parse_untrusted_xml` rejects a DOCTYPE or ENT
 Keep the existing byte prescan. Add an Expat validator. Parse the same immutable payload with all three steps.
 
 ```python
-payload = data.encode("utf-8") if isinstance(data, str) else data
+# 0. A str is already decoded. Make its declaration truthful before
+#    encoding, or both parsers will read the UTF-8 bytes back through the
+#    stale declared encoding. Reuses the existing shared helper.
+if isinstance(data, str):
+    payload = prepare_xml_text_for_utf8(data).encode("utf-8")
+else:
+    payload = data
 
 # 1. Existing conservative prescan - unchanged, nothing removed.
 if _DOCTYPE_RE.search(payload):
@@ -112,11 +120,14 @@ if _DOCTYPE_RE.search(payload):
 # 3. Then parse that same payload with ElementTree.
 ```
 
-Three properties make this the right shape:
+Four properties make this the right shape:
 
 1. **One immutable payload** feeds the prescan, the validator, and the parse. The old draft's requirement that "the representation that is checked and the representation that is parsed must be equivalent" becomes true by construction rather than something an implementer must argue. There is no second encoding interpretation to keep in sync.
 2. **Nothing is removed**, so the current conservative screening policy survives intact — including declaration-shaped text inside comments and CDATA, which the plan already required preserving for this patch.
 3. **`UntrustedXmlError` handling is untouched.** It stays a `ValueError` subclass, keeps the part-name context, and keeps its existing message for every case that reaches it today.
+4. **A decoded `str` keeps its characters**, because step 0 makes the declaration agree with the bytes actually produced. See §4.3.
+
+Step 0 fixes a latent defect in the current guard rather than merely preserving it; §4.8 records that as a deliberate behaviour change. `prepare_xml_text_for_utf8` is idempotent, so the existing pre-normalizing call at `arch_env_applier.py:223` becomes redundant but stays harmless — leave it or remove it, but do not make removal a condition of this patch.
 
 Both the validator and `ElementTree` use the same Expat build, so they cannot disagree about encoding detection or well-formedness.
 
@@ -144,6 +155,20 @@ Replacing the scan silently relaxes two cases the plan requires preserving, and 
 
 Note that `<w:p>...<!ENTITY a "b"></w:p>` is not well-formed XML at all; the current guard is deliberately stricter than well-formedness requires, and the union keeps that intent. A later cleanup must not drop it as redundant.
 
+**Encoding a decoded `str` without normalizing its declaration is a live defect today.** `parse_untrusted_xml` currently does `data.encode("utf-8")` on a `str` and hands the result to a parser that still believes the stale declaration. OPC permits non-UTF-8 parts, and `read_xml_text` returns decoded text with its original declaration intact, so this is reachable rather than theoretical:
+
+| `str` input | Current guard | With step 0 |
+|---|---|---|
+| `encoding="windows-1252"`, content `é` | `'Ã©'` — silent mojibake | `'é'` |
+| `encoding="utf-16"`, content `é` | `UntrustedXmlError: XML parse error` | `'é'` |
+| `encoding="UTF-8"` or no declaration | correct | correct |
+
+Both parsers agree on the mis-declared payload, so the union guard is internally consistent either way — they simply agree on the *wrong* interpretation. Only normalizing the declaration fixes it.
+
+Reachable callers passing decoded text straight through include `core/classification.py:385` (`numbering_xml_text`) and `core/classification.py:1464` (`styles_xml_text`). `arch_env_applier.py:223` is the one site that already normalizes, which is evidence the hazard was known and handled locally rather than at the boundary.
+
+Two fixes were considered. Handing the original `str` to `ElementTree` also decodes correctly, but it makes the checked and parsed representations differ by type, cannot feed the byte prescan without re-encoding anyway, and leans on parser-specific `str` handling across the supported interpreter range. Normalizing with the existing `prepare_xml_text_for_utf8` keeps one bytes payload for all three steps and reuses a helper the codebase already relies on in `write_xml_text`. Prefer it.
+
 ### 4.4 Files
 
 Primary:
@@ -151,7 +176,7 @@ Primary:
 - `spec_formatter/style_application/core/untrusted_xml.py`
 - `tests/style_application_regression/test_untrusted_xml.py`
 
-`core/ooxml_text.py` needs no change under this design. Touch it only if a separate defect is found there, and say so explicitly.
+`core/ooxml_text.py` needs no change under this design; §4.2 step 0 *calls* its existing `prepare_xml_text_for_utf8` rather than modifying it. Touch that module only if a separate defect is found there, and say so explicitly.
 
 Trace and exercise callers in `header_footer_importer.py` (`_remove_existing_hf_files`, `_rebuild_document_rels`, `_ensure_content_types`), `phase2_invariants.py::validate_docx_package`, `core/registry.py` bundle-artifact loading, `docx_patch.py::validate_xml_wellformedness`, and `arch_env_applier.py` content-type and relationship preparation.
 
@@ -165,7 +190,7 @@ Use tiny payloads. Do not run an unbounded amplification payload.
 | Valid UTF-16 LE/BE with BOM and matching declarations | Correct root and text |
 | BOM-less UTF-16 LE/BE, with and without declarations | Correct parse or documented rejection; never unchecked expansion |
 | Declared single-byte encoding with non-ASCII text (e.g. windows-1252) | Characters preserved |
-| Already-decoded text carrying a non-UTF-8 declaration | Correct safe handling |
+| Already-decoded text declaring `windows-1252`, `utf-16`, `UTF-8`, and no declaration | Characters preserved in every case; specifically `é` never becomes `Ã©` |
 | Tiny DOCTYPE plus internal entity in each supported encoding | `UntrustedXmlError` before expansion |
 | External SYSTEM/PUBLIC declarations | Rejected without filesystem or network dereference |
 | Every existing case in the current parametrized rejection test | Same exception type and message as today |
@@ -220,6 +245,7 @@ Acceptance:
 
 - The original bypass fails for bytes and text, across the tested encodings.
 - Every existing rejection keeps its current exception type and message.
+- One deliberate behaviour change is documented rather than silent: a decoded `str` with a non-UTF-8 declaration now parses with correct characters instead of mojibake, and a `utf-16`-declared `str` now parses instead of raising. Both were defects; the fix is in scope because §4.5 promises those cases work.
 - Valid content retains its Unicode across supported encodings.
 - Package validation, both application modes, and the corpus regression are unaffected.
 - Python and Expat versions are recorded for the parser results.
