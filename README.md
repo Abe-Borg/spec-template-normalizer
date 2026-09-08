@@ -235,6 +235,15 @@ print(result.diagnostics_path)  # diagnostics.jsonl for this run
 Target inputs may be individual DOCX paths or folders. Folder expansion is
 non-recursive. Multi-file runs are independent: one corrupt target is reported
 as a failure without discarding valid outputs from other targets.
+
+Target classification requests share one process-wide limiter, so a batch of
+targets, each split into several chunks, never opens more than a bounded
+number of API streams at once. The default is 4 concurrent requests; set the
+`SPEC_FORMATTER_MAX_CONCURRENT_REQUESTS` environment variable (1 to 64) to
+change it. Transient failures (rate limits, connection errors, 5xx responses)
+are retried a bounded number of times, honouring a `retry-after` header when
+one is sent; an invalid key, a bad request, or a model refusal fails the target
+immediately instead of retrying.
 `output_dir` is the output **root**; `result.output_dir` remains a
 backward-compatible alias of the concrete `result.run_dir`.
 

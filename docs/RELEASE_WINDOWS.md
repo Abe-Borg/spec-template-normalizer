@@ -103,6 +103,7 @@ refuses plaintext (the manifest is the root of trust for the installer hash).
 | `SPEC_FORMATTER_UPDATE_URL` | Override the manifest URL (testing / a fork's releases). Must be https. |
 | `SPEC_FORMATTER_DISABLE_UPDATE_CHECK` | Set truthy to turn off update checks entirely. `0`/`false`/`no`/`off`/empty keep checks on. |
 | `SPEC_FORMATTER_SELFCHECK_OUT` | Path the frozen `--selfcheck` writes its result to (used by CI, since the windowed exe has no stdout). |
+| `SPEC_FORMATTER_MAX_CONCURRENT_REQUESTS` | Maximum concurrent target-classification API requests across all targets and chunks (default 4, clamped to 1 to 64). |
 
 ## Building locally (optional)
 

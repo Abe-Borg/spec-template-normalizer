@@ -6,10 +6,12 @@ with retry logic, chunking for large documents, and coverage reporting.
 """
 
 import json
+import os
+import threading
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Any, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from .classification import (
     PHASE2_MASTER_PROMPT,
@@ -24,6 +26,113 @@ _CHARS_PER_TOKEN = 3
 _MAX_BUNDLE_TOKENS = 80_000
 _MAX_BUNDLE_CHARS = _MAX_BUNDLE_TOKENS * _CHARS_PER_TOKEN
 _CHUNK_OVERLAP = 20
+
+
+# Transport policy -----------------------------------------------------------
+#
+# The SDK's hidden retries are disabled so the bounded policy below owns every
+# attempt; a bad key used to cost up to 54 doomed requests per target. A
+# process-wide limiter bounds concurrent requests across all targets and all
+# of their chunks (six targets times six chunk workers used to mean 36 open
+# streams).
+
+_MAX_CONCURRENT_REQUESTS_ENV = "SPEC_FORMATTER_MAX_CONCURRENT_REQUESTS"
+_DEFAULT_MAX_CONCURRENT_REQUESTS = 4
+_MAX_CONCURRENT_REQUESTS_CEILING = 64
+_TRANSPORT_RETRIES = 2  # initial request + 2 retries for transient failures
+_MAX_RETRY_AFTER_SECONDS = 120.0
+
+
+class ClassificationRefused(RuntimeError):
+    """The model refused the request (``stop_reason == "refusal"``).
+
+    Terminal: a refusal is not transient and regenerating the same request
+    would not change the outcome. No server-side fallback is attempted
+    because the run manifest records the model that produced the result.
+    """
+
+
+class _NeverRaised(Exception):
+    """Placeholder for SDK exception types missing from a stubbed module."""
+
+
+def _max_concurrent_requests() -> int:
+    raw = os.environ.get(_MAX_CONCURRENT_REQUESTS_ENV, "").strip()
+    try:
+        value = int(raw) if raw else _DEFAULT_MAX_CONCURRENT_REQUESTS
+    except ValueError:
+        value = _DEFAULT_MAX_CONCURRENT_REQUESTS
+    return max(1, min(value, _MAX_CONCURRENT_REQUESTS_CEILING))
+
+
+_REQUEST_LIMITER = threading.BoundedSemaphore(_max_concurrent_requests())
+
+
+def _configure_request_limit(limit: int) -> None:
+    """Replace the process-wide limiter (tests and embedding applications)."""
+
+    global _REQUEST_LIMITER
+    _REQUEST_LIMITER = threading.BoundedSemaphore(max(1, int(limit)))
+
+
+def _sdk_error_classes(anthropic_module: Any) -> Dict[str, type]:
+    return {
+        name: getattr(anthropic_module, name, _NeverRaised)
+        for name in ("RateLimitError", "APIConnectionError", "APIStatusError")
+    }
+
+
+def _retry_after_seconds(error: Exception) -> Optional[float]:
+    """Honour a numeric ``retry-after`` header when the SDK exposes one."""
+
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except ValueError:
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, _MAX_RETRY_AFTER_SECONDS)
+
+
+def _transport_retry_delay(
+    error: Exception,
+    attempt: int,
+    errors: Dict[str, type],
+) -> Optional[float]:
+    """Seconds to wait before retrying ``error``, or ``None`` to fail now.
+
+    Rate limits wait for ``retry-after`` when present, connection failures
+    and 5xx responses back off exponentially, and everything else (bad key,
+    bad request, refusal, programming errors) is re-raised at once.
+    """
+
+    backoff = float(2 ** (attempt + 1))
+    if isinstance(error, errors["RateLimitError"]):
+        retry_after = _retry_after_seconds(error)
+        return retry_after if retry_after is not None else backoff
+    if isinstance(error, errors["APIConnectionError"]):
+        return backoff
+    if isinstance(error, errors["APIStatusError"]):
+        status = getattr(error, "status_code", 0) or 0
+        return backoff if status >= 500 else None
+    return None
+
+
+def _final_stop_reason(stream: Any) -> Optional[str]:
+    get_final_message = getattr(stream, "get_final_message", None)
+    if get_final_message is None:
+        return None
+    return getattr(get_final_message(), "stop_reason", None)
 
 
 def _build_user_message(slim_bundle: dict, available_roles: list) -> str:
@@ -325,8 +434,18 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
         return deterministic_only
 
     import anthropic
+    import httpx
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # The classifier owns the retry policy: no SDK retries, a short connect
+    # timeout so an unreachable endpoint fails fast, and the SDK-default
+    # 10-minute read window for long adaptive-thinking turns. This mirrors the
+    # architect-side client in llm_classifier._call_api.
+    client = anthropic.Anthropic(
+        api_key=api_key,
+        timeout=httpx.Timeout(600.0, connect=5.0),
+        max_retries=0,
+    )
+    sdk_errors = _sdk_error_classes(anthropic)
     chunks = _split_bundle_into_chunks(slim_bundle)
     chunk_results: List[dict] = [None] * len(chunks)
 
@@ -335,7 +454,7 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
             print(f"  Processing chunk {i + 1}/{len(chunks)}...")
 
         user_message = _build_user_message(chunk, available_roles)
-        max_retries = 2
+        max_regenerations = 2
         allowed_indices = {
             p.get("paragraph_index")
             for p in chunk.get("paragraphs", [])
@@ -343,54 +462,87 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
         }
         retry_error: Exception | None = None
         response_text = ""
+        regeneration = 0
+        transport_attempt = 0
 
-        for attempt in range(max_retries + 1):
+        while True:
             try:
                 # No sampling params (temperature/top_p/top_k): Sonnet 5 and
                 # Opus 4.7+ reject non-default values with a 400.
-                with client.messages.stream(
-                    model=model,
-                    max_tokens=128000,
-                    thinking={"type": "adaptive"},
-                    output_config=_classification_output_config(available_roles),
-                    system=PHASE2_MASTER_PROMPT.strip(),
-                    messages=[{
-                        "role": "user",
-                        "content": (
-                            user_message
-                            if attempt == 0
-                            else user_message + _retry_requirement(
-                                retry_error or ValueError("prior response was not usable"),
-                                allowed_indices,
-                            )
-                        ),
-                    }],
-                ) as stream:
-                    response_text = stream.get_final_text()
+                with _REQUEST_LIMITER:
+                    with client.messages.stream(
+                        model=model,
+                        max_tokens=128000,
+                        thinking={"type": "adaptive"},
+                        output_config=_classification_output_config(available_roles),
+                        system=PHASE2_MASTER_PROMPT.strip(),
+                        messages=[{
+                            "role": "user",
+                            "content": (
+                                user_message
+                                if regeneration == 0
+                                else user_message + _retry_requirement(
+                                    retry_error or ValueError("prior response was not usable"),
+                                    allowed_indices,
+                                )
+                            ),
+                        }],
+                    ) as stream:
+                        response_text = stream.get_final_text()
+                        stop_reason = _final_stop_reason(stream)
+                if stop_reason == "refusal":
+                    raise ClassificationRefused(
+                        "LLM refused the target-classification request "
+                        "(stop_reason=refusal)"
+                    )
+                if stop_reason == "max_tokens":
+                    raise ValueError(
+                        "LLM response reached the output-token limit before "
+                        "completing its JSON (stop_reason=max_tokens)"
+                    )
                 parsed = _parse_classification_response(response_text)
                 return _validate_classifications(parsed, available_roles, allowed_indices)
             except json.JSONDecodeError as e:
+                # Malformed output: regenerate with the stricter instruction.
                 retry_error = e
-                if attempt < max_retries:
-                    print(f"  JSON parse error, retrying ({attempt + 1}/{max_retries})...")
-                    time.sleep(2 ** attempt)
+                if regeneration < max_regenerations:
+                    print(f"  JSON parse error, retrying ({regeneration + 1}/{max_regenerations})...")
+                    time.sleep(2 ** regeneration)
+                    regeneration += 1
                 else:
                     response_length = len(response_text.strip())
                     raise ValueError(
                         "Failed to parse LLM response as JSON after "
-                        f"{max_retries + 1} attempts (last response: "
+                        f"{max_regenerations + 1} attempts (last response: "
                         f"{response_length} characters): {e}"
                     )
-            except Exception as e:
+            except ValueError as e:
+                # Validation failure or a truncated response: regenerate with
+                # the exact allowed indices restated.
                 retry_error = e
-                if attempt < max_retries:
-                    wait = 2 ** (attempt + 1)
-                    print(f"  Classification attempt failed: {e}, retrying in {wait}s ({attempt + 1}/{max_retries})...")
+                if regeneration < max_regenerations:
+                    wait = 2 ** (regeneration + 1)
+                    print(f"  Classification attempt failed: {e}, retrying in {wait}s ({regeneration + 1}/{max_regenerations})...")
                     time.sleep(wait)
+                    regeneration += 1
                 else:
-                    raise RuntimeError(f"LLM classification failed after {max_retries + 1} attempts: {e}")
-
-        raise RuntimeError("Unexpected chunk classification exit without result")
+                    raise RuntimeError(
+                        f"LLM classification failed after {max_regenerations + 1} attempts: {e}"
+                    )
+            except ClassificationRefused:
+                raise
+            except Exception as e:
+                # Transport failures: retry only what can heal. A bad key, a
+                # bad request, or an unexpected error is re-raised at once.
+                delay = _transport_retry_delay(e, transport_attempt, sdk_errors)
+                if delay is None or transport_attempt >= _TRANSPORT_RETRIES:
+                    raise
+                print(
+                    f"  Transient API failure: {e}; retrying in {delay:g}s "
+                    f"({transport_attempt + 1}/{_TRANSPORT_RETRIES})..."
+                )
+                time.sleep(delay)
+                transport_attempt += 1
 
     if len(chunks) == 1:
         chunk_results[0] = _classify_chunk(0, chunks[0])
