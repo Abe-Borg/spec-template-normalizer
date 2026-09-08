@@ -27,6 +27,56 @@ _MAX_BUNDLE_TOKENS = 80_000
 _MAX_BUNDLE_CHARS = _MAX_BUNDLE_TOKENS * _CHARS_PER_TOKEN
 _CHUNK_OVERLAP = 20
 
+# The chunker measures exactly the bytes the request sends: compact JSON with
+# sorted keys. The old chunker measured compact JSON but sent indent=2, a
+# 1.35x under-count, and compact input is about a third smaller anyway.
+_JSON_WIRE_KWARGS = {"separators": (",", ":"), "sort_keys": True}
+_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _wire_json(value: Any) -> str:
+    return json.dumps(value, **_JSON_WIRE_KWARGS)
+
+
+def _system_blocks(available_roles: list) -> List[dict]:
+    """The byte-stable request prefix, marked for prompt caching.
+
+    The master prompt, run instruction, and role list do not change between
+    chunks, retries, or targets in one run, so they form one cached system
+    block. Together they clear the model's minimum cacheable prefix, which the
+    3.3 KB master prompt alone did not.
+    """
+
+    return [
+        {
+            "type": "text",
+            "text": (
+                PHASE2_MASTER_PROMPT.strip()
+                + "\n\n"
+                + PHASE2_RUN_INSTRUCTION.strip()
+                + "\n\navailable_roles: "
+                + json.dumps(list(available_roles))
+            ),
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
+def _usage_numbers(final_message: Any) -> Dict[str, int]:
+    usage = getattr(final_message, "usage", None)
+    numbers: Dict[str, int] = {}
+    for name in _USAGE_FIELDS:
+        value = getattr(usage, name, None)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        numbers[name] = value
+    return numbers
+
 
 # Transport policy -----------------------------------------------------------
 #
@@ -143,10 +193,11 @@ def _build_user_message(slim_bundle: dict, available_roles: list) -> str:
     prompt_bundle = {"paragraphs": slim_bundle.get("paragraphs", [])}
     if "_chunk_info" in slim_bundle:
         prompt_bundle["_chunk_info"] = slim_bundle["_chunk_info"]
+    # The run instruction and role list live in the cached system block; the
+    # user turn carries only what changes per chunk.
     return (
-        PHASE2_RUN_INSTRUCTION.strip()
-        + "\n\navailable_roles: " + json.dumps(available_roles)
-        + "\n\n" + json.dumps(prompt_bundle, indent=2)
+        "available_roles: " + json.dumps(list(available_roles))
+        + "\n\n" + _wire_json(prompt_bundle)
     )
 
 
@@ -319,11 +370,11 @@ def _split_bundle_into_chunks(slim_bundle: dict, max_chars: int = _MAX_BUNDLE_CH
     roles = slim_bundle.get("available_roles", [])
     filter_report = slim_bundle.get("filter_report", {})
 
-    full_json = json.dumps({"paragraphs": paragraphs})
+    full_json = _wire_json({"paragraphs": paragraphs})
     if len(full_json) <= max_chars and len(paragraphs) <= 300:
         return [slim_bundle]
 
-    overhead = len(json.dumps({
+    overhead = len(_wire_json({
         "available_roles": roles,
         "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
         "paragraphs": []
@@ -333,7 +384,7 @@ def _split_bundle_into_chunks(slim_bundle: dict, max_chars: int = _MAX_BUNDLE_CH
     # per-paragraph average). Clamp the chunk size above _CHUNK_OVERLAP so the
     # window always advances — otherwise `start = end - _CHUNK_OVERLAP` can
     # move backwards and loop forever.
-    avg_para_size = len(json.dumps(paragraphs)) / max(len(paragraphs), 1)
+    avg_para_size = len(_wire_json(paragraphs)) / max(len(paragraphs), 1)
     paras_per_chunk = max(_CHUNK_OVERLAP + 10, int((max_chars - overhead) / max(avg_para_size, 1)))
 
     chunks = []
@@ -353,6 +404,82 @@ def _split_bundle_into_chunks(slim_bundle: dict, max_chars: int = _MAX_BUNDLE_CH
         chunks.append(chunk)
         start = end - _CHUNK_OVERLAP if end < len(paragraphs) else end
     return chunks
+
+
+def _chunk_conflicts(chunk_results: List[dict]) -> List[Dict[str, Any]]:
+    """Return every paragraph index two chunks disposed of differently."""
+
+    seen: Dict[int, tuple[str, str]] = {}
+    conflicts: List[Dict[str, Any]] = []
+    for result in chunk_results:
+        for item in result.get("classifications", []):
+            idx = item.get("paragraph_index")
+            role = item.get("csi_role")
+            if idx is None or role is None:
+                continue
+            disposition = ("classified", role)
+            prior = seen.get(idx)
+            if prior is not None and prior != disposition:
+                conflicts.append({
+                    "paragraph_index": idx,
+                    "existing": prior,
+                    "conflicting": disposition,
+                })
+            seen[idx] = disposition
+        for item in result.get("ignored_paragraphs", []):
+            idx = item.get("paragraph_index")
+            reason = item.get("reason")
+            if idx is None or reason is None:
+                continue
+            disposition = ("ignored", reason)
+            prior = seen.get(idx)
+            if prior is not None and prior != disposition:
+                conflicts.append({
+                    "paragraph_index": idx,
+                    "existing": prior,
+                    "conflicting": disposition,
+                })
+            seen[idx] = disposition
+    return conflicts
+
+
+def _reask_indices(chunks: List[dict], conflicts: List[Dict[str, Any]]) -> Set[int]:
+    """The overlap windows that contain a conflict, whole.
+
+    Re-asking only the disputed index would strip it of the neighbouring
+    context both chunks saw; re-asking the entire overlap window it sits in
+    keeps that context and resolves every index in the window consistently.
+    """
+
+    conflict_indices = {c["paragraph_index"] for c in conflicts}
+    index_sets = [
+        {
+            p.get("paragraph_index")
+            for p in chunk.get("paragraphs", [])
+            if isinstance(p, dict) and isinstance(p.get("paragraph_index"), int)
+        }
+        for chunk in chunks
+    ]
+    reask: Set[int] = set(conflict_indices)
+    for left, right in zip(index_sets, index_sets[1:]):
+        overlap = left & right
+        if overlap & conflict_indices:
+            reask |= overlap
+    return reask
+
+
+def _without_indices(result: dict, indices: Set[int]) -> dict:
+    return {
+        "classifications": [
+            item for item in result.get("classifications", [])
+            if item.get("paragraph_index") not in indices
+        ],
+        "ignored_paragraphs": [
+            item for item in result.get("ignored_paragraphs", [])
+            if item.get("paragraph_index") not in indices
+        ],
+        "notes": list(result.get("notes", [])),
+    }
 
 
 def _merge_chunk_results(chunk_results: List[dict]) -> dict:
@@ -448,6 +575,15 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
     sdk_errors = _sdk_error_classes(anthropic)
     chunks = _split_bundle_into_chunks(slim_bundle)
     chunk_results: List[dict] = [None] * len(chunks)
+    system_blocks = _system_blocks(available_roles)
+    usage_lock = threading.Lock()
+    usage_totals: Dict[str, int] = {"requests": 0}
+
+    def _record_usage(final_message: Any) -> None:
+        with usage_lock:
+            usage_totals["requests"] += 1
+            for name, value in _usage_numbers(final_message).items():
+                usage_totals[name] = usage_totals.get(name, 0) + value
 
     def _classify_chunk(i: int, chunk: dict) -> dict:
         if len(chunks) > 1:
@@ -475,7 +611,7 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                         max_tokens=128000,
                         thinking={"type": "adaptive"},
                         output_config=_classification_output_config(available_roles),
-                        system=PHASE2_MASTER_PROMPT.strip(),
+                        system=system_blocks,
                         messages=[{
                             "role": "user",
                             "content": (
@@ -489,7 +625,10 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                         }],
                     ) as stream:
                         response_text = stream.get_final_text()
-                        stop_reason = _final_stop_reason(stream)
+                        get_final_message = getattr(stream, "get_final_message", None)
+                        final_message = get_final_message() if get_final_message else None
+                        stop_reason = getattr(final_message, "stop_reason", None)
+                _record_usage(final_message)
                 if stop_reason == "refusal":
                     raise ClassificationRefused(
                         "LLM refused the target-classification request "
@@ -557,8 +696,43 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                 i = futures[future]
                 chunk_results[i] = future.result()
 
-    llm_only = chunk_results[0] if len(chunk_results) == 1 else _merge_chunk_results(chunk_results)
+    if len(chunk_results) > 1:
+        conflicts = _chunk_conflicts(chunk_results)
+        if conflicts:
+            # Chunks disagreed inside an overlap window. Ask once more about
+            # exactly those windows, adopt that answer for every index in
+            # them, and let the merge fail closed on anything still unresolved.
+            reask = _reask_indices(chunks, conflicts)
+            print(
+                f"  Chunk overlap disagreement on {len(conflicts)} paragraph(s); "
+                f"re-asking {len(reask)} overlap paragraph(s) once..."
+            )
+            reask_paragraphs = [
+                p for p in unresolved_paragraphs
+                if isinstance(p, dict) and p.get("paragraph_index") in reask
+            ]
+            reask_chunk = {
+                "available_roles": slim_bundle.get("available_roles", []),
+                "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
+                "paragraphs": reask_paragraphs,
+                "_chunk_info": {
+                    "chunk_index": len(chunks),
+                    "paragraph_range": [
+                        min(reask) if reask else 0,
+                        max(reask) if reask else 0,
+                    ],
+                    "overlap_reask": True,
+                },
+            }
+            reask_result = _classify_chunk(len(chunks), reask_chunk)
+            chunk_results = [
+                _without_indices(result, reask) for result in chunk_results
+            ] + [reask_result]
+        llm_only = _merge_chunk_results(chunk_results)
+    else:
+        llm_only = chunk_results[0]
     result = coerce_to_final_classifications(slim_bundle, llm_only, available_roles)
+    result["usage"] = dict(usage_totals)
 
     total_expected = (
         len(slim_bundle.get("paragraphs", []))

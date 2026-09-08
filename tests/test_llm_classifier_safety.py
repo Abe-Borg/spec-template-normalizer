@@ -913,3 +913,35 @@ def test_classifier_disables_hidden_sdk_retries(monkeypatch) -> None:
     assert timeout.read == 600.0
     assert timeout.write == 600.0
     assert timeout.pool == 600.0
+
+
+def test_call_api_sends_the_system_prompt_as_one_cached_block(monkeypatch) -> None:
+    _install_fake_anthropic(monkeypatch)
+    captured = {}
+
+    class FinalStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_final_text(self):
+            return "success"
+
+        def get_final_message(self):
+            return types.SimpleNamespace(stop_reason="end_turn")
+
+    class Messages:
+        def stream(self, **kwargs):
+            captured.update(kwargs)
+            return FinalStream()
+
+    client = types.SimpleNamespace(messages=Messages())
+
+    assert _call_api(client, "master prompt", "user", "model") == "success"
+    assert captured["system"] == [
+        {"type": "text", "text": "master prompt", "cache_control": {"type": "ephemeral"}}
+    ]
+    assert captured["messages"] == [{"role": "user", "content": "user"}]
+

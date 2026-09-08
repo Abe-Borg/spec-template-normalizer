@@ -224,6 +224,26 @@ def _is_structured_output_compilation_error(error: Exception) -> bool:
     return any(marker in normalized for marker in _STRUCTURED_OUTPUT_COMPILATION_ERRORS)
 
 
+def _cached_system_blocks(system: Any) -> Any:
+    """Mark the byte-stable system prompt for prompt caching.
+
+    The master prompt (about 1,600 tokens) is identical for every attempt on
+    a template, so a single cached text block lets regeneration attempts and
+    targeted patches reuse it. A caller that already supplies content blocks
+    is passed through unchanged.
+    """
+
+    if not isinstance(system, str):
+        return system
+    return [
+        {
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
 def _call_api(
     client: Any,
     system: str,
@@ -273,7 +293,7 @@ def _call_api(
                 max_tokens=max_tokens,
                 thinking={"type": "adaptive"},
                 output_config=output_config,
-                system=system,
+                system=_cached_system_blocks(system),
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
                 raw = stream.get_final_text()
@@ -901,8 +921,10 @@ def classify_document(
         ValueError: If the LLM response is not valid JSON or fails validation
                     after all patch attempts are exhausted.
     """
-    paragraphs = slim_bundle.get("paragraphs", [])
-    bundle_json = json.dumps(slim_bundle, indent=2)
+    # Compact, key-sorted JSON is what the request sends, so the cost guard
+    # below measures exactly that (and the input is about a third smaller
+    # than the old indent=2 layout).
+    bundle_json = json.dumps(slim_bundle, separators=(",", ":"), sort_keys=True)
     input_tokens = estimate_tokens(master_prompt + run_instruction + bundle_json)
     if input_tokens > MAX_SINGLE_PASS_INPUT_TOKENS:
         raise ValueError(

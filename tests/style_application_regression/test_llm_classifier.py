@@ -565,3 +565,179 @@ def test_request_limit_env_var_is_bounded(monkeypatch):
     monkeypatch.delenv(lc._MAX_CONCURRENT_REQUESTS_ENV)
     assert lc._max_concurrent_requests() == lc._DEFAULT_MAX_CONCURRENT_REQUESTS
 
+
+# ---------------------------------------------------------------------------
+# Compact wire JSON, cached system prefix, usage accounting, overlap re-ask
+# ---------------------------------------------------------------------------
+
+
+def test_system_prefix_is_one_cached_block_and_user_turn_is_compact(monkeypatch):
+    from spec_formatter.style_application.core.classification import (
+        PHASE2_MASTER_PROMPT,
+        PHASE2_RUN_INSTRUCTION,
+    )
+
+    _sdk, messages, _sleeps, _constructed = _run(monkeypatch, [_ScriptedStream(_GOOD)])
+
+    classify_target_document(_unresolved_bundle(), ["PART"], api_key="k", model="m")
+
+    kwargs = messages.calls[0]
+    assert isinstance(kwargs["system"], list) and len(kwargs["system"]) == 1
+    block = kwargs["system"][0]
+    assert block["type"] == "text"
+    assert block["cache_control"] == {"type": "ephemeral"}
+    assert block["text"].startswith(PHASE2_MASTER_PROMPT.strip())
+    assert PHASE2_RUN_INSTRUCTION.strip() in block["text"]
+    assert block["text"].endswith('available_roles: ["PART"]')
+    content = kwargs["messages"][0]["content"]
+    assert content.startswith('available_roles: ["PART"]\n\n{')
+    assert "\n  " not in content  # compact JSON, no indentation
+    assert PHASE2_RUN_INSTRUCTION.strip() not in content
+
+
+def test_chunker_measures_the_bytes_the_request_sends():
+    from spec_formatter.style_application.core.llm_classifier import (
+        _build_user_message,
+        _split_bundle_into_chunks,
+        _wire_json,
+    )
+
+    paragraphs = [{"paragraph_index": i, "text": f"Paragraph {i}"} for i in range(40)]
+    bundle = {"paragraphs": paragraphs, "available_roles": ["PART"]}
+    compact = len(_wire_json({"paragraphs": paragraphs}))
+    pretty = len(json.dumps({"paragraphs": paragraphs}, indent=2))
+    assert compact < pretty
+
+    # A limit between the two sizes keeps one chunk: the guard measures what
+    # is sent, so an indent=2 layout can no longer under-count by a third.
+    chunks = _split_bundle_into_chunks(bundle, max_chars=compact)
+    assert len(chunks) == 1
+    sent = _build_user_message(bundle, ["PART"])
+    assert sent.endswith(_wire_json({"paragraphs": paragraphs}))
+
+
+def test_usage_numbers_are_summed_across_requests(monkeypatch):
+    class UsageStream(_ScriptedStream):
+        def __init__(self, payload, cache_read):
+            super().__init__(payload)
+            self.cache_read = cache_read
+
+        def get_final_message(self):
+            return types.SimpleNamespace(
+                stop_reason="end_turn",
+                usage=types.SimpleNamespace(
+                    input_tokens=100,
+                    output_tokens=10,
+                    cache_read_input_tokens=self.cache_read,
+                    cache_creation_input_tokens=0 if self.cache_read else 900,
+                ),
+            )
+
+    _sdk, _messages, _sleeps, _constructed = _run(
+        monkeypatch,
+        [UsageStream('{"classifications": [', 0), UsageStream(_GOOD, 900)],
+    )
+
+    result = classify_target_document(_unresolved_bundle(), ["PART"], api_key="k", model="m")
+
+    assert result["usage"] == {
+        "requests": 2,
+        "input_tokens": 200,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 900,
+        "cache_creation_input_tokens": 900,
+    }
+
+
+def _overlap_client(monkeypatch, answers):
+    """Chunk calls answered from ``answers`` keyed by _chunk_info.chunk_index."""
+
+    class OverlapMessages:
+        def __init__(self):
+            self.calls = []
+            self.lock = threading.Lock()
+
+        def stream(self, **kwargs):
+            content = kwargs["messages"][0]["content"]
+            # A regeneration attempt appends the retry requirement after the
+            # JSON, so decode the object rather than the whole tail.
+            slim_bundle, _end = json.JSONDecoder().raw_decode(
+                content[content.find("\n\n{") + 2:]
+            )
+            chunk_index = slim_bundle["_chunk_info"]["chunk_index"]
+            with self.lock:
+                self.calls.append(slim_bundle)
+            return _FakeStream(json.dumps(answers[chunk_index](slim_bundle)))
+
+    client = types.SimpleNamespace(messages=OverlapMessages())
+    _fake_sdk(monkeypatch, client, [])
+    return client.messages
+
+
+def _overlap_bundle(monkeypatch):
+    from spec_formatter.style_application.core import llm_classifier as lc
+
+    paragraphs = [{"paragraph_index": i, "text": f"P{i}"} for i in range(8)]
+    monkeypatch.setattr(lc, "_split_bundle_into_chunks", lambda slim_bundle: [
+        {"paragraphs": paragraphs[:5], "_chunk_info": {"chunk_index": 0}},
+        {"paragraphs": paragraphs[3:], "_chunk_info": {"chunk_index": 1}},
+    ])
+    return {
+        "paragraphs": paragraphs,
+        "available_roles": ["PART", "ARTICLE"],
+        "deterministic_classifications": [],
+        "deterministic_ignored_paragraphs": [],
+    }
+
+
+def _all_as(role):
+    return lambda bundle: {
+        "classifications": [
+            {"paragraph_index": p["paragraph_index"], "csi_role": role}
+            for p in bundle["paragraphs"]
+        ]
+    }
+
+
+def test_overlap_disagreement_is_re_asked_once_for_the_whole_window(monkeypatch):
+    bundle = _overlap_bundle(monkeypatch)
+    messages = _overlap_client(
+        monkeypatch,
+        {0: _all_as("PART"), 1: _all_as("ARTICLE"), 2: _all_as("ARTICLE")},
+    )
+
+    result = classify_target_document(bundle, ["PART", "ARTICLE"], api_key="k", model="m")
+
+    assert len(messages.calls) == 3
+    reask = next(call for call in messages.calls if call["_chunk_info"]["chunk_index"] == 2)
+    assert reask["_chunk_info"]["overlap_reask"] is True
+    assert [p["paragraph_index"] for p in reask["paragraphs"]] == [3, 4]
+    roles = {item["paragraph_index"]: item["csi_role"] for item in result["classifications"]}
+    assert roles == {0: "PART", 1: "PART", 2: "PART", 3: "ARTICLE", 4: "ARTICLE",
+                     5: "ARTICLE", 6: "ARTICLE", 7: "ARTICLE"}
+
+
+def test_overlap_re_ask_that_omits_a_disputed_index_fails_closed(monkeypatch):
+    bundle = _overlap_bundle(monkeypatch)
+    messages = _overlap_client(
+        monkeypatch,
+        {
+            0: _all_as("PART"),
+            1: _all_as("ARTICLE"),
+            2: lambda b: {"classifications": [{"paragraph_index": 3, "csi_role": "PART"}]},
+        },
+    )
+
+    with pytest.raises((ValueError, RuntimeError), match="coverage|indices|4"):
+        classify_target_document(bundle, ["PART", "ARTICLE"], api_key="k", model="m")
+
+    # The re-ask window is asked once (plus its own bounded regeneration
+    # attempts); the original chunks are never re-run and there is no second
+    # re-ask round.
+    reask_calls = [c for c in messages.calls if c["_chunk_info"]["chunk_index"] == 2]
+    assert 1 <= len(reask_calls) <= 3
+    assert all(
+        [p["paragraph_index"] for p in call["paragraphs"]] == [3, 4] for call in reask_calls
+    )
+    assert sum(1 for c in messages.calls if c["_chunk_info"]["chunk_index"] in (0, 1)) == 2
+

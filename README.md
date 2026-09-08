@@ -244,6 +244,16 @@ change it. Transient failures (rate limits, connection errors, 5xx responses)
 are retried a bounded number of times, honouring a `retry-after` header when
 one is sent; an invalid key, a bad request, or a model refusal fails the target
 immediately instead of retrying.
+
+Both classifiers send their byte-stable prompt prefix as a cached system
+block, and the target classifier sends compact JSON, so repeated chunks and
+regeneration attempts reuse the cached prefix and input is about a third
+smaller. The `classify` phase event in `diagnostics.jsonl` records
+`requests`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and
+`cache_creation_input_tokens` for each target, so cache reuse is visible per
+run. When two overlapping chunks disagree about a paragraph, the classifier
+re-asks once about the whole overlap window and fails closed if the answer
+still leaves a paragraph without a single disposition.
 `output_dir` is the output **root**; `result.output_dir` remains a
 backward-compatible alias of the concrete `result.run_dir`.
 

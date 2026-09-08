@@ -515,3 +515,80 @@ def test_classification_audit_does_not_clamp_an_overfull_payload() -> None:
 
     assert summary["unresolved"] == -1
 
+
+def test_classifier_usage_becomes_classify_phase_diagnostics_not_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    extract_dir = _seed_extract(tmp_path)
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source package")
+
+    class FakeDecomposer:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def extract(self, *, output_dir: Path) -> Path:
+            del output_dir
+            return extract_dir
+
+    monkeypatch.setattr(batch_runner, "DocxDecomposer", FakeDecomposer)
+    monkeypatch.setattr(
+        batch_runner,
+        "build_phase2_slim_bundle",
+        lambda *_args, **_kwargs: {
+            "paragraphs": [{"paragraph_index": 0}],
+            "deterministic_classifications": [],
+            "deterministic_ignored_paragraphs": [],
+        },
+    )
+    monkeypatch.setattr(
+        batch_runner,
+        "classify_target_document",
+        lambda **_kwargs: {
+            "classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}],
+            "ignored_paragraphs": [],
+            "notes": [],
+            "usage": {
+                "requests": 2,
+                "input_tokens": 1200,
+                "cache_read_input_tokens": 700,
+                "cache_creation_input_tokens": 400,
+                "bogus": "text that must never reach diagnostics",
+            },
+        },
+    )
+    seen_payloads = []
+
+    def fake_apply(**kwargs):
+        seen_payloads.append(kwargs["classifications"])
+        return (
+            tmp_path / "out.docx",
+            None,
+            {"styled": 1, "ignored": 0, "out_of_scope": 0, "unresolved": 0},
+            {},
+            {},
+        )
+
+    monkeypatch.setattr(batch_runner, "_apply_classified_target", fake_apply)
+
+    result = batch_runner.process_single_file(
+        docx_path=source,
+        arch_registry={"PARAGRAPH": "Body"},
+        env_registry={},
+        arch_styles_xml="<w:styles/>",
+        available_roles=["PARAGRAPH"],
+        api_key="key",
+        output_dir=tmp_path / "output",
+    )
+
+    assert result.success is True
+    assert "usage" not in seen_payloads[0]
+    classify_events = [e for e in result.diagnostics if e.get("event") == "classify"]
+    assert classify_events, result.diagnostics
+    fields = classify_events[-1]["fields"]
+    assert fields["requests"] == 2
+    assert fields["cache_read_input_tokens"] == 700
+    assert fields["cache_creation_input_tokens"] == 400
+    assert "bogus" not in fields
+

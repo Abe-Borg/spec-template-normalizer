@@ -1051,6 +1051,15 @@ def process_single_file(
                     api_key=api_key,
                     model=model,
                 )
+                # Token accounting travels out of the classifier as counts
+                # only; it is diagnostics, not part of the disposition payload.
+                usage = classifications.pop("usage", None) if isinstance(classifications, dict) else None
+                if isinstance(usage, dict):
+                    phase.set(**{
+                        key: value
+                        for key, value in usage.items()
+                        if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool)
+                    })
 
             stage = "application"
             (
