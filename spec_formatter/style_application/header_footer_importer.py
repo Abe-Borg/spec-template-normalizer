@@ -40,6 +40,7 @@ from .core.section_numbers import (
     section_number_display_form,
 )
 from .core.untrusted_xml import UntrustedXmlError, parse_untrusted_xml
+from .core.errors import EngineError
 from .core.sectpr_tools import (
     canonical_sectpr_order_index,
     child_tag_name,
@@ -1589,16 +1590,18 @@ def _validate_explicit_token_postconditions(
     host_text = "\n".join(_host_visible_texts(updated_xml))
     if source_canonical and source_canonical != target_section_numeric:
         if _matching_section_number_ranges(host_text, source_canonical):
-            raise ValueError(
+            raise EngineError(
+                "header_footer_token_residual",
                 "Architect SECTION number remained in imported header/footer "
-                f"part {part_name} after token substitution"
+                f"part {part_name} after token substitution",
             )
         textbox_text = "\n".join(_textbox_texts(updated_xml))
         if _matching_section_number_ranges(textbox_text, source_canonical):
-            raise ValueError(
+            raise EngineError(
+                "header_footer_token_residual",
                 "Architect SECTION number remained in a text box of imported "
                 f"header/footer part {part_name}; the text box is not part of "
-                "a corroborated mirrored shell, so it cannot be patched safely"
+                "a corroborated mirrored shell, so it cannot be patched safely",
             )
     if not arch_title_forms:
         return
@@ -1611,9 +1614,10 @@ def _validate_explicit_token_postconditions(
         return
     for form in arch_title_forms:
         if _bounded_text_ranges(host_text, form):
-            raise ValueError(
+            raise EngineError(
+                "header_footer_token_residual",
                 "Architect SectionTitle remained in imported header/footer "
-                f"part {part_name} after token substitution"
+                f"part {part_name} after token substitution",
             )
 
 
@@ -1710,21 +1714,26 @@ def patch_header_footer_tokens(
         for form in arch_title_forms
     )
     if number_slots and not target_section_numeric:
-        raise ValueError(
+        raise EngineError(
+            "header_footer_target_section_id_required",
             "Imported header/footer parts carry the architect SECTION number; "
-            "token substitution requires a recognisable target SectionID"
+            "token substitution requires a recognisable target SectionID",
         )
     if title_slots and not target_title_for_patch:
-        raise ValueError(
+        raise EngineError(
+            "header_footer_target_section_title_required",
             "Imported header/footer parts carry the architect SectionTitle; "
-            "token substitution requires a target SectionTitle"
+            "token substitution requires a target SectionTitle",
         )
     if inferred is not None and (
         not target_section_numeric or not target_title_for_patch
     ):
-        raise ValueError(
+        raise EngineError(
+            "header_footer_target_section_id_required"
+            if not target_section_numeric
+            else "header_footer_target_section_title_required",
             "Imported header/footer token substitution requires a complete "
-            "target SectionID and SectionTitle"
+            "target SectionID and SectionTitle",
         )
     if inferred is not None:
         log.append(

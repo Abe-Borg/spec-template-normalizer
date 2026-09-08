@@ -408,6 +408,48 @@ Use these terms consistently:
 
 The retired names `arch_styles_raw.xml` and `arch_settings_raw.xml` are not bundle artifacts.
 
+## Error codes and stages
+
+Engine failures reach `run.json`, every `audit.json`, and the GUI as a stable
+`error_code` plus a fixed remediation sentence, never as the raw exception
+text (which can echo document text and is redacted to a fingerprint).
+`spec_formatter/style_application/core/errors.py` owns the closed code set
+in `ERROR_REMEDIATIONS`; raise `EngineError(code, detail)` (a `ValueError`,
+so `str(exc)` keeps the developer detail and existing handlers still catch
+it) or `attach_engine_error(exc, code)` when the exception type must stay
+(an `ImportError`, say). `ApplicationStageError` forwards the code from its
+cause, `BatchResult.error_code`/`safe_error` and `TargetFormatResult.error_code`
+carry it, and `_write_run_artifacts` prefers it over classifying `error`
+text. Adding a code is a contract change: list it here.
+
+Current codes: `header_footer_target_section_id_required`,
+`header_footer_target_section_title_required`, `header_footer_token_residual`,
+`canadian_architect_contract`, `canadian_target_hierarchy`,
+`canadian_target_markup`, `canadian_numbering_unprovable`,
+`classification_invalid_payload`, `classification_deterministic_override`,
+`classification_coverage_incomplete`, `numbering_importer_unavailable`,
+`template_section_shell_conflict`, `template_default_section_conflict`,
+`template_duplicate_section_index`.
+
+`stage` is public on `BatchResult`, `TargetFormatResult`, `audit.json`, and
+`run.json`: the last checkpoint reached. The sets are closed and tested
+(`ENGINE_STAGES`, `RUNNER_STAGES`, `PIPELINE_STAGES` in `core/errors.py`):
+
+- engine (shared application path, in order): `classification_ready`,
+  `disposition_verification`, `application_policy`,
+  `classification_checkpoint`, `source_catalog_snapshot`,
+  `target_token_extraction`, `csi_conversion`,
+  `canadian_classification_mapping`, `environment_application`,
+  `header_footer_token_patch`, `numbering_import`,
+  `header_footer_numbering_remap`, `style_import`,
+  `header_footer_style_remap`, `stability_snapshot`,
+  `classification_application`, `stability_verification`,
+  `application_reporting`, `output_publication`, `complete`
+- runner (before the shared path): `validation`, `extraction`,
+  `bundle_build`, `classification_preflight`, `classification`,
+  `application`
+- pipeline: `not_started`, `processing`, `publication`, `complete`
+
 ## Run artifacts and public results
 
 Each invocation creates:

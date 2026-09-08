@@ -27,6 +27,7 @@ from .core.csi_to_canadian import (
     validate_conversion_mode,
 )
 from .core.classification import validate_phase2_final_payload
+from .core.errors import EngineError, attach_engine_error
 from .core.token_utils import extract_target_tokens
 from .core.batch_classifier import (
     BatchClassificationError,
@@ -81,6 +82,10 @@ class BatchResult:
     # Structured, redaction-safe phase-timing/count events for this target.
     # Carries no free text; the pipeline folds it into the run diagnostics.
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    # Stable engine error code and its fixed remediation sentence, when the
+    # failure carried one (core/errors.py). ``error`` keeps the raw detail.
+    error_code: Optional[str] = None
+    safe_error: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -110,16 +115,27 @@ class ApplicationFailureDiagnostics:
 
 
 class ApplicationStageError(RuntimeError):
-    """Application failure augmented with the last safe diagnostic checkpoint."""
+    """Application failure augmented with the last safe diagnostic checkpoint.
+
+    When the underlying failure carries an engine error code, the code and
+    its fixed remediation sentence are forwarded so the runner, the pipeline,
+    and the GUI all report the same identity.
+    """
 
     def __init__(
         self,
         message: str,
         *,
         diagnostics: ApplicationFailureDiagnostics,
+        cause: Optional[BaseException] = None,
     ) -> None:
         super().__init__(message)
         self.diagnostics = diagnostics
+        code = getattr(cause, "safe_error_code", None)
+        safe_message = getattr(cause, "safe_error_message", None)
+        if isinstance(code, str) and isinstance(safe_message, str):
+            self.safe_error_code = code
+            self.safe_error_message = safe_message
 
     @property
     def stage(self) -> str:
@@ -194,16 +210,29 @@ def _coverage_counts(bundle: Dict[str, Any], classifications: Dict[str, Any]) ->
     return resolved, total, len(bundle.get("paragraphs", []))
 
 
+def _safe_error_code(error: BaseException) -> Optional[str]:
+    code = getattr(error, "safe_error_code", None)
+    return code if isinstance(code, str) and code else None
+
+
+def _safe_error_message(error: BaseException) -> Optional[str]:
+    message = getattr(error, "safe_error_message", None)
+    return message if isinstance(message, str) and message else None
+
+
 def _check_numbering_module_needed(arch_styles_xml: str, needed_style_ids: List[str]) -> None:
     """Raise if styles need numbering but numbering_importer is unavailable."""
     for sid in collect_style_dependency_closure(arch_styles_xml, needed_style_ids):
         pat = r'<w:style[^>]*w:styleId="' + re.escape(sid) + r'"[^>]*>[\s\S]*?</w:style>'
         m = re.search(pat, arch_styles_xml)
         if m and '<w:numId' in m.group(0):
-            raise ImportError(
-                "numbering_importer module is not available but imported styles "
-                f"require numbering definitions (e.g. style '{sid}'). "
-                "Ensure numbering_importer.py is on the Python path."
+            raise attach_engine_error(
+                ImportError(
+                    "numbering_importer module is not available but imported styles "
+                    f"require numbering definitions (e.g. style '{sid}'). "
+                    "Ensure numbering_importer.py is on the Python path."
+                ),
+                "numbering_importer_unavailable",
             )
 
 
@@ -667,8 +696,9 @@ def _apply_classified_target_impl(
     )
     summary, _audit = _classification_audit(bundle, classifications)
     if summary["unresolved"]:
-        raise ValueError(
-            f"{summary['unresolved']} classifiable paragraph(s) have no disposition"
+        raise EngineError(
+            "classification_coverage_incomplete",
+            f"{summary['unresolved']} classifiable paragraph(s) have no disposition",
         )
 
     checkpoint.stage = "application_policy"
@@ -972,6 +1002,7 @@ def _apply_classified_target(
         raise ApplicationStageError(
             str(exc),
             diagnostics=checkpoint.failure_diagnostics(),
+            cause=exc,
         ) from exc
 
 
@@ -1122,6 +1153,8 @@ def process_single_file(
             numbering_checks=numbering_checks,
             stage=stage,
             diagnostics=per_file_diag,
+            error_code=_safe_error_code(exc),
+            safe_error=_safe_error_message(exc),
         )
 
 
@@ -1239,6 +1272,8 @@ def _apply_batch_result(
             numbering_checks=numbering_checks,
             stage=stage,
             diagnostics=per_file_diag,
+            error_code=_safe_error_code(exc),
+            safe_error=_safe_error_message(exc),
         )
 
 

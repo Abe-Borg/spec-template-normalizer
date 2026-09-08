@@ -37,6 +37,7 @@ from .style_application.core.application_policy import (
     APPLICATION_POLICY_VERSION,
     application_policy_for_mode,
 )
+from .style_application.core.errors import remediation_for as engine_remediation_for
 from .style_application.core.csi_to_canadian import (
     CSI_TO_CANADIAN,
     FORMAT_ONLY,
@@ -116,6 +117,9 @@ class TargetFormatResult:
     # Structured, redaction-safe phase-timing/count events for this target,
     # folded into the run-wide diagnostics recorder before publication.
     diagnostics: tuple[dict[str, Any], ...] = ()
+    # Stable engine error code (core/errors.py) when the failure carried one;
+    # run.json and audit.json prefer it over classifying ``error`` text.
+    error_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1224,6 +1228,20 @@ def safe_error_diagnostic(
     )
 
 
+def _target_error_diagnostic(
+    item: TargetFormatResult,
+    secrets: Sequence[str],
+) -> Optional[SafeErrorDiagnostic]:
+    """Prefer the engine's stable code and remediation over classified text."""
+
+    code = getattr(item, "error_code", None)
+    if isinstance(code, str) and code:
+        remediation = engine_remediation_for(code)
+        if remediation:
+            return SafeErrorDiagnostic(code=code, message=remediation)
+    return safe_error_diagnostic(item.error, secrets)
+
+
 def _plan_output_paths(
     targets: Sequence[Path],
     output_dir: Path,
@@ -1379,6 +1397,7 @@ def _format_one_target(
                 output_path=None,
                 log=processor_log,
                 error=result.error or "Target formatting failed.",
+                error_code=getattr(result, "error_code", None),
                 duration_seconds=result.duration_seconds,
                 conversion_report=conversion_report,
                 source_sha256=snapshot_sha256,
@@ -1511,7 +1530,7 @@ def _write_run_artifacts(
 
     audited_results: list[TargetFormatResult] = []
     for index, item in enumerate(targets, start=1):
-        error_diagnostic = safe_error_diagnostic(item.error, secrets)
+        error_diagnostic = _target_error_diagnostic(item, secrets)
         identity = (item.source_sha256 or hashlib.sha256(
             str(item.source_path).encode("utf-8")
         ).hexdigest())[:12]
@@ -1605,7 +1624,7 @@ def _write_run_artifacts(
     profile_metadata = _profile_provenance(profile)
     target_records: list[dict[str, Any]] = []
     for item in audited_results:
-        error_diagnostic = safe_error_diagnostic(item.error, secrets)
+        error_diagnostic = _target_error_diagnostic(item, secrets)
         target_records.append(
             {
                 "source_path": str(item.source_path),

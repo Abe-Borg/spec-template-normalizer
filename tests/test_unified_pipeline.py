@@ -1780,3 +1780,77 @@ def test_cached_profile_rejection_message_carries_no_raw_detail(
     assert rejection
     assert all(private not in line and "tampered" not in line for line in rejection)
 
+
+def test_run_artifacts_prefer_the_engine_error_code_over_classified_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS
+
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+    raw_detail = "Paragraph 412 begins with ambiguous decimal text 'CONFIDENTIAL CLAUSE'"
+
+    def coded_processor(**kwargs) -> BatchResult:
+        return BatchResult(
+            filename=Path(kwargs["docx_path"]).name,
+            success=False,
+            output_path=None,
+            log=["FAILED: " + raw_detail],
+            error=raw_detail,
+            duration_seconds=0.01,
+            stage="disposition_verification",
+            error_code="classification_coverage_incomplete",
+            safe_error=ERROR_REMEDIATIONS["classification_coverage_incomplete"],
+        )
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=coded_processor,
+    )
+
+    item = result.targets[0]
+    assert item.success is False
+    assert item.error_code == "classification_coverage_incomplete"
+    manifest_text = result.manifest_path.read_text(encoding="utf-8")
+    audit_text = item.audit_path.read_text(encoding="utf-8")
+    assert "CONFIDENTIAL CLAUSE" not in manifest_text
+    assert "CONFIDENTIAL CLAUSE" not in audit_text
+    manifest = json.loads(manifest_text)
+    record = manifest["targets"][0]
+    assert record["error_code"] == "classification_coverage_incomplete"
+    assert record["error"] == ERROR_REMEDIATIONS["classification_coverage_incomplete"]
+    assert record["stage"] == "disposition_verification"
+    audit = json.loads(audit_text)
+    assert audit["error_code"] == "classification_coverage_incomplete"
+    assert audit["error"] == record["error"]
+
+
+def test_target_error_diagnostic_falls_back_to_text_classification_without_a_code() -> None:
+    from spec_formatter.pipeline import TargetFormatResult, _target_error_diagnostic
+
+    coded = TargetFormatResult(
+        source_path=Path("t.docx"), success=False, output_path=None, log=(),
+        error="detail with CONFIDENTIAL text", duration_seconds=0.0,
+        error_code="canadian_target_hierarchy",
+    )
+    uncoded = TargetFormatResult(
+        source_path=Path("t.docx"), success=False, output_path=None, log=(),
+        error="detail with CONFIDENTIAL text", duration_seconds=0.0,
+    )
+    unknown = TargetFormatResult(
+        source_path=Path("t.docx"), success=False, output_path=None, log=(),
+        error="detail with CONFIDENTIAL text", duration_seconds=0.0,
+        error_code="not_a_real_code",
+    )
+
+    assert _target_error_diagnostic(coded, ()).code == "canadian_target_hierarchy"
+    assert "CONFIDENTIAL" not in _target_error_diagnostic(coded, ()).message
+    assert _target_error_diagnostic(uncoded, ()).code == "untrusted_error"
+    assert _target_error_diagnostic(unknown, ()).code == "untrusted_error"
+

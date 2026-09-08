@@ -39,6 +39,7 @@ from .style_import import (
 from .ooxml_text import read_xml_text, write_xml_text
 from .section_numbers import LABELED_SECTION_RE, SECTION_HEADING_RE
 from .untrusted_xml import UntrustedXmlError, parse_untrusted_xml
+from .errors import EngineError
 
 
 def _load_prompt_text(filename: str) -> str:
@@ -1073,17 +1074,17 @@ def _validate_disposition_payload(
 def _bundle_unresolved_indices(bundle: Dict[str, Any]) -> Set[int]:
     raw = bundle.get("paragraphs", [])
     if not isinstance(raw, list):
-        raise ValueError("bundle paragraphs must be a list")
+        raise EngineError("classification_invalid_payload", "bundle paragraphs must be a list")
     indices: Set[int] = set()
     for item in raw:
         if not isinstance(item, dict) or not isinstance(
             item.get("paragraph_index"),
             int,
         ):
-            raise ValueError("bundle contains an invalid unresolved paragraph")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid unresolved paragraph")
         idx = item["paragraph_index"]
         if idx in indices:
-            raise ValueError(f"duplicate unresolved paragraph_index={idx}")
+            raise EngineError("classification_invalid_payload", f"duplicate unresolved paragraph_index={idx}")
         indices.add(idx)
     return indices
 
@@ -1096,30 +1097,30 @@ def _bundle_deterministic_dispositions(
     allowed = set(allowed_roles)
     for item in bundle.get("deterministic_classifications", []):
         if not isinstance(item, dict):
-            raise ValueError("bundle contains an invalid deterministic classification")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid deterministic classification")
         idx = item.get("paragraph_index")
         role = item.get("csi_role")
         if not isinstance(idx, int) or role not in allowed:
-            raise ValueError("bundle contains an invalid deterministic classification")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid deterministic classification")
         if idx in deterministic:
-            raise ValueError(f"duplicate deterministic classification for paragraph_index={idx}")
+            raise EngineError("classification_invalid_payload", f"duplicate deterministic classification for paragraph_index={idx}")
         deterministic[idx] = role
 
     deterministic_ignored: Dict[int, str] = {}
     for item in bundle.get("deterministic_ignored_paragraphs", []):
         if not isinstance(item, dict):
-            raise ValueError("bundle contains an invalid deterministic ignored disposition")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid deterministic ignored disposition")
         idx = item.get("paragraph_index")
         reason = item.get("reason")
         if not isinstance(idx, int) or not isinstance(reason, str) or not reason.strip():
-            raise ValueError("bundle contains an invalid deterministic ignored disposition")
+            raise EngineError("classification_invalid_payload", "bundle contains an invalid deterministic ignored disposition")
         if idx in deterministic_ignored:
-            raise ValueError(f"duplicate deterministic ignored disposition for paragraph_index={idx}")
+            raise EngineError("classification_invalid_payload", f"duplicate deterministic ignored disposition for paragraph_index={idx}")
         deterministic_ignored[idx] = reason.strip()
 
     overlap = set(deterministic) & set(deterministic_ignored)
     if overlap:
-        raise ValueError(
+        raise EngineError("classification_invalid_payload", 
             "bundle has conflicting deterministic dispositions for paragraph "
             f"indices: {sorted(overlap)[:20]}"
         )
@@ -1135,7 +1136,7 @@ def validate_phase2_llm_payload(bundle: Dict[str, Any], classifications: Dict[st
     )
     missing = sorted(unresolved - set(classified) - set(ignored))
     if missing:
-        raise ValueError(f"missing coverage for paragraph indices: {missing[:20]}")
+        raise EngineError("classification_coverage_incomplete", f"missing coverage for paragraph indices: {missing[:20]}")
 
 
 def coerce_to_final_classifications(
@@ -1151,7 +1152,7 @@ def coerce_to_final_classifications(
     deterministic_indices = set(deterministic) | set(deterministic_ignored)
     bundle_overlap = deterministic_indices & unresolved
     if bundle_overlap:
-        raise ValueError(
+        raise EngineError("classification_invalid_payload", 
             "bundle paragraph appears in both unresolved and deterministic "
             f"dispositions: {sorted(bundle_overlap)[:20]}"
         )
@@ -1167,7 +1168,7 @@ def coerce_to_final_classifications(
     if incoming_indices <= unresolved:
         missing_unresolved = sorted(unresolved - incoming_indices)
         if missing_unresolved:
-            raise ValueError(f"missing coverage for paragraph indices: {missing_unresolved[:20]}")
+            raise EngineError("classification_coverage_incomplete", f"missing coverage for paragraph indices: {missing_unresolved[:20]}")
         merged = dict(deterministic)
         merged.update(incoming)
         merged_ignored = dict(deterministic_ignored)
@@ -1176,21 +1177,21 @@ def coerce_to_final_classifications(
         for idx, expected in deterministic.items():
             actual = incoming.get(idx)
             if actual != expected:
-                raise ValueError(
+                raise EngineError("classification_deterministic_override", 
                     f"deterministic override attempted at paragraph_index={idx}: "
                     f"expected {expected!r}, got {actual!r}"
                 )
         for idx, expected in deterministic_ignored.items():
             actual = incoming_ignored.get(idx)
             if actual != expected:
-                raise ValueError(
+                raise EngineError("classification_deterministic_override", 
                     f"deterministic ignored override attempted at paragraph_index={idx}: "
                     f"expected {expected!r}, got {actual!r}"
                 )
         merged = incoming
         merged_ignored = incoming_ignored
     else:
-        raise ValueError("payload is neither unresolved-only nor valid final coverage")
+        raise EngineError("classification_coverage_incomplete", "payload is neither unresolved-only nor valid final coverage")
 
     notes = classifications.get("notes", []) if isinstance(classifications, dict) else []
     return {

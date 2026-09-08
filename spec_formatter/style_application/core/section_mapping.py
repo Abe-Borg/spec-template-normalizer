@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .errors import EngineError
 
 import copy
 import json
@@ -88,7 +89,7 @@ def _resolved_default_section(
             if section.get("section_index") == section_index
         ]
         if len(matching_positions) > 1:
-            raise ValueError(
+            raise EngineError("template_duplicate_section_index", 
                 "Architect template section chain has duplicate section_index values."
             )
         if matching_positions:
@@ -150,7 +151,7 @@ def choose_section_sources(
             _canonical_shell_signature(section) for section in effective_chain
         }
         if len(signatures) != 1:
-            raise ValueError(
+            raise EngineError("template_section_shell_conflict", 
                 "Architect template has conflicting section shells; use one canonical "
                 "page layout and default/even/first header-footer mapping."
             )
@@ -160,7 +161,7 @@ def choose_section_sources(
             effective_chain
             and _canonical_shell_signature(default_section) not in signatures
         ):
-            raise ValueError(
+            raise EngineError("template_default_section_conflict", 
                 "Architect template default section conflicts with its section chain."
             )
         # The architect shell is canonical and applies to every target section;

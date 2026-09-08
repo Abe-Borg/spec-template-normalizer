@@ -101,8 +101,13 @@ stable source suffix so neither output can overwrite the other. Failed reruns
 therefore cannot make an older output appear current. `run.json` records the
 mode, application/profile contract versions, template and target hashes, model
 and prompt fingerprints, cache identity, output hashes, disposition counts,
-numbering checks, durations, a `diagnostics` rollup, and errors. API keys and
-document text are never written to run metadata.
+numbering checks, durations, a `diagnostics` rollup, and errors. Each target
+record (and its `audit.json`) also names the `stage` at which processing
+stopped and, when the engine failed on a known condition, a stable
+`error_code` with a fixed remediation sentence (for example
+`header_footer_target_section_id_required` or `canadian_target_hierarchy`);
+the closed sets are listed in CLAUDE.md. API keys and document text are never
+written to run metadata.
 
 `diagnostics.jsonl` is the detailed, structured diagnostics stream: one JSON
 object per phase event (`seq`, `ts`, `level`, `component`, `event`, and a
