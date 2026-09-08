@@ -409,6 +409,25 @@ DOCX input and relationship metadata are untrusted.
   through `core/untrusted_xml.parse_untrusted_xml()`, which also wraps parse
   errors with the part name. Never call `ET.fromstring` on package bytes
   directly.
+- That rejection is encoding-independent, in three steps over one immutable
+  byte payload, so what is screened is always what is parsed. A `str` is
+  already decoded, so its declaration is made truthful with
+  `prepare_xml_text_for_utf8` before encoding; skipping that reads UTF-8
+  bytes back through a stale declared encoding, silently turning `é` into
+  `Ã©` under `windows-1252` and failing outright under `utf-16`. A byte scan
+  then rejects `<!DOCTYPE`/`<!ENTITY` anywhere in the payload -- deliberately
+  broader than XML requires, since it also catches declaration-shaped text in
+  comments and CDATA, which is the long-standing contract and must not be
+  relaxed as redundant. Finally expat's `StartDoctypeDeclHandler` rejects a
+  real declaration in any encoding it can auto-detect, which the ASCII byte
+  scan cannot: UTF-16 encodes `<!DOCTYPE` as `<\x00!\x00D\x00...`.
+  Keep the byte scan and the expat pass together; either alone has a hole.
+- The expat pass judges declarations only. When it finds a payload malformed
+  it stays silent and lets `ElementTree` parse the same bytes and word the
+  error, so a caller never sees a message that depends on which parser
+  noticed first. An encoding expat cannot use (a codec Python lacks, or a
+  multi-byte one it refuses internally) becomes `UntrustedXmlError` with the
+  part name rather than a bare `LookupError` or `ValueError`.
 - Header/footer media limits: 16 MiB per asset and 64 MiB total. They are
   enforced in shared-profile preflight and again at the write site in
   `header_footer_importer._write_hf_parts`; only the `data_base64` payload

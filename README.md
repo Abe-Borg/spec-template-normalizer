@@ -371,6 +371,15 @@ fails instead of publishing a header that still names the architect's section.
 - Extraction is capped at 10,000 entries, 512 MiB total, 128 MiB per part, and
   a 1,000:1 compression ratio. Header/footer media is capped at 16 MiB per
   asset and 64 MiB total.
+- `DOCTYPE` and `ENTITY` declarations are rejected before any XML part reaches
+  a parser, so an entity-expansion payload never expands. Rejection does not
+  depend on the part's encoding: a UTF-16 part cannot smuggle a declaration
+  past the ASCII byte scan, because expat also refuses the declaration in
+  whatever encoding it detects. Declaration-shaped text inside comments and
+  CDATA is refused too, which is stricter than XML requires and deliberate.
+- OOXML parts may legally use encodings other than UTF-8. Those are decoded
+  from their BOM or declaration and keep their characters; an encoding the
+  parser cannot use fails with the part name rather than a bare error.
 - Internal relationship targets must resolve inside the package. External
   targets are recorded but never fetched. Architect classifier input is capped
   at 150,000 tokens as a cost guard (measured with the API's token counter,

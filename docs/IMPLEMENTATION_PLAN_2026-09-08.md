@@ -4,7 +4,8 @@
 **Revised:** 2026-09-08, after implementation review and reproduction on the supported runtime.
 **Repository:** `spec-template-normalizer`
 **Baseline inspected:** `b66258a`; revision verified against `b156679`
-**Status:** Implementation plan. No application changes have been made.
+**Status:** W1 implemented (see §4). Everything after it is unstarted; the §5 spend
+gate is the next step and is the owner's to run.
 **Audience:** Coding agents capable of independent investigation, implementation, adversarial testing, and integration review.
 
 **Reading guide:** Section 0 records what this revision changed and why. Sections 1-3 hold the decisions, verified evidence, and invariants. Section 4 is the initial deliverable and can be implemented on its own. Sections 5-7 are the conditional follow-on work and the gate that decides whether any of it happens. Sections 8-11 cover integration, working arrangement, and handoff.
@@ -91,7 +92,12 @@ Read `CLAUDE.md` before implementation. Retain these throughout.
 
 ## 4. W1 — encoding-independent rejection of prohibited XML declarations
 
-This is the initial deliverable and stands alone.
+This is the initial deliverable and stands alone. **Implemented.** The union guard
+ships in `core/untrusted_xml.py` with the §4.5 matrix in
+`tests/style_application_regression/test_untrusted_xml.py`. Measured on the real
+corpus payloads (109 parses, 0.29 MB): 6.55 ms to 8.86 ms, so **+2.32 ms per
+corpus run** — 35% of parse time and about 0.5% of the run's wall clock. Two
+further encoding leaks found during implementation are recorded in §4.8.
 
 ### 4.1 Intended behaviour
 
@@ -245,10 +251,20 @@ Acceptance:
 
 - The original bypass fails for bytes and text, across the tested encodings.
 - Every existing rejection keeps its current exception type and message.
-- One deliberate behaviour change is documented rather than silent: a decoded `str` with a non-UTF-8 declaration now parses with correct characters instead of mojibake, and a `utf-16`-declared `str` now parses instead of raising. Both were defects; the fix is in scope because §4.5 promises those cases work.
+- Three deliberate behaviour changes, all fixing defects rather than relaxing the
+  contract. A decoded `str` with a non-UTF-8 declaration now parses with correct
+  characters instead of mojibake, and a `utf-16`-declared `str` now parses instead
+  of raising. An encoding expat cannot use — a codec Python lacks (`LookupError`)
+  or a multi-byte one it refuses internally (`ValueError`) — now raises
+  `UntrustedXmlError` with the part name instead of escaping unwrapped past every
+  caller that handles it. That last one was found by an adversarial encoding sweep
+  during implementation, not by the original review.
 - Valid content retains its Unicode across supported encodings.
 - Package validation, both application modes, and the corpus regression are unaffected.
-- Python and Expat versions are recorded for the parser results.
+- Python and Expat versions are recorded for the parser results: implemented and
+  verified on Python 3.11.15 / Expat 2.6.1.
+- Corpus regression timed before and after: 6.55 ms to 8.86 ms of parse time over
+  its 109 parses, so +2.32 ms per run.
 - The change is one isolated commit. If compatibility regresses, revise the approach; never restore acceptance of prohibited declarations.
 
 W1 does not touch `engine_identity.py`'s covered files, so it does not invalidate cached profiles.
