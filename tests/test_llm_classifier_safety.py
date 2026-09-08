@@ -945,3 +945,151 @@ def test_call_api_sends_the_system_prompt_as_one_cached_block(monkeypatch) -> No
     ]
     assert captured["messages"] == [{"role": "user", "content": "user"}]
 
+
+def _stream_with(text: str, stop_reason: str = "end_turn"):
+    class Stream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_final_text(self):
+            return text
+
+        def get_final_message(self):
+            return types.SimpleNamespace(stop_reason=stop_reason)
+
+    return Stream()
+
+
+def test_max_tokens_response_enters_bounded_regeneration(monkeypatch) -> None:
+    _install_fake_anthropic(monkeypatch)
+    good = json.dumps(_body_instructions([0]))
+    prompts = []
+
+    class Messages:
+        def __init__(self):
+            self.outcomes = [
+                _stream_with('{"create_styles": [', stop_reason="max_tokens"),
+                _stream_with(good),
+            ]
+
+        def stream(self, **kwargs):
+            prompts.append(kwargs["messages"][0]["content"])
+            return self.outcomes.pop(0)
+
+    client = types.SimpleNamespace(messages=Messages())
+
+    result = _request_json_response(
+        client,
+        "system",
+        "user",
+        "model",
+        response_schema=llm_classifier._instruction_response_schema(),
+        max_attempts=2,
+    )
+
+    assert result["apply_pStyle"] == [{"paragraph_index": 0, "styleId": "Body"}]
+    assert len(prompts) == 2
+    assert "RETRY REQUIREMENT" in prompts[1]
+    assert "max_tokens" in prompts[1]
+
+
+def test_refusal_is_terminal_and_never_regenerated(monkeypatch) -> None:
+    _install_fake_anthropic(monkeypatch)
+    calls = 0
+
+    class Messages:
+        def stream(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return _stream_with("", stop_reason="refusal")
+
+    client = types.SimpleNamespace(messages=Messages())
+
+    with pytest.raises(llm_classifier.ClassificationRefused, match="refusal"):
+        _request_json_response(
+            client,
+            "system",
+            "user",
+            "model",
+            response_schema=llm_classifier._instruction_response_schema(),
+            max_attempts=3,
+        )
+    assert calls == 1
+
+
+def test_cost_guard_uses_the_api_token_count_when_available(monkeypatch) -> None:
+    anthropic = _install_fake_anthropic(monkeypatch)
+    counted = {}
+
+    class Messages:
+        def count_tokens(self, **kwargs):
+            counted.update(kwargs)
+            return types.SimpleNamespace(input_tokens=llm_classifier.MAX_SINGLE_PASS_INPUT_TOKENS + 1)
+
+        def stream(self, **_kwargs):
+            raise AssertionError("the guard must fire before any classification request")
+
+    anthropic.Anthropic = lambda **_kwargs: types.SimpleNamespace(messages=Messages())
+
+    with pytest.raises(ValueError, match="measures 150,001 tokens.*cost guard"):
+        classify_document(_plain_bundle(3), "master", "run", api_key="k")
+
+    assert counted["model"] == "claude-opus-5"
+    assert counted["system"][0]["text"] == "master"
+    assert counted["messages"][0]["content"].startswith("run")
+
+
+def test_cost_guard_falls_back_to_the_estimate_without_a_counter(monkeypatch) -> None:
+    anthropic = _install_fake_anthropic(monkeypatch)
+    good = json.dumps(_body_instructions(range(3)))
+
+    class Messages:
+        def stream(self, **_kwargs):
+            return _stream_with(good)
+
+    anthropic.Anthropic = lambda **_kwargs: types.SimpleNamespace(messages=Messages())
+
+    result = classify_document(_plain_bundle(3), "master", "run", api_key="k")
+
+    assert [item["paragraph_index"] for item in result["apply_pStyle"]] == [0, 1, 2]
+
+
+def test_based_on_is_repaired_from_the_exemplar_pstyle_and_noted() -> None:
+    bundle = _plain_bundle(2)
+    bundle["paragraphs"][1]["pStyle"] = "Heading1"
+    instructions = {
+        "create_styles": [
+            {
+                "styleId": "CSI_Part__ARCH",
+                "name": "CSI Part",
+                "type": "paragraph",
+                "derive_from_paragraph_index": 1,
+                "basedOn": "Normal",
+            },
+            {
+                "styleId": "CSI_Paragraph__ARCH",
+                "name": "CSI Paragraph",
+                "type": "paragraph",
+                "derive_from_paragraph_index": 0,
+                "basedOn": "Body",
+            },
+        ],
+        "apply_pStyle": [],
+        "ignored_paragraphs": [],
+        "roles": {},
+        "notes": [],
+    }
+
+    repaired = llm_classifier._repair_style_based_on(instructions, bundle)
+
+    assert repaired == 1
+    assert instructions["create_styles"][0]["basedOn"] == "Heading1"
+    assert instructions["create_styles"][1]["basedOn"] == "Body"
+    assert instructions["notes"] == [
+        "Deterministic repair: basedOn of style CSI_Part__ARCH set to exemplar "
+        "pStyle 'Heading1' (was 'Normal')"
+    ]
+

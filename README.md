@@ -353,8 +353,10 @@ fails instead of publishing a header that still names the architect's section.
   a 1,000:1 compression ratio. Header/footer media is capped at 16 MiB per
   asset and 64 MiB total.
 - Internal relationship targets must resolve inside the package. External
-  targets are recorded but never fetched, and classifier input is capped at an
-  estimated 150,000 tokens.
+  targets are recorded but never fetched. Architect classifier input is capped
+  at 150,000 tokens as a cost guard (measured with the API's token counter,
+  with a size estimate as the fallback); the cap is not a context-window
+  limit, and a template that exceeds it is refused before any request.
 - Architect and target inputs are read-only; outputs are separate files.
 - Template profiles are reused only after manifest, size, checksum, source hash,
   producer-version, prompt/model fingerprint, and cache-contract validation.

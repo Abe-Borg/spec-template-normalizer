@@ -332,6 +332,19 @@ and emits role metadata. `llm_classifier.py`, `paragraph_rules.py`,
 `arch_env_extractor.py`, and `phase1_validator.py` own architect classification,
 signals, shell capture, and cross-contract validation respectively.
 
+`llm_classifier.classify_document()` applies these deterministic repairs to
+the model's instructions before validation, in this order: known editorial
+exclusions become ignored paragraphs; roles proven by strong text signals are
+added when omitted; role exemplars whose text signals a different role are
+corrected; `apply_pStyle` entries contradicted by strong signals are
+corrected; and every created style's `basedOn` is set to its exemplar's
+source `pStyle` (a note records each such repair, and the classification
+audit embeds the notes). The model never decides `basedOn`. The 150,000-token
+input cap is a cost guard measured with the API's token counter (estimate
+fallback), not a context-window limit; a response that stops at the
+output-token limit enters the bounded regeneration loop, while a refusal is
+terminal.
+
 ### `gui.py`
 
 Owns input collection, background execution, immutable active-run display,
