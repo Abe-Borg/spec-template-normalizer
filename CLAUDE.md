@@ -252,6 +252,13 @@ Owns all mode-dependent decisions. Add a policy field rather than scattering a
 new conversion-mode conditional across the pipeline. Its contract version must
 be recorded in `run.json` and changed when policy semantics change.
 
+`output_suffix` is one of those fields: the engine's staged output name in
+`_build_and_patch_output` and the pipeline's planned output names in
+`_plan_output_paths` both read it (`_FORMATTED.docx` for Format-only,
+`_CANADIAN_FORMATTED.docx` for Canadian conversion), so the two can never
+disagree. `_PHASE2_FORMATTED.docx` is a retired engine-only name that folder
+discovery still excludes as legacy output.
+
 ### `spec_formatter/style_application/batch_runner.py`
 
 - Loads one validated profile and prepares/classifies targets.

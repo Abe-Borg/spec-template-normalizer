@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from .csi_to_canadian import CSI_TO_CANADIAN, FORMAT_ONLY, validate_conversion_mode
 
 
-APPLICATION_POLICY_VERSION = "2"
+APPLICATION_POLICY_VERSION = "3"
+
+FORMAT_ONLY_OUTPUT_SUFFIX = "_FORMATTED.docx"
+CSI_TO_CANADIAN_OUTPUT_SUFFIX = "_CANADIAN_FORMATTED.docx"
 
 
 @dataclass(frozen=True)
@@ -23,6 +26,10 @@ class ApplicationPolicy:
     preserve_target_numbering: bool
     convert_to_canadian: bool
     import_body_numbering: bool
+    #: Suffix appended to the target stem for the published DOCX. Owned here so
+    #: the engine's staged output and the pipeline's planned output paths can
+    #: never disagree about a mode's naming.
+    output_suffix: str
     allow_ignored_paragraphs: bool = True
     apply_full_architect_shell: bool = True
     contract_version: str = APPLICATION_POLICY_VERSION
@@ -42,6 +49,7 @@ def application_policy_for_mode(conversion_mode: str) -> ApplicationPolicy:
             preserve_target_numbering=True,
             convert_to_canadian=False,
             import_body_numbering=False,
+            output_suffix=FORMAT_ONLY_OUTPUT_SUFFIX,
         )
     if mode == CSI_TO_CANADIAN:
         return ApplicationPolicy(
@@ -49,12 +57,15 @@ def application_policy_for_mode(conversion_mode: str) -> ApplicationPolicy:
             preserve_target_numbering=False,
             convert_to_canadian=True,
             import_body_numbering=True,
+            output_suffix=CSI_TO_CANADIAN_OUTPUT_SUFFIX,
         )
     raise AssertionError(f"Unhandled conversion mode: {mode}")
 
 
 __all__ = [
     "APPLICATION_POLICY_VERSION",
+    "CSI_TO_CANADIAN_OUTPUT_SUFFIX",
+    "FORMAT_ONLY_OUTPUT_SUFFIX",
     "ApplicationPolicy",
     "application_policy_for_mode",
 ]

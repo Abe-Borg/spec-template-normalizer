@@ -32,7 +32,10 @@ from .style_application.batch_runner import (
     load_and_validate_shared_config,
     process_single_file,
 )
-from .style_application.core.application_policy import APPLICATION_POLICY_VERSION
+from .style_application.core.application_policy import (
+    APPLICATION_POLICY_VERSION,
+    application_policy_for_mode,
+)
 from .style_application.core.csi_to_canadian import (
     CSI_TO_CANADIAN,
     FORMAT_ONLY,
@@ -47,6 +50,9 @@ TemplateClassifier = Callable[..., dict[str, Any]]
 TemplateAnalyzer = Callable[..., template_analysis.Phase1Result]
 TargetProcessor = Callable[..., BatchResult]
 
+# Upper-cased suffixes of formatter outputs, used to exclude earlier outputs
+# from folder discovery. ``_PHASE2_FORMATTED`` is the pre-unification engine
+# name and stays here so legacy outputs are still skipped.
 _FORMATTED_SUFFIXES = (
     "_FORMATTED.DOCX",
     "_CANADIAN_FORMATTED.DOCX",
@@ -1121,7 +1127,7 @@ def _plan_output_paths(
     conversion_mode: str = FORMAT_ONLY,
 ) -> dict[Path, Path]:
     conversion_mode = validate_conversion_mode(conversion_mode)
-    suffix = "_CANADIAN_FORMATTED.docx" if conversion_mode == CSI_TO_CANADIAN else "_FORMATTED.docx"
+    suffix = application_policy_for_mode(conversion_mode).output_suffix
     stem_counts: dict[str, int] = {}
     for target in targets:
         key = target.stem.casefold()

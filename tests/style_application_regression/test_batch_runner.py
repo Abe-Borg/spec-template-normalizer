@@ -103,6 +103,45 @@ def test_direct_batch_canadian_output_name_does_not_collide(monkeypatch, tmp_pat
     assert output.name == "source_CANADIAN_FORMATTED.docx"
 
 
+def test_direct_format_only_output_name_matches_the_pipeline_suffix(monkeypatch, tmp_path):
+    # The engine used to stage format_only output as _PHASE2_FORMATTED.docx
+    # while the pipeline planned _FORMATTED.docx; both now read the suffix
+    # from the one ApplicationPolicy.
+    from spec_formatter.pipeline import _plan_output_paths
+    from spec_formatter.style_application.core.application_policy import (
+        application_policy_for_mode,
+    )
+
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source")
+    extract = tmp_path / "extract"
+    (extract / "word").mkdir(parents=True)
+    (extract / "word" / "document.xml").write_bytes(b"document")
+    (extract / "word" / "styles.xml").write_bytes(b"styles")
+
+    def fake_patch_docx(**kwargs):
+        Path(kwargs["out_docx"]).write_bytes(b"output")
+
+    monkeypatch.setattr(
+        "spec_formatter.style_application.batch_runner.patch_docx",
+        fake_patch_docx,
+    )
+    monkeypatch.setattr(
+        "spec_formatter.style_application.batch_runner.validate_docx_package",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "spec_formatter.style_application.batch_runner.verify_phase2_invariants",
+        lambda *_args, **_kwargs: None,
+    )
+
+    output = _build_and_patch_output(source, extract, {}, tmp_path / "out")
+
+    assert output.name == "source_FORMATTED.docx"
+    assert output.name.endswith(application_policy_for_mode("format_only").output_suffix)
+    assert _plan_output_paths([source], tmp_path / "planned")[source].name == output.name
+
+
 def test_file_key_yields_batch_api_safe_custom_ids():
     # Batch API custom_ids must match [a-zA-Z0-9_-]{1,64}; CSI spec filenames
     # are long and dotted, so the stem must be sanitized and bounded.

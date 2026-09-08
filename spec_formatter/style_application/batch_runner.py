@@ -559,11 +559,7 @@ def _build_and_patch_output(
 ) -> Path:
     conversion_mode = validate_conversion_mode(conversion_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
-    suffix = (
-        "_CANADIAN_FORMATTED.docx"
-        if conversion_mode == CSI_TO_CANADIAN
-        else "_PHASE2_FORMATTED.docx"
-    )
+    suffix = application_policy_for_mode(conversion_mode).output_suffix
     output_path = output_dir / (docx_path.stem + suffix)
     replacements = {
         "word/document.xml": (extract_dir / "word" / "document.xml").read_bytes(),
