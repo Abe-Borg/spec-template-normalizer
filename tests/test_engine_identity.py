@@ -26,8 +26,12 @@ def test_committed_engine_digest_matches_the_checkout():
 
 
 def test_engine_digest_is_line_ending_independent(tmp_path: Path):
+    # Normalise to LF before producing CRLF: on a Windows checkout with
+    # autocrlf the files already carry CRLF, and a blind "\n" -> "\r\n"
+    # replacement would produce "\r\r\n", which is a real content change.
     for name in ENGINE_SOURCE_FILES:
-        (tmp_path / name).write_bytes((REPO_ROOT / name).read_bytes().replace(b"\n", b"\r\n"))
+        source = (REPO_ROOT / name).read_bytes().replace(b"\r\n", b"\n")
+        (tmp_path / name).write_bytes(source.replace(b"\n", b"\r\n"))
     assert compute_engine_source_digest(tmp_path) == ENGINE_SOURCE_DIGEST
 
 
