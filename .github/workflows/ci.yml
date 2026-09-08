@@ -53,6 +53,15 @@ jobs:
         run: |
           pip install -r requirements.txt
           python -c "import spec_formatter.pipeline, phase1_pipeline"
+      - name: Untrusted-XML guard on this interpreter
+        # The guard rejects DOCTYPE/ENTITY across encodings using expat's
+        # own handler, so its behaviour depends on the interpreter's expat
+        # build. An import check would not catch a regression there, and the
+        # full suite only runs on Windows/3.11, so exercise this one module
+        # on the source floor too.
+        run: |
+          python -c "import sys, pyexpat; print(sys.version, pyexpat.EXPAT_VERSION)"
+          python -m pytest tests/style_application_regression/test_untrusted_xml.py tests/test_ooxml_text.py tests/style_application_regression/test_ooxml_text.py -q
 
   suite:
     name: Full test suite (Windows)
