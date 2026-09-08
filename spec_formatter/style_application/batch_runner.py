@@ -5,10 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import os
 import tempfile
 import time
-import zipfile
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -159,6 +158,8 @@ class _ApplicationCheckpoint:
             audit=_safe_application_audit(self.audit),
             numbering_checks=_safe_numbering_checks(self.numbering_checks),
         )
+
+
 @dataclass(frozen=True)
 class SharedConfig:
     arch_registry: Dict[str, str]

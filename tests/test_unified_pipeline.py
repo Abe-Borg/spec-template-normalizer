@@ -1633,3 +1633,150 @@ def test_stale_profiles_for_one_template_are_pruned_to_the_newest_two(
     assert any("Removed 1 older cached profile" in line for line in messages)
     assert not any(profiles[0].bundle_dir.name in line for line in messages)
 
+
+def test_profile_provenance_is_captured_at_selection_not_revalidated_at_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    validator = pipeline.template_analysis.validate_bundle_directory
+    validations: list[Path] = []
+
+    def counting_validator(bundle_dir, *, expected_source_sha256):
+        validations.append(Path(bundle_dir))
+        return validator(bundle_dir, expected_source_sha256=expected_source_sha256)
+
+    monkeypatch.setattr(pipeline.template_analysis, "validate_bundle_directory", counting_validator)
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    assert result.template_profile.provenance is not None
+    assert result.template_profile.provenance["producer"]["name"] == "spec-template-normalizer"
+    # One validation when the fresh profile is selected; none while writing run.json.
+    assert len(validations) == 1
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["template_profile"]["producer"]["name"] == "spec-template-normalizer"
+    assert manifest["template_profile"]["reused"] is False
+
+
+def test_publication_failure_still_writes_a_failed_manifest_with_target_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+
+    def failing_writer(**_kwargs):
+        raise OSError("disk full while writing audits")
+
+    monkeypatch.setattr(pipeline, "_write_run_artifacts", failing_writer)
+
+    with pytest.raises(OSError) as raised:
+        _run_with_fakes(
+            architect,
+            [target],
+            tmp_path / "formatted",
+            analyzer=analyzer,
+            config_loader=config_loader,
+            processor=processor,
+        )
+
+    run_dir = raised.value.run_dir
+    manifest_path = raised.value.manifest_path
+    assert run_dir.is_dir() and manifest_path == run_dir / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["failure_phase"] == "publication"
+    assert "disk full" not in manifest_path.read_text(encoding="utf-8")
+    record = manifest["targets"][0]
+    assert record["success"] is True
+    assert record["stage"] == "complete"
+    assert record["output_path"] == str(run_dir / "target_FORMATTED.docx")
+    assert (run_dir / "target_FORMATTED.docx").is_file()
+    assert "RUN FAILED DURING PUBLICATION" in (run_dir / "run.log").read_text(encoding="utf-8")
+    assert not (run_dir / ".staging").exists()
+
+
+def test_staging_directory_is_removed_when_the_run_ends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    observed: list[bool] = []
+    original = pipeline._atomic_write_bytes
+
+    def observing_write(path, payload):
+        original(path, payload)
+        observed.append((path.parent / ".staging").is_dir())
+
+    monkeypatch.setattr(pipeline, "_atomic_write_bytes", observing_write)
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    assert observed and all(observed)
+    assert not (result.run_dir / ".staging").exists()
+    assert sorted(p.name for p in result.run_dir.iterdir() if p.name.startswith(".")) == []
+
+
+def test_cached_profile_rejection_message_carries_no_raw_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+    cache_dir = tmp_path / "profile-cache"
+    first = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+        cache_dir=cache_dir,
+    )
+    private = r"C:\\Users\\Private\\secret-bundle"
+    validator = pipeline.template_analysis.validate_bundle_directory
+
+    def rejecting_validator(bundle_dir, *, expected_source_sha256):
+        if Path(bundle_dir) == first.template_profile.bundle_dir:
+            raise ValueError(f"manifest tampered at {private}")
+        return validator(bundle_dir, expected_source_sha256=expected_source_sha256)
+
+    monkeypatch.setattr(pipeline.template_analysis, "validate_bundle_directory", rejecting_validator)
+    messages: list[str] = []
+
+    _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+        cache_dir=cache_dir,
+        progress=messages.append,
+    )
+
+    rejection = [line for line in messages if "Ignoring an invalid cached template profile" in line]
+    assert rejection
+    assert all(private not in line and "tampered" not in line for line in rejection)
+

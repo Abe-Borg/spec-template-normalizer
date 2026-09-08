@@ -273,6 +273,19 @@ class DiagnosticEvent:
 # ---------------------------------------------------------------------------
 
 
+# Engine events are produced on worker threads and folded into the run's
+# recorder later, so the recorder's ``ts`` is an ingest time. ``t_ms`` is a
+# monotonic offset (milliseconds since this module loaded) stamped when the
+# event is produced; sort on it to order phases across targets truthfully.
+_MONOTONIC_EPOCH = time.monotonic()
+
+
+def monotonic_ms() -> float:
+    """Milliseconds since the diagnostics clock started (monotonic)."""
+
+    return round((time.monotonic() - _MONOTONIC_EPOCH) * 1000.0, 3)
+
+
 def emit(
     collector: List[Dict[str, Any]],
     level: str,
@@ -280,8 +293,13 @@ def emit(
     event: str,
     **fields: Any,
 ) -> None:
-    """Append one structured event dict to *collector*."""
+    """Append one structured event dict to *collector*.
 
+    ``t_ms`` is the production time; :func:`timed` passes the phase's start
+    time so a phase sorts where it began, not where it ended.
+    """
+
+    fields.setdefault("t_ms", monotonic_ms())
     collector.append(
         {
             "level": level.upper() if isinstance(level, str) else "INFO",
@@ -323,17 +341,18 @@ def timed(
 
     handle = _PhaseHandle()
     start = time.monotonic()
+    start_ms = monotonic_ms()
     try:
         yield handle
     except BaseException as exc:  # noqa: BLE001 - re-raised after recording
         duration_ms = round((time.monotonic() - start) * 1000.0, 3)
         merged = {**fields, **handle.fields, "duration_ms": duration_ms, "failed": True,
-                  "error_type": _clean_name(type(exc).__name__.lower())}
+                  "error_type": _clean_name(type(exc).__name__.lower()), "t_ms": start_ms}
         emit(collector, "ERROR", component, event, **merged)
         raise
     duration_ms = round((time.monotonic() - start) * 1000.0, 3)
     emit(collector, level, component, event, **fields, **handle.fields,
-         duration_ms=duration_ms)
+         duration_ms=duration_ms, t_ms=start_ms)
 
 
 class DiagnosticsRecorder:

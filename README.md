@@ -107,8 +107,10 @@ document text are never written to run metadata.
 `diagnostics.jsonl` is the detailed, structured diagnostics stream: one JSON
 object per phase event (`seq`, `ts`, `level`, `component`, `event`, and a
 `fields` object of counts/timings such as per-phase `duration_ms`, styles
-imported, numbering remaps, and paragraphs modified). It complements the
-human-readable `run.log`. Diagnostics carry only numbers and short structural
+imported, numbering remaps, and paragraphs modified). Engine phase events also
+carry `fields.t_ms`, the monotonic time at which the phase started, so events
+from different targets can be ordered truthfully even though their `ts` is
+the time the run folded them in. It complements the human-readable `run.log`. Diagnostics carry only numbers and short structural
 identifiers -- never document text or secrets -- and the verbosity is set with
 `diagnostics_level` (`debug`/`info`/`warning`/`error`, default `info`) or the
 `SPEC_FORMATTER_DIAGNOSTICS_LEVEL` environment variable, which overrides it.

@@ -176,7 +176,9 @@ def test_engine_helpers_emit_and_time_sanitized_dicts() -> None:
     diag.emit(collector, "info", "target", "slim_bundle", paragraphs=10, junk="a b c")
     with diag.timed(collector, "target", "extract") as phase:
         phase.set(bytes_read=4096)
-    assert collector[0]["fields"] == {"paragraphs": 10}
+    first_fields = dict(collector[0]["fields"])
+    assert isinstance(first_fields.pop("t_ms"), float)
+    assert first_fields == {"paragraphs": 10}
     assert collector[1]["event"] == "extract"
     assert "duration_ms" in collector[1]["fields"]
     assert collector[1]["fields"]["bytes_read"] == 4096
@@ -216,3 +218,26 @@ def test_sanitize_event_cleans_component_event_and_fields() -> None:
         "fields": {"pct": 90.0},
         "target": 3,
     }
+
+
+def test_engine_events_carry_a_monotonic_production_time():
+    from spec_formatter import diagnostics as diag
+
+    events: list = []
+    with diag.timed(events, "target", "first"):
+        pass
+    diag.emit(events, "INFO", "target", "second", count=1)
+    with diag.timed(events, "target", "third"):
+        pass
+
+    stamps = [event["fields"]["t_ms"] for event in events]
+    assert all(isinstance(stamp, float) for stamp in stamps)
+    assert stamps == sorted(stamps)
+    # A timed phase is stamped with its start, so it sorts where it began.
+    assert stamps[0] <= events[0]["fields"]["t_ms"] + events[0]["fields"]["duration_ms"]
+
+    recorder = diag.DiagnosticsRecorder(min_level=diag.DEBUG)
+    recorder.ingest(events, target=1)
+    ingested = recorder.iter_dicts()
+    assert [event["fields"]["t_ms"] for event in ingested] == stamps
+

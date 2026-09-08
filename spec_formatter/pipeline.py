@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 import warnings
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,11 +80,19 @@ def _empty_audit_summary() -> dict[str, int]:
 
 @dataclass(frozen=True)
 class TemplateProfile:
-    """Validated internal template profile selected for a formatting run."""
+    """Validated internal template profile selected for a formatting run.
+
+    ``provenance`` is captured from the manifest at selection time so the run
+    manifest can record it without re-validating the bundle after the DOCX
+    files, audits, and logs have already been published. It is optional so
+    callers and test doubles that construct a profile directly keep working;
+    without it the provenance is resolved by validating the bundle again.
+    """
 
     bundle_dir: Path
     source_sha256: str
     reused: bool
+    provenance: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -511,11 +519,19 @@ def _find_cached_profile(
                 classifier=classifier,
             ):
                 continue
-            return TemplateProfile(candidate, source_sha256, reused=True)
+            return TemplateProfile(
+                candidate,
+                source_sha256,
+                reused=True,
+                provenance=_provenance_from_manifest(manifest),
+            )
         except Exception as exc:
+            # The rejection reason can carry a filesystem path or bundle
+            # detail; only its safe form reaches the progress log.
             _emit(
                 progress,
-                f"Ignoring an invalid cached template profile ({candidate.name}): {exc}",
+                "Ignoring an invalid cached template profile: "
+                f"{safe_error_diagnostic(exc).message}",
             )
     return None
 
@@ -598,7 +614,23 @@ def prepare_template_profile(
         selected=Path(phase1_result.bundle_dir),
         progress=progress,
     )
-    return TemplateProfile(phase1_result.bundle_dir, source_sha256, reused=False)
+    return TemplateProfile(
+        phase1_result.bundle_dir,
+        source_sha256,
+        reused=False,
+        provenance=_provenance_from_manifest(manifest),
+    )
+
+
+def _provenance_from_manifest(manifest: Any) -> dict[str, Any]:
+    """The manifest facts the run manifest records about a selected profile."""
+
+    producer = getattr(manifest, "producer", {})
+    return {
+        "bundle_id": getattr(manifest, "bundle_id", None),
+        "created_utc": getattr(manifest, "created_utc", None),
+        "producer": dict(producer) if isinstance(producer, Mapping) else {},
+    }
 
 
 def _prune_stale_profiles(
@@ -670,11 +702,32 @@ def _create_run_directory(output_root: Path, conversion_mode: str) -> tuple[str,
     raise FileExistsError("Could not allocate a unique formatter run directory.")
 
 
+_STAGING_DIR_NAME = ".staging"
+
+
+def _staging_partial(destination: Path, prefix: str, suffix: str) -> Path:
+    """A partial-file path in the destination folder's ``.staging`` directory.
+
+    Keeping partial files in one sub-directory (on the same filesystem, so
+    ``os.replace`` stays atomic) means a hard kill leaves them out of the
+    run folder's listing, and the run removes the directory when it ends.
+    Nothing ever sweeps other run directories: they are immutable history.
+    """
+
+    staging = destination.parent / _STAGING_DIR_NAME
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging / f"{prefix}-{uuid.uuid4().hex[:12]}{suffix}"
+
+
+def _remove_staging_dir(run_dir: Path) -> None:
+    shutil.rmtree(run_dir / _STAGING_DIR_NAME, ignore_errors=True)
+
+
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    """Durably stage *payload* beside *path*, then publish it atomically."""
+    """Durably stage *payload* under ``.staging``, then publish it atomically."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.parent / f".meta-{uuid.uuid4().hex[:12]}.tmp"
+    partial = _staging_partial(path, "meta", ".tmp")
     try:
         with partial.open("xb") as writer:
             writer.write(payload)
@@ -700,7 +753,7 @@ def _publish_output(source: Path, destination: Path) -> str:
     """Copy from short staging, then atomically publish inside the run folder."""
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    partial = destination.parent / f".publish-{uuid.uuid4().hex[:12]}.tmp.docx"
+    partial = _staging_partial(destination, "publish", ".tmp.docx")
     digest = hashlib.sha256()
     try:
         with source.open("rb") as reader, partial.open("xb") as writer:
@@ -1379,15 +1432,20 @@ def _format_one_target(
 
 
 def _profile_provenance(profile: TemplateProfile) -> dict[str, Any]:
-    manifest = template_analysis.validate_bundle_directory(
-        profile.bundle_dir,
-        expected_source_sha256=profile.source_sha256,
-    )
-    producer = getattr(manifest, "producer", {})
+    provenance = getattr(profile, "provenance", None)
+    if not isinstance(provenance, Mapping):
+        # A profile constructed without captured provenance (an older caller
+        # or a test double): resolve it from the bundle now.
+        manifest = template_analysis.validate_bundle_directory(
+            profile.bundle_dir,
+            expected_source_sha256=profile.source_sha256,
+        )
+        provenance = _provenance_from_manifest(manifest)
+    producer = provenance.get("producer", {})
     return {
         "bundle_dir": str(profile.bundle_dir),
-        "bundle_id": getattr(manifest, "bundle_id", profile.bundle_dir.name),
-        "created_utc": getattr(manifest, "created_utc", None),
+        "bundle_id": provenance.get("bundle_id") or profile.bundle_dir.name,
+        "created_utc": provenance.get("created_utc"),
         "source_sha256": profile.source_sha256,
         "reused": profile.reused,
         "contract_version": _PROFILE_CONTRACT_VERSION,
@@ -1638,10 +1696,19 @@ def _write_initialization_failure_artifacts(
     error: Exception,
     secrets: Sequence[str],
     recorder: diag.DiagnosticsRecorder,
+    failure_phase: str = "initialization",
+    results: Optional[Sequence[TargetFormatResult]] = None,
 ) -> Path:
-    """Persist a complete failed-run record when preparation cannot finish."""
+    """Persist a complete failed-run record when a run cannot finish.
+
+    Used for initialization failures (no target ran) and for publication
+    failures (the DOCX files may exist but the audits or manifest could not
+    be written); ``results`` supplies truthful per-target outcomes for the
+    latter.
+    """
 
     finished_utc = _utc_now()
+    results_by_path = {Path(item.source_path): item for item in (results or ())}
     error_diagnostic = safe_error_diagnostic(error, secrets)
     if error_diagnostic is None:  # pragma: no cover - ``error`` is concrete
         error_diagnostic = SafeErrorDiagnostic(
@@ -1683,20 +1750,41 @@ def _write_initialization_failure_artifacts(
             "conversion_report": None,
         }
         _atomic_write_json(audit_path, audit_payload)
+        outcome = results_by_path.get(Path(target))
+        if outcome is None:
+            target_records.append(
+                {
+                    "source_path": str(target),
+                    "source_sha256": source_hash,
+                    "success": False,
+                    "stage": "not_started",
+                    "output_path": None,
+                    "output_sha256": None,
+                    "audit_path": str(audit_path),
+                    "duration_seconds": 0.0,
+                    "error_type": type(error).__name__,
+                    "error_code": error_diagnostic.code,
+                    "error": error_diagnostic.message,
+                    "disposition_counts": _empty_audit_summary(),
+                    "numbering_checks": {},
+                }
+            )
+            continue
+        target_error = safe_error_diagnostic(outcome.error, secrets)
         target_records.append(
             {
                 "source_path": str(target),
-                "source_sha256": source_hash,
-                "success": False,
-                "stage": "not_started",
-                "output_path": None,
-                "output_sha256": None,
+                "source_sha256": outcome.source_sha256 or source_hash,
+                "success": bool(outcome.success),
+                "stage": getattr(outcome, "stage", None) or "processing",
+                "output_path": str(outcome.output_path) if outcome.output_path else None,
+                "output_sha256": outcome.output_sha256,
                 "audit_path": str(audit_path),
-                "duration_seconds": 0.0,
-                "error_type": type(error).__name__,
-                "error_code": error_diagnostic.code,
-                "error": error_diagnostic.message,
-                "disposition_counts": _empty_audit_summary(),
+                "duration_seconds": round(float(outcome.duration_seconds), 6),
+                "error_type": None if outcome.success else type(error).__name__,
+                "error_code": target_error.code if target_error else None,
+                "error": target_error.message if target_error else None,
+                "disposition_counts": _normalize_audit_summary(outcome.audit_summary),
                 "numbering_checks": {},
             }
         )
@@ -1707,7 +1795,7 @@ def _write_initialization_failure_artifacts(
         for event in events
     ]
     log_lines.append(
-        "RUN FAILED DURING INITIALIZATION "
+        f"RUN FAILED DURING {failure_phase.upper()} "
         f"[{error_diagnostic.code}]: {error_diagnostic.message}"
     )
     _atomic_write_bytes(
@@ -1723,7 +1811,7 @@ def _write_initialization_failure_artifacts(
         "run_id": run_id,
         "conversion_mode": conversion_mode,
         "status": "failed",
-        "failure_phase": "initialization",
+        "failure_phase": failure_phase,
         "started_utc": _iso_utc(started_utc),
         "finished_utc": _iso_utc(finished_utc),
         "duration_seconds": round((finished_utc - started_utc).total_seconds(), 6),
@@ -1801,7 +1889,11 @@ def format_specifications(
 
     started_utc = _utc_now()
     events: list[str] = []
-    pending_events: queue.SimpleQueue[tuple[datetime, str]] = queue.SimpleQueue()
+    # One signal queue carries both progress events and target completions,
+    # so the completion loop blocks on it instead of polling at 20 Hz. FIFO
+    # order guarantees a worker's progress events are published before its
+    # completion is handled.
+    pending_events: queue.SimpleQueue[tuple[Any, ...]] = queue.SimpleQueue()
     event_order_lock = threading.Lock()
     event_owner_thread = threading.get_ident()
     last_event_at: Optional[datetime] = None
@@ -1824,17 +1916,33 @@ def format_specifications(
             if last_event_at is not None and event_time < last_event_at:
                 event_time = last_event_at
             last_event_at = event_time
-            pending_events.put((event_time, message))
+            pending_events.put(("event", event_time, message))
         return event_time
 
-    def drain_reported_events(*, emit_callbacks: bool = True) -> None:
-        """Publish queued events from the calling thread in occurrence order."""
+    def drain_reported_events(
+        *,
+        emit_callbacks: bool = True,
+        block: bool = False,
+    ) -> list[Future[TargetFormatResult]]:
+        """Publish queued events from the calling thread in occurrence order.
 
+        Returns the target futures whose completion signals were drained.
+        With ``block`` the first wait is blocking, so the completion loop
+        sleeps until a worker reports progress or finishes.
+        """
+
+        finished: list[Future[TargetFormatResult]] = []
+        first = True
         while True:
             try:
-                event_time, message = pending_events.get_nowait()
+                item = pending_events.get() if block and first else pending_events.get_nowait()
             except queue.Empty:
-                return
+                return finished
+            first = False
+            if item[0] == "done":
+                finished.append(item[1])
+                continue
+            _kind, event_time, message = item
             events.append(f"{_iso_utc(event_time)} {message}")
             if emit_callbacks:
                 _emit(progress, message)
@@ -1942,6 +2050,7 @@ def format_specifications(
             setattr(exc, "manifest_path", manifest_path)
         except Exception:  # pragma: no cover - unusual immutable exception type
             pass
+        _remove_staging_dir(run_dir)
         raise
     results_by_target: dict[Path, TargetFormatResult] = {}
 
@@ -1970,19 +2079,22 @@ def format_specifications(
                     ),
                 )
                 futures[future] = (index + 1, target)
+                future.add_done_callback(
+                    lambda done_future: pending_events.put(("done", done_future))
+                )
                 # A fast worker can start before ``submit`` returns. Publish
                 # its queued event before submitting another target.
                 drain_reported_events()
 
             completed = 0
-            pending = set(futures)
-            while pending:
-                drain_reported_events()
-                done, pending = wait(
-                    pending,
-                    timeout=0.05,
-                    return_when=FIRST_COMPLETED,
-                )
+            outstanding = set(futures)
+            while outstanding:
+                done = [
+                    future
+                    for future in drain_reported_events(block=True)
+                    if future in outstanding
+                ]
+                outstanding.difference_update(done)
                 for future in done:
                     target_number, target = futures[future]
                     try:
@@ -2035,7 +2147,6 @@ def format_specifications(
                     report(
                         f"{status} {completed} of {len(targets)}: {target.name}"
                     )
-                drain_reported_events()
             drain_reported_events()
 
     ordered_results = tuple(results_by_target[target] for target in targets)
@@ -2054,22 +2165,56 @@ def format_specifications(
     # guarantee that UI completion is emitted only after artifacts publish.
     drain_reported_events(emit_callbacks=False)
     finished_utc = _utc_now()
-    audited_results, manifest_path, diagnostics_path = _write_run_artifacts(
-        run_id=run_id,
-        conversion_mode=conversion_mode,
-        output_root=destination,
-        run_dir=run_dir,
-        architect=architect,
-        profile=profile,
-        template_model=template_model,
-        target_model=target_model,
-        started_utc=started_utc,
-        finished_utc=finished_utc,
-        targets=ordered_results,
-        events=events,
-        secrets=(normalized_api_key,),
-        recorder=recorder,
-    )
+    try:
+        audited_results, manifest_path, diagnostics_path = _write_run_artifacts(
+            run_id=run_id,
+            conversion_mode=conversion_mode,
+            output_root=destination,
+            run_dir=run_dir,
+            architect=architect,
+            profile=profile,
+            template_model=template_model,
+            target_model=target_model,
+            started_utc=started_utc,
+            finished_utc=finished_utc,
+            targets=ordered_results,
+            events=events,
+            secrets=(normalized_api_key,),
+            recorder=recorder,
+        )
+    except Exception as exc:
+        # The DOCX files may already be published; the run directory must
+        # still end with a manifest that says what happened.
+        recorder.error("pipeline", "publication_failed", error_type=type(exc).__name__.lower())
+        manifest_path = None
+        try:
+            manifest_path = _write_initialization_failure_artifacts(
+                run_id=run_id,
+                conversion_mode=conversion_mode,
+                output_root=destination,
+                run_dir=run_dir,
+                architect=architect,
+                targets=targets,
+                template_model=template_model,
+                target_model=target_model,
+                started_utc=started_utc,
+                events=events,
+                error=exc,
+                secrets=(normalized_api_key,),
+                recorder=recorder,
+                failure_phase="publication",
+                results=ordered_results,
+            )
+        except Exception:  # pragma: no cover - the disk itself is failing
+            pass
+        try:
+            setattr(exc, "run_dir", run_dir)
+            setattr(exc, "manifest_path", manifest_path)
+        except Exception:  # pragma: no cover - unusual immutable exception type
+            pass
+        _remove_staging_dir(run_dir)
+        raise
+    _remove_staging_dir(run_dir)
     run_result = FormatRunResult(
         template_profile=profile,
         output_dir=run_dir,

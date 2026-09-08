@@ -204,6 +204,17 @@ finally `run.json`. Never put secrets or document text in any of these,
 including diagnostics fields. Existing run directories and flat legacy outputs
 are immutable history.
 
+Partial files for those atomic publications live in `<run_dir>/.staging/`
+(same filesystem, so `os.replace` stays atomic) and the run removes that
+directory when it ends, on success or failure; a hard kill can leave it
+behind, but nothing ever sweeps other run directories. If writing the run
+artifacts themselves fails after the DOCX files are published, the run still
+writes a failed `run.json` with `failure_phase: "publication"` and truthful
+per-target outcomes, and the raised error carries `run_dir` and
+`manifest_path`. Profile provenance for `run.json` is captured on
+`TemplateProfile.provenance` when the profile is selected, not by
+re-validating the bundle after the outputs are already published.
+
 ## Bundle contract
 
 A successful run publishes:
@@ -421,7 +432,10 @@ complements the human-readable `run.log`: one JSON object per phase event with
 `seq`, `ts`, `level` (`DEBUG`/`INFO`/`WARNING`/`ERROR`), `component`, `event`,
 optional `target`, and a `fields` object of counts/timings (per-phase
 `duration_ms`, styles imported, numbering remaps, paragraphs modified, and so
-on). It is written after per-target audits and `run.log` but before `run.json`.
+on). Engine events are produced on worker threads and folded into the recorder
+later, so their `ts` is an ingest time; `fields.t_ms` is the monotonic
+production time (a phase's start, in milliseconds since the diagnostics clock
+started), and sorting on it orders phases across targets truthfully. It is written after per-target audits and `run.log` but before `run.json`.
 `spec_formatter/diagnostics.py` owns the recorder. Every field is reduced to
 JSON scalars and short identifier-shaped strings by `sanitize_fields`, so a
 value that could carry document text (anything with whitespace or a
