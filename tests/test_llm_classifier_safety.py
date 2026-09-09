@@ -264,7 +264,7 @@ def test_targeted_patch_merges_styled_and_ignored_paragraphs(monkeypatch) -> Non
 
     def fake_call(
         _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
-        response_format_state=None,
+        response_format_state=None, usage=None,
     ):
         prompts.append(user_message)
         return responses.pop(0)
@@ -296,7 +296,7 @@ def test_classifier_regenerates_after_missing_comma_in_initial_response(
 
     def fake_call(
         _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
-        response_format_state=None,
+        response_format_state=None, usage=None,
     ):
         prompts.append(user_message)
         return responses.pop(0)
@@ -325,7 +325,7 @@ def test_classifier_bounds_repeated_malformed_initial_responses(monkeypatch) -> 
 
     def fake_call(
         _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
-        response_format_state=None,
+        response_format_state=None, usage=None,
     ):
         prompts.append(user_message)
         return _MISSING_COMMA_INITIAL_RESPONSE
@@ -377,7 +377,7 @@ def test_classifier_regenerates_malformed_targeted_patch_then_merges(
 
     def fake_call(
         _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
-        response_format_state=None,
+        response_format_state=None, usage=None,
     ):
         prompts.append(user_message)
         schemas.append(response_schema)
@@ -457,7 +457,7 @@ def test_incomplete_patches_fail_closed_without_nearest_neighbor_fill(monkeypatc
 
     def fake_call(
         _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
-        response_format_state=None,
+        response_format_state=None, usage=None,
     ):
         prompts.append(user_message)
         return responses.pop(0)
@@ -626,7 +626,7 @@ def test_classifier_normalizes_wire_roles_before_runtime_validation(
 
     def fake_call(
         _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
-        response_format_state=None,
+        response_format_state=None, usage=None,
     ):
         prompts.append(user_message)
         return json.dumps(wire_response)
@@ -669,7 +669,7 @@ def test_classifier_regenerates_duplicate_wire_roles_before_validation(
 
     def fake_call(
         _client, _system, user_message, _model, max_tokens=128000,
-        response_schema=None, response_format_state=None,
+        response_schema=None, response_format_state=None, usage=None,
     ):
         prompts.append(user_message)
         states.append(response_format_state)
@@ -876,7 +876,7 @@ def test_more_than_500_small_paragraphs_reach_classifier(monkeypatch) -> None:
 
     def fake_call(
         _client, _system, user_message, _model, max_tokens=128000, response_schema=None,
-        response_format_state=None,
+        response_format_state=None, usage=None,
     ):
         calls.append(user_message)
         return json.dumps(instructions)
@@ -1093,3 +1093,114 @@ def test_based_on_is_repaired_from_the_exemplar_pstyle_and_noted() -> None:
         "pStyle 'Heading1' (was 'Normal')"
     ]
 
+
+
+# --- Architect usage accounting (W2) ---------------------------------------
+
+
+def _usage_message(stop_reason="end_turn", **counts):
+    defaults = {
+        "input_tokens": 100,
+        "output_tokens": 10,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    defaults.update(counts)
+    return types.SimpleNamespace(
+        stop_reason=stop_reason, usage=types.SimpleNamespace(**defaults)
+    )
+
+
+class _UsageStream:
+    def __init__(self, text, message):
+        self._text = text
+        self._message = message
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get_final_text(self):
+        return self._text
+
+    def get_final_message(self):
+        return self._message
+
+
+def _usage_client(pairs):
+    """A client answering each request with one (text, final message) pair."""
+
+    class Messages:
+        def __init__(self):
+            self.remaining = list(pairs)
+
+        def stream(self, **_kwargs):
+            return _UsageStream(*self.remaining.pop(0))
+
+    class Client:
+        def __init__(self):
+            self.messages = Messages()
+
+    return Client()
+
+
+def test_call_api_records_usage_on_a_successful_response():
+    from spec_formatter.llm_usage import UsageCollector
+
+    collector = UsageCollector()
+    client = _usage_client([('{"ok": 1}', _usage_message())])
+    llm_classifier._call_api(client, "sys", "user", "model", usage=collector)
+    snapshot = collector.snapshot()
+    assert snapshot["requests_attempted"] == 1
+    assert snapshot["input_tokens"] == 100
+    assert snapshot["usage_complete"] is True
+
+
+@pytest.mark.parametrize(
+    "stop_reason,expected_error",
+    [("refusal", llm_classifier.ClassificationRefused), ("max_tokens", ValueError)],
+)
+def test_call_api_records_usage_before_raising_on_stop_reason(stop_reason, expected_error):
+    """A refusal and an output-limit response are both billed.
+
+    Both used to raise straight out of the stream block with their usage
+    never read, so the run reported them as free.
+    """
+    from spec_formatter.llm_usage import UsageCollector
+
+    collector = UsageCollector()
+    client = _usage_client([("partial", _usage_message(stop_reason=stop_reason))])
+    with pytest.raises(expected_error):
+        llm_classifier._call_api(client, "sys", "user", "model", usage=collector)
+    snapshot = collector.snapshot()
+    assert snapshot["responses_completed"] == 1
+    assert snapshot["input_tokens"] == 100
+    assert snapshot["output_tokens"] == 10
+
+
+def test_call_api_counts_an_attempt_that_never_answered():
+    from spec_formatter.llm_usage import UsageCollector
+
+    collector = UsageCollector()
+
+    class Messages:
+        def stream(self, **_kwargs):
+            raise RuntimeError("connection reset")
+
+    class Client:
+        messages = Messages()
+
+    with pytest.raises(RuntimeError):
+        llm_classifier._call_api(Client(), "sys", "user", "model", usage=collector)
+    snapshot = collector.snapshot()
+    assert snapshot["requests_attempted"] == 1
+    assert snapshot["responses_completed"] == 0
+    assert snapshot["usage_complete"] is False
+
+
+def test_call_api_without_a_collector_still_works():
+    """The collector is optional; nothing requires callers to pass one."""
+    client = _usage_client([('{"ok": 1}', _usage_message())])
+    assert llm_classifier._call_api(client, "sys", "user", "model") == '{"ok": 1}'

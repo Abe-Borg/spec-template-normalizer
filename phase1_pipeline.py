@@ -13,7 +13,7 @@ import json
 import shutil
 import tempfile
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -31,6 +31,7 @@ from llm_classifier import (
     compute_coverage,
 )
 from paragraph_rules import is_classifiable_paragraph
+from spec_formatter.llm_usage import UsageCollector, attach_usage
 from spec_formatter.resources import architect_prompt_dir
 from phase1_bundle import (
     BundleArtifacts,
@@ -63,6 +64,9 @@ class Phase1Result:
     source_sha256: str
     handled_paragraphs: int
     classifiable_paragraphs: int
+    #: Observed architect model usage for this run. Empty when an injected
+    #: classifier was used, since only the built-in one reports counts.
+    usage: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def coverage(self) -> float:
@@ -156,6 +160,10 @@ def run_phase1(
     run_instruction = load_prompt_file(prompt_dir / "run_instruction_prompt.txt")
     classifier_is_injected = classifier is not None
     classify = classifier or classify_document
+    # Only the built-in classifier reports usage. An injected one keeps its
+    # existing signature and reports nothing, rather than being probed for
+    # support by a call that could repeat a real request.
+    usage_collector = None if classifier_is_injected else UsageCollector()
 
     work_dir = Path(tempfile.mkdtemp(prefix=".phase1-work-", dir=str(output_root)))
     try:
@@ -181,15 +189,16 @@ def run_phase1(
         _emit(progress, "Reading paragraph, style, and numbering structure...")
         slim_bundle = build_slim_bundle(extract_dir)
         _emit(progress, f"Classifying {len(slim_bundle.get('paragraphs', []))} paragraphs...")
-        instructions = _normalize_instruction_roles(
-            classify(
-                slim_bundle=slim_bundle,
-                master_prompt=master_prompt,
-                run_instruction=run_instruction,
-                api_key=api_key,
-                model=model,
-            )
-        )
+        classify_kwargs: Dict[str, Any] = {
+            "slim_bundle": slim_bundle,
+            "master_prompt": master_prompt,
+            "run_instruction": run_instruction,
+            "api_key": api_key,
+            "model": model,
+        }
+        if usage_collector is not None:
+            classify_kwargs["usage_collector"] = usage_collector
+        instructions = _normalize_instruction_roles(classify(**classify_kwargs))
         validate_instructions(instructions, slim_bundle=slim_bundle)
         coverage, handled, classifiable = compute_coverage(slim_bundle, instructions)
         if coverage != 1.0:
@@ -289,7 +298,13 @@ def run_phase1(
             source_sha256=identity.sha256,
             handled_paragraphs=handled,
             classifiable_paragraphs=classifiable,
+            usage=usage_collector.snapshot() if usage_collector is not None else {},
         )
+    except BaseException as exc:
+        # Analysis paid for whatever it already sent. Style derivation,
+        # validation, and bundle publication all run after the model work,
+        # so a failure here would otherwise discard those counts entirely.
+        raise attach_usage(exc, usage_collector)
     finally:
         try:
             shutil.rmtree(work_dir)

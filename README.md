@@ -385,6 +385,11 @@ fails instead of publishing a header that still names the architect's section.
   at 150,000 tokens as a cost guard (measured with the API's token counter,
   with a size estimate as the fallback); the cap is not a context-window
   limit, and a template that exceeds it is refused before any request.
+- Observed model usage is recorded for both the architect analysis and each
+  target, including work that failed. A refusal or an exhausted retry is
+  counted rather than reported as free, and a request whose counters never
+  arrived is marked unknown instead of zero, so a token total is never
+  quietly understated.
 - Architect and target inputs are read-only; outputs are separate files.
 - Template profiles are reused only after manifest, size, checksum, source hash,
   producer-version, prompt/model fingerprint, and cache-contract validation.

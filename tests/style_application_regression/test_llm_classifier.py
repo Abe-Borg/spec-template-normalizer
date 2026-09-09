@@ -640,8 +640,15 @@ def test_usage_numbers_are_summed_across_requests(monkeypatch):
 
     result = classify_target_document(_unresolved_bundle(), ["PART"], api_key="k", model="m")
 
+    # "requests" used to mean both "attempted" and "answered". The shared
+    # contract splits them, so an attempt whose usage never arrived is
+    # visible instead of being averaged into a total that looks complete.
     assert result["usage"] == {
-        "requests": 2,
+        "requests_attempted": 2,
+        "responses_completed": 2,
+        "responses_with_usage": 2,
+        "requests_with_unknown_usage": 0,
+        "usage_complete": True,
         "input_tokens": 200,
         "output_tokens": 20,
         "cache_read_input_tokens": 900,
@@ -741,3 +748,68 @@ def test_overlap_re_ask_that_omits_a_disputed_index_fails_closed(monkeypatch):
     )
     assert sum(1 for c in messages.calls if c["_chunk_info"]["chunk_index"] in (0, 1)) == 2
 
+
+
+# --- Usage survives target failure (W2) ------------------------------------
+
+
+def _counted_stream(payload, stop_reason="end_turn"):
+    class Stream(_ScriptedStream):
+        def get_final_message(self):
+            return types.SimpleNamespace(
+                stop_reason=stop_reason,
+                usage=types.SimpleNamespace(
+                    input_tokens=100,
+                    output_tokens=10,
+                    cache_read_input_tokens=0,
+                    cache_creation_input_tokens=0,
+                ),
+            )
+
+    return Stream(payload)
+
+
+def test_usage_survives_a_refused_classification(monkeypatch):
+    """A refusal is paid for; it used to leave no trace in the accounting."""
+    from spec_formatter.llm_usage import usage_from_exception
+
+    _run(monkeypatch, [_counted_stream("", stop_reason="refusal")])
+
+    with pytest.raises(Exception) as raised:
+        classify_target_document(_unresolved_bundle(), ["PART"], api_key="k", model="m")
+
+    observed = usage_from_exception(raised.value)
+    assert observed["input_tokens"] == 100
+    assert observed["output_tokens"] == 10
+    assert observed["responses_completed"] == 1
+
+
+def test_usage_survives_exhausted_regeneration(monkeypatch):
+    """Every wasted attempt is counted, not just the ones that parsed."""
+    from spec_formatter.llm_usage import usage_from_exception
+
+    _run(monkeypatch, [_counted_stream("not json") for _ in range(6)])
+
+    with pytest.raises(Exception) as raised:
+        classify_target_document(_unresolved_bundle(), ["PART"], api_key="k", model="m")
+
+    observed = usage_from_exception(raised.value)
+    assert observed["requests_attempted"] >= 2
+    assert observed["input_tokens"] == 100 * observed["responses_completed"]
+
+
+def test_deterministic_only_target_reports_no_requests(monkeypatch):
+    """No unresolved paragraphs means no client and no usage to report."""
+    bundle = {
+        "paragraphs": [],
+        "available_roles": ["PART"],
+        "deterministic_classifications": [],
+        "deterministic_ignored_paragraphs": [],
+        "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
+    }
+    _sdk, _messages, _sleeps, constructed = _run(monkeypatch, [])
+
+    result = classify_target_document(bundle, ["PART"], api_key="", model="m")
+
+    assert constructed == []
+    assert "usage" not in result or result["usage"].get("requests_attempted", 0) == 0

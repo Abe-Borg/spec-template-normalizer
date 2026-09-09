@@ -53,6 +53,8 @@ spec_formatter/pipeline.py
     canonical public orchestration, profile cache, isolated runs, manifests
 spec_formatter/diagnostics.py
     thread-safe, redaction-safe structured diagnostics recorder and rollup
+spec_formatter/llm_usage.py
+    the one observed-usage contract for both classifiers, including failures
 spec_formatter/resources.py
     one root for shipped prompts and notices (sys._MEIPASS when frozen)
 spec_formatter/template_analysis.py
@@ -509,6 +511,43 @@ Current codes: `header_footer_target_section_id_required`,
   `bundle_build`, `classification_preflight`, `classification`,
   `application`
 - pipeline: `not_started`, `processing`, `publication`, `complete`
+
+## Observed model usage
+
+`spec_formatter/llm_usage.py` owns the one counting contract for both
+classifiers. `UsageCollector` records what the provider reported and, just as
+importantly, records when it could not.
+
+- **Missing usage is unknown, not zero.** A request whose final counters never
+  arrived increments `requests_with_unknown_usage` and clears `usage_complete`,
+  so a total is never quietly understated. A snapshot with `usage_complete`
+  false is a lower bound; the provider's invoice stays authoritative.
+- A `bool` is not accepted as a counter even though it is an `int`, and a
+  non-integer field is dropped rather than coerced.
+- `requests_attempted` counts requests sent, `responses_completed` counts
+  final messages obtained, and `responses_with_usage` counts those that
+  carried recognized counters. Do not collapse these into one "requests"
+  number: they answer different questions, and the difference is what makes
+  an incomplete total visible.
+- Record the response the moment the final message is in hand and **before**
+  acting on its stop reason. A refusal and an output-limit response are both
+  billed, and both used to raise with their usage unread.
+- Classification failures carry their counts out on the exception
+  (`attach_usage` / `usage_from_exception`), because everything that fails
+  after a request -- regeneration, the overlap re-ask, the chunk merge,
+  coverage, style derivation, bundle publication -- would otherwise discard
+  work the run already paid for.
+- Only the built-in classifier reports usage. `run_phase1` passes a collector
+  solely when no classifier was injected; an injected one keeps its existing
+  signature. Never probe a callable for telemetry support by calling it and
+  catching `TypeError` -- that can repeat a real, paid request.
+- Usage reaches artifacts as diagnostics counters only, through the same
+  `sanitize_fields` boundary as every other field. Never route provider
+  metadata, response text, or error strings there.
+
+Scope: this is observation, not billing reconciliation. A request ledger,
+per-request purpose enums, and cross-run rollups are deliberately not built
+until measured spend justifies them.
 
 ## Run artifacts and public results
 
