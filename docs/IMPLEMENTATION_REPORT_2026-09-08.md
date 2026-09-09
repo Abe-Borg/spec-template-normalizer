@@ -1,9 +1,18 @@
 # Specification Formatter: implementation report
 
 **Plan:** `docs/IMPLEMENTATION_PLAN_2026-09-08.md`, removed once the work
-closed. It is recoverable from git history if the reasoning is ever needed
-(`git log --diff-filter=D -- docs/IMPLEMENTATION_PLAN_2026-09-08.md`); the
-parts still load-bearing are reproduced here so this report stands alone.
+closed. The parts still load-bearing are reproduced here, so this report
+stands alone; the full plan is recoverable from history when the reasoning
+behind a decision is wanted:
+
+```bash
+P=docs/IMPLEMENTATION_PLAN_2026-09-08.md
+git show "$(git rev-list -1 HEAD -- "$P")^:$P" > "$P"
+```
+
+(`git log -- "$P"` only lists the commits; recovering the file needs the
+blob from the deletion commit's parent, which is what `git show` above
+does.)
 **Implemented:** 2026-09-08 to 2026-09-09
 **Baseline at start:** `b156679` (suite: 1049 passed, 3 skipped)
 **Final:** `49c73cc` (suite: 1115 passed, 3 skipped)
