@@ -107,11 +107,17 @@ validation. Do not recreate mode checks independently in downstream modules.
   conversion and may import architect numbering for classified roles.
 - Both modes apply the architect's complete shell.
 
-What Format-only preserves is **semantic, not byte-level**. Body text and
-effective numbering are proven unchanged; the DOCX package is not
-byte-identical, and it is not meant to be -- styles are imported, the shell is
-applied, and parts are re-serialized. Do not describe or test Format-only as
-package byte identity.
+What Format-only preserves is **semantic, not byte-level**, and the guarantee
+is scoped to the **body**. `_verify_format_only_body_invariants` compares
+paragraph blocks from `word/document.xml` before and after; that is where
+"unchanged text and numbering" is proven and where the claim stops. The DOCX
+package is not byte-identical and is not meant to be -- styles are imported,
+the shell is applied, and parts are re-serialized. Header and footer wording
+is deliberately outside the promise: `import_headers_footers` removes the
+target's parts and writes the architect's, so target-authored header/footer
+text is expected to change in both modes. Do not describe or test Format-only
+as package byte identity, and do not describe it as preserving every word in
+the file.
 
 The same distinction applies to ignored paragraphs. Leaving a paragraph's XML
 unedited proves the engine did not touch it; it does not prove the paragraph
@@ -558,11 +564,18 @@ itself. Do not describe the semaphore as a global request cap.
 
 **Two retry policies, deliberately not unified.** Both clients set
 `max_retries=0` with the same timeouts, so each owns every attempt rather than
-multiplying behind the SDK's hidden retries. They differ in one respect: the
-target classifier honours a numeric `Retry-After` header when the SDK exposes
-one (`_retry_after_seconds`), while root `_call_api` uses fixed exponential
-sleeps. That difference is real but narrow. Do not unify them without concrete
-failure evidence; a retry redesign is its own change with its own review.
+multiplying behind the SDK's hidden retries, and both fail fast on a bad key,
+a bad request, or a refusal. Beyond that they differ in three ways, and a
+maintainer who assumes one policy will be wrong about the others:
+
+| | Architect (`llm_classifier.py`) | Target (`core/llm_classifier.py`) |
+|---|---|---|
+| Transport backoff | fixed `2 ** (attempt + 1)` sleeps, initial + 2 transient retries | `_transport_retry_delay`: honours a numeric `Retry-After` on a rate limit, else exponential; `_TRANSPORT_RETRIES = 2` |
+| Structured-output compiler failure | retried **once without the schema** (`_is_structured_output_compilation_error`), and that fallback does not consume a transport retry | no equivalent; a non-transient 4xx is terminal |
+| Unusable-JSON regeneration | `DEFAULT_RESPONSE_ATTEMPTS = 2` total attempts | `max_regenerations = 2`, so 3 total attempts |
+
+Do not unify them without concrete failure evidence; a retry redesign is its
+own change with its own review.
 
 **Inherited-style lookup is already memoized.** `_style_block_index`
 (`core/style_import.py`, `maxsize=16`) indexes every `w:style` block in one
