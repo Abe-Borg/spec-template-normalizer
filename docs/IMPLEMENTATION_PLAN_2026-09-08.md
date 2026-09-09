@@ -4,9 +4,10 @@
 **Revised:** 2026-09-08, after implementation review and reproduction on the supported runtime.
 **Repository:** `spec-template-normalizer`
 **Baseline inspected:** `b66258a`; revision verified against `b156679`
-**Status:** W1 (§4), W2-reduced (§6) and W4 (§8) implemented — the whole
-unconditional programme. The §5 spend gate is the owner's to run and decides
-whether anything in §7 happens at all, or whether this plan is finished.
+**Status:** **Complete.** W1 (§4), W2-reduced (§6) and W4 (§8) shipped. The §5
+spend gate ran on 2026-09-09 and returned *small*, which closes W3 and W5–W8
+(§7). Results and the decision table are in
+`docs/IMPLEMENTATION_REPORT_2026-09-08.md`.
 **Audience:** Coding agents capable of independent investigation, implementation, adversarial testing, and integration review.
 
 **Reading guide:** Section 0 records what this revision changed and why. Sections 1-3 hold the decisions, verified evidence, and invariants. Section 4 is the initial deliverable and can be implemented on its own. Sections 5-7 are the conditional follow-on work and the gate that decides whether any of it happens. Sections 8-11 cover integration, working arrangement, and handoff.
@@ -281,6 +282,16 @@ W1 does not touch `engine_identity.py`'s covered files, so it does not invalidat
 
 ## 5. Spend inspection gate
 
+**Ran 2026-09-09. Result: small. W3 and W5–W8 are closed.** The figure itself
+is deliberately not recorded here — this repository is source-available, and
+the owner's real API spend is private financial information that does not
+belong in a public file. The decision is what the record needs. See
+`docs/IMPLEMENTATION_REPORT_2026-09-08.md` §4 for the decision table, and
+re-run this gate if the workload changes materially.
+
+The original reasoning follows, retained because it explains why the gate
+came before the work rather than after it.
+
 Before building anything to measure cost, look at what is already known.
 
 Read the provider's existing usage reporting for recent real runs and answer one question: **is architect and target classification spend material enough to justify optimization work?**
@@ -354,6 +365,13 @@ Primary files: `tests/test_llm_classifier_safety.py`, `tests/test_phase1_pipelin
 Changing root `llm_classifier.py` changes `ENGINE_SOURCE_DIGEST`, invalidating every cached architect profile and forcing a fresh paid analysis per template on the next run. Keep the conservative digest — do not weaken it with a comment-stripping heuristic. Where practical, land architect telemetry together with other already-planned changes to the covered engine files so one invalidation covers both. Do not invent changes merely to amortize it, and do not delay W1 for it. Recompute with `python engine_identity.py` after final integration and explain the decision in the PR.
 
 ## 7. Conditional work
+
+**All closed by the §5 gate on 2026-09-09.** None was rejected on merit; each
+is closed because the evidence that would justify it does not exist and, at
+this spend, is not worth generating. The specifications below are retained so
+any of them can be reopened on the same terms if the workload changes — in
+particular §7.2, whose correctness argument must be read before anyone
+attempts a target-classification cache.
 
 None of this is authorized by this document. Each needs a demonstrated purpose from §5 and its own review.
 
