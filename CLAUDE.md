@@ -541,7 +541,30 @@ importantly, records when it could not.
   solely when no classifier was injected; an injected one keeps its existing
   signature. Never probe a callable for telemetry support by calling it and
   catching `TypeError` -- that can repeat a real, paid request.
-- Usage reaches artifacts as diagnostics counters only, through the same
+- **Totals must not depend on verbosity.** Diagnostics events are dropped
+  below the configured level, so usage attached only to an INFO phase event
+  vanishes at `warning`. `DiagnosticsRecorder.record_usage(scope, snapshot)`
+  accumulates per-scope totals outside the event log and `summary()` publishes
+  them under `diagnostics.usage` in `run.json`, identically at every level.
+  Keep both: the phase event for per-phase detail, the accumulator for cost.
+- `usage_complete` requires every counter in `REQUIRED_USAGE_FIELDS`
+  (`input_tokens`, `output_tokens`), not merely one recognized field. A
+  response reporting input but not output is partly unknown. Cache counters
+  are deliberately not required, since a response that neither read nor wrote
+  cache legitimately omits them. A scope's total stays incomplete once any
+  contribution was incomplete.
+- A deterministic-only target reports an explicit zero snapshot, never an
+  absent one: "we sent nothing" and "we could not tell you" are different
+  answers and must look different.
+- Usage travels on its own field (`BatchResult.usage`,
+  `TargetFormatResult.usage`, `TemplateProfile.usage`, `Phase1Result.usage`),
+  not by reading it back out of diagnostics events. Every conversion between
+  those types must carry it; a boundary that drops it silently makes the
+  accounting inert without failing anything.
+- A reused profile reports no architect usage for the current run. The
+  analysis was paid for by the run that created it, and charging it again
+  would overstate every later run.
+- Usage reaches artifacts as counters only, through the same
   `sanitize_fields` boundary as every other field. Never route provider
   metadata, response text, or error strings there.
 

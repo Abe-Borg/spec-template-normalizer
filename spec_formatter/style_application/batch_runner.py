@@ -79,6 +79,10 @@ class BatchResult:
     # failure carried one (core/errors.py). ``error`` keeps the raw detail.
     error_code: Optional[str] = None
     safe_error: Optional[str] = None
+    #: Observed model usage for this target, on success and on failure. Kept
+    #: as its own field rather than read back out of ``diagnostics``, because
+    #: those events are level-filtered and cost must not be.
+    usage: Dict[str, Any] = field(default_factory=dict)
 
 
 def _set_usage_fields(phase: Any, usage: Optional[Dict[str, Any]]) -> None:
@@ -1033,6 +1037,7 @@ def process_single_file(
     start = time.monotonic()
     per_file_log: List[str] = []
     per_file_diag: List[Dict[str, Any]] = []
+    observed_usage: Dict[str, Any] = {}
     filename = docx_path.name
     output_path: Optional[Path] = None
     conversion_report: Optional[CanadianConversionReport] = None
@@ -1098,11 +1103,14 @@ def process_single_file(
                     # A refusal, an exhausted regeneration, or a merge failure
                     # still consumed tokens. Record them before the failure
                     # propagates, or the run reports this target as free.
-                    _set_usage_fields(phase, usage_from_exception(exc))
+                    observed_usage = usage_from_exception(exc)
+                    _set_usage_fields(phase, observed_usage)
                     raise
                 # Token accounting travels out of the classifier as counts
                 # only; it is diagnostics, not part of the disposition payload.
                 usage = classifications.pop("usage", None) if isinstance(classifications, dict) else None
+                if isinstance(usage, dict):
+                    observed_usage = dict(usage)
                 _set_usage_fields(phase, usage)
 
             stage = "application"
@@ -1167,6 +1175,7 @@ def process_single_file(
             diagnostics=per_file_diag,
             error_code=_safe_error_code(exc),
             safe_error=_safe_error_message(exc),
+            usage=observed_usage,
         )
 
 

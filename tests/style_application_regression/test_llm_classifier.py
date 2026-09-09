@@ -812,4 +812,7 @@ def test_deterministic_only_target_reports_no_requests(monkeypatch):
     result = classify_target_document(bundle, ["PART"], api_key="", model="m")
 
     assert constructed == []
-    assert "usage" not in result or result["usage"].get("requests_attempted", 0) == 0
+    # An explicit known zero, not an absent key: "we sent nothing" and "we
+    # could not tell you" are different answers and must look different.
+    assert result["usage"]["requests_attempted"] == 0
+    assert result["usage"]["usage_complete"] is True

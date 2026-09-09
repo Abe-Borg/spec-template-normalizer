@@ -542,6 +542,11 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
         )
         print("LLM skipped: all paragraphs resolved deterministically.")
         print(f"Disposition coverage: {total_expected}/{total_expected} (100.0%)")
+        # An explicit zero, not an absent key: no request was sent, so the
+        # cost is known to be nothing. Omitting the snapshot would make a
+        # genuinely free target look like one whose telemetry was
+        # unavailable, which is the distinction this contract exists to keep.
+        deterministic_only["usage"] = UsageCollector().snapshot()
         return deterministic_only
 
     import anthropic

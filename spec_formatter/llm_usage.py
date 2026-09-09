@@ -31,6 +31,13 @@ USAGE_FIELDS = (
     "cache_creation_input_tokens",
 )
 
+#: Counters every completed response must report for its usage to be counted
+#: as fully known. The cache fields are deliberately absent: a response that
+#: neither read nor wrote cache legitimately omits them, so requiring them
+#: would mark ordinary responses incomplete. Input and output are always
+#: billed, so a response missing either is only partly accounted for.
+REQUIRED_USAGE_FIELDS = ("input_tokens", "output_tokens")
+
 
 def usage_numbers(final_message: Any) -> Dict[str, int]:
     """Return the recognized integer counters on ``final_message.usage``.
@@ -63,6 +70,7 @@ class UsageCollector:
         self._requests_attempted = 0
         self._responses_completed = 0
         self._responses_with_usage = 0
+        self._responses_fully_accounted = 0
         self._totals: Dict[str, int] = {}
 
     def record_attempt(self) -> None:
@@ -84,10 +92,13 @@ class UsageCollector:
         """
 
         numbers = usage_numbers(final_message)
+        complete = all(name in numbers for name in REQUIRED_USAGE_FIELDS)
         with self._lock:
             self._responses_completed += 1
             if numbers:
                 self._responses_with_usage += 1
+            if complete:
+                self._responses_fully_accounted += 1
             for name, value in numbers.items():
                 self._totals[name] = self._totals.get(name, 0) + value
 
@@ -99,7 +110,11 @@ class UsageCollector:
         """
 
         with self._lock:
-            unknown = self._requests_attempted - self._responses_with_usage
+            # Completeness is measured against responses that reported every
+            # required counter, not merely one. A response carrying
+            # input_tokens but no output_tokens is partly unknown, and
+            # counting it as known would present a short total as final.
+            unknown = self._requests_attempted - self._responses_fully_accounted
             snapshot: Dict[str, Any] = {
                 "requests_attempted": self._requests_attempted,
                 "responses_completed": self._responses_completed,

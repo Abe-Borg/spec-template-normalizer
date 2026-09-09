@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from . import __version__ as APPLICATION_VERSION
 from . import diagnostics as diag
 from . import template_analysis
+from .llm_usage import usage_from_exception
 from .resources import TARGET_PROMPT_FILES, architect_prompt_dir, target_prompt_dir
 from .style_application.batch_runner import (
     BatchResult,
@@ -95,6 +96,10 @@ class TemplateProfile:
     source_sha256: str
     reused: bool
     provenance: Optional[Mapping[str, Any]] = None
+    #: Observed architect model usage for *this* run. Empty for a reused
+    #: profile: the analysis was paid for by the run that created it, and
+    #: charging it again here would overstate every later run.
+    usage: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,10 @@ class TargetFormatResult:
     # Structured, redaction-safe phase-timing/count events for this target,
     # folded into the run-wide diagnostics recorder before publication.
     diagnostics: tuple[dict[str, Any], ...] = ()
+    #: Observed model usage for this target, on success and on failure.
+    #: Separate from ``diagnostics`` because those events are level-filtered
+    #: and what a run spent must not depend on its verbosity.
+    usage: dict[str, Any] = field(default_factory=dict)
     # Stable engine error code (core/errors.py) when the failure carried one;
     # run.json and audit.json prefer it over classifying ``error`` text.
     error_code: Optional[str] = None
@@ -622,6 +631,7 @@ def prepare_template_profile(
     return TemplateProfile(
         phase1_result.bundle_dir,
         source_sha256,
+        usage=dict(getattr(phase1_result, "usage", {}) or {}),
         reused=False,
         provenance=_provenance_from_manifest(manifest),
     )
@@ -1338,6 +1348,9 @@ def _format_one_target(
 ) -> TargetFormatResult:
     start = time.monotonic()
     processor_log: tuple[str, ...] = ()
+    # Initialised before the try: the processor can raise before returning a
+    # result, and a target that failed that way still has no usage to lose.
+    observed_usage: dict[str, Any] = {}
     conversion_report: Optional[CanadianConversionReport] = None
     snapshot_sha256: Optional[str] = None
     audit_summary = _empty_audit_summary()
@@ -1386,6 +1399,7 @@ def _format_one_target(
         audit_summary = _normalize_audit_summary(
             getattr(result, "audit_summary", None)
         )
+        observed_usage = dict(getattr(result, "usage", {}) or {})
         audit = _normalize_audit_details(getattr(result, "audit", None))
         numbering_checks = _normalize_numbering_checks(
             getattr(result, "numbering_checks", None)
@@ -1407,6 +1421,7 @@ def _format_one_target(
                 numbering_checks=numbering_checks,
                 stage=stage,
                 diagnostics=tuple(diag_events),
+                usage=observed_usage,
             )
         stage = "publication"
         if result.output_path is None or not result.output_path.is_file():
@@ -1432,6 +1447,7 @@ def _format_one_target(
             numbering_checks=numbering_checks,
             stage=getattr(result, "stage", None) or "complete",
             diagnostics=tuple(diag_events),
+            usage=observed_usage,
         )
     except Exception as exc:
         return TargetFormatResult(
@@ -1448,6 +1464,7 @@ def _format_one_target(
             numbering_checks=numbering_checks,
             stage=stage,
             diagnostics=tuple(diag_events),
+            usage=observed_usage,
         )
 
 
@@ -2089,6 +2106,7 @@ def format_specifications(
                 analyzer=_template_analyzer,
             )
             phase.set(reused=profile.reused)
+            recorder.record_usage("architect", dict(profile.usage))
         if _stable_source_sha256(architect) != profile.source_sha256:
             raise RuntimeError(
                 "The architect template changed during this run. Finish saving it and run again."
@@ -2101,6 +2119,10 @@ def format_specifications(
         _validate_output_plan(architect, targets, planned_outputs)
     except Exception as exc:
         drain_reported_events()
+        # A failed architect analysis still sent requests. Without this the
+        # one run that most needs a cost record - the one that produced no
+        # profile and no output - would report nothing.
+        recorder.record_usage("architect", usage_from_exception(exc))
         recorder.error("pipeline", "init_failed", error_type=type(exc).__name__.lower())
         manifest_path = _write_initialization_failure_artifacts(
             run_id=run_id,
@@ -2189,6 +2211,7 @@ def format_specifications(
                     results_by_target[target] = result
                     completed += 1
                     recorder.ingest(result.diagnostics, target=target_number)
+                    recorder.record_usage("target", dict(getattr(result, "usage", {}) or {}))
                     counts = result.audit_summary
                     recorder.record(
                         diag.INFO if result.success else diag.WARNING,

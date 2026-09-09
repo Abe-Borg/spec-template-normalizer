@@ -46,6 +46,31 @@ def test_booleans_and_non_integers_are_not_counters():
     assert snapshot["cache_read_input_tokens"] == 7
 
 
+def test_a_partly_reported_response_is_not_complete():
+    """One recognized field is not full accounting.
+
+    A response carrying input_tokens but no output_tokens leaves a billed
+    counter unknown; reporting the total as complete would present a short
+    number as final.
+    """
+    collector = UsageCollector()
+    collector.record_attempt()
+    collector.record_response(_message(input_tokens=500))
+    snapshot = collector.snapshot()
+    assert snapshot["responses_with_usage"] == 1
+    assert snapshot["requests_with_unknown_usage"] == 1
+    assert snapshot["usage_complete"] is False
+    assert snapshot["input_tokens"] == 500
+
+
+def test_cache_counters_are_not_required_for_completeness():
+    """A response that neither read nor wrote cache omits those fields."""
+    collector = UsageCollector()
+    collector.record_attempt()
+    collector.record_response(_message(input_tokens=10, output_tokens=2))
+    assert collector.snapshot()["usage_complete"] is True
+
+
 def test_missing_usage_is_unknown_rather_than_zero():
     collector = UsageCollector()
     collector.record_attempt()
