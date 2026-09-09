@@ -1,12 +1,24 @@
 # Specification Formatter: implementation report
 
-**Plan:** `docs/IMPLEMENTATION_PLAN_2026-09-08.md`
+**Plan:** `docs/IMPLEMENTATION_PLAN_2026-09-08.md`, removed once the work
+closed. The parts still load-bearing are reproduced here, so this report
+stands alone; the full plan is recoverable from history when the reasoning
+behind a decision is wanted:
+
+```bash
+P=docs/IMPLEMENTATION_PLAN_2026-09-08.md
+git show "$(git rev-list -1 HEAD -- "$P")^:$P" > "$P"
+```
+
+(`git log -- "$P"` only lists the commits; recovering the file needs the
+blob from the deletion commit's parent, which is what `git show` above
+does.)
 **Implemented:** 2026-09-08 to 2026-09-09
 **Baseline at start:** `b156679` (suite: 1049 passed, 3 skipped)
 **Final:** `49c73cc` (suite: 1115 passed, 3 skipped)
-**Outcome:** the unconditional programme (W1, W2-reduced, W4) shipped; the §5
-spend gate closed W3 and W5–W8. **Implementation is complete; acceptance is
-not** — the Word inspection §9.4 requires for W1 has not been done (§5).
+**Outcome:** the unconditional programme (W1, W2-reduced, W4) shipped; the spend
+gate closed W3 and W5–W8. **Implementation is complete; acceptance is
+not** — the Word inspection the plan required for W1 has not been done (see §5).
 
 This report records what was actually measured and decided, not what the plan
 predicted. Where the two differ, the difference is the point.
@@ -20,7 +32,8 @@ predicted. Where the two differ, the difference is the point.
 | W4 — documentation corrected against the implementation | [#44](https://github.com/Abe-Borg/spec-template-normalizer/pull/44) | merged |
 
 W0 was folded into W1 as ordinary verification, as the revised plan specified.
-No evaluation tooling was built (see §4), so plan item 8.11 is not applicable.
+No evaluation tooling was built (see §4), so the plan's item about describing
+that tooling is not applicable.
 
 ## 2. Measured results
 
@@ -55,10 +68,10 @@ untouched.
 
 ## 3. Defects found
 
-Eleven. **Five were already recorded in the revised plan's §2 evidence table
-before implementation began** — the UTF-16 bypass, the stale-declaration
+Eleven. **Five were already recorded in the revised plan's evidence table before
+implementation began** — the UTF-16 bypass, the stale-declaration
 mojibake, both usage-accounting gaps, and the verbosity-filtering hazard. Six
-surfaced during implementation, from the §4.5 encoding matrix, an adversarial
+surfaced during implementation, from the plan's encoding matrix, an adversarial
 encoding sweep, and automated review.
 
 An earlier draft of this report said the plan knew about one. That was wrong,
@@ -77,7 +90,7 @@ correction is the point of writing this down.
 | 6 | Architect response usage never read; refusals and output-limit responses recorded as free | the plan (W2's premise) | untruthful cost reporting |
 | 7 | Target usage published only on success; refusal or merge failure discarded it | the plan (W2's premise) | untruthful cost reporting |
 | 8 | `prepare_template_profile` dropped `Phase1Result.usage`; init-failure path ignored `exc.observed_usage` — so `format_specifications()` published **no** architect tokens at all | review | W2 inert at the canonical entry point |
-| 9 | Target usage attached only to an INFO event, so it vanished at `warning`/`error` verbosity | **plan §6.5 named it**; review caught the first W2 commit ignoring it | cost reporting depended on log level |
+| 9 | Target usage attached only to an INFO event, so it vanished at `warning`/`error` verbosity | **the plan named it**; review caught the first W2 commit ignoring it | cost reporting depended on log level |
 | 10 | `usage_complete` derived from "at least one field", so a response missing `output_tokens` reported a short total as final | review | overstated completeness |
 | 11 | Deterministic-only target returned no usage snapshot, making a free target indistinguishable from unavailable telemetry | review | ambiguous accounting |
 
@@ -90,8 +103,8 @@ suite objected. This is why usage now travels on explicit fields through
 `Phase1Result` → `TemplateProfile` → `BatchResult` → `TargetFormatResult`
 rather than being read back out of diagnostics events.
 
-**A named hazard is not a handled one.** Defect 9 was written down in plan
-§6.5 before any code was touched, and the first W2 commit still shipped it —
+**A named hazard is not a handled one.** Defect 9 was written down in the plan
+before any code was touched, and the first W2 commit still shipped it —
 copying the warning into `CLAUDE.md` while implementing the thing it warns
 against. Knowing about a failure mode in advance did not prevent it; only
 someone re-checking the implementation against the stated requirement did.
@@ -101,7 +114,7 @@ descriptions — introduced two inaccurate descriptions of its own, and its PR
 body carried a corrected claim in its uncorrected form until that was caught
 too.
 
-## 4. The §5 spend gate
+## 4. The spend gate
 
 **Decision: spend is small. W3, W5, W6, W7 and W8 are closed.**
 
@@ -120,15 +133,48 @@ W2-reduced shipping regardless was the correct call and is unaffected by this
 result. A run that reports a refused target as free is wrong whatever the
 spend turns out to be, and that is now fixed.
 
-### Decision table for §7
+### Decision table for the conditional packages
 
 | Package | Decision | Why |
 |---|---|---|
 | W3 — workload analyzer and evaluation harness | **Closed** | Built only to decide whether optimization is worth it. Spend says no, so the harness has no question left to answer. The corpus and gold-labelling programme it needed would have cost the owner's own adjudication time — the real constraint — for a decision already made. |
 | W5 — payload reduction | **Closed** | Its acceptance gate required demonstrated token or cost savings worth the added complexity. With spend immaterial there is no saving worth the risk to classification quality. |
-| W6 — target-classification cache | **Closed** | No measured repeated work to justify invalidation, corruption, concurrency and provenance obligations. The correctness argument against the review brief's proposed key is retained in plan §7.2 and should be read by anyone who revisits this: keying on target hash plus role names would serve a **wrong** cached classification, because `role_specs` drives deterministic dispositions. |
+| W6 — target-classification cache | **Closed** | No measured repeated work to justify invalidation, corruption, concurrency and provenance obligations. Anyone revisiting it must read the correctness argument reproduced below first. |
 | W7 — architect response replay cache | **Closed** | Was already conditional on evidence that repeated architect analysis is expensive. It is not. `ENGINE_SOURCE_DIGEST` stays conservative. |
 | W8 — effort, model, chunking, deterministic-rule tuning | **Closed** | Each needed the adjudicated corpus from W3. Defaults are unchanged, which was the plan's position absent evidence. |
+
+#### If a target-classification cache is ever reconsidered
+
+Reproduced from the plan because it is the one conclusion that must not be
+lost with it. The review brief that preceded this work proposed keying a
+target-classification cache on the target's hash plus the available role
+names.
+
+**That key is incorrect, not merely coarse.** `role_specs` — the architect's
+portable numbering patterns — flows into `build_phase2_slim_bundle` and drives
+*deterministic* classification (`core/classification.py:503,569`). Two
+architect templates with identical role **names** but different numbering
+patterns produce different deterministic dispositions, a different unresolved
+set, and a different request. Keying on target hash plus role names would
+therefore serve a **wrong** cached classification, not a stale one — the
+formatter would apply dispositions computed for a different template and
+nothing would fail.
+
+If it is ever built: cache model-derived dispositions for an exact
+classification request plan; rebuild the target bundle and deterministic
+dispositions every run; reapply every local validator, deterministic-override
+check and coverage check before application; and never cache formatted DOCX
+outputs or bypass source snapshots, run isolation, application policy,
+package validation or publication. Cache identity must cover the target
+source identity and paragraph-index universe, the exact template-derived role
+definitions including numbering patterns and counter constraints, the actual
+unresolved paragraph data and every piece of evidence sent to the model, the
+system and user instructions with serialized role ordering and response
+schema, provider and model identity with effort and output constraints, the
+chunking and re-ask strategy, the preprocessing and merge semantics, and an
+explicit cache contract version. The five-file architect engine digest does
+**not** cover target preprocessing. Acceptance requires a two-template,
+same-role-list regression that fails under the brief's proposed key.
 
 None of these is rejected on merit. Each is closed because the evidence that
 would justify it does not exist and, at this spend, is not worth generating.
@@ -141,7 +187,7 @@ Stated plainly, because the plan's acceptance checklist asks for it and
 because an implementation report that only lists successes is not evidence.
 
 **No Word visual inspection was performed — this is the one outstanding
-acceptance item.** Plan §9.4 requires inspecting
+acceptance item.** The plan required inspecting
 representative output in Word for any W1 encoding behaviour that affects
 resulting documents, and W1 does affect them: defects 2 and 5 both changed
 what reaches a parsed tree or a published part. This work ran in a Linux
@@ -192,8 +238,8 @@ Not authorized by this report; listed so they are not lost.
    the next, failing nothing — may exist on paths nobody has recently
    exercised. This is a hypothesis, not a finding; it deserves a look, not a
    rewrite.
-4. **Re-run the §5 gate if the workload changes materially.** The closures in
-   §4 are conditional on today's spend, not permanent judgements.
+4. **Re-run the spend gate if the workload changes materially.** The closures
+   in §4 are conditional on today's spend, not permanent judgements.
 
 ## 7. Provenance
 
@@ -201,6 +247,5 @@ Implemented across three reviewed pull requests, each verified on Windows
 Python 3.11 and Linux Python 3.10/3.11 CI before merge. Automated review ran
 on each and produced six of the eleven findings; every one was reproduced
 against the code before being accepted, and two of its suggested remedies
-were declined in favour of alternatives recorded on the threads and in plan
-§4.3. Prompts, schemas, and validators were not modified: no contract in the
+were declined in favour of alternatives recorded on the review threads. Prompts, schemas, and validators were not modified: no contract in the
 CSI role table, the bundle manifest, or the error-code set changed.
