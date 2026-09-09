@@ -124,3 +124,176 @@ def test_package_validation_rejects_doctype_in_content_types(tmp_path: Path):
 
     with pytest.raises(Exception, match=r"\[Content_Types\]\.xml: DOCTYPE/ENTITY"):
         validate_docx_package(docx)
+
+
+# --- Encoding-independent rejection (W1) -----------------------------------
+#
+# The byte scan matches ASCII, so a UTF-16 part could carry `<!DOCTYPE`
+# past it and reach expat with entities intact. These cover every encoding
+# the shared reader claims to support, in both directions: a prohibited
+# declaration is always rejected, and valid content always survives.
+
+TINY_ENTITY_DOC = '<!DOCTYPE r [<!ENTITY a "AAAA">]><r>&a;</r>'
+
+
+def _declared(encoding: str, body: str = '<r a="café">naïve — éà</r>') -> str:
+    return f'<?xml version="1.0" encoding="{encoding}"?>{body}'
+
+
+@pytest.mark.parametrize(
+    "label,payload",
+    [
+        ("utf-8", _declared("UTF-8").encode("utf-8")),
+        ("utf-8 with BOM", b"\xef\xbb\xbf" + _declared("UTF-8").encode("utf-8")),
+        ("utf-16 with BOM", _declared("UTF-16").encode("utf-16")),
+        ("utf-16-le with BOM", b"\xff\xfe" + _declared("UTF-16").encode("utf-16-le")),
+        ("utf-16-be with BOM", b"\xfe\xff" + _declared("UTF-16").encode("utf-16-be")),
+        ("bom-less utf-16-le", _declared("UTF-16").encode("utf-16-le")),
+        ("bom-less utf-16-be", _declared("UTF-16").encode("utf-16-be")),
+        ("declared windows-1252", _declared("windows-1252").encode("cp1252")),
+        ("str", _declared("UTF-8")),
+        ("str declaring windows-1252", _declared("windows-1252")),
+        ("str declaring utf-16", _declared("UTF-16")),
+        ("str with no declaration", '<r a="café">naïve — éà</r>'),
+    ],
+)
+def test_valid_content_keeps_its_characters_across_encodings(label, payload):
+    root = parse_untrusted_xml(payload, "word/document.xml")
+    assert root.tag == "r"
+    assert root.attrib["a"] == "café", label
+    assert root.text == "naïve — éà", label
+
+
+@pytest.mark.parametrize(
+    "label,payload",
+    [
+        ("utf-8", TINY_ENTITY_DOC.encode("utf-8")),
+        ("utf-8 with BOM", b"\xef\xbb\xbf" + TINY_ENTITY_DOC.encode("utf-8")),
+        ("utf-16 with BOM", TINY_ENTITY_DOC.encode("utf-16")),
+        ("utf-16-be with BOM", b"\xfe\xff" + TINY_ENTITY_DOC.encode("utf-16-be")),
+        (
+            "utf-16 with BOM and declaration",
+            ('<?xml version="1.0" encoding="UTF-16"?>' + TINY_ENTITY_DOC).encode("utf-16"),
+        ),
+        ("bom-less utf-16-le", TINY_ENTITY_DOC.encode("utf-16-le")),
+        ("bom-less utf-16-be", TINY_ENTITY_DOC.encode("utf-16-be")),
+        ("str", TINY_ENTITY_DOC),
+    ],
+)
+def test_doctype_is_rejected_in_every_supported_encoding(label, payload):
+    with pytest.raises(UntrustedXmlError, match="DOCTYPE/ENTITY") as raised:
+        parse_untrusted_xml(payload, "word/document.xml")
+    assert "word/document.xml" in str(raised.value), label
+
+
+def test_utf16_entity_is_rejected_before_expansion(monkeypatch):
+    """The contract is "before expansion", so prove the payload never parses."""
+    import xml.etree.ElementTree as element_tree
+    from spec_formatter.style_application.core import untrusted_xml as module
+
+    calls = []
+    monkeypatch.setattr(
+        module.ET,
+        "fromstring",
+        lambda payload: calls.append(payload) or element_tree.fromstring(payload),
+    )
+    with pytest.raises(UntrustedXmlError, match="DOCTYPE/ENTITY"):
+        parse_untrusted_xml(TINY_ENTITY_DOC.encode("utf-16"), "word/document.xml")
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '<!DOCTYPE r SYSTEM "http://example.invalid/evil.dtd"><r/>',
+        '<!DOCTYPE r PUBLIC "-//X//EN" "/etc/passwd"><r/>',
+        '<!DOCTYPE r SYSTEM "file:///etc/passwd"><r/>',
+        '<!DOCTYPE r SYSTEM "http://example.invalid/evil.dtd"><r/>'.encode("utf-16"),
+    ],
+)
+def test_external_declarations_are_rejected_without_dereferencing(payload):
+    with pytest.raises(UntrustedXmlError, match="DOCTYPE/ENTITY"):
+        parse_untrusted_xml(payload, "word/document.xml")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Declaration-shaped text the byte scan has always rejected, even
+        # though XML would allow it here. Preserved deliberately.
+        f'<w:p xmlns:w="{W_NS}"><!-- <!DOCTYPE evil> --></w:p>',
+        f'<w:p xmlns:w="{W_NS}"><![CDATA[<!DOCTYPE evil>]]></w:p>',
+        f'<w:p xmlns:w="{W_NS}"><![CDATA[<!ENTITY a "b">]]></w:p>',
+    ],
+)
+def test_conservative_screening_of_declaration_shaped_text_is_preserved(payload):
+    with pytest.raises(UntrustedXmlError, match="DOCTYPE/ENTITY"):
+        parse_untrusted_xml(payload, "word/document.xml")
+
+
+def test_escaped_declaration_text_is_still_ordinary_content():
+    root = parse_untrusted_xml(
+        f'<w:p xmlns:w="{W_NS}">&lt;!DOCTYPE evil&gt;</w:p>', "word/document.xml"
+    )
+    assert root.text == "<!DOCTYPE evil>"
+
+
+@pytest.mark.parametrize(
+    "label,payload",
+    [
+        ("truncated utf-16", "<r>abc".encode("utf-16")),
+        ("literal NUL in content", b"<r>\x00</r>"),
+        ("unknown declared encoding", b'<?xml version="1.0" encoding="nope-9000"?><r/>'),
+        ("invalid utf-8 bytes", b"<r>\xff\xfe\xfa</r>"),
+        ("empty", b""),
+    ],
+)
+def test_malformed_payloads_fail_predictably(label, payload):
+    with pytest.raises(UntrustedXmlError) as raised:
+        parse_untrusted_xml(payload, "word/document.xml")
+    assert isinstance(raised.value, ValueError), label
+    assert "word/document.xml" in str(raised.value), label
+
+
+def test_str_declaration_is_normalized_rather_than_reinterpreted():
+    """A decoded str must not be read back through its stale declaration."""
+    root = parse_untrusted_xml(_declared("windows-1252", "<x>é</x>"), "part.xml")
+    assert root.text == "é"  # not "Ã©"
+    root = parse_untrusted_xml(_declared("utf-16", "<x>é</x>"), "part.xml")
+    assert root.text == "é"
+
+
+def test_comments_namespaces_and_attributes_still_parse():
+    root = parse_untrusted_xml(
+        f'<?xml version="1.0"?><!-- lead --><w:p xmlns:w="{W_NS}" w:rsidR="00Aé">'
+        f"<w:t>a &amp; b</w:t></w:p>",
+        "word/document.xml",
+    )
+    assert root.tag == f"{{{W_NS}}}p"
+    assert root.attrib[f"{{{W_NS}}}rsidR"] == "00Aé"
+    assert root.find(f"{{{W_NS}}}t").text == "a & b"
+
+
+@pytest.mark.parametrize(
+    "label,payload",
+    [
+        # Both used to escape as bare LookupError / ValueError with no part
+        # name, so a caller handling UntrustedXmlError never saw them.
+        ("codec Python lacks", b'<?xml version="1.0" encoding="nope-9000"?><r/>'),
+        ("multi-byte expat refuses", b'<?xml version="1.0" encoding="utf-7"?><r/>'),
+    ],
+)
+def test_unsupported_encodings_are_wrapped_with_the_part_name(label, payload):
+    with pytest.raises(UntrustedXmlError, match="unsupported XML encoding") as raised:
+        parse_untrusted_xml(payload, "part.xml")
+    assert isinstance(raised.value, ValueError), label
+    assert "part.xml" in str(raised.value), label
+
+
+def test_cdata_declaration_text_is_not_rewritten_by_normalization():
+    """Step 0 must normalize the prolog only, never document content."""
+    original = '<?xml version="1.0" encoding="windows-1252"?>'
+    root = parse_untrusted_xml(
+        f'<w:t xmlns:w="{W_NS}"><![CDATA[{original}]]></w:t>', "word/document.xml"
+    )
+    assert root.text == original
