@@ -4,8 +4,9 @@
 **Revised:** 2026-09-08, after implementation review and reproduction on the supported runtime.
 **Repository:** `spec-template-normalizer`
 **Baseline inspected:** `b66258a`; revision verified against `b156679`
-**Status:** W1 (§4) and W2-reduced (§6) implemented. The §5 spend gate is the
-owner's to run and decides whether anything in §7 happens at all.
+**Status:** W1 (§4), W2-reduced (§6) and W4 (§8) implemented — the whole
+unconditional programme. The §5 spend gate is the owner's to run and decides
+whether anything in §7 happens at all, or whether this plan is finished.
 **Audience:** Coding agents capable of independent investigation, implementation, adversarial testing, and integration review.
 
 **Reading guide:** Section 0 records what this revision changed and why. Sections 1-3 hold the decisions, verified evidence, and invariants. Section 4 is the initial deliverable and can be implemented on its own. Sections 5-7 are the conditional follow-on work and the gate that decides whether any of it happens. Sections 8-11 cover integration, working arrangement, and handoff.
@@ -391,6 +392,14 @@ Acceptance requires a two-template, same-role-list regression that fails under t
 Also excluded: another inherited-style cache without profiling, splitting or renaming classifier modules, reviving the Batch API or retired runners, and altering GUI, updater, licensing, or CI platform coverage without a task-specific reason.
 
 ## 8. W4 — documentation corrections
+
+**Implemented.** Items 1 and 2 shipped with W1 and W2. Items 3, 4, 5 and 9 are
+now one "Concurrency, retries, and caches" section in `CLAUDE.md`; items 6 and
+7 sit with the invariants they qualify, and item 6 also appears in `README.md`
+in user-facing terms. Item 10 was already in the change checklist. Item 11 is
+not applicable: no evaluation tooling was built, because §5 has not run. Item 8
+is closed by the corrections table below rather than by a doc edit, since the
+brief it corrects is not in this repository.
 
 Update `CLAUDE.md` and `README.md` alongside whatever ships. Keep the engineering detail; do not replace substantive guidance with a shorter summary.
 

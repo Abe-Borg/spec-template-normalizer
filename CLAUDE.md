@@ -107,6 +107,27 @@ validation. Do not recreate mode checks independently in downstream modules.
   conversion and may import architect numbering for classified roles.
 - Both modes apply the architect's complete shell.
 
+What Format-only preserves is **semantic, not byte-level**, and the guarantee
+is scoped to the **body**. `_verify_format_only_body_invariants` compares
+paragraph blocks from `word/document.xml` before and after; that is where
+"unchanged text and numbering" is proven and where the claim stops. The DOCX
+package is not byte-identical and is not meant to be -- styles are imported,
+the shell is applied, and parts are re-serialized. Header and footer wording
+is deliberately outside the promise: `import_headers_footers` removes the
+target's parts and writes the architect's, so target-authored header/footer
+text is expected to change in both modes. Do not describe or test Format-only
+as package byte identity, and do not describe it as preserving every word in
+the file.
+
+The same distinction applies to ignored paragraphs. Leaving a paragraph's XML
+unedited proves the engine did not touch it; it does not prove the paragraph
+still *renders* the same. The architect shell is document-global, so document
+defaults, theme, and page geometry can reflow untouched content. That is
+expected behaviour, not a preservation failure -- and it is why the change
+checklist asks for visual inspection of representative output when shell or
+formatting behaviour changes, rather than treating XML invariants as
+sufficient on their own.
+
 ### 3. Explicit disposition coverage
 
 Every visible classifiable target paragraph must occur exactly once in one of:
@@ -153,6 +174,16 @@ typed single-letter marker `i.`/`v.`/`x.` (any case, any of the `x.`, `x)`,
 previous paragraph carries the preceding letter in the same style. A
 deterministic text-only classification cannot be overridden by the model, so
 when in doubt the heuristics return nothing.
+
+**Resolving a paragraph locally is not the same as resolving it correctly.**
+A higher deterministic rate lowers cost and latency and removes a source of
+variance; it says nothing on its own about precision. Because a deterministic
+result cannot be overridden by the model, a wrong rule is *more* damaging than
+a wrong model answer, not less. Every rule therefore needs adversarial
+coverage of its close negatives -- cross-references, heading-shaped
+requirement sentences, Roman/alpha ambiguity, template-specific numbering
+conflicts -- and the metric for adding one is correct resolution with no
+known precision regression, never a lower unresolved percentage.
 
 ### 5. Architect formatting is source-derived and collision-safe
 
@@ -308,7 +339,8 @@ discovery still excludes as legacy output.
   The retired `run_batch_concurrent` / `run_batch_api` entry points, the
   Anthropic Batch API classifier, and the `allow_legacy_bundle` opt-in (which
   referenced the retired `arch_styles_raw.xml`) were removed; the pipeline's
-  thread pool is the one concurrency implementation.
+  thread pool is the one *target* concurrency implementation. It is not the
+  only pool in the process -- see "Concurrency, retries, and caches".
 
 ### `spec_formatter/style_application/core/classification.py`
 
@@ -511,6 +543,56 @@ Current codes: `header_footer_target_section_id_required`,
   `bundle_build`, `classification_preflight`, `classification`,
   `application`
 - pipeline: `not_started`, `processing`, `publication`, `complete`
+
+## Concurrency, retries, and caches
+
+Three separate mechanisms, often conflated. Describe them precisely.
+
+**Two pools, at different levels.** `pipeline.py` runs a thread pool over
+targets: that is the one public target-processing orchestration path, and no
+second one may be added. Inside a single target, `core/llm_classifier.py`
+runs its own pool over the chunks of that target's slim bundle (at most six
+workers). So a run with six targets can have far more than six requests in
+flight, which is why the limiter below exists.
+
+**One process-wide request limiter, target-side only.** `_REQUEST_LIMITER` in
+`core/llm_classifier.py` is a `BoundedSemaphore` bounding concurrent streams
+across every target and every chunk (`SPEC_FORMATTER_MAX_CONCURRENT_REQUESTS`,
+default 4). It does **not** cover root `llm_classifier.py`: architect analysis
+is single-threaded and one template at a time, so it never contends with
+itself. Do not describe the semaphore as a global request cap.
+
+**Two retry policies, deliberately not unified.** Both clients set
+`max_retries=0` with the same timeouts, so each owns every attempt rather than
+multiplying behind the SDK's hidden retries, and both fail fast on a bad key,
+a bad request, or a refusal. Beyond that they differ in three ways, and a
+maintainer who assumes one policy will be wrong about the others:
+
+| | Architect (`llm_classifier.py`) | Target (`core/llm_classifier.py`) |
+|---|---|---|
+| Transport backoff | fixed `2 ** (attempt + 1)` sleeps, initial + 2 transient retries | `_transport_retry_delay`: honours a numeric `Retry-After` on a rate limit, else exponential; `_TRANSPORT_RETRIES = 2` |
+| Structured-output compiler failure | retried **once without the schema** (`_is_structured_output_compilation_error`), and that fallback does not consume a transport retry | no equivalent; a non-transient 4xx is terminal |
+| Unusable-JSON regeneration | `DEFAULT_RESPONSE_ATTEMPTS = 2` total attempts | `max_regenerations = 2`, so 3 total attempts |
+
+Do not unify them without concrete failure evidence; a retry redesign is its
+own change with its own review.
+
+**Inherited-style lookup is already memoized.** `_style_block_index`
+(`core/style_import.py`, `maxsize=16`) indexes every `w:style` block in one
+structural pass, `_find_style_numpr_in_chain` (`maxsize=8192`) caches the
+`basedOn` walk, and `_parsed_style_elements` (`core/classification.py`,
+`maxsize=16`) parses `styles.xml` once per distinct text. These were the
+engine's second-largest cost before caching. Do not add another cache here on
+suspicion; profile first and show the numbers.
+
+**Prompt caching is requested, not guaranteed.** Both classifiers mark their
+system block `cache_control: ephemeral`. Zero cache reads in a run identifies
+no single cause on its own: concurrent requests can all miss before the first
+response returns, the prefix may be under the provider's minimum cacheable
+size, the TTL may have expired, or the prefix may simply differ from the
+previous run's. Concurrent misses are not by themselves a correctness bug, and
+serializing requests to manufacture hits trades latency for them -- measure
+before assuming that trade is worth making.
 
 ## Observed model usage
 

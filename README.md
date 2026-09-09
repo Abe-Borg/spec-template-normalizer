@@ -144,6 +144,15 @@ outside body restyling. The architect shell is document-global, so ignored or
 out-of-scope content can still reflow under the architect's page geometry,
 theme, and defaults.
 
+What Format-only guarantees is therefore semantic rather than byte-level, and
+it is a guarantee about the **body**: your body text and its list numbering
+come through unchanged, and the file itself is legitimately a different file.
+Headers and footers are not covered by that promise -- applying the
+architect's shell replaces them, which is the point of step 5 above, so
+target-authored header and footer wording is expected to change. An untouched
+body paragraph can also still look different on the page once the architect's
+defaults apply to it.
+
 Architect styles are always imported into deterministic private `SF_*`
 namespaces. Existing target style IDs, including built-ins such as `Normal`,
 are never overwritten, and every imported dependency reference is rewritten to
