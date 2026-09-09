@@ -5,7 +5,8 @@
 **Baseline at start:** `b156679` (suite: 1049 passed, 3 skipped)
 **Final:** `49c73cc` (suite: 1115 passed, 3 skipped)
 **Outcome:** the unconditional programme (W1, W2-reduced, W4) shipped; the §5
-spend gate closed W3 and W5–W8. **The plan is complete.**
+spend gate closed W3 and W5–W8. **Implementation is complete; acceptance is
+not** — the Word inspection §9.4 requires for W1 has not been done (§5).
 
 This report records what was actually measured and decided, not what the plan
 predicted. Where the two differ, the difference is the point.
@@ -54,21 +55,29 @@ untouched.
 
 ## 3. Defects found
 
-Eleven, of which the plan knew about one. The other ten came from writing the
-§4.5 encoding matrix, an adversarial encoding sweep, and six automated review
-findings across the three PRs.
+Eleven. **Five were already recorded in the revised plan's §2 evidence table
+before implementation began** — the UTF-16 bypass, the stale-declaration
+mojibake, both usage-accounting gaps, and the verbosity-filtering hazard. Six
+surfaced during implementation, from the §4.5 encoding matrix, an adversarial
+encoding sweep, and automated review.
+
+An earlier draft of this report said the plan knew about one. That was wrong,
+contradicted by the table below and by this section's own narrative, and it
+flattered the implementation at the planning work's expense. The planning
+review found more than a third of what was ultimately fixed, and the
+correction is the point of writing this down.
 
 | # | Defect | Found by | Severity in practice |
 |---|---|---|---|
 | 1 | UTF-16 part smuggles `<!DOCTYPE` past the ASCII byte scan; entity expands | the plan | the reason W1 existed |
-| 2 | Decoded `str` parsed through a stale declaration: `windows-1252` turns `é` into `Ã©` **with no error**; `utf-16` fails outright | review of the plan | **silent document corruption** |
+| 2 | Decoded `str` parsed through a stale declaration: `windows-1252` turns `é` into `Ã©` **with no error**; `utf-16` fails outright | review of the plan, then recorded in it | **silent document corruption** |
 | 3 | Declared codec Python lacks raises bare `LookupError` — not a `ValueError`, so it escapes every caller handling `UntrustedXmlError` | adversarial sweep | unhandled crash on malformed input |
 | 4 | Declared multi-byte encoding Expat refuses raises bare `ValueError` with no part name | adversarial sweep | unhandled crash on malformed input |
 | 5 | `prepare_xml_text_for_utf8` rewrote declaration-shaped text **anywhere** in a part, including inside CDATA — on paths that write to disk and into a published output part | review | silent edit to published document content |
 | 6 | Architect response usage never read; refusals and output-limit responses recorded as free | the plan (W2's premise) | untruthful cost reporting |
 | 7 | Target usage published only on success; refusal or merge failure discarded it | the plan (W2's premise) | untruthful cost reporting |
 | 8 | `prepare_template_profile` dropped `Phase1Result.usage`; init-failure path ignored `exc.observed_usage` — so `format_specifications()` published **no** architect tokens at all | review | W2 inert at the canonical entry point |
-| 9 | Target usage attached only to an INFO event, so it vanished at `warning`/`error` verbosity | review | cost reporting depended on log level |
+| 9 | Target usage attached only to an INFO event, so it vanished at `warning`/`error` verbosity | **plan §6.5 named it**; review caught the first W2 commit ignoring it | cost reporting depended on log level |
 | 10 | `usage_complete` derived from "at least one field", so a response missing `output_tokens` reported a short total as final | review | overstated completeness |
 | 11 | Deterministic-only target returned no usage snapshot, making a free target indistinguishable from unavailable telemetry | review | ambiguous accounting |
 
@@ -81,10 +90,13 @@ suite objected. This is why usage now travels on explicit fields through
 `Phase1Result` → `TemplateProfile` → `BatchResult` → `TargetFormatResult`
 rather than being read back out of diagnostics events.
 
-**Descriptions drift faster than code, and nothing fails when they do.**
-Defect 9 was a hazard the plan named explicitly in §6.5; the first W2 commit
-wrote that warning into `CLAUDE.md` while implementing the thing it warns
-against. W4 — a package whose entire purpose is correcting inaccurate
+**A named hazard is not a handled one.** Defect 9 was written down in plan
+§6.5 before any code was touched, and the first W2 commit still shipped it —
+copying the warning into `CLAUDE.md` while implementing the thing it warns
+against. Knowing about a failure mode in advance did not prevent it; only
+someone re-checking the implementation against the stated requirement did.
+
+**Descriptions drift faster than code, and nothing fails when they do.** W4 — a package whose entire purpose is correcting inaccurate
 descriptions — introduced two inaccurate descriptions of its own, and its PR
 body carried a corrected claim in its uncorrected form until that was caught
 too.
@@ -128,7 +140,8 @@ template — the gate can be re-run and any of them reopened on the same terms.
 Stated plainly, because the plan's acceptance checklist asks for it and
 because an implementation report that only lists successes is not evidence.
 
-**No Word visual inspection was performed.** Plan §9.4 requires inspecting
+**No Word visual inspection was performed — this is the one outstanding
+acceptance item.** Plan §9.4 requires inspecting
 representative output in Word for any W1 encoding behaviour that affects
 resulting documents, and W1 does affect them: defects 2 and 5 both changed
 what reaches a parsed tree or a published part. This work ran in a Linux

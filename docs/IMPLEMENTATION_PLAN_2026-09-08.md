@@ -4,9 +4,13 @@
 **Revised:** 2026-09-08, after implementation review and reproduction on the supported runtime.
 **Repository:** `spec-template-normalizer`
 **Baseline inspected:** `b66258a`; revision verified against `b156679`
-**Status:** **Complete.** W1 (§4), W2-reduced (§6) and W4 (§8) shipped. The §5
-spend gate ran on 2026-09-09 and returned *small*, which closes W3 and W5–W8
-(§7). Results and the decision table are in
+**Status:** **Implementation complete; acceptance pending.** W1 (§4),
+W2-reduced (§6) and W4 (§8) shipped, and the §5 spend gate ran on 2026-09-09
+and returned *small*, closing W3 and W5–W8 (§7). One acceptance item from
+§9.4 is **outstanding**: no representative Word inspection was performed for
+W1's encoding behaviour, which does affect resulting documents. Do not treat
+the document-output change as accepted until that is done and recorded.
+Results, the decision table, and the full limitations are in
 `docs/IMPLEMENTATION_REPORT_2026-09-08.md`.
 **Audience:** Coding agents capable of independent investigation, implementation, adversarial testing, and integration review.
 
