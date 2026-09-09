@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .. import diagnostics as diag
+from ..llm_usage import usage_from_exception
 from .arch_env_applier import apply_environment_to_target
 from .core.classification import apply_phase2_classifications, build_phase2_slim_bundle
 from .core.application_policy import ApplicationPolicy, application_policy_for_mode
@@ -78,6 +79,33 @@ class BatchResult:
     # failure carried one (core/errors.py). ``error`` keeps the raw detail.
     error_code: Optional[str] = None
     safe_error: Optional[str] = None
+    #: Observed model usage for this target, on success and on failure. Kept
+    #: as its own field rather than read back out of ``diagnostics``, because
+    #: those events are level-filtered and cost must not be.
+    usage: Dict[str, Any] = field(default_factory=dict)
+
+
+def _set_usage_fields(phase: Any, usage: Optional[Dict[str, Any]]) -> None:
+    """Record observed usage counters on a diagnostics phase.
+
+    Diagnostics carry counts and validated identifiers only, so a bool, a
+    float, or anything else a provider might add is dropped rather than
+    coerced. ``usage_complete`` is the one flag worth keeping, because a
+    total that omits a request has to be readable as a lower bound.
+    """
+
+    if not isinstance(usage, dict):
+        return
+    fields: Dict[str, Any] = {}
+    for key, value in usage.items():
+        if not isinstance(key, str):
+            continue
+        if key == "usage_complete" and isinstance(value, bool):
+            fields[key] = value
+        elif isinstance(value, int) and not isinstance(value, bool):
+            fields[key] = value
+    if fields:
+        phase.set(**fields)
 
 
 @dataclass(frozen=True)
@@ -1009,6 +1037,7 @@ def process_single_file(
     start = time.monotonic()
     per_file_log: List[str] = []
     per_file_diag: List[Dict[str, Any]] = []
+    observed_usage: Dict[str, Any] = {}
     filename = docx_path.name
     output_path: Optional[Path] = None
     conversion_report: Optional[CanadianConversionReport] = None
@@ -1063,21 +1092,26 @@ def process_single_file(
                 )
             with diag.timed(per_file_diag, "target", "classify") as phase:
                 phase.set(unresolved_sent=unresolved, llm_used=bool(unresolved), model=model)
-                classifications = classify_target_document(
-                    slim_bundle=bundle,
-                    available_roles=available_roles,
-                    api_key=api_key,
-                    model=model,
-                )
+                try:
+                    classifications = classify_target_document(
+                        slim_bundle=bundle,
+                        available_roles=available_roles,
+                        api_key=api_key,
+                        model=model,
+                    )
+                except BaseException as exc:
+                    # A refusal, an exhausted regeneration, or a merge failure
+                    # still consumed tokens. Record them before the failure
+                    # propagates, or the run reports this target as free.
+                    observed_usage = usage_from_exception(exc)
+                    _set_usage_fields(phase, observed_usage)
+                    raise
                 # Token accounting travels out of the classifier as counts
                 # only; it is diagnostics, not part of the disposition payload.
                 usage = classifications.pop("usage", None) if isinstance(classifications, dict) else None
                 if isinstance(usage, dict):
-                    phase.set(**{
-                        key: value
-                        for key, value in usage.items()
-                        if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool)
-                    })
+                    observed_usage = dict(usage)
+                _set_usage_fields(phase, usage)
 
             stage = "application"
             (
@@ -1141,6 +1175,7 @@ def process_single_file(
             diagnostics=per_file_diag,
             error_code=_safe_error_code(exc),
             safe_error=_safe_error_message(exc),
+            usage=observed_usage,
         )
 
 

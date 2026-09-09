@@ -13,6 +13,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from spec_formatter.llm_usage import UsageCollector, attach_usage
 from paragraph_rules import (
     is_classifiable_paragraph,
     infer_expected_roles,
@@ -301,6 +302,7 @@ def _call_api(
     max_tokens: int = 128000,
     response_schema: Optional[dict] = None,
     response_format_state: Optional[Dict[str, bool]] = None,
+    usage: Optional[UsageCollector] = None,
 ) -> str:
     """Single API call with retry logic. Returns raw response text.
 
@@ -337,6 +339,8 @@ def _call_api(
                     "type": "json_schema",
                     "schema": active_schema,
                 }
+            if usage is not None:
+                usage.record_attempt()
             with client.messages.stream(
                 model=model,
                 max_tokens=max_tokens,
@@ -346,7 +350,13 @@ def _call_api(
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
                 raw = stream.get_final_text()
-                stop_reason = stream.get_final_message().stop_reason
+                final_message = stream.get_final_message()
+                # Before the stop-reason checks below: a refusal and an
+                # output-limit response are both billed, and both used to
+                # raise with their usage unread.
+                if usage is not None:
+                    usage.record_response(final_message)
+                stop_reason = final_message.stop_reason
                 if stop_reason == "max_tokens":
                     raise ValueError(
                         "LLM response reached the output-token limit before "
@@ -438,6 +448,7 @@ def _request_json_response(
     response_schema: dict,
     max_attempts: int,
     response_transform: Optional[Callable[[dict], dict]] = None,
+    usage: Optional[UsageCollector] = None,
 ) -> dict:
     """Request and validate JSON, regenerating unusable output when allowed."""
     if type(max_attempts) is not int or max_attempts < 1:
@@ -465,6 +476,7 @@ def _request_json_response(
                 model,
                 response_schema=response_schema,
                 response_format_state=response_format_state,
+                usage=usage,
             )
             parsed = _parse_response(raw)
             return (
@@ -990,6 +1002,8 @@ def classify_document(
     model: str = "claude-opus-5",
     max_patch_attempts: int = 3,
     max_response_attempts: int = DEFAULT_RESPONSE_ATTEMPTS,
+    *,
+    usage_collector: Optional[UsageCollector] = None,
 ) -> dict:
     """
     Classify all paragraphs in a slim bundle using the Anthropic API.
@@ -1059,6 +1073,7 @@ def classify_document(
         response_schema=_instruction_response_schema(),
         max_attempts=max_response_attempts,
         response_transform=_normalize_instruction_roles,
+        usage=usage_collector,
     )
 
     normalized_exclusions = _normalize_known_exclusions(instructions, slim_bundle)
@@ -1120,6 +1135,7 @@ def classify_document(
                 model,
                 response_schema=_patch_response_schema(),
                 max_attempts=max_response_attempts,
+                usage=usage_collector,
             )
             _validate_patch_result(patch_result, missing, instructions)
 

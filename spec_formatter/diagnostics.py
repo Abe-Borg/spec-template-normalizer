@@ -369,6 +369,7 @@ class DiagnosticsRecorder:
         self._lock = threading.Lock()
         self._events: List[DiagnosticEvent] = []
         self._seq = 0
+        self._usage: Dict[str, Dict[str, Any]] = {}
 
     @property
     def min_level(self) -> int:
@@ -494,6 +495,41 @@ class DiagnosticsRecorder:
     def iter_dicts(self) -> List[Dict[str, Any]]:
         return [event.as_dict() for event in self.snapshot()]
 
+    def record_usage(self, scope: str, usage: Optional[Dict[str, Any]]) -> None:
+        """Accumulate observed model usage for ``scope`` outside the event log.
+
+        Usage is cost, not chatter. Attaching it only to an INFO phase event
+        means a run at ``warning`` or ``error`` verbosity reports no tokens at
+        all, so what a run spent would depend on how much logging someone
+        asked for. These totals are kept separately and are never filtered by
+        level.
+
+        ``scope`` is a code-defined name (``architect``, ``target``), and only
+        integer counters plus ``usage_complete`` are kept, so nothing a
+        provider might add can reach an artifact through here. Scopes
+        accumulate: several targets in one run sum into ``target``, and a
+        scope stays incomplete once any contribution was incomplete.
+        """
+
+        if not isinstance(usage, dict) or not usage:
+            return
+        with self._lock:
+            bucket = self._usage.setdefault(scope, {})
+            for key, value in usage.items():
+                if not isinstance(key, str):
+                    continue
+                if key == "usage_complete":
+                    if isinstance(value, bool):
+                        bucket[key] = bucket.get(key, True) and value
+                elif isinstance(value, int) and not isinstance(value, bool):
+                    bucket[key] = bucket.get(key, 0) + value
+
+    def usage_totals(self) -> Dict[str, Dict[str, Any]]:
+        """Return the accumulated per-scope usage, independent of verbosity."""
+
+        with self._lock:
+            return {scope: dict(fields) for scope, fields in self._usage.items()}
+
     def summary(self) -> Dict[str, Any]:
         """Return a compact, JSON-safe rollup for ``run.json``."""
 
@@ -512,7 +548,7 @@ class DiagnosticsRecorder:
                 key = f"{record.component}.{record.event}"
                 phase_durations[key] = round(phase_durations.get(key, 0.0) + float(duration), 3)
                 phase_counts[key] = phase_counts.get(key, 0) + 1
-        return {
+        summary: Dict[str, Any] = {
             "level": level_name(self._min_level),
             "event_count": len(events),
             "counts_by_level": counts_by_level,
@@ -523,6 +559,12 @@ class DiagnosticsRecorder:
             "phase_counts": phase_counts,
             "log": "diagnostics.jsonl",
         }
+        usage = self.usage_totals()
+        if usage:
+            # Deliberately outside counts_by_level: these totals must not
+            # vary with the configured verbosity.
+            summary["usage"] = usage
+        return summary
 
 
 __all__ = [

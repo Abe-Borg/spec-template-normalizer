@@ -241,3 +241,54 @@ def test_engine_events_carry_a_monotonic_production_time():
     ingested = recorder.iter_dicts()
     assert [event["fields"]["t_ms"] for event in ingested] == stamps
 
+
+
+def test_usage_totals_do_not_depend_on_verbosity():
+    """Cost must not vary with how much logging someone asked for.
+
+    Usage was attached only to an INFO phase event, so a run at warning or
+    error level reported no tokens at all while still spending them.
+    """
+    from spec_formatter import diagnostics as diag
+
+    totals = {}
+    for name in ("debug", "info", "warning", "error"):
+        recorder = diag.DiagnosticsRecorder(min_level=diag.level_from_name(name))
+        with recorder.timer("target", "classify") as phase:
+            phase.set(input_tokens=1500, output_tokens=30)
+        recorder.record_usage(
+            "target",
+            {"requests_attempted": 1, "input_tokens": 1500, "output_tokens": 30,
+             "usage_complete": True},
+        )
+        totals[name] = recorder.summary()["usage"]
+
+    assert totals["warning"] == totals["info"] == totals["debug"] == totals["error"]
+    assert totals["error"]["target"]["input_tokens"] == 1500
+
+
+def test_usage_scopes_accumulate_and_stay_honest_about_completeness():
+    from spec_formatter import diagnostics as diag
+
+    recorder = diag.DiagnosticsRecorder()
+    recorder.record_usage("target", {"input_tokens": 100, "usage_complete": True})
+    recorder.record_usage("target", {"input_tokens": 50, "usage_complete": False})
+    recorder.record_usage("architect", {"input_tokens": 9, "usage_complete": True})
+    usage = recorder.usage_totals()
+    assert usage["target"]["input_tokens"] == 150
+    # One incomplete contribution makes the scope's total a lower bound.
+    assert usage["target"]["usage_complete"] is False
+    assert usage["architect"]["usage_complete"] is True
+
+
+def test_usage_rejects_values_that_are_not_counters():
+    from spec_formatter import diagnostics as diag
+
+    recorder = diag.DiagnosticsRecorder()
+    recorder.record_usage(
+        "target",
+        {"input_tokens": 5, "note": "text that must never reach an artifact",
+         "ratio": 1.5, "flag": True},
+    )
+    fields = recorder.usage_totals()["target"]
+    assert fields == {"input_tokens": 5}

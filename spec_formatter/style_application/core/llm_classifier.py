@@ -13,6 +13,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set
 
+from ...llm_usage import UsageCollector, attach_usage
 from .classification import (
     PHASE2_MASTER_PROMPT,
     PHASE2_RUN_INSTRUCTION,
@@ -31,12 +32,6 @@ _CHUNK_OVERLAP = 20
 # sorted keys. The old chunker measured compact JSON but sent indent=2, a
 # 1.35x under-count, and compact input is about a third smaller anyway.
 _JSON_WIRE_KWARGS = {"separators": (",", ":"), "sort_keys": True}
-_USAGE_FIELDS = (
-    "input_tokens",
-    "output_tokens",
-    "cache_read_input_tokens",
-    "cache_creation_input_tokens",
-)
 
 
 def _wire_json(value: Any) -> str:
@@ -65,17 +60,6 @@ def _system_blocks(available_roles: list) -> List[dict]:
             "cache_control": {"type": "ephemeral"},
         }
     ]
-
-
-def _usage_numbers(final_message: Any) -> Dict[str, int]:
-    usage = getattr(final_message, "usage", None)
-    numbers: Dict[str, int] = {}
-    for name in _USAGE_FIELDS:
-        value = getattr(usage, name, None)
-        if isinstance(value, bool) or not isinstance(value, int):
-            continue
-        numbers[name] = value
-    return numbers
 
 
 # Transport policy -----------------------------------------------------------
@@ -558,6 +542,11 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
         )
         print("LLM skipped: all paragraphs resolved deterministically.")
         print(f"Disposition coverage: {total_expected}/{total_expected} (100.0%)")
+        # An explicit zero, not an absent key: no request was sent, so the
+        # cost is known to be nothing. Omitting the snapshot would make a
+        # genuinely free target look like one whose telemetry was
+        # unavailable, which is the distinction this contract exists to keep.
+        deterministic_only["usage"] = UsageCollector().snapshot()
         return deterministic_only
 
     import anthropic
@@ -576,14 +565,7 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
     chunks = _split_bundle_into_chunks(slim_bundle)
     chunk_results: List[dict] = [None] * len(chunks)
     system_blocks = _system_blocks(available_roles)
-    usage_lock = threading.Lock()
-    usage_totals: Dict[str, int] = {"requests": 0}
-
-    def _record_usage(final_message: Any) -> None:
-        with usage_lock:
-            usage_totals["requests"] += 1
-            for name, value in _usage_numbers(final_message).items():
-                usage_totals[name] = usage_totals.get(name, 0) + value
+    usage = UsageCollector()
 
     def _classify_chunk(i: int, chunk: dict) -> dict:
         if len(chunks) > 1:
@@ -605,6 +587,7 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
             try:
                 # No sampling params (temperature/top_p/top_k): Sonnet 5 and
                 # Opus 4.7+ reject non-default values with a 400.
+                usage.record_attempt()
                 with _REQUEST_LIMITER:
                     with client.messages.stream(
                         model=model,
@@ -628,7 +611,7 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                         get_final_message = getattr(stream, "get_final_message", None)
                         final_message = get_final_message() if get_final_message else None
                         stop_reason = getattr(final_message, "stop_reason", None)
-                _record_usage(final_message)
+                usage.record_response(final_message)
                 if stop_reason == "refusal":
                     raise ClassificationRefused(
                         "LLM refused the target-classification request "
@@ -683,71 +666,78 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                 time.sleep(delay)
                 transport_attempt += 1
 
-    if len(chunks) == 1:
-        chunk_results[0] = _classify_chunk(0, chunks[0])
-    else:
-        max_workers = min(len(chunks), 6)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_classify_chunk, i, chunk): i
-                for i, chunk in enumerate(chunks)
-            }
-            for future in as_completed(futures):
-                i = futures[future]
-                chunk_results[i] = future.result()
+    # Every failure below - a refused chunk, exhausted regeneration, an
+    # overlap re-ask, the merge, or the coverage check - happens after
+    # requests were already paid for. Carry the observed counts out on the
+    # exception so the run records what the attempt cost.
+    try:
+        if len(chunks) == 1:
+            chunk_results[0] = _classify_chunk(0, chunks[0])
+        else:
+            max_workers = min(len(chunks), 6)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_classify_chunk, i, chunk): i
+                    for i, chunk in enumerate(chunks)
+                }
+                for future in as_completed(futures):
+                    i = futures[future]
+                    chunk_results[i] = future.result()
 
-    if len(chunk_results) > 1:
-        conflicts = _chunk_conflicts(chunk_results)
-        if conflicts:
-            # Chunks disagreed inside an overlap window. Ask once more about
-            # exactly those windows, adopt that answer for every index in
-            # them, and let the merge fail closed on anything still unresolved.
-            reask = _reask_indices(chunks, conflicts)
-            print(
-                f"  Chunk overlap disagreement on {len(conflicts)} paragraph(s); "
-                f"re-asking {len(reask)} overlap paragraph(s) once..."
-            )
-            reask_paragraphs = [
-                p for p in unresolved_paragraphs
-                if isinstance(p, dict) and p.get("paragraph_index") in reask
-            ]
-            reask_chunk = {
-                "available_roles": slim_bundle.get("available_roles", []),
-                "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
-                "paragraphs": reask_paragraphs,
-                "_chunk_info": {
-                    "chunk_index": len(chunks),
-                    "paragraph_range": [
-                        min(reask) if reask else 0,
-                        max(reask) if reask else 0,
-                    ],
-                    "overlap_reask": True,
-                },
-            }
-            reask_result = _classify_chunk(len(chunks), reask_chunk)
-            chunk_results = [
-                _without_indices(result, reask) for result in chunk_results
-            ] + [reask_result]
-        llm_only = _merge_chunk_results(chunk_results)
-    else:
-        llm_only = chunk_results[0]
-    result = coerce_to_final_classifications(slim_bundle, llm_only, available_roles)
-    result["usage"] = dict(usage_totals)
+        if len(chunk_results) > 1:
+            conflicts = _chunk_conflicts(chunk_results)
+            if conflicts:
+                # Chunks disagreed inside an overlap window. Ask once more about
+                # exactly those windows, adopt that answer for every index in
+                # them, and let the merge fail closed on anything still unresolved.
+                reask = _reask_indices(chunks, conflicts)
+                print(
+                    f"  Chunk overlap disagreement on {len(conflicts)} paragraph(s); "
+                    f"re-asking {len(reask)} overlap paragraph(s) once..."
+                )
+                reask_paragraphs = [
+                    p for p in unresolved_paragraphs
+                    if isinstance(p, dict) and p.get("paragraph_index") in reask
+                ]
+                reask_chunk = {
+                    "available_roles": slim_bundle.get("available_roles", []),
+                    "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
+                    "paragraphs": reask_paragraphs,
+                    "_chunk_info": {
+                        "chunk_index": len(chunks),
+                        "paragraph_range": [
+                            min(reask) if reask else 0,
+                            max(reask) if reask else 0,
+                        ],
+                        "overlap_reask": True,
+                    },
+                }
+                reask_result = _classify_chunk(len(chunks), reask_chunk)
+                chunk_results = [
+                    _without_indices(result, reask) for result in chunk_results
+                ] + [reask_result]
+            llm_only = _merge_chunk_results(chunk_results)
+        else:
+            llm_only = chunk_results[0]
+        result = coerce_to_final_classifications(slim_bundle, llm_only, available_roles)
+        result["usage"] = usage.snapshot()
 
-    total_expected = (
-        len(slim_bundle.get("paragraphs", []))
-        + len(slim_bundle.get("deterministic_classifications", []))
-        + len(slim_bundle.get("deterministic_ignored_paragraphs", []))
-    )
-    disposition_count = (
-        len(result.get("classifications", []))
-        + len(result.get("ignored_paragraphs", []))
-    )
-    if total_expected > 0 and disposition_count != total_expected:
-        raise ValueError(
-            f"Disposition coverage incomplete: {disposition_count}/{total_expected}. "
-            "All classifiable paragraphs must be classified or explicitly ignored."
+        total_expected = (
+            len(slim_bundle.get("paragraphs", []))
+            + len(slim_bundle.get("deterministic_classifications", []))
+            + len(slim_bundle.get("deterministic_ignored_paragraphs", []))
         )
+        disposition_count = (
+            len(result.get("classifications", []))
+            + len(result.get("ignored_paragraphs", []))
+        )
+        if total_expected > 0 and disposition_count != total_expected:
+            raise ValueError(
+                f"Disposition coverage incomplete: {disposition_count}/{total_expected}. "
+                "All classifiable paragraphs must be classified or explicitly ignored."
+            )
 
-    print(f"Disposition coverage: {disposition_count}/{total_expected} (100.0%)")
-    return result
+        print(f"Disposition coverage: {disposition_count}/{total_expected} (100.0%)")
+        return result
+    except BaseException as exc:
+        raise attach_usage(exc, usage)

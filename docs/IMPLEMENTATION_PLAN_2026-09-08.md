@@ -4,8 +4,8 @@
 **Revised:** 2026-09-08, after implementation review and reproduction on the supported runtime.
 **Repository:** `spec-template-normalizer`
 **Baseline inspected:** `b66258a`; revision verified against `b156679`
-**Status:** W1 implemented (see §4). Everything after it is unstarted; the §5 spend
-gate is the next step and is the owner's to run.
+**Status:** W1 (§4) and W2-reduced (§6) implemented. The §5 spend gate is the
+owner's to run and decides whether anything in §7 happens at all.
 **Audience:** Coding agents capable of independent investigation, implementation, adversarial testing, and integration review.
 
 **Reading guide:** Section 0 records what this revision changed and why. Sections 1-3 hold the decisions, verified evidence, and invariants. Section 4 is the initial deliverable and can be implemented on its own. Sections 5-7 are the conditional follow-on work and the gate that decides whether any of it happens. Sections 8-11 cover integration, working arrangement, and handoff.
@@ -290,6 +290,12 @@ Read the provider's existing usage reporting for recent real runs and answer one
 This costs minutes. The first draft required an evaluation harness before establishing that optimization mattered, which inverted its own evidence-first principle.
 
 ## 6. W2 (reduced) — honest usage accounting
+
+**Implemented.** `spec_formatter/llm_usage.py` owns the shared contract;
+`Phase1Result.usage` carries architect counts; both classifiers hand their
+observed counts out on the exception when they fail. The engine digest moved to
+`cdfe7148986b940e` because `llm_classifier.py` is a covered file, so cached
+architect profiles are invalidated once — the accepted cost recorded in §6.4.
 
 Two items, both worth doing independently of what §5 shows, because both currently produce untruthful run artifacts:
 

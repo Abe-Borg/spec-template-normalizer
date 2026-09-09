@@ -592,3 +592,83 @@ def test_classifier_usage_becomes_classify_phase_diagnostics_not_payload(
     assert fields["cache_creation_input_tokens"] == 400
     assert "bogus" not in fields
 
+
+
+def test_failed_classification_still_reports_what_it_spent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A target that fails mid-classification is not a free target.
+
+    The counts are observed inside the classifier and would leave with the
+    exception. Without the handoff the run reports a refused or exhausted
+    target as costing nothing, which is worse than reporting nothing at all.
+    """
+    from spec_formatter.llm_usage import UsageCollector, attach_usage
+
+    extract_dir = _seed_extract(tmp_path)
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source package")
+
+    class FakeDecomposer:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def extract(self, *, output_dir: Path) -> Path:
+            del output_dir
+            return extract_dir
+
+    monkeypatch.setattr(batch_runner, "DocxDecomposer", FakeDecomposer)
+    monkeypatch.setattr(
+        batch_runner,
+        "build_phase2_slim_bundle",
+        lambda *_args, **_kwargs: {
+            "paragraphs": [{"paragraph_index": 0}],
+            "deterministic_classifications": [],
+            "deterministic_ignored_paragraphs": [],
+        },
+    )
+
+    collector = UsageCollector()
+    collector.record_attempt()
+    collector.record_response(
+        SimpleNamespace(
+            stop_reason="refusal",
+            usage=SimpleNamespace(
+                input_tokens=1500,
+                output_tokens=30,
+                cache_read_input_tokens=0,
+                cache_creation_input_tokens=0,
+            ),
+        )
+    )
+    collector.record_attempt()  # a second request whose usage never arrived
+
+    def refuse(**_kwargs):
+        raise attach_usage(RuntimeError(SECRET_TEXT), collector)
+
+    monkeypatch.setattr(batch_runner, "classify_target_document", refuse)
+
+    result = batch_runner.process_single_file(
+        docx_path=source,
+        arch_registry={"PARAGRAPH": "Body"},
+        env_registry={},
+        arch_styles_xml="<w:styles/>",
+        available_roles=["PARAGRAPH"],
+        api_key="key",
+        output_dir=tmp_path / "output",
+    )
+
+    assert result.success is False
+    classify_events = [e for e in result.diagnostics if e.get("event") == "classify"]
+    assert classify_events, result.diagnostics
+    fields = classify_events[-1]["fields"]
+    assert fields["input_tokens"] == 1500
+    assert fields["output_tokens"] == 30
+    assert fields["requests_attempted"] == 2
+    # The second request never reported counters, so the total is a lower
+    # bound and says so rather than looking complete.
+    assert fields["requests_with_unknown_usage"] == 1
+    assert fields["usage_complete"] is False
+    # The failure text is document-derived and must not ride along.
+    assert SECRET_TEXT not in json.dumps(result.diagnostics)

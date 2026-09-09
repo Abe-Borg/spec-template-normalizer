@@ -1957,3 +1957,63 @@ def test_completion_signals_drained_during_submission_are_not_lost(
     assert result.success and len(result.targets) == 3
     assert [item.success for item in result.targets] == [True, True, True]
     assert result.manifest_path.is_file()
+
+
+def test_architect_and_target_usage_reach_run_json_at_every_verbosity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Usage recorded by the classifiers must survive into the canonical run.
+
+    A fresh architect analysis reports its counts on Phase1Result, which
+    prepare_template_profile used to drop on the floor, so the canonical
+    entry point published no architect tokens at all. Target usage lived
+    only on an INFO event, so a run at warning level published none either.
+    """
+    for level in ("info", "warning"):
+        architect = _write_input(tmp_path / f"arch-{level}.docx", b"architect-original")
+        target = _write_input(tmp_path / f"target-{level}.docx", b"target-original")
+        calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
+
+        def analyzer_with_usage(**kwargs):
+            base = analyzer(**kwargs)
+            return SimpleNamespace(
+                bundle_dir=base.bundle_dir,
+                usage={
+                    "requests_attempted": 2,
+                    "input_tokens": 40000,
+                    "output_tokens": 900,
+                    "usage_complete": True,
+                },
+            )
+
+        base_processor = processor
+
+        def processor_with_usage(**kwargs):
+            result = base_processor(**kwargs)
+            result.usage = {
+                "requests_attempted": 1,
+                "input_tokens": 1200,
+                "output_tokens": 60,
+                "usage_complete": True,
+            }
+            return result
+
+        result = pipeline.format_specifications(
+            architect,
+            [target],
+            tmp_path / f"formatted-{level}",
+            api_key="offline-test-key",
+            cache_dir=tmp_path / f"cache-{level}",
+            diagnostics_level=level,
+            _template_analyzer=analyzer_with_usage,
+            _config_loader=config_loader,
+            _target_processor=processor_with_usage,
+        )
+
+        manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+        usage = manifest["diagnostics"]["usage"]
+        assert usage["architect"]["input_tokens"] == 40000, level
+        assert usage["architect"]["output_tokens"] == 900, level
+        assert usage["target"]["input_tokens"] == 1200, level
+        assert usage["target"]["usage_complete"] is True, level
