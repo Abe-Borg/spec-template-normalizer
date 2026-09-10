@@ -8,7 +8,6 @@ from spec_formatter.style_application import batch_runner
 from spec_formatter.style_application.batch_runner import (
     ApplicationFailureDiagnostics,
     ApplicationStageError,
-    PreparedFile,
 )
 from spec_formatter.style_application.core.csi_to_canadian import (
     CSI_TO_CANADIAN,
@@ -246,20 +245,34 @@ def test_batch_result_preserves_late_numbering_checkpoint_without_publishing_doc
 
     monkeypatch.setattr(batch_runner, "_build_and_patch_output", fail_output)
 
-    prepared = PreparedFile(
-        file_key="source",
-        docx_path=kwargs["docx_path"],
-        extract_dir=extract_dir,
-        bundle=bundle,
-        prep_log=["prepared"],
+    class FakeDecomposer:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def extract(self, *, output_dir: Path) -> Path:
+            del output_dir
+            return extract_dir
+
+    monkeypatch.setattr(batch_runner, "DocxDecomposer", FakeDecomposer)
+    monkeypatch.setattr(
+        batch_runner,
+        "build_phase2_slim_bundle",
+        lambda *_args, **_kwargs: bundle,
     )
-    result = batch_runner._apply_batch_result(
-        prepared,
-        classifications,
-        kwargs["arch_registry"],
-        kwargs["env_registry"],
-        kwargs["arch_styles_xml"],
-        kwargs["output_dir"],
+    monkeypatch.setattr(
+        batch_runner,
+        "classify_target_document",
+        lambda **_kwargs: classifications,
+    )
+
+    result = batch_runner.process_single_file(
+        docx_path=kwargs["docx_path"],
+        arch_registry=kwargs["arch_registry"],
+        env_registry=kwargs["env_registry"],
+        arch_styles_xml=kwargs["arch_styles_xml"],
+        available_roles=["PARAGRAPH"],
+        api_key="offline-test-key",
+        output_dir=kwargs["output_dir"],
         conversion_mode=CSI_TO_CANADIAN,
     )
 
