@@ -33,7 +33,7 @@ from .core.csi_to_canadian import (
     validate_conversion_mode,
 )
 from .core.classification import validate_phase2_final_payload
-from .core.errors import EngineError, attach_engine_error
+from .core.errors import EngineError, attach_engine_error, safe_error_location
 from .core.token_utils import extract_target_tokens
 from .core.llm_classifier import classify_target_document
 from .core.ooxml_text import read_xml_text, write_xml_text
@@ -85,6 +85,10 @@ class BatchResult:
     # failure carried one (core/errors.py). ``error`` keeps the raw detail.
     error_code: Optional[str] = None
     safe_error: Optional[str] = None
+    #: Validated, scalar-only placement of the failure (``core/errors.py``),
+    #: when the failure carried one. The remediation sentence is fixed and can
+    #: only say "the reported paragraph"; this is what reports it.
+    error_location: Optional[Dict[str, Any]] = None
     #: Observed model usage for this target, on success and on failure. Kept
     #: as its own field rather than read back out of ``diagnostics``, because
     #: those events are level-filtered and cost must not be.
@@ -162,6 +166,9 @@ class ApplicationStageError(RuntimeError):
         if isinstance(code, str) and isinstance(safe_message, str):
             self.safe_error_code = code
             self.safe_error_message = safe_message
+        location = getattr(cause, "safe_error_location", None)
+        if location is not None:
+            self.safe_error_location = location
 
     @property
     def stage(self) -> str:
@@ -240,6 +247,12 @@ def _safe_error_code(error: BaseException) -> Optional[str]:
 def _safe_error_message(error: BaseException) -> Optional[str]:
     message = getattr(error, "safe_error_message", None)
     return message if isinstance(message, str) and message else None
+
+
+def _safe_error_location(error: BaseException) -> Optional[Dict[str, Any]]:
+    """Where the failure happened, as scalars an artifact can publish."""
+
+    return safe_error_location(error)
 
 
 def _check_numbering_module_needed(arch_styles_xml: str, needed_style_ids: List[str]) -> None:
@@ -1311,6 +1324,7 @@ def process_single_file(
             diagnostics=per_file_diag,
             error_code=_safe_error_code(exc),
             safe_error=_safe_error_message(exc),
+            error_location=_safe_error_location(exc),
             usage=observed_usage,
         )
 

@@ -25,7 +25,7 @@ import html
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from spec_formatter.numbering_roles import (
     role_from_numbering_catalog,
@@ -38,7 +38,7 @@ from spec_formatter.role_contract import (
     ROLE_PARENT,
 )
 
-from .errors import EngineError
+from .errors import EngineError, ErrorLocation
 from .section_numbers import section_number_display_form
 from .xml_helpers import (
     OUT_OF_SCOPE_SUBTREE_NAMES,
@@ -270,62 +270,125 @@ def _literal_counter(role: str, literal: _LiteralMarker) -> Tuple[Optional[int],
     return None, int(value)
 
 
-def _no_locator(index: int) -> str:
-    return ""
+class _NullLocator:
+    """The locator used where no role map is available.
+
+    Still resolves an :class:`ErrorLocation`, because a bare paragraph index
+    is worth more in an artifact than nothing at all, and a caller should not
+    have to branch on whether a locator happens to be the real one.
+    """
+
+    def __call__(self, index: int) -> str:
+        return ""
+
+    def at(self, index: int) -> ErrorLocation:
+        return ErrorLocation(paragraph_index=index)
+
+
+_no_locator = _NullLocator()
+
+#: Anything that renders a paragraph's placement as a message suffix and
+#: resolves the same placement as a structured :class:`ErrorLocation`.
+Locator = Union["_ParagraphLocator", _NullLocator]
+
+
+class _ParagraphLocator:
+    """Places a paragraph by SECTION number and heading ordinal.
+
+    Engine messages name paragraphs by their ``word/document.xml`` index,
+    which nobody can find in Word. Calling the locator returns the developer
+    suffix `` (Section 21 13 13, heading 5)``: the number on the nearest
+    preceding SectionID paragraph and the 1-based ordinal of the paragraph
+    among the PART and numbered-role headings after that SECTION line. A
+    paragraph that is not itself a heading reports ``after heading 5`` (or
+    ``before its first heading``), and one ahead of every SECTION line says
+    so. Only the section number and counts are reported, never body text.
+
+    :meth:`at` returns the same placement as a validated
+    :class:`ErrorLocation`. The two are deliberately one object resolving one
+    set of index tables: a message and an artifact that disagreed about which
+    paragraph failed would be worse than either alone.
+    """
+
+    def __init__(self, blocks: list, role_by_index: Dict[int, str]) -> None:
+        self._resolve = _build_locator_resolver(blocks, role_by_index)
+
+    def __call__(self, index: int) -> str:
+        return f" ({self._resolve(index).describe_position()})"
+
+    def at(self, index: int) -> ErrorLocation:
+        return self._resolve(index)
 
 
 def _paragraph_locator(
     blocks: list,
     role_by_index: Dict[int, str],
-) -> Callable[[int], str]:
-    """Return a describer that places a paragraph by SECTION number and heading.
+) -> _ParagraphLocator:
+    """Return the locator for *blocks*; see :class:`_ParagraphLocator`."""
 
-    Engine messages name paragraphs by their ``word/document.xml`` index,
-    which nobody can find in Word. The describer appends
-    `` (Section 21 13 13, heading 5)``: the number on the nearest preceding
-    SectionID paragraph and the 1-based ordinal of the paragraph among the
-    PART and numbered-role headings after that SECTION line. A paragraph
-    that is not itself a heading reports ``after heading 5`` (or ``before
-    its first heading``), and one ahead of every SECTION line says so.
-    Only the section number and counts are reported, never body text.
-    """
+    return _ParagraphLocator(blocks, role_by_index)
+
+
+def _build_locator_resolver(
+    blocks: list,
+    role_by_index: Dict[int, str],
+) -> Callable[[int], ErrorLocation]:
+    """Index the document once and resolve any paragraph against it."""
 
     section_indices: list[int] = []
-    section_labels: list[str] = []
+    section_numbers: list[str] = []
     heading_indices: list[int] = []
     for index in sorted(role_by_index):
         role = role_by_index[index]
         if role == "SectionID" and index < len(blocks):
-            number = section_number_display_form(
-                paragraph_text_from_block(blocks[index][2])
-            )
             section_indices.append(index)
-            section_labels.append(
-                f"Section {number}" if number else "an unnumbered SECTION line"
+            section_numbers.append(
+                section_number_display_form(
+                    paragraph_text_from_block(blocks[index][2])
+                )
             )
         elif role in _LOCATOR_HEADING_ROLES:
             heading_indices.append(index)
 
-    def describe(index: int) -> str:
+    def resolve(index: int) -> ErrorLocation:
         position = bisect.bisect_right(section_indices, index) - 1
         if position >= 0:
             section_index = section_indices[position]
-            label = section_labels[position]
+            number = section_numbers[position]
         else:
             section_index = -1
-            label = "before any SECTION line"
+            number = None
+        if position < 0:
+            section_state = "none"
+        elif number and section_number_display_form(number) == number:
+            # ``ErrorLocation`` re-validates the number through this same
+            # grammar. Checking here too means a number that would fail that
+            # gate degrades to "unnumbered" -- losing the number but keeping
+            # the placement -- rather than raising a bare ValueError while the
+            # engine is in the middle of building a failure message.
+            section_state = "numbered"
+        else:
+            number = ""
+            section_state = "unnumbered"
         first = bisect.bisect_right(heading_indices, section_index)
         last = bisect.bisect_right(heading_indices, index)
         ordinal = last - first
         if ordinal and role_by_index.get(index) in _LOCATOR_HEADING_ROLES:
-            place = f"heading {ordinal}"
+            placement = "heading"
         elif ordinal:
-            place = f"after heading {ordinal}"
+            placement = "after_heading"
         else:
-            place = "before its first heading"
-        return f" ({label}, {place})"
+            placement = "before_first_heading"
+            ordinal = None
+        return ErrorLocation(
+            paragraph_index=index,
+            section_number=number if section_state == "numbered" else None,
+            heading_ordinal=ordinal,
+            placement=placement,
+            section_state=section_state,
+        )
 
-    return describe
+    return resolve
 
 
 def _find_numbering_instance(root: ET.Element, num_id: str) -> Optional[ET.Element]:
@@ -343,10 +406,21 @@ def _find_numbering_level(
     root: ET.Element,
     num_id: str,
     ilvl: str,
+    *,
+    error_code: str = "canadian_numbering_unprovable",
+    location: Optional[ErrorLocation] = None,
 ) -> Tuple[ET.Element, Optional[ET.Element]]:
+    """Resolve a numbering level, reporting failures under the caller's code.
+
+    Both converters resolve levels through here, and each has its own error
+    code. Hard-coding the forward one made a reverse run report
+    ``canadian_numbering_unprovable`` -- and with it a remediation about
+    Canadian conversion -- for a ``canadian_to_csi`` failure.
+    """
+
     num = _find_numbering_instance(root, num_id)
     if num is None:
-        raise EngineError("canadian_numbering_unprovable", f"Numbering instance numId={num_id!r} is missing")
+        raise EngineError(error_code, f"Numbering instance numId={num_id!r} is missing", location)
     override = next(
         (
             node
@@ -368,8 +442,10 @@ def _find_numbering_level(
         None,
     )
     if abstract is None:
-        raise EngineError("canadian_numbering_unprovable", 
-            f"Numbering instance numId={num_id!r} references a missing abstract list"
+        raise EngineError(
+            error_code,
+            f"Numbering instance numId={num_id!r} references a missing abstract list",
+            location,
         )
     level = next(
         (
@@ -382,8 +458,10 @@ def _find_numbering_level(
     override_level = override.find(_wq("lvl")) if override is not None else None
     effective_level = override_level if override_level is not None else level
     if effective_level is None:
-        raise EngineError("canadian_numbering_unprovable", 
-            f"Numbering instance numId={num_id!r} has no level ilvl={ilvl!r}"
+        raise EngineError(
+            error_code,
+            f"Numbering instance numId={num_id!r} has no level ilvl={ilvl!r}",
+            location,
         )
     return effective_level, override
 
@@ -394,11 +472,15 @@ def _validate_numbering_start(
     *,
     context: str,
     reject_override: bool,
+    error_code: str = "canadian_numbering_unprovable",
+    location: Optional[ErrorLocation] = None,
 ) -> None:
     if override is not None and reject_override:
-        raise EngineError("canadian_numbering_unprovable", 
+        raise EngineError(
+            error_code,
             f"{context} uses a list-level override; its counter state cannot be "
-            "proven without a Word numbering walker."
+            "proven without a Word numbering walker.",
+            location,
         )
     start_override = override.find(_wq("startOverride")) if override is not None else None
     start = level.find(_wq("start"))
@@ -408,11 +490,15 @@ def _validate_numbering_start(
     elif start is not None:
         start_value = start.attrib.get(_wq("val"))
     if start_value not in {None, "1"}:
-        raise EngineError("canadian_numbering_unprovable", f"{context} starts at {start_value!r}, not 1")
+        raise EngineError(
+            error_code, f"{context} starts at {start_value!r}, not 1", location
+        )
     if level.find(_wq("lvlRestart")) is not None:
-        raise EngineError("canadian_numbering_unprovable", 
+        raise EngineError(
+            error_code,
             f"{context} uses an explicit restart rule that Canadian conversion "
-            "cannot yet prove safe."
+            "cannot yet prove safe.",
+            location,
         )
 
 
@@ -550,7 +636,7 @@ def _verify_changed_paragraph(
 def _validate_source_sequence(
     evidence: list[_SourceEvidence],
     *,
-    describe: Callable[[int], str] = _no_locator,
+    describe: Locator = _no_locator,
     error_code: str = "canadian_target_hierarchy",
 ) -> None:
     """Prove that regenerated counters preserve a canonical source sequence.
@@ -602,20 +688,24 @@ def _validate_source_sequence(
         if item.role == "ARTICLE":
             part_number = active.get("PART")
             if part_number is not None and parent_number != part_number:
-                raise EngineError(error_code, 
+                raise EngineError(
+                    error_code,
                     f"Paragraph {item.paragraph_index}{describe(item.paragraph_index)} "
                     f"article {item.literal.marker!r} "
-                    f"does not belong to the active PART {part_number}."
+                    f"does not belong to the active PART {part_number}.",
+                    describe.at(item.paragraph_index),
                 )
 
         previous = active.get(item.role)
         expected = 1 if previous is None else previous + 1
         if counter != expected:
-            raise EngineError(error_code, 
+            raise EngineError(
+                error_code,
                 f"Paragraph {item.paragraph_index}{describe(item.paragraph_index)} "
                 f"has non-contiguous {item.role} marker "
                 f"{item.literal.marker!r}; expected counter {expected}. Canadian conversion "
-                "does not silently repair gaps or restarts."
+                "does not silently repair gaps or restarts.",
+                describe.at(item.paragraph_index),
             )
         active[item.role] = counter
 
@@ -626,7 +716,7 @@ def _validate_automatic_source(
     numbering_catalog: Dict[str, Any],
     available_roles: set[str],
     *,
-    describe: Callable[[int], str] = _no_locator,
+    describe: Locator = _no_locator,
     error_code: str = "canadian_numbering_unprovable",
 ) -> None:
     """Prove a paragraph's automatic numbering really is the role it was given.
@@ -640,16 +730,21 @@ def _validate_automatic_source(
     """
 
     where = describe(item.paragraph_index)
+    location = describe.at(item.paragraph_index)
     if numbering_root is None or item.automatic_numpr is None:
-        raise EngineError(error_code, 
+        raise EngineError(
+            error_code,
             f"Paragraph {item.paragraph_index}{where} uses automatic numbering, but the "
-            "target numbering.xml is unavailable."
+            "target numbering.xml is unavailable.",
+            location,
         )
     pattern = item.automatic_pattern
     if not isinstance(pattern, dict):
-        raise EngineError(error_code, 
+        raise EngineError(
+            error_code,
             f"Paragraph {item.paragraph_index}{where} automatic numbering cannot be "
-            "resolved."
+            "resolved.",
+            location,
         )
     num_id = str(item.automatic_numpr["numId"])
     ilvl = str(item.automatic_numpr.get("ilvl", "0"))
@@ -671,21 +766,27 @@ def _validate_automatic_source(
         None,
     ) if inferred is not None else None
     if resolved != item.role:
-        raise EngineError(error_code, 
+        raise EngineError(
+            error_code,
             f"Paragraph {item.paragraph_index}{where} is classified as {item.role}, but its "
             f"automatic numbering signature resolves to {inferred or 'no safe role'}"
             + (
                 f" (available-role fallback: {resolved})."
                 if resolved is not None and resolved != inferred
                 else "."
-            )
+            ),
+            location,
         )
-    level, override = _find_numbering_level(numbering_root, num_id, ilvl)
+    level, override = _find_numbering_level(
+        numbering_root, num_id, ilvl, error_code=error_code, location=location
+    )
     _validate_numbering_start(
         level,
         override,
         context=f"Paragraph {item.paragraph_index}{where} source numbering",
         reject_override=True,
+        error_code=error_code,
+        location=location,
     )
 
 
@@ -712,6 +813,7 @@ __all__ = [
     "_marker_family",
     "_marker_markup_delimiter",
     "_no_locator",
+    "Locator",
     "_paragraph_locator",
     "_remove_first_tab",
     "_remove_literal_marker",

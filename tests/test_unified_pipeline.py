@@ -13,6 +13,7 @@ import pytest
 
 import spec_formatter
 from spec_formatter import pipeline
+from spec_formatter.style_application.core.errors import ErrorLocation
 from spec_formatter.style_application.batch_runner import BatchResult, SharedConfig
 from spec_formatter.style_application.core.conversion_modes import (
     VALID_CONVERSION_MODES,
@@ -355,7 +356,7 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
     assert api_key not in manifest_text
     assert api_key not in run_log_text
     manifest = json.loads(manifest_text)
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["run_id"] == result.run_id
     assert manifest["conversion_mode"] == pipeline.FORMAT_ONLY
     assert manifest["application"]["version"] == spec_formatter.__version__
@@ -390,7 +391,7 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
     ).hexdigest()
     assert target_result.audit_path is not None
     audit = json.loads(target_result.audit_path.read_text(encoding="utf-8"))
-    assert audit["schema_version"] == 2
+    assert audit["schema_version"] == 3
     assert audit["disposition_counts"] == target_result.audit_summary
     assert audit["application_audit"]["paragraph_indices"] == [0]
     assert "original_text_preview" not in manifest_text
@@ -1218,6 +1219,220 @@ def test_known_target_failure_persists_actionable_code_message_and_stage(
     assert "PRIVATE WRAPPER DETAIL" not in run_log
 
 
+def test_a_located_failure_reports_where_in_every_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fixed remediation says "the reported paragraph"; this reports it.
+
+    The engine already knows which paragraph failed and renders a Word-findable
+    placement for its developer detail. That detail is discarded at the
+    redaction boundary, so the placement has to travel on its own field -- and
+    it has to reach every artifact, because a user reading run.json and a user
+    reading run.log are the same user looking for the same paragraph.
+    """
+
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+    location = ErrorLocation(
+        paragraph_index=119,
+        section_number="21 13 13",
+        heading_ordinal=5,
+        placement="after_heading",
+        section_state="numbered",
+    )
+
+    def processor(**kwargs) -> BatchResult:
+        return BatchResult(
+            filename=Path(kwargs["docx_path"]).name,
+            success=False,
+            output_path=None,
+            log=["FAILED: private detail quoting the document"],
+            error="private detail quoting the document",
+            duration_seconds=0.01,
+            stage="canadian_to_csi_conversion",
+            error_code="canadian_to_csi_hierarchy",
+            error_location=location.as_dict(),
+        )
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    audit = json.loads(result.targets[0].audit_path.read_text(encoding="utf-8"))
+    run_log = (result.run_dir / "run.log").read_text(encoding="utf-8")
+
+    for record in (manifest["targets"][0], audit):
+        assert record["error_location"] == {
+            "paragraph_index": 119,
+            "section_number": "21 13 13",
+            "heading_ordinal": 5,
+            "placement": "after_heading",
+            "section_state": "numbered",
+            "description": "Section 21 13 13, after heading 5, paragraph index 119",
+        }
+    assert (
+        "WHERE: Section 21 13 13, after heading 5, paragraph index 119" in run_log
+    )
+    assert "private detail quoting the document" not in run_log
+    assert result.targets[0].error_location == location.as_dict()
+
+
+def test_a_malformed_location_never_reaches_an_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pipeline re-validates a location instead of trusting its producer.
+
+    ``_redact_json`` replaces configured secrets only, so a location accepted
+    as an arbitrary dict would copy its ``description`` verbatim into
+    ``run.json``, ``audit.json``, ``run.log`` and the GUI. The location's whole
+    claim is that it cannot carry document text; that has to hold at the
+    boundary the payload crosses, not only where it is built.
+    """
+
+    leaked = "Provide listed CPVC piping per the confidential basis of design."
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+
+    def processor(**kwargs) -> BatchResult:
+        return BatchResult(
+            filename=Path(kwargs["docx_path"]).name,
+            success=False,
+            output_path=None,
+            log=["FAILED: detail"],
+            error="detail",
+            duration_seconds=0.01,
+            stage="canadian_to_csi_conversion",
+            error_code="canadian_to_csi_hierarchy",
+            error_location={"description": leaked, "paragraph_index": leaked},
+        )
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    manifest = result.manifest_path.read_text(encoding="utf-8")
+    audit = result.targets[0].audit_path.read_text(encoding="utf-8")
+    run_log = (result.run_dir / "run.log").read_text(encoding="utf-8")
+    for artifact in (manifest, audit, run_log):
+        assert leaked not in artifact
+    assert "WHERE:" not in run_log
+    assert json.loads(manifest)["targets"][0]["error_location"] is None
+    assert json.loads(audit)["error_location"] is None
+    # The result the API hands back is validated at the same boundary.
+    assert result.targets[0].error_location is None
+    # The failure itself is still reported; only the unusable location is gone.
+    assert json.loads(audit)["error_code"] == "canadian_to_csi_hierarchy"
+
+
+def test_a_malformed_location_does_not_discard_a_good_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the spoofed field is dropped; a valid placement still publishes."""
+
+    leaked = "Provide listed CPVC piping per the confidential basis of design."
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+    honest = ErrorLocation(
+        paragraph_index=119,
+        section_number="21 13 13",
+        heading_ordinal=5,
+        placement="after_heading",
+        section_state="numbered",
+    ).as_dict()
+
+    def processor(**kwargs) -> BatchResult:
+        return BatchResult(
+            filename=Path(kwargs["docx_path"]).name,
+            success=False,
+            output_path=None,
+            log=["FAILED: detail"],
+            error="detail",
+            duration_seconds=0.01,
+            stage="canadian_to_csi_conversion",
+            error_code="canadian_to_csi_hierarchy",
+            # Every scalar is honest; only the rendered sentence was tampered with.
+            error_location={**honest, "description": leaked},
+        )
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    run_log = (result.run_dir / "run.log").read_text(encoding="utf-8")
+    audit = json.loads(result.targets[0].audit_path.read_text(encoding="utf-8"))
+    assert leaked not in run_log
+    assert audit["error_location"] == honest
+    assert (
+        "WHERE: Section 21 13 13, after heading 5, paragraph index 119" in run_log
+    )
+
+
+def test_a_failure_without_a_location_publishes_the_key_as_null(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent is not the same as unknown, so the key is always present.
+
+    A reader who found no ``error_location`` key could not tell whether the
+    engine had no placement or the run simply predates the field.
+    """
+
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+    _calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+
+    def processor(**kwargs) -> BatchResult:
+        return BatchResult(
+            filename=Path(kwargs["docx_path"]).name,
+            success=False,
+            output_path=None,
+            log=["FAILED: no placement known"],
+            error="no placement known",
+            duration_seconds=0.01,
+            stage="validation",
+            error_code="classification_coverage_incomplete",
+        )
+
+    result = _run_with_fakes(
+        architect,
+        [target],
+        tmp_path / "formatted",
+        analyzer=analyzer,
+        config_loader=config_loader,
+        processor=processor,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    audit = json.loads(result.targets[0].audit_path.read_text(encoding="utf-8"))
+    assert "error_location" in manifest["targets"][0]
+    assert manifest["targets"][0]["error_location"] is None
+    assert "error_location" in audit
+    assert audit["error_location"] is None
+    assert "WHERE:" not in (result.run_dir / "run.log").read_text(encoding="utf-8")
+
+
 def test_target_processor_receives_an_isolated_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1884,7 +2099,7 @@ def test_run_artifacts_prefer_the_engine_error_code_over_classified_text(
 
 
 def test_target_error_diagnostic_falls_back_to_text_classification_without_a_code() -> None:
-    from spec_formatter.pipeline import TargetFormatResult, _target_error_diagnostic
+    from spec_formatter.pipeline import TargetFormatResult, target_error_diagnostic
 
     coded = TargetFormatResult(
         source_path=Path("t.docx"), success=False, output_path=None, log=(),
@@ -1901,10 +2116,10 @@ def test_target_error_diagnostic_falls_back_to_text_classification_without_a_cod
         error_code="not_a_real_code",
     )
 
-    assert _target_error_diagnostic(coded, ()).code == "canadian_target_hierarchy"
-    assert "CONFIDENTIAL" not in _target_error_diagnostic(coded, ()).message
-    assert _target_error_diagnostic(uncoded, ()).code == "untrusted_error"
-    assert _target_error_diagnostic(unknown, ()).code == "untrusted_error"
+    assert target_error_diagnostic(coded, ()).code == "canadian_target_hierarchy"
+    assert "CONFIDENTIAL" not in target_error_diagnostic(coded, ()).message
+    assert target_error_diagnostic(uncoded, ()).code == "untrusted_error"
+    assert target_error_diagnostic(unknown, ()).code == "untrusted_error"
 
 
 def test_package_exports_every_name_the_gui_imports() -> None:

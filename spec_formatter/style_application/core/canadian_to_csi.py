@@ -52,12 +52,14 @@ from .csi_to_canadian import (
     MarkerEdit,
     PRESERVED_UNNUMBERED_ROLE,
 )
-from .errors import EngineError
+from .errors import EngineError, ErrorLocation
 from .marker_tools import (
+    Locator,
     _TRACKED_OR_FIELD_RX,
     _detect_any_literal_marker,
     _detect_literal_marker,
     _find_numbering_level,
+    _no_locator,
     _paragraph_locator,
     _remove_literal_marker,
     _SourceEvidence,
@@ -512,7 +514,7 @@ def _verify_marked_paragraph(
     marker: str,
     expected_body: str,
     *,
-    describe: Callable[[int], str],
+    describe: Locator,
 ) -> None:
     """Prove the edit added the marker and changed nothing else in the text."""
 
@@ -522,6 +524,7 @@ def _verify_marked_paragraph(
             _HIERARCHY,
             f"Paragraph {index}{describe(index)} did not receive its CSI marker "
             f"{marker!r} as leading text.",
+            describe.at(index),
         )
     remainder = actual[len(marker):].lstrip(" \t ")
     if remainder != expected_body.lstrip(" \t "):
@@ -529,6 +532,7 @@ def _verify_marked_paragraph(
             _HIERARCHY,
             f"Paragraph {index}{describe(index)} changed beyond its numbering "
             "marker; the conversion was withheld.",
+            describe.at(index),
         )
 
 
@@ -634,7 +638,7 @@ def _verify_prediction(
     after_blocks: List[Any],
     predicted: List[Tuple[int, str, str]],
     *,
-    describe: Callable[[int], str],
+    describe: Locator,
 ) -> None:
     """Assert the finished document is exactly the document that was predicted.
 
@@ -659,6 +663,7 @@ def _verify_prediction(
                 _PREDICTION,
                 f"Paragraph {index}{describe(index)} was predicted to lead with "
                 f"CSI marker {marker!r} but does not.",
+                describe.at(index),
             )
 
     for index, (_start, _end, before) in enumerate(before_blocks):
@@ -671,6 +676,7 @@ def _verify_prediction(
                 _PREDICTION,
                 f"Paragraph {index}{describe(index)} changed text but no CSI "
                 "marker was predicted for it.",
+                describe.at(index),
             )
 
 
@@ -678,6 +684,9 @@ def _validate_converted_list(
     numbering_xml: str,
     num_ids: set[str],
     ilvls: Dict[str, set[str]],
+    *,
+    locate: Locator = _no_locator,
+    first_on_level: Optional[Dict[Tuple[str, str], int]] = None,
 ) -> Dict[Tuple[str, str], Tuple[str, ...]]:
     """Prove every converted list level has a countable, unoverridden counter.
 
@@ -685,15 +694,23 @@ def _validate_converted_list(
     collected here rather than in a second pass because this is already the one
     place that resolves every converted level, and the suppression step needs
     exactly what this loop already holds.
+
+    A failure here is about a *level*, not a paragraph, but "some level of some
+    list has an override" is not something anyone can act on in Word. Each
+    level is therefore reported at the first paragraph that sits on it, which
+    is a place the user can actually open.
     """
 
     if not num_ids:
         return {}
+    on_level = first_on_level or {}
+    earliest = min(on_level.values(), default=None)
     if not numbering_xml.strip():
         raise EngineError(
             _UNPROVABLE,
             "Paragraphs use automatic numbering but the target has no "
             "numbering.xml, so their numbers cannot be read.",
+            locate.at(earliest) if earliest is not None else None,
         )
     root = parse_untrusted_xml(
         prepare_xml_text_for_utf8(numbering_xml),
@@ -702,7 +719,11 @@ def _validate_converted_list(
     geometry: Dict[Tuple[str, str], Tuple[str, ...]] = {}
     for num_id in sorted(num_ids):
         for ilvl in sorted(ilvls.get(num_id, set())):
-            level, override = _find_numbering_level(root, num_id, ilvl)
+            index = on_level.get((num_id, ilvl))
+            location = locate.at(index) if index is not None else None
+            level, override = _find_numbering_level(
+                root, num_id, ilvl, error_code=_UNPROVABLE, location=location
+            )
             # ``reject_override=True``: a level override changes the counter in
             # a way this walker does not model, and a wrong number written as
             # literal text is unrecoverable for the reader.
@@ -711,6 +732,8 @@ def _validate_converted_list(
                 override,
                 context=f"Target numbering numId={num_id} ilvl={ilvl}",
                 reject_override=True,
+                error_code=_UNPROVABLE,
+                location=location,
             )
             # ``level`` is already the effective one: _find_numbering_level
             # resolves an override's own ``w:lvl`` in preference to the
@@ -804,6 +827,7 @@ def plan_canadian_to_csi(
     literal_indices: Dict[int, Any] = {}
     num_ids: set[str] = set()
     ilvls: Dict[str, set[str]] = {}
+    first_on_level: Dict[Tuple[str, str], int] = {}
 
     for index, role in sorted(effective_role_by_index.items()):
         if role not in _CONVERTIBLE_ROLES:
@@ -820,6 +844,7 @@ def plan_canadian_to_csi(
                 _HIERARCHY,
                 f"Paragraph {index}{locate(index)} is classified as {role} but starts "
                 f"with incompatible marker {any_literal!r}.",
+                locate.at(index),
             )
         if literal is not None and automatic_numpr is not None:
             raise EngineError(
@@ -827,6 +852,7 @@ def plan_canadian_to_csi(
                 f"Paragraph {index}{locate(index)} has both automatic numbering and "
                 f"typed marker {literal.marker!r}; remove the doubled numbering "
                 "before conversion.",
+                locate.at(index),
             )
 
         if literal is not None:
@@ -838,6 +864,7 @@ def plan_canadian_to_csi(
             automatic_indices[index] = {"numId": num_id, "ilvl": ilvl}
             num_ids.add(num_id)
             ilvls.setdefault(num_id, set()).add(ilvl)
+            first_on_level.setdefault((num_id, ilvl), index)
             evidence.append(
                 _SourceEvidence(
                     index,
@@ -853,15 +880,35 @@ def plan_canadian_to_csi(
                 _HIERARCHY,
                 f"Paragraph {index}{locate(index)} is classified as numbered role "
                 f"{role} but carries no number to convert.",
+                locate.at(index),
             )
 
     if len(num_ids) > 1:
+        # Report the paragraph that starts the *second* list rather than the
+        # run of paragraphs that agree with each other: that first disagreement
+        # is where a user finds the pasted-in block or the restarted list.
+        first_use = {
+            num_id: min(
+                index
+                for (candidate, _ilvl), index in first_on_level.items()
+                if candidate == num_id
+            )
+            for num_id in num_ids
+        }
+        second = sorted(first_use.values())[1]
         raise EngineError(
             _HIERARCHY,
             "Converted paragraphs span more than one Word list instance "
             f"({sorted(num_ids)}); their counters cannot be proven together.",
+            locate.at(second),
         )
-    level_geometry = _validate_converted_list(numbering_xml, num_ids, ilvls)
+    level_geometry = _validate_converted_list(
+        numbering_xml,
+        num_ids,
+        ilvls,
+        locate=locate,
+        first_on_level=first_on_level,
+    )
 
     # The counter walk below is driven by the *classified* role's level, so a
     # role that disagrees with the level Word is actually rendering would
@@ -896,6 +943,7 @@ def plan_canadian_to_csi(
                 f"classified as {item.role} (list level {expected_ilvl}) but sits at "
                 f"list level {actual_ilvl}; the CSI marker would not match the "
                 "number the document currently shows.",
+                locate.at(item.paragraph_index),
             )
 
     # Every paragraph on a converted list must be converted. One left behind
@@ -911,6 +959,7 @@ def plan_canadian_to_csi(
                 f"Unconverted paragraph {index}{locate(index)} shares automatic list "
                 f"numId={effective.get('numId')!r} with converted paragraphs; "
                 "leaving it numbered would desynchronise the sequence.",
+                locate.at(index),
             )
 
     # A paragraph whose *mark* is an unresolved tracked revision does not have
@@ -930,6 +979,7 @@ def plan_canadian_to_csi(
                 f"Paragraph {index}{locate(index)} is classified as a numbered "
                 f"role but its paragraph mark is a tracked {revision}; its CSI "
                 "number would depend on whether that revision is accepted.",
+                locate.at(index),
             )
 
     _validate_source_sequence(evidence, describe=locate, error_code=_HIERARCHY)
@@ -961,6 +1011,7 @@ def plan_canadian_to_csi(
                 _HIERARCHY,
                 f"Paragraph {index}{locate(index)} is an ARTICLE with no preceding "
                 "PART, so its CSI article number cannot be formed.",
+                locate.at(index),
             )
         predicted.append((index, role, _csi_marker(role, counters)))
 
@@ -990,6 +1041,7 @@ def plan_canadian_to_csi(
                     "tracking is on would delete text without recording the "
                     "deletion as a revision. Turn Track Changes off for the "
                     "conversion, or accept the existing markers first.",
+                    locate.at(index),
                 )
             stripped, _tab_removed = _remove_literal_marker(paragraph, role)
             body = literal.body_text

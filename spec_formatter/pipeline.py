@@ -41,7 +41,11 @@ from .style_application.core.application_policy import (
     APPLICATION_POLICY_VERSION,
     application_policy_for_mode,
 )
-from .style_application.core.errors import remediation_for as engine_remediation_for
+from .style_application.core.errors import (
+    ErrorLocation,
+    remediation_for as engine_remediation_for,
+    safe_error_location as engine_error_location,
+)
 from .style_application.core.conversion_modes import (
     CANADIAN_TO_CSI,
     CSI_TO_CANADIAN,
@@ -69,8 +73,11 @@ _FORMATTED_SUFFIXES = (
     "_PHASE2_FORMATTED.DOCX",
 )
 _MAX_WORKERS = 6
-_RUN_MANIFEST_VERSION = 2
-_RUN_AUDIT_VERSION = 2
+# Version 3 added ``error_location`` to every failure record. It is always
+# present, null when the engine knew no placement, so a reader can rely on it
+# rather than having to tell "no location" from "an older run".
+_RUN_MANIFEST_VERSION = 3
+_RUN_AUDIT_VERSION = 3
 # Contract 3: manifest version 2 with the committed engine fingerprint.
 _PROFILE_CONTRACT_VERSION = "3"
 _PROFILE_CACHE_KEEP = 2
@@ -136,6 +143,10 @@ class TargetFormatResult:
     # Stable engine error code (core/errors.py) when the failure carried one;
     # run.json and audit.json prefer it over classifying ``error`` text.
     error_code: Optional[str] = None
+    #: Validated, scalar-only placement of that failure, when the engine knew
+    #: one. Published beside the code so "the reported paragraph" in a fixed
+    #: remediation sentence actually points somewhere.
+    error_location: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +202,10 @@ class SafeErrorDiagnostic:
 
     code: str
     message: str
+    #: Validated, scalar-only placement of the failure, when the engine knew
+    #: one (``core/errors.ErrorLocation``). ``message`` is a fixed remediation
+    #: sentence and can only say "the reported paragraph"; this reports it.
+    location: Optional[dict] = None
 
 
 def _attach_safe_error_diagnostic(
@@ -1286,7 +1301,11 @@ def safe_error_diagnostic(
         code = getattr(value, "safe_error_code", None)
         message = getattr(value, "safe_error_message", None)
         if isinstance(code, str) and isinstance(message, str):
-            return SafeErrorDiagnostic(code=code, message=message)
+            return SafeErrorDiagnostic(
+                code=code,
+                message=message,
+                location=engine_error_location(value),
+            )
         raw_value = str(value)
     else:
         raw_value = value
@@ -1302,18 +1321,74 @@ def safe_error_diagnostic(
     )
 
 
-def _target_error_diagnostic(
+def describe_error_location(location: Optional[dict]) -> str:
+    """Render a published location for ``run.log`` and the GUI.
+
+    Reads the sentence the engine already rendered rather than re-deriving one
+    from the scalars: two renderings of the same failure that drifted apart
+    would be worse than one, and the payload is validated before it gets here.
+    """
+
+    if not isinstance(location, dict):
+        return ""
+    description = location.get("description")
+    return description if isinstance(description, str) else ""
+
+
+def validated_error_location(value: Any) -> Optional[dict]:
+    """Rebuild a location payload through ``ErrorLocation`` before publishing it.
+
+    A location is safe to publish *because it was validated*, not because its
+    producer was careful -- and by the time a payload reaches here it has
+    crossed a boundary this module does not own. ``BatchResult`` is a plain
+    dataclass, the target processor is injectable, and ``_redact_json``
+    replaces configured secrets only, so an arbitrary dict accepted here would
+    put its ``description`` verbatim into ``run.json``, ``audit.json``,
+    ``run.log`` and the GUI. That is the redaction hole the type exists to
+    close, so the dict is reconstructed rather than trusted.
+
+    ``description`` is re-rendered from the validated scalars instead of being
+    carried across, so a spoofed one is discarded even when every other field
+    is well formed. A payload that will not round-trip is dropped whole: a
+    half-trusted location is worth less than none.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    try:
+        return ErrorLocation(
+            paragraph_index=value.get("paragraph_index"),
+            section_number=value.get("section_number"),
+            heading_ordinal=value.get("heading_ordinal"),
+            placement=value.get("placement", "unknown"),
+            section_state=value.get("section_state", "unknown"),
+        ).as_dict()
+    except (TypeError, ValueError):
+        return None
+
+
+def target_error_diagnostic(
     item: TargetFormatResult,
     secrets: Sequence[str],
 ) -> Optional[SafeErrorDiagnostic]:
     """Prefer the engine's stable code and remediation over classified text."""
 
     code = getattr(item, "error_code", None)
+    # Public function: a caller can hand it any ``TargetFormatResult``, so the
+    # location is re-validated here as well as at the runner boundary.
+    location = validated_error_location(getattr(item, "error_location", None))
     if isinstance(code, str) and code:
         remediation = engine_remediation_for(code)
         if remediation:
-            return SafeErrorDiagnostic(code=code, message=remediation)
-    return safe_error_diagnostic(item.error, secrets)
+            return SafeErrorDiagnostic(
+                code=code,
+                message=remediation,
+                location=location,
+            )
+    diagnostic = safe_error_diagnostic(item.error, secrets)
+    if diagnostic is not None and diagnostic.location is None and location is not None:
+        return replace(diagnostic, location=location)
+    return diagnostic
 
 
 def _plan_output_paths(
@@ -1476,6 +1551,9 @@ def _format_one_target(
                 log=processor_log,
                 error=result.error or "Target formatting failed.",
                 error_code=getattr(result, "error_code", None),
+                error_location=validated_error_location(
+                    getattr(result, "error_location", None)
+                ),
                 duration_seconds=result.duration_seconds,
                 conversion_report=conversion_report,
                 source_sha256=snapshot_sha256,
@@ -1645,7 +1723,7 @@ def _target_audit_payload(
     writes it.
     """
 
-    error_diagnostic = _target_error_diagnostic(item, secrets)
+    error_diagnostic = target_error_diagnostic(item, secrets)
     conversion = (
         _normalize_audit_details(item.conversion_report.as_dict())
         if item.conversion_report is not None
@@ -1675,6 +1753,10 @@ def _target_audit_payload(
         ),
         "error": (
             error_diagnostic.message if error_diagnostic is not None else None
+        ),
+        "error_location": _redact_json(
+            error_diagnostic.location if error_diagnostic is not None else None,
+            secrets,
         ),
         "disposition_counts": dict(item.audit_summary),
         "numbering_checks": _redact_json(item.numbering_checks, secrets),
@@ -1730,7 +1812,7 @@ def _write_run_artifacts(
         for event in events
     ]
     for item in audited_results:
-        error_diagnostic = safe_error_diagnostic(item.error, secrets)
+        error_diagnostic = target_error_diagnostic(item, secrets)
         log_lines.append(
             f"TARGET {item.source_path.name}: "
             f"{'succeeded' if item.success else 'failed'} "
@@ -1752,6 +1834,9 @@ def _write_run_artifacts(
             log_lines.append(
                 f"  ERROR [{error_diagnostic.code}]: {error_diagnostic.message}"
             )
+            where = describe_error_location(error_diagnostic.location)
+            if where:
+                log_lines.append(f"  WHERE: {where}")
         if item.audit_path is not None:
             log_lines.append(f"  AUDIT: {item.audit_path.name}")
     run_log_path = run_dir / "run.log"
@@ -1767,7 +1852,7 @@ def _write_run_artifacts(
     profile_metadata = _profile_provenance(profile) if profile is not None else {}
     target_records: list[dict[str, Any]] = []
     for item in audited_results:
-        error_diagnostic = _target_error_diagnostic(item, secrets)
+        error_diagnostic = target_error_diagnostic(item, secrets)
         target_records.append(
             {
                 "source_path": str(item.source_path),
@@ -1783,6 +1868,10 @@ def _write_run_artifacts(
                 ),
                 "error": (
                     error_diagnostic.message if error_diagnostic is not None else None
+                ),
+                "error_location": _redact_json(
+                    error_diagnostic.location if error_diagnostic is not None else None,
+                    secrets,
                 ),
                 "disposition_counts": dict(item.audit_summary),
                 "numbering_checks": _redact_json(item.numbering_checks, secrets),
@@ -1910,6 +1999,7 @@ def _write_initialization_failure_artifacts(
                 "error_type": type(error).__name__,
                 "error_code": error_diagnostic.code,
                 "error": error_diagnostic.message,
+                "error_location": _redact_json(error_diagnostic.location, secrets),
                 "disposition_counts": _empty_audit_summary(),
                 "numbering_checks": {},
                 "application_audit": {},
@@ -1929,6 +2019,7 @@ def _write_initialization_failure_artifacts(
                     "error_type": type(error).__name__,
                     "error_code": error_diagnostic.code,
                     "error": error_diagnostic.message,
+                    "error_location": _redact_json(error_diagnostic.location, secrets),
                     "disposition_counts": _empty_audit_summary(),
                     "numbering_checks": {},
                 }
@@ -1946,7 +2037,7 @@ def _write_initialization_failure_artifacts(
                 secrets=secrets,
             ),
         )
-        target_error = _target_error_diagnostic(outcome, secrets)
+        target_error = target_error_diagnostic(outcome, secrets)
         target_records.append(
             {
                 "source_path": str(target),
@@ -1960,6 +2051,9 @@ def _write_initialization_failure_artifacts(
                 "error_type": None,
                 "error_code": target_error.code if target_error else None,
                 "error": target_error.message if target_error else None,
+                "error_location": _redact_json(
+                    target_error.location if target_error else None, secrets
+                ),
                 "disposition_counts": _normalize_audit_summary(outcome.audit_summary),
                 "numbering_checks": _redact_json(outcome.numbering_checks, secrets),
             }
@@ -2019,6 +2113,7 @@ def _write_initialization_failure_artifacts(
         "error_type": type(error).__name__,
         "error_code": error_diagnostic.code,
         "error": error_diagnostic.message,
+        "error_location": _redact_json(error_diagnostic.location, secrets),
         "summary": {
             "targets": len(target_records),
             "succeeded": succeeded,
@@ -2457,5 +2552,8 @@ __all__ = [
     "default_template_cache_dir",
     "format_specifications",
     "prepare_template_profile",
+    "describe_error_location",
     "safe_error_diagnostic",
+    "target_error_diagnostic",
+    "validated_error_location",
 ]

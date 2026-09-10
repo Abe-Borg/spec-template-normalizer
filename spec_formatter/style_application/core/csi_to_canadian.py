@@ -471,13 +471,15 @@ def plan_csi_to_canadian(
             raise EngineError("canadian_target_hierarchy", 
                 f"Paragraph {index}{locate(index)} is classified as {role} but starts "
                 "with incompatible "
-                f"marker {any_literal!r}."
+                f"marker {any_literal!r}.",
+                locate.at(index),
             )
         if literal is not None and automatic:
             raise EngineError("canadian_target_hierarchy", 
                 f"Paragraph {index}{locate(index)} has both automatic numbering and "
                 "typed marker "
-                f"{literal.marker!r}; remove the doubled numbering before conversion."
+                f"{literal.marker!r}; remove the doubled numbering before conversion.",
+                locate.at(index),
             )
 
         if literal is not None:
@@ -485,7 +487,8 @@ def plan_csi_to_canadian(
             if delimiter == "line_break":
                 raise EngineError("canadian_target_hierarchy", 
                     f"Paragraph {index}{locate(index)} uses a line break after typed marker "
-                    f"{literal.marker!r}; only a normal space or Word list tab is safe."
+                    f"{literal.marker!r}; only a normal space or Word list tab is safe.",
+                    locate.at(index),
                 )
             # A two-component article marker such as ``1.1`` is proven later
             # against its active PART and contiguous article sequence.  The
@@ -495,7 +498,8 @@ def plan_csi_to_canadian(
                 raise EngineError("canadian_target_hierarchy", 
                     f"Paragraph {index}{locate(index)} begins with ambiguous decimal text "
                     f"{literal.marker!r}. A typed Canadian marker is converted only "
-                    "when followed by a structural Word tab."
+                    "when followed by a structural Word tab.",
+                    locate.at(index),
                 )
             if (
                 literal.family == "csc_article"
@@ -505,7 +509,8 @@ def plan_csi_to_canadian(
                 raise EngineError("canadian_target_hierarchy", 
                     f"Paragraph {index}{locate(index)} begins with ambiguous decimal text "
                     f"{literal.marker!r}. A spaced Canadian article marker must "
-                    "be followed by heading-like text or a structural Word tab."
+                    "be followed by heading-like text or a structural Word tab.",
+                    locate.at(index),
                 )
             evidence.append(
                 _SourceEvidence(index, role, "literal", literal, None, None)
@@ -545,7 +550,8 @@ def plan_csi_to_canadian(
                 f"Paragraph {index}{locate(index)} is classified as numbered role {role}, "
                 "but it has "
                 "neither a recognized typed marker nor Word automatic numbering. "
-                "Canadian conversion will not insert an unproven list item."
+                "Canadian conversion will not insert an unproven list item.",
+                locate.at(index),
             )
 
     automatic_ids: Dict[str, set[str]] = {}
@@ -590,7 +596,8 @@ def plan_csi_to_canadian(
             raise EngineError("canadian_target_hierarchy", 
                 f"Unconverted paragraph {index} shares automatic source list "
                 f"numId={effective_numpr.get('numId')!r}; removing it would change "
-                f"following counters. It is paragraph {index}{locate(index)}."
+                f"following counters. It is paragraph {index}{locate(index)}.",
+                locate.at(index),
             )
     _validate_source_sequence(evidence, describe=locate)
 
