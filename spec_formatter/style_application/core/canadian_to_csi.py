@@ -28,8 +28,9 @@ closed rather than publishing a document whose numbers are a guess.
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from spec_formatter.role_contract import (
     BODY_HIERARCHY_ROLES,
@@ -41,6 +42,7 @@ from .classification import (
     _build_numbering_catalog,
     _effective_numpr,
     _resolve_numbering_pattern,
+    _style_replacement_ppr_properties,
 )
 from .csi_to_canadian import (
     CanadianConversionReport,
@@ -61,6 +63,7 @@ from .marker_tools import (
     _validate_automatic_source,
     _validate_numbering_start,
     _validate_source_sequence,
+    _wq,
 )
 from .ooxml_text import prepare_xml_text_for_utf8, read_xml_text, write_xml_text
 from .sectpr_tools import extract_all_sectpr_blocks
@@ -84,10 +87,6 @@ _CONVERTIBLE_ROLES = frozenset(BODY_HIERARCHY_ROLES)
 
 _PPR_RX = re.compile(r"<w:pPr\b[^>]*(?:/>|>.*?</w:pPr>)", re.S)
 _NUMPR_RX = re.compile(r"<w:numPr\b[^>]*(?:/>|>.*?</w:numPr>)", re.S)
-#: Word's "this paragraph is not in a list" numbering reference. Written as a
-#: direct property so it also cancels numbering inherited from a style, which
-#: simply deleting a direct ``numPr`` would not.
-_NUMBERING_OFF = '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>'
 _FIRST_TEXT_RX = re.compile(r"<w:t\b[^>]*>", re.S)
 
 
@@ -149,50 +148,142 @@ def _csi_marker(role: str, counters: Dict[int, int]) -> str:
     raise AssertionError(f"Unhandled convertible role: {role}")
 
 
-#: The ``CT_PPr`` children that must precede ``w:numPr`` in schema order.
-#: ``w:numPr`` written before ``w:pStyle`` is invalid OOXML even though Word
-#: often renders it anyway, and a stricter consumer is entitled to reject the
-#: file, so the insertion point is chosen rather than assumed to be the front.
-_PPR_BEFORE_NUMPR = (
+#: The complete ``CT_PPr`` child sequence, in schema order, from
+#: ``ISO-IEC29500-4_2016/wml.xsd`` (``CT_PPrBase`` supplies 1-33 and ``CT_PPr``
+#: appends the final three).
+#:
+#: This is deliberately the *whole* table rather than a prefix trimmed to the
+#: elements written today. An abbreviated order table is only correct for the
+#: one element it was abbreviated for: a six-entry "everything before
+#: ``w:numPr``" list silently places ``w:ind`` immediately after ``w:pStyle``,
+#: which is invalid even where Word renders it, and only an XSD check catches
+#: it. Insert through :func:`_ppr_insertion_point` and this stays true for any
+#: element a later change needs to write.
+_PPR_CHILD_ORDER = (
     "w:pStyle",
     "w:keepNext",
     "w:keepLines",
     "w:pageBreakBefore",
     "w:framePr",
     "w:widowControl",
+    "w:numPr",
+    "w:suppressLineNumbers",
+    "w:pBdr",
+    "w:shd",
+    "w:tabs",
+    "w:suppressAutoHyphens",
+    "w:kinsoku",
+    "w:wordWrap",
+    "w:overflowPunct",
+    "w:topLinePunct",
+    "w:autoSpaceDE",
+    "w:autoSpaceDN",
+    "w:bidi",
+    "w:adjustRightInd",
+    "w:snapToGrid",
+    "w:spacing",
+    "w:ind",
+    "w:contextualSpacing",
+    "w:mirrorIndents",
+    "w:suppressOverlap",
+    "w:jc",
+    "w:textDirection",
+    "w:textAlignment",
+    "w:textboxTightWrap",
+    "w:outlineLvl",
+    "w:divId",
+    "w:cnfStyle",
+    "w:rPr",
+    "w:sectPr",
+    "w:pPrChange",
 )
 
 
-def _numpr_insertion_point(ppr_inner: str) -> int:
-    """Offset inside a ``w:pPr`` body where ``w:numPr`` may legally be added."""
+def _ppr_insertion_point(ppr_inner: str, element_name: str) -> int:
+    """Offset inside a ``w:pPr`` body where *element_name* may legally be added.
 
+    The offset is the end of the last present child that must precede
+    *element_name*, so the new element lands after its predecessors and before
+    everything that must follow it.
+    """
+
+    try:
+        position = _PPR_CHILD_ORDER.index(element_name)
+    except ValueError:  # pragma: no cover - guarded by the caller's constants
+        raise AssertionError(f"Unknown w:pPr child: {element_name}") from None
     offset = 0
-    for name in _PPR_BEFORE_NUMPR:
+    for name in _PPR_CHILD_ORDER[:position]:
         for match in re.finditer(rf"<{name}\b[^>]*(?:/>|>.*?</{name}>)", ppr_inner, re.S):
             offset = max(offset, match.end())
     return offset
 
 
-def _suppress_automatic_numbering(paragraph_xml: str) -> str:
-    """Return *paragraph_xml* with its effective list membership cancelled."""
+def _numbering_off(ilvl: str) -> str:
+    """Word's "this paragraph is not in a list" reference at *ilvl*.
 
+    The level is carried through rather than flattened to ``0``. With
+    ``numId=0`` the value does not render, but a paragraph that states level 0
+    while sitting at level 3 is simply describing itself falsely to the next
+    reader of the file -- including this application's own converters.
+    """
+
+    return f'<w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="0"/></w:numPr>'
+
+
+def _suppress_automatic_numbering(
+    paragraph_xml: str,
+    ilvl: str = "0",
+    level_geometry: Tuple[str, ...] = (),
+) -> str:
+    """Return *paragraph_xml* with its effective list membership cancelled.
+
+    Cancelling the list is only half the edit. A numbering level's ``w:pPr``
+    -- its ``w:ind`` and its ``w:tabs`` num stop -- applies *only* while the
+    paragraph is a member of that list, so ``numId=0`` discards the paragraph's
+    indentation along with its number whenever the geometry lived in
+    ``numbering.xml`` rather than in the style. Templates written that way are
+    normal, not exotic: a ``Cdn*``-style stylesheet carries ``w:numPr`` and no
+    ``w:ind`` at all, so *every* indent in the document comes from the level.
+    Dropping it flattens the whole outline into one column while leaving the
+    text, the numbers and the run structure provably intact -- which is exactly
+    why no text-level check can see it happen.
+
+    So the level's geometry is materialized onto the paragraph in the same
+    edit, which is what Word itself writes when a user turns numbering off on
+    one paragraph by hand. A property the paragraph already sets directly is
+    left alone: it already outranks the level and is the author's own choice.
+
+    The caller decides *whether* there is anything to restore -- see
+    :func:`_restorable_level_geometry`. This function only places what it is
+    given.
+    """
+
+    numbering_off = _numbering_off(ilvl)
     match = _PPR_RX.search(paragraph_xml)
     if match is None:
+        inserted = numbering_off + "".join(level_geometry)
         insert_at = paragraph_xml.index(">") + 1
         return (
             paragraph_xml[:insert_at]
-            + f"<w:pPr>{_NUMBERING_OFF}</w:pPr>"
+            + f"<w:pPr>{inserted}</w:pPr>"
             + paragraph_xml[insert_at:]
         )
     ppr = match.group(0)
     if ppr.endswith("/>"):
-        rebuilt = ppr[:-2] + ">" + _NUMBERING_OFF + "</w:pPr>"
+        inserted = numbering_off + "".join(level_geometry)
+        rebuilt = ppr[:-2] + ">" + inserted + "</w:pPr>"
     else:
-        without = _NUMPR_RX.sub("", ppr, count=1)
-        open_end = without.index(">") + 1
-        inner = without[open_end : without.rindex("</w:pPr>")]
-        cut = open_end + _numpr_insertion_point(inner)
-        rebuilt = without[:cut] + _NUMBERING_OFF + without[cut:]
+        rebuilt = _NUMPR_RX.sub("", ppr, count=1)
+        for fragment in (numbering_off,) + tuple(level_geometry):
+            name = re.match(r"<(w:\w+)", fragment).group(1)
+            open_end = rebuilt.index(">") + 1
+            inner = rebuilt[open_end : rebuilt.rindex("</w:pPr>")]
+            if re.search(rf"<{name}\b", inner):
+                # Already set directly on the paragraph: the author's own
+                # value wins over the numbering level's.
+                continue
+            cut = open_end + _ppr_insertion_point(inner, name)
+            rebuilt = rebuilt[:cut] + fragment + rebuilt[cut:]
     return paragraph_xml[: match.start()] + rebuilt + paragraph_xml[match.end():]
 
 
@@ -264,15 +355,117 @@ def _verify_marked_paragraph(
         )
 
 
+#: Numbering-level ``w:pPr`` children that carry the geometry a paragraph
+#: loses when it stops being a list member, in schema order. ``w:ind`` is the
+#: indentation itself; ``w:tabs`` is the level's num tab stop, which decides
+#: where the text after the marker's tab actually lands.
+_LEVEL_GEOMETRY_ELEMENTS = ("tabs", "ind")
+
+
+def _serialize_w_element(element: ET.Element) -> str:
+    """Serialize a WordprocessingML element as a prefixed, declaration-free fragment.
+
+    ``ET.tostring`` would emit an ``xmlns`` declaration on the fragment root (or
+    an ``ns0`` prefix), neither of which can be spliced into a paragraph that
+    already declares ``w``. These elements are small and attribute-only apart
+    from ``w:tabs``'s children, so the fragment is built directly.
+    """
+
+    local = element.tag.split("}", 1)[-1]
+    attributes = "".join(
+        f' w:{name.split("}", 1)[-1]}="{_escape_attribute(value)}"'
+        for name, value in sorted(element.attrib.items())
+    )
+    children = "".join(_serialize_w_element(child) for child in element)
+    if not children:
+        return f"<w:{local}{attributes}/>"
+    return f"<w:{local}{attributes}>{children}</w:{local}>"
+
+
+def _escape_attribute(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _restorable_level_geometry(
+    geometry: Tuple[str, ...],
+    paragraph_xml: str,
+    styles_xml: str,
+) -> Tuple[str, ...]:
+    """Narrow *geometry* to the properties whose loss is actually provable.
+
+    OOXML precedence between a paragraph style's own ``w:ind`` and the ``w:ind``
+    of the numbering level it references is genuinely ambiguous -- the spec's
+    style hierarchy puts paragraph styles after numbering, while Word's
+    observed behaviour for a directly referenced list is the reverse. So this
+    restores geometry only where nothing else could have supplied it: when the
+    paragraph's effective style chain sets the property, that value was
+    available before the edit and is still available after it, and guessing
+    which of the two Word preferred would risk *changing* a rendering in order
+    to protect it.
+
+    That leaves the case this exists for -- a stylesheet whose list styles
+    carry ``w:numPr`` and no ``w:ind`` at all, so the level was unambiguously
+    the only source of indentation. Anything more ambitious is a guess, and
+    the differential geometry invariant is what catches the residue.
+    """
+
+    if not geometry:
+        return ()
+    style_id = _paragraph_style_id(paragraph_xml)
+    supplied: Set[str] = (
+        _style_replacement_ppr_properties(styles_xml, style_id) if style_id else set()
+    )
+    return tuple(
+        fragment
+        for fragment in geometry
+        if re.match(r"<w:(\w+)", fragment).group(1) not in supplied
+    )
+
+
+def _paragraph_style_id(paragraph_xml: str) -> Optional[str]:
+    match = re.search(r'<w:pStyle\b[^>]*w:val="([^"]+)"', paragraph_xml)
+    return match.group(1) if match else None
+
+
+def _level_geometry(level: Optional[ET.Element]) -> Tuple[str, ...]:
+    """Serialize the geometry a level's ``w:pPr`` contributes to its paragraphs.
+
+    Returned in ``CT_PPr`` order so a caller can insert them in sequence.
+    """
+
+    if level is None:
+        return ()
+    level_ppr = level.find(_wq("pPr"))
+    if level_ppr is None:
+        return ()
+    fragments: List[str] = []
+    for local in _LEVEL_GEOMETRY_ELEMENTS:
+        element = level_ppr.find(_wq(local))
+        if element is not None:
+            fragments.append(_serialize_w_element(element))
+    return tuple(fragments)
+
+
 def _validate_converted_list(
     numbering_xml: str,
     num_ids: set[str],
     ilvls: Dict[str, set[str]],
-) -> None:
-    """Prove every converted list level has a countable, unoverridden counter."""
+) -> Dict[Tuple[str, str], Tuple[str, ...]]:
+    """Prove every converted list level has a countable, unoverridden counter.
+
+    Also returns each level's geometry, keyed by ``(numId, ilvl)``. It is
+    collected here rather than in a second pass because this is already the one
+    place that resolves every converted level, and the suppression step needs
+    exactly what this loop already holds.
+    """
 
     if not num_ids:
-        return
+        return {}
     if not numbering_xml.strip():
         raise EngineError(
             _UNPROVABLE,
@@ -283,6 +476,7 @@ def _validate_converted_list(
         prepare_xml_text_for_utf8(numbering_xml),
         "word/numbering.xml",
     )
+    geometry: Dict[Tuple[str, str], Tuple[str, ...]] = {}
     for num_id in sorted(num_ids):
         for ilvl in sorted(ilvls.get(num_id, set())):
             level, override = _find_numbering_level(root, num_id, ilvl)
@@ -295,6 +489,12 @@ def _validate_converted_list(
                 context=f"Target numbering numId={num_id} ilvl={ilvl}",
                 reject_override=True,
             )
+            # ``level`` is already the effective one: _find_numbering_level
+            # resolves an override's own ``w:lvl`` in preference to the
+            # abstract level and returns that, so its geometry is the geometry
+            # Word applies.
+            geometry[(num_id, ilvl)] = _level_geometry(level)
+    return geometry
 
 
 def _advance(counters: Dict[int, int], level: int) -> None:
@@ -436,7 +636,7 @@ def plan_canadian_to_csi(
             "Converted paragraphs span more than one Word list instance "
             f"({sorted(num_ids)}); their counters cannot be proven together.",
         )
-    _validate_converted_list(numbering_xml, num_ids, ilvls)
+    level_geometry = _validate_converted_list(numbering_xml, num_ids, ilvls)
 
     # The counter walk below is driven by the *classified* role's level, so a
     # role that disagrees with the level Word is actually rendering would
@@ -518,7 +718,17 @@ def plan_canadian_to_csi(
             source_kind = "literal"
             literal_removed += 1
         else:
-            stripped = _suppress_automatic_numbering(paragraph)
+            source_numpr = automatic_indices[index]
+            source_ilvl = str(source_numpr["ilvl"])
+            stripped = _suppress_automatic_numbering(
+                paragraph,
+                source_ilvl,
+                _restorable_level_geometry(
+                    level_geometry.get((str(source_numpr["numId"]), source_ilvl), ()),
+                    paragraph,
+                    styles_xml,
+                ),
+            )
             body = paragraph_text_from_block(paragraph)
             source_kind = "automatic"
             automatic_converted += 1

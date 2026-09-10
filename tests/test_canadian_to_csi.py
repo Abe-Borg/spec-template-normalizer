@@ -389,3 +389,163 @@ def test_suppressed_numbering_keeps_ooxml_ppr_child_order() -> None:
 def test_article_number_follows_the_active_part() -> None:
     assert _csi_marker("ARTICLE", {0: 3, 1: 7}) == "3.7"
     assert _csi_marker("PART", {0: 4}) == "PART 4"
+
+
+# --- Numbering-derived geometry ------------------------------------------
+#
+# The stylesheet below is the shape that made this class of defect invisible
+# for so long, and it is the ordinary shape rather than an exotic one: the
+# list styles carry ``w:numPr`` and no ``w:ind`` at all, so *every* indent in
+# the document is supplied by the numbering level. Cancelling the list without
+# putting that geometry back flattens the whole outline into one column while
+# leaving text, numbers and run structure provably intact -- which is why the
+# fixtures that assert on marker text could never see it.
+
+#: ``(left, hanging, numFmt, lvlText)`` per level, copied from the real
+#: Canadian PageFormat template this defect was found in, so the fixture
+#: exercises the same numbering signatures the role validator checks.
+_GEOMETRY_LEVELS = {
+    0: (720, 720, "decimal", "%1"),
+    1: (720, 720, "decimalZero", "%1.%2"),
+    2: (1259, 539, "decimal", ".%3"),
+    3: (1797, 538, "decimal", ".%4"),
+}
+
+
+def _geometry_numbering_xml() -> str:
+    levels = "".join(
+        f'<w:lvl w:ilvl="{ilvl}"><w:start w:val="1"/>'
+        f'<w:numFmt w:val="{fmt}"/><w:lvlText w:val="{text}"/>'
+        f"<w:pPr><w:tabs><w:tab w:val=\"num\" w:pos=\"{left}\"/></w:tabs>"
+        f'<w:ind w:left="{left}" w:hanging="{hanging}"/></w:pPr></w:lvl>'
+        for ilvl, (left, hanging, fmt, text) in sorted(_GEOMETRY_LEVELS.items())
+    )
+    return (
+        f'<w:numbering xmlns:w="{W_NS}">'
+        f'<w:abstractNum w:abstractNumId="7">{levels}</w:abstractNum>'
+        f'<w:num w:numId="4"><w:abstractNumId w:val="7"/></w:num>'
+        f"</w:numbering>"
+    )
+
+
+def _geometry_styles_xml(*, list1_indent: str = "") -> str:
+    """Styles that source their indentation only from the numbering level."""
+
+    styles = "".join(
+        f'<w:style w:type="paragraph" w:styleId="Geo{ilvl}">'
+        f'<w:name w:val="Geo {ilvl}"/><w:basedOn w:val="Normal"/>'
+        f'<w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="4"/></w:numPr>'
+        f"{list1_indent if ilvl == 2 else ''}</w:pPr></w:style>"
+        for ilvl in sorted(_GEOMETRY_LEVELS)
+    )
+    return (
+        f'<w:styles xmlns:w="{W_NS}">'
+        f'<w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>'
+        f"{styles}</w:styles>"
+    )
+
+
+_GEOMETRY_ROLE_STYLE = {
+    "PART": "Geo0",
+    "ARTICLE": "Geo1",
+    "PARAGRAPH": "Geo2",
+    "SUBPARAGRAPH": "Geo3",
+}
+
+
+def _convert_geometry(rows, *, styles_xml=None, extra_ppr=""):
+    roles = [role for role, _text in rows]
+    paragraphs = [
+        f'<w:p><w:pPr><w:pStyle w:val="{_GEOMETRY_ROLE_STYLE[role]}"/>{extra_ppr}</w:pPr>'
+        f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+        for role, text in rows
+    ]
+    return plan_canadian_to_csi(
+        _document(paragraphs),
+        styles_xml if styles_xml is not None else _geometry_styles_xml(),
+        _classifications(roles),
+        numbering_xml=_geometry_numbering_xml(),
+    )
+
+
+def _ppr_of(document_xml: str, index: int) -> str:
+    block = list(iter_paragraph_xml_blocks(document_xml))[index][2]
+    match = re.search(r"<w:pPr>[\s\S]*?</w:pPr>", block)
+    return match.group(0) if match else ""
+
+
+def test_cancelled_numbering_restores_the_level_indent() -> None:
+    """The indent the level supplied survives the loss of the level."""
+
+    plan = _convert_geometry(
+        [
+            ("PART", "GENERAL"),
+            ("ARTICLE", "SUMMARY"),
+            ("PARAGRAPH", "Section includes."),
+            ("SUBPARAGRAPH", "A related requirement."),
+        ]
+    )
+    for index, ilvl in enumerate((0, 1, 2, 3)):
+        left, hanging, _fmt, _text = _GEOMETRY_LEVELS[ilvl]
+        ppr = _ppr_of(plan.document_xml, index)
+        assert f'w:left="{left}"' in ppr, ppr
+        assert f'w:hanging="{hanging}"' in ppr, ppr
+        # The level's num tab stop decides where the text after the marker's
+        # tab lands; without it the tab falls through to w:defaultTabStop.
+        assert f'w:pos="{left}"' in ppr, ppr
+
+
+def test_cancelled_numbering_records_the_real_level() -> None:
+    """``w:ilvl`` states the level the paragraph actually sat at.
+
+    With ``numId=0`` the value does not render, but a paragraph claiming level
+    0 while sitting at level 3 describes itself falsely to every later reader,
+    this application's own converters included.
+    """
+
+    plan = _convert_geometry(
+        [("PART", "GENERAL"), ("ARTICLE", "SUMMARY"), ("PARAGRAPH", "Body.")]
+    )
+    levels = re.findall(r'<w:numPr><w:ilvl w:val="(\d+)"/><w:numId w:val="0"/>', plan.document_xml)
+    assert levels == ["0", "1", "2"]
+
+
+def test_restored_geometry_keeps_ooxml_ppr_child_order() -> None:
+    """``w:tabs`` (#11) and ``w:ind`` (#23) land at their schema positions."""
+
+    plan = _convert_geometry([("PARAGRAPH", "Body.")])
+    ppr = _ppr_of(plan.document_xml, 0)
+    order = [
+        ppr.index(tag)
+        for tag in ("<w:pStyle", "<w:numPr", "<w:tabs", "<w:ind")
+        if tag in ppr
+    ]
+    assert order == sorted(order), ppr
+
+
+def test_style_supplied_indent_is_left_alone() -> None:
+    """A style that sets ``w:ind`` keeps supplying it; nothing is injected.
+
+    Precedence between a style's ``w:ind`` and its numbering level's is
+    genuinely ambiguous, so the converter restores geometry only where nothing
+    else could have supplied it rather than guessing which Word preferred.
+    """
+
+    styles = _geometry_styles_xml(list1_indent='<w:ind w:left="999" w:hanging="111"/>')
+    plan = _convert_geometry([("PARAGRAPH", "Body.")], styles_xml=styles)
+    ppr = _ppr_of(plan.document_xml, 0)
+    assert "<w:ind" not in ppr, ppr
+    # The level's tab stop is still restored: the style supplies no w:tabs.
+    assert "<w:tabs>" in ppr, ppr
+
+
+def test_direct_paragraph_indent_outranks_the_level() -> None:
+    """A direct ``w:ind`` is the author's own choice and is never overwritten."""
+
+    plan = _convert_geometry(
+        [("PARAGRAPH", "Body.")],
+        extra_ppr='<w:ind w:left="2500"/>',
+    )
+    ppr = _ppr_of(plan.document_xml, 0)
+    assert 'w:left="2500"' in ppr, ppr
+    assert 'w:left="1259"' not in ppr, ppr
