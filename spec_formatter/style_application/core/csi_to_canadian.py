@@ -104,6 +104,14 @@ class CanadianConversionReport:
     unnumbered_paragraphs_numbered: int
     edits: Tuple[MarkerEdit, ...]
     warnings: Tuple[ConversionIssue, ...]
+    #: Whether the source document had ``<w:trackRevisions/>`` set, and whether
+    #: the markers this run wrote were therefore written as tracked insertions.
+    #: Both are recorded, always, so "the markers are plain text" is a visible
+    #: decision in the run record rather than something a reader has to infer
+    #: from the absence of a field.
+    source_tracks_revisions: bool = False
+    markers_tracked: bool = False
+    marker_author: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -112,6 +120,9 @@ class CanadianConversionReport:
             "literal_markers_removed": self.literal_markers_removed,
             "automatic_numbering_retargeted": self.automatic_numbering_retargeted,
             "unnumbered_paragraphs_numbered": self.unnumbered_paragraphs_numbered,
+            "source_tracks_revisions": self.source_tracks_revisions,
+            "markers_tracked": self.markers_tracked,
+            "marker_author": self.marker_author,
             "edits": [item.as_dict() for item in self.edits],
             "warnings": [item.as_dict() for item in self.warnings],
         }

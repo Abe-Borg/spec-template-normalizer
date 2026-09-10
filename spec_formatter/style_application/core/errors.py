@@ -65,6 +65,24 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "own numbering, so no CSI marker could be written for it. Check that "
         "the paragraph is a real list item with numbering that starts at 1."
     ),
+    "canadian_to_csi_tracked_hierarchy": (
+        "A heading or list paragraph is itself an unresolved tracked insertion "
+        "or deletion, so its CSI number depends on whether that revision is "
+        "later accepted or rejected. Accept or reject the tracked changes on "
+        "the reported paragraph, then convert."
+    ),
+    "conversion_prediction_mismatch": (
+        "The converted document did not match the set of numbering edits the "
+        "converter committed to before writing, so the output was withheld. "
+        "This is a defect in the application rather than in your document; "
+        "please report the target."
+    ),
+    "geometry_not_preserved": (
+        "A paragraph's effective indentation changed during formatting, so the "
+        "output was withheld. This is usually a template whose list styles take "
+        "their indents from the numbering definition; please report the target "
+        "and the reported paragraph index."
+    ),
     "builtin_scheme_contract": (
         "The built-in Canadian CSC PageFormat scheme failed its own contract "
         "check. This is a defect in the application rather than in your "
@@ -121,6 +139,7 @@ ENGINE_STAGES: tuple[str, ...] = (
     "stability_snapshot",
     "classification_application",
     "stability_verification",
+    "geometry_verification",
     "application_reporting",
     "output_publication",
     "complete",

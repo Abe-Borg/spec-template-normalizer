@@ -28,8 +28,10 @@ closed rather than publishing a document whose numbers are a guess.
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from spec_formatter.role_contract import (
     BODY_HIERARCHY_ROLES,
@@ -41,6 +43,7 @@ from .classification import (
     _build_numbering_catalog,
     _effective_numpr,
     _resolve_numbering_pattern,
+    _style_replacement_ppr_properties,
 )
 from .csi_to_canadian import (
     CanadianConversionReport,
@@ -61,6 +64,7 @@ from .marker_tools import (
     _validate_automatic_source,
     _validate_numbering_start,
     _validate_source_sequence,
+    _wq,
 )
 from .ooxml_text import prepare_xml_text_for_utf8, read_xml_text, write_xml_text
 from .sectpr_tools import extract_all_sectpr_blocks
@@ -75,6 +79,8 @@ from .xml_helpers import (
 
 _HIERARCHY = "canadian_to_csi_hierarchy"
 _UNPROVABLE = "canadian_to_csi_numbering_unprovable"
+_TRACKED = "canadian_to_csi_tracked_hierarchy"
+_PREDICTION = "conversion_prediction_mismatch"
 
 #: Roles this converter writes a marker for. ``PART`` is included
 #: unconditionally, unlike in the forward direction: a CSI ``PART 1`` heading
@@ -84,11 +90,44 @@ _CONVERTIBLE_ROLES = frozenset(BODY_HIERARCHY_ROLES)
 
 _PPR_RX = re.compile(r"<w:pPr\b[^>]*(?:/>|>.*?</w:pPr>)", re.S)
 _NUMPR_RX = re.compile(r"<w:numPr\b[^>]*(?:/>|>.*?</w:numPr>)", re.S)
-#: Word's "this paragraph is not in a list" numbering reference. Written as a
-#: direct property so it also cancels numbering inherited from a style, which
-#: simply deleting a direct ``numPr`` would not.
-_NUMBERING_OFF = '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>'
 _FIRST_TEXT_RX = re.compile(r"<w:t\b[^>]*>", re.S)
+
+
+
+_MARK_RPR_RX = re.compile(r"<w:rPr\b[^>]*(?:/>|>(.*?)</w:rPr>)", re.S)
+
+
+def _paragraph_mark_revision(paragraph_xml: str) -> Optional[str]:
+    """Return ``"insertion"``/``"deletion"`` if the paragraph *mark* is tracked.
+
+    Only ``w:pPr/w:rPr`` counts. A ``w:ins`` anywhere else in the paragraph
+    marks inserted *text*, which leaves the paragraph -- and therefore the
+    sequence -- intact under both accept and reject, so the search is bounded
+    to the ``w:pPr`` element rather than run against the whole paragraph.
+    """
+
+    ppr = _PPR_RX.search(paragraph_xml)
+    if ppr is None:
+        return None
+    mark = _MARK_RPR_RX.search(ppr.group(0))
+    if mark is None or not mark.group(1):
+        return None
+    if re.search(r"<w:ins\b", mark.group(1)):
+        return "insertion"
+    if re.search(r"<w:del\b", mark.group(1)):
+        return "deletion"
+    return None
+
+
+
+#: Revision ids must be unique within the document. The source's own ids are
+#: Word's, in the low thousands at most; starting well above that keeps the
+#: application's insertions from colliding with them without needing to scan.
+_MARKER_REVISION_ID_BASE = 900000
+
+
+def _utc_revision_date() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _escape(value: str) -> str:
@@ -149,65 +188,276 @@ def _csi_marker(role: str, counters: Dict[int, int]) -> str:
     raise AssertionError(f"Unhandled convertible role: {role}")
 
 
-#: The ``CT_PPr`` children that must precede ``w:numPr`` in schema order.
-#: ``w:numPr`` written before ``w:pStyle`` is invalid OOXML even though Word
-#: often renders it anyway, and a stricter consumer is entitled to reject the
-#: file, so the insertion point is chosen rather than assumed to be the front.
-_PPR_BEFORE_NUMPR = (
+#: The complete ``CT_PPr`` child sequence, in schema order, from
+#: ``ISO-IEC29500-4_2016/wml.xsd`` (``CT_PPrBase`` supplies 1-33 and ``CT_PPr``
+#: appends the final three).
+#:
+#: This is deliberately the *whole* table rather than a prefix trimmed to the
+#: elements written today. An abbreviated order table is only correct for the
+#: one element it was abbreviated for: a six-entry "everything before
+#: ``w:numPr``" list silently places ``w:ind`` immediately after ``w:pStyle``,
+#: which is invalid even where Word renders it, and only an XSD check catches
+#: it. Insert through :func:`_ppr_insertion_point` and this stays true for any
+#: element a later change needs to write.
+_PPR_CHILD_ORDER = (
     "w:pStyle",
     "w:keepNext",
     "w:keepLines",
     "w:pageBreakBefore",
     "w:framePr",
     "w:widowControl",
+    "w:numPr",
+    "w:suppressLineNumbers",
+    "w:pBdr",
+    "w:shd",
+    "w:tabs",
+    "w:suppressAutoHyphens",
+    "w:kinsoku",
+    "w:wordWrap",
+    "w:overflowPunct",
+    "w:topLinePunct",
+    "w:autoSpaceDE",
+    "w:autoSpaceDN",
+    "w:bidi",
+    "w:adjustRightInd",
+    "w:snapToGrid",
+    "w:spacing",
+    "w:ind",
+    "w:contextualSpacing",
+    "w:mirrorIndents",
+    "w:suppressOverlap",
+    "w:jc",
+    "w:textDirection",
+    "w:textAlignment",
+    "w:textboxTightWrap",
+    "w:outlineLvl",
+    "w:divId",
+    "w:cnfStyle",
+    "w:rPr",
+    "w:sectPr",
+    "w:pPrChange",
 )
 
 
-def _numpr_insertion_point(ppr_inner: str) -> int:
-    """Offset inside a ``w:pPr`` body where ``w:numPr`` may legally be added."""
+def _ppr_insertion_point(ppr_inner: str, element_name: str) -> int:
+    """Offset inside a ``w:pPr`` body where *element_name* may legally be added.
 
+    The offset is the end of the last present child that must precede
+    *element_name*, so the new element lands after its predecessors and before
+    everything that must follow it.
+    """
+
+    try:
+        position = _PPR_CHILD_ORDER.index(element_name)
+    except ValueError:  # pragma: no cover - guarded by the caller's constants
+        raise AssertionError(f"Unknown w:pPr child: {element_name}") from None
     offset = 0
-    for name in _PPR_BEFORE_NUMPR:
+    for name in _PPR_CHILD_ORDER[:position]:
         for match in re.finditer(rf"<{name}\b[^>]*(?:/>|>.*?</{name}>)", ppr_inner, re.S):
             offset = max(offset, match.end())
     return offset
 
 
-def _suppress_automatic_numbering(paragraph_xml: str) -> str:
-    """Return *paragraph_xml* with its effective list membership cancelled."""
+def _numbering_off(ilvl: str) -> str:
+    """Word's "this paragraph is not in a list" reference at *ilvl*.
 
+    The level is carried through rather than flattened to ``0``. With
+    ``numId=0`` the value does not render, but a paragraph that states level 0
+    while sitting at level 3 is simply describing itself falsely to the next
+    reader of the file -- including this application's own converters.
+    """
+
+    return f'<w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="0"/></w:numPr>'
+
+
+def _suppress_automatic_numbering(
+    paragraph_xml: str,
+    ilvl: str = "0",
+    level_geometry: Tuple[str, ...] = (),
+    *,
+    tracked: bool = False,
+    revision_id: int = 0,
+    revision_date: str = "",
+) -> str:
+    """Return *paragraph_xml* with its effective list membership cancelled.
+
+    Cancelling the list is only half the edit. A numbering level's ``w:pPr``
+    -- its ``w:ind`` and its ``w:tabs`` num stop -- applies *only* while the
+    paragraph is a member of that list, so ``numId=0`` discards the paragraph's
+    indentation along with its number whenever the geometry lived in
+    ``numbering.xml`` rather than in the style. Templates written that way are
+    normal, not exotic: a ``Cdn*``-style stylesheet carries ``w:numPr`` and no
+    ``w:ind`` at all, so *every* indent in the document comes from the level.
+    Dropping it flattens the whole outline into one column while leaving the
+    text, the numbers and the run structure provably intact -- which is exactly
+    why no text-level check can see it happen.
+
+    So the level's geometry is materialized onto the paragraph in the same
+    edit, which is what Word itself writes when a user turns numbering off on
+    one paragraph by hand. A property the paragraph already sets directly is
+    left alone: it already outranks the level and is the author's own choice.
+
+    The caller decides *whether* there is anything to restore -- see
+    :func:`_restorable_level_geometry`. This function only places what it is
+    given.
+    """
+
+    numbering_off = _numbering_off(ilvl)
     match = _PPR_RX.search(paragraph_xml)
+    change = (
+        _ppr_change(match.group(0) if match else "", revision_id, revision_date)
+        if tracked
+        else ""
+    )
     if match is None:
+        inserted = numbering_off + "".join(level_geometry) + change
         insert_at = paragraph_xml.index(">") + 1
         return (
             paragraph_xml[:insert_at]
-            + f"<w:pPr>{_NUMBERING_OFF}</w:pPr>"
+            + f"<w:pPr>{inserted}</w:pPr>"
             + paragraph_xml[insert_at:]
         )
     ppr = match.group(0)
     if ppr.endswith("/>"):
-        rebuilt = ppr[:-2] + ">" + _NUMBERING_OFF + "</w:pPr>"
+        inserted = numbering_off + "".join(level_geometry) + change
+        rebuilt = ppr[:-2] + ">" + inserted + "</w:pPr>"
     else:
-        without = _NUMPR_RX.sub("", ppr, count=1)
-        open_end = without.index(">") + 1
-        inner = without[open_end : without.rindex("</w:pPr>")]
-        cut = open_end + _numpr_insertion_point(inner)
-        rebuilt = without[:cut] + _NUMBERING_OFF + without[cut:]
+        rebuilt = _NUMPR_RX.sub("", ppr, count=1)
+        for fragment in (numbering_off,) + tuple(level_geometry) + (
+            (change,) if change else ()
+        ):
+            name = re.match(r"<(w:\w+)", fragment).group(1)
+            open_end = rebuilt.index(">") + 1
+            inner = rebuilt[open_end : rebuilt.rindex("</w:pPr>")]
+            if re.search(rf"<{name}\b", inner):
+                # Already set directly on the paragraph: the author's own
+                # value wins over the numbering level's.
+                continue
+            cut = open_end + _ppr_insertion_point(inner, name)
+            rebuilt = rebuilt[:cut] + fragment + rebuilt[cut:]
     return paragraph_xml[: match.start()] + rebuilt + paragraph_xml[match.end():]
 
 
-def _insert_marker(paragraph_xml: str, marker: str) -> str:
-    """Prepend *marker* and a tab inside the paragraph's first text run.
+#: Author recorded on marker insertions when the source is under review.
+#:
+#: Deliberately *not* the document author. Three things depend on it being
+#: distinguishable: Word's markup pane should show a machine conversion apart
+#: from a person's own edits; the run-structure invariant projects the app's
+#: revisions back out by author; and a reviewer validating that nothing changed
+#: the author's content outside a revision must not have that check pass
+#: trivially because the app signed the author's name to its own work.
+MARKER_REVISION_AUTHOR = "Specification Formatter"
 
-    The marker goes *into* the existing run rather than into new runs of its
-    own, for two reasons. It inherits that run's character formatting, so a
-    bold heading gets a bold number instead of a bare one in the document
-    default; and the paragraph's run structure is unchanged, which is what the
-    run-property invariant in ``phase2_invariants`` checks. Adding runs would
-    trip that check for a change that loses no formatting at all -- the right
-    answer is not to widen the invariant but not to add the runs.
+_TRACK_REVISIONS_RX = re.compile(
+    r"<w:trackRevisions\b(?![^>]*\bw:val=\"(?:0|false|off)\")"
+)
 
-    A run may hold several ``w:t`` and ``w:tab`` children, so the result is
+
+def source_tracks_revisions(settings_xml: str) -> bool:
+    """Whether ``settings.xml`` has revision tracking switched on.
+
+    ``<w:trackRevisions w:val="false"/>`` is the off state written explicitly,
+    so a bare element test would read it backwards.
+    """
+
+    return bool(_TRACK_REVISIONS_RX.search(settings_xml or ""))
+
+
+#: ``w:pPr`` children that may not appear inside ``w:pPrChange``: its content
+#: model is ``CT_PPrBase``, which stops short of these three.
+_PPR_CHANGE_EXCLUDED = ("w:rPr", "w:sectPr", "w:pPrChange")
+
+
+def _revision_attributes(revision_id: int, date: str) -> str:
+    return (
+        f' w:id="{revision_id}"'
+        f' w:author="{_escape_attribute(MARKER_REVISION_AUTHOR)}"'
+        f' w:date="{date}"'
+    )
+
+
+def _ppr_change(original_ppr: str, revision_id: int, date: str) -> str:
+    """A ``w:pPrChange`` recording the paragraph properties as they were.
+
+    Suppressing numbering is a *property* edit, not a text edit, so wrapping
+    only the marker in ``w:ins`` tracks half the change: rejecting the revision
+    would take the typed marker away and leave ``numId=0`` behind, giving the
+    paragraph no number at all -- worse than either the source or the output.
+    ``w:pPrChange`` carries the previous properties, so a rejection restores
+    the paragraph's original numbering along with its original text.
+    """
+
+    inner = ""
+    if original_ppr:
+        body = original_ppr
+        if body.endswith("/>"):
+            inner = ""
+        else:
+            open_end = body.index(">") + 1
+            inner = body[open_end : body.rindex("</w:pPr>")]
+            for name in _PPR_CHANGE_EXCLUDED:
+                inner = re.sub(
+                    rf"<{name}\b[^>]*(?:/>|>.*?</{name}>)", "", inner, flags=re.S
+                )
+    return (
+        f"<w:pPrChange{_revision_attributes(revision_id, date)}>"
+        f"<w:pPr>{inner}</w:pPr></w:pPrChange>"
+    )
+
+
+_RUN_RPR_RX = re.compile(r"<w:rPr\b[^>]*(?:/>|>.*?</w:rPr>)", re.S)
+
+
+def _run_properties(run_xml: str) -> str:
+    """The ``w:rPr`` of a run, or empty when it carries none.
+
+    Copied onto a tracked marker run so the marker matches the text it
+    precedes. The untracked path gets this for free by joining the existing
+    run; a tracked marker must be its own run, and a bare one renders in the
+    document defaults -- a bold 14pt heading would get a plain number. The
+    run-property invariant cannot catch it either, because it removes this
+    application's insertions before comparing.
+    """
+
+    match = _RUN_RPR_RX.search(run_xml)
+    return match.group(0) if match else ""
+
+
+def _tracked_marker_run(
+    marker: str, revision_id: int, date: str, run_properties: str = ""
+) -> str:
+    return (
+        f"<w:ins{_revision_attributes(revision_id, date)}>"
+        f"<w:r>{run_properties}<w:t xml:space=\"preserve\">{_escape(marker)}</w:t>"
+        f"<w:tab/></w:r></w:ins>"
+    )
+
+
+def _insert_marker(
+    paragraph_xml: str,
+    marker: str,
+    *,
+    tracked: bool = False,
+    revision_id: int = 0,
+    revision_date: str = "",
+) -> str:
+    """Prepend *marker* and a tab at the start of the paragraph's text.
+
+    Untracked, the marker goes *into* the paragraph's existing first run rather
+    than into a run of its own, for two reasons. It inherits that run's
+    character formatting, so a bold heading gets a bold number instead of a
+    bare one in the document default; and the paragraph's run structure is
+    unchanged, which is what the run-property invariant in ``phase2_invariants``
+    checks. Adding runs would trip that check for a change that loses no
+    formatting at all.
+
+    Tracked, it cannot: a revision is a subtree, so the marker must be its own
+    run inside ``w:ins``. That does shift every following run index, and the
+    answer is still not to widen the invariant -- ``phase2_invariants`` runs the
+    unchanged check against the document with this application's own revisions
+    projected back out, where the run structure is identical again.
+
+    A run may hold several ``w:t`` and ``w:tab`` children, so both results are
     ordinary OOXML.
     """
 
@@ -232,6 +482,24 @@ def _insert_marker(paragraph_xml: str, marker: str) -> str:
                 f"result, so CSI marker {marker!r} could not be written where it "
                 "would survive. Accept the changes or unlink the field first.",
             )
+        if tracked:
+            # The revision wraps its own run, so it is placed before the run
+            # holding the first text rather than inside it.
+            run_start = unprotected.rfind("<w:r", 0, match.start())
+            if run_start < 0:
+                raise EngineError(
+                    _HIERARCHY,
+                    f"A paragraph classified for CSI marker {marker!r} has no run "
+                    "to place a tracked marker before.",
+                )
+            # The run this marker is placed before is the run it should look
+            # like, so its properties come along.
+            run_end = unprotected.find("</w:r>", run_start)
+            source_run = unprotected[run_start : run_end if run_end >= 0 else None]
+            insertion = _tracked_marker_run(
+                marker, revision_id, revision_date, _run_properties(source_run)
+            )
+            return unprotected[:run_start] + insertion + unprotected[run_start:]
         prefix = f'<w:t xml:space="preserve">{_escape(marker)}</w:t><w:tab/>'
         return unprotected[: match.start()] + prefix + unprotected[match.start():]
 
@@ -264,15 +532,163 @@ def _verify_marked_paragraph(
         )
 
 
+#: Numbering-level ``w:pPr`` children that carry the geometry a paragraph
+#: loses when it stops being a list member, in schema order. ``w:ind`` is the
+#: indentation itself; ``w:tabs`` is the level's num tab stop, which decides
+#: where the text after the marker's tab actually lands.
+_LEVEL_GEOMETRY_ELEMENTS = ("tabs", "ind")
+
+
+def _serialize_w_element(element: ET.Element) -> str:
+    """Serialize a WordprocessingML element as a prefixed, declaration-free fragment.
+
+    ``ET.tostring`` would emit an ``xmlns`` declaration on the fragment root (or
+    an ``ns0`` prefix), neither of which can be spliced into a paragraph that
+    already declares ``w``. These elements are small and attribute-only apart
+    from ``w:tabs``'s children, so the fragment is built directly.
+    """
+
+    local = element.tag.split("}", 1)[-1]
+    attributes = "".join(
+        f' w:{name.split("}", 1)[-1]}="{_escape_attribute(value)}"'
+        for name, value in sorted(element.attrib.items())
+    )
+    children = "".join(_serialize_w_element(child) for child in element)
+    if not children:
+        return f"<w:{local}{attributes}/>"
+    return f"<w:{local}{attributes}>{children}</w:{local}>"
+
+
+def _escape_attribute(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _restorable_level_geometry(
+    geometry: Tuple[str, ...],
+    paragraph_xml: str,
+    styles_xml: str,
+) -> Tuple[str, ...]:
+    """Narrow *geometry* to the properties whose loss is actually provable.
+
+    OOXML precedence between a paragraph style's own ``w:ind`` and the ``w:ind``
+    of the numbering level it references is genuinely ambiguous -- the spec's
+    style hierarchy puts paragraph styles after numbering, while Word's
+    observed behaviour for a directly referenced list is the reverse. So this
+    restores geometry only where nothing else could have supplied it: when the
+    paragraph's effective style chain sets the property, that value was
+    available before the edit and is still available after it, and guessing
+    which of the two Word preferred would risk *changing* a rendering in order
+    to protect it.
+
+    That leaves the case this exists for -- a stylesheet whose list styles
+    carry ``w:numPr`` and no ``w:ind`` at all, so the level was unambiguously
+    the only source of indentation. Anything more ambitious is a guess, and
+    the differential geometry invariant is what catches the residue.
+    """
+
+    if not geometry:
+        return ()
+    style_id = _paragraph_style_id(paragraph_xml)
+    supplied: Set[str] = (
+        _style_replacement_ppr_properties(styles_xml, style_id) if style_id else set()
+    )
+    return tuple(
+        fragment
+        for fragment in geometry
+        if re.match(r"<w:(\w+)", fragment).group(1) not in supplied
+    )
+
+
+def _paragraph_style_id(paragraph_xml: str) -> Optional[str]:
+    match = re.search(r'<w:pStyle\b[^>]*w:val="([^"]+)"', paragraph_xml)
+    return match.group(1) if match else None
+
+
+def _level_geometry(level: Optional[ET.Element]) -> Tuple[str, ...]:
+    """Serialize the geometry a level's ``w:pPr`` contributes to its paragraphs.
+
+    Returned in ``CT_PPr`` order so a caller can insert them in sequence.
+    """
+
+    if level is None:
+        return ()
+    level_ppr = level.find(_wq("pPr"))
+    if level_ppr is None:
+        return ()
+    fragments: List[str] = []
+    for local in _LEVEL_GEOMETRY_ELEMENTS:
+        element = level_ppr.find(_wq(local))
+        if element is not None:
+            fragments.append(_serialize_w_element(element))
+    return tuple(fragments)
+
+
+
+def _verify_prediction(
+    before_blocks: List[Any],
+    after_blocks: List[Any],
+    predicted: List[Tuple[int, str, str]],
+    *,
+    describe: Callable[[int], str],
+) -> None:
+    """Assert the finished document is exactly the document that was predicted.
+
+    Read back out of the assembled XML rather than off the edit list, so this
+    cannot pass by agreeing with the code that produced it. Two things are
+    checked and both matter:
+
+    * every predicted paragraph leads with its predicted marker -- tested on
+      the text rather than on whether the paragraph changed, because a typed
+      Canadian ``PART 1`` converts to a CSI ``PART 1`` and correctly leaves the
+      text untouched; and
+    * no paragraph outside the prediction changed its text at all, which is the
+      half that catches an edit nobody asked for.
+    """
+
+    expected = {index: marker for index, _role, marker in predicted}
+
+    for index, marker in expected.items():
+        actual = paragraph_text_from_block(after_blocks[index][2])
+        if not actual.startswith(marker):
+            raise EngineError(
+                _PREDICTION,
+                f"Paragraph {index}{describe(index)} was predicted to lead with "
+                f"CSI marker {marker!r} but does not.",
+            )
+
+    for index, (_start, _end, before) in enumerate(before_blocks):
+        if index in expected:
+            continue
+        if paragraph_text_from_block(before) != paragraph_text_from_block(
+            after_blocks[index][2]
+        ):
+            raise EngineError(
+                _PREDICTION,
+                f"Paragraph {index}{describe(index)} changed text but no CSI "
+                "marker was predicted for it.",
+            )
+
+
 def _validate_converted_list(
     numbering_xml: str,
     num_ids: set[str],
     ilvls: Dict[str, set[str]],
-) -> None:
-    """Prove every converted list level has a countable, unoverridden counter."""
+) -> Dict[Tuple[str, str], Tuple[str, ...]]:
+    """Prove every converted list level has a countable, unoverridden counter.
+
+    Also returns each level's geometry, keyed by ``(numId, ilvl)``. It is
+    collected here rather than in a second pass because this is already the one
+    place that resolves every converted level, and the suppression step needs
+    exactly what this loop already holds.
+    """
 
     if not num_ids:
-        return
+        return {}
     if not numbering_xml.strip():
         raise EngineError(
             _UNPROVABLE,
@@ -283,6 +699,7 @@ def _validate_converted_list(
         prepare_xml_text_for_utf8(numbering_xml),
         "word/numbering.xml",
     )
+    geometry: Dict[Tuple[str, str], Tuple[str, ...]] = {}
     for num_id in sorted(num_ids):
         for ilvl in sorted(ilvls.get(num_id, set())):
             level, override = _find_numbering_level(root, num_id, ilvl)
@@ -295,6 +712,12 @@ def _validate_converted_list(
                 context=f"Target numbering numId={num_id} ilvl={ilvl}",
                 reject_override=True,
             )
+            # ``level`` is already the effective one: _find_numbering_level
+            # resolves an override's own ``w:lvl`` in preference to the
+            # abstract level and returns that, so its geometry is the geometry
+            # Word applies.
+            geometry[(num_id, ilvl)] = _level_geometry(level)
+    return geometry
 
 
 def _advance(counters: Dict[int, int], level: int) -> None:
@@ -312,6 +735,8 @@ def plan_canadian_to_csi(
     classifications: Dict[str, Any],
     *,
     numbering_xml: str = "",
+    settings_xml: str = "",
+    revision_date: str = "",
 ) -> ConversionPlan:
     """Validate and build the complete document edit before writing anything."""
 
@@ -436,7 +861,7 @@ def plan_canadian_to_csi(
             "Converted paragraphs span more than one Word list instance "
             f"({sorted(num_ids)}); their counters cannot be proven together.",
         )
-    _validate_converted_list(numbering_xml, num_ids, ilvls)
+    level_geometry = _validate_converted_list(numbering_xml, num_ids, ilvls)
 
     # The counter walk below is driven by the *classified* role's level, so a
     # role that disagrees with the level Word is actually rendering would
@@ -488,42 +913,114 @@ def plan_canadian_to_csi(
                 "leaving it numbered would desynchronise the sequence.",
             )
 
+    # A paragraph whose *mark* is an unresolved tracked revision does not have
+    # one position in the sequence, it has two: reject an inserted mark and the
+    # paragraph disappears, accept a deleted one and it merges into the next.
+    # Automatic numbering renumbers itself either way. A literal marker cannot,
+    # so every marker after such a paragraph would silently become wrong the
+    # moment somebody resolved the revision -- in a document a reader trusts,
+    # long after this run is forgotten.
+    for index in sorted(effective_role_by_index):
+        if effective_role_by_index[index] not in _CONVERTIBLE_ROLES:
+            continue
+        revision = _paragraph_mark_revision(blocks[index][2])
+        if revision is not None:
+            raise EngineError(
+                _TRACKED,
+                f"Paragraph {index}{locate(index)} is classified as a numbered "
+                f"role but its paragraph mark is a tracked {revision}; its CSI "
+                "number would depend on whether that revision is accepted.",
+            )
+
     _validate_source_sequence(evidence, describe=locate, error_code=_HIERARCHY)
 
     # --- Pass 2: walk the counters and build the edits ----------------------
-    counters: Dict[int, int] = {}
-    replacements: Dict[int, str] = {}
-    edits: List[MarkerEdit] = []
-    literal_removed = 0
-    automatic_converted = 0
+    # A document with revision tracking on is in an active review cycle, and
+    # writing 122 numbers into it as plain accepted text would put the
+    # application's own work beyond the reach of the review everything else in
+    # the document is subject to. Where the source says edits are tracked, the
+    # markers are tracked too.
+    tracked = source_tracks_revisions(settings_xml)
+    date = revision_date or _utc_revision_date()
 
+    # The counter walk runs to completion *before* any paragraph is touched,
+    # and the list it produces is then asserted against the finished document.
+    # Recording what an edit did after doing it only proves the recorder and
+    # the editor agree; committing to the whole answer first and checking the
+    # document against it is what makes the check independent of the code that
+    # produced it. Nothing here needs the document mutated to be computed, so
+    # this costs a loop and buys a real assertion.
+    counters: Dict[int, int] = {}
+    predicted: List[Tuple[int, str, str]] = []
     for index, role in sorted(effective_role_by_index.items()):
         if role not in _CONVERTIBLE_ROLES:
             continue
-        level = ROLE_LEVEL[role]
-        _advance(counters, level)
+        _advance(counters, ROLE_LEVEL[role])
         if role == "ARTICLE" and ROLE_LEVEL["PART"] not in counters:
             raise EngineError(
                 _HIERARCHY,
                 f"Paragraph {index}{locate(index)} is an ARTICLE with no preceding "
                 "PART, so its CSI article number cannot be formed.",
             )
-        marker = _csi_marker(role, counters)
+        predicted.append((index, role, _csi_marker(role, counters)))
+
+    replacements: Dict[int, str] = {}
+    edits: List[MarkerEdit] = []
+    literal_removed = 0
+    automatic_converted = 0
+
+    for index, role, marker in predicted:
         paragraph = blocks[index][2]
 
         literal = literal_indices.get(index)
         if literal is not None:
+            if tracked:
+                # Replacing a typed marker is a text deletion plus a text
+                # insertion. The insertion is tracked below, but the deletion
+                # rewrites w:t contents in place inside shared code both
+                # converters use, and cannot be represented as w:del without
+                # restructuring that path. Rather than make half the edit
+                # reviewable and quietly drop the other half -- the same defect
+                # this mode was added to avoid -- the target fails closed and
+                # says what to do about it.
+                raise EngineError(
+                    _TRACKED,
+                    f"Paragraph {index}{locate(index)} carries the typed marker "
+                    f"{literal.marker!r}, and replacing it while revision "
+                    "tracking is on would delete text without recording the "
+                    "deletion as a revision. Turn Track Changes off for the "
+                    "conversion, or accept the existing markers first.",
+                )
             stripped, _tab_removed = _remove_literal_marker(paragraph, role)
             body = literal.body_text
             source_kind = "literal"
             literal_removed += 1
         else:
-            stripped = _suppress_automatic_numbering(paragraph)
+            source_numpr = automatic_indices[index]
+            source_ilvl = str(source_numpr["ilvl"])
+            stripped = _suppress_automatic_numbering(
+                paragraph,
+                source_ilvl,
+                _restorable_level_geometry(
+                    level_geometry.get((str(source_numpr["numId"]), source_ilvl), ()),
+                    paragraph,
+                    styles_xml,
+                ),
+                tracked=tracked,
+                revision_id=_MARKER_REVISION_ID_BASE + 2 * len(edits) + 1,
+                revision_date=date,
+            )
             body = paragraph_text_from_block(paragraph)
             source_kind = "automatic"
             automatic_converted += 1
 
-        converted = _insert_marker(stripped, marker)
+        converted = _insert_marker(
+            stripped,
+            marker,
+            tracked=tracked,
+            revision_id=_MARKER_REVISION_ID_BASE + 2 * len(edits),
+            revision_date=date,
+        )
         _verify_marked_paragraph(index, converted, marker, body, describe=locate)
         replacements[index] = converted
         edits.append(
@@ -561,6 +1058,7 @@ def plan_canadian_to_csi(
         prepare_xml_text_for_utf8(converted_document),
         "word/document.xml (converted)",
     )
+    _verify_prediction(blocks, after_blocks, predicted, describe=locate)
 
     report = CanadianConversionReport(
         paragraphs_examined=sum(
@@ -572,6 +1070,9 @@ def plan_canadian_to_csi(
         unnumbered_paragraphs_numbered=0,
         edits=tuple(edits),
         warnings=tuple(warnings),
+        source_tracks_revisions=tracked,
+        markers_tracked=tracked and automatic_converted + literal_removed > 0,
+        marker_author=MARKER_REVISION_AUTHOR if tracked else None,
     )
     return ConversionPlan(converted_document, report)
 
@@ -586,12 +1087,16 @@ def apply_canadian_to_csi(
     document_path = Path(extract_dir) / "word" / "document.xml"
     styles_path = Path(extract_dir) / "word" / "styles.xml"
     numbering_path = Path(extract_dir) / "word" / "numbering.xml"
+    settings_path = Path(extract_dir) / "word" / "settings.xml"
     plan = plan_canadian_to_csi(
         read_xml_text(document_path),
         read_xml_text(styles_path),
         classifications,
         numbering_xml=(
             read_xml_text(numbering_path) if numbering_path.is_file() else ""
+        ),
+        settings_xml=(
+            read_xml_text(settings_path) if settings_path.is_file() else ""
         ),
     )
     write_xml_text(document_path, plan.document_xml)
@@ -609,6 +1114,7 @@ def apply_canadian_to_csi(
 
 
 __all__ = [
+    "MARKER_REVISION_AUTHOR",
     "apply_canadian_to_csi",
     "plan_canadian_to_csi",
 ]
