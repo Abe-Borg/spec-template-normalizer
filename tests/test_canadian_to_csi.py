@@ -635,3 +635,94 @@ def test_inline_tracked_insertion_still_converts() -> None:
     )
     assert plan.report.paragraphs_converted == 2
     assert "1.1" in plan.document_xml
+
+
+# --- Tracked markers ------------------------------------------------------
+
+
+_TRACKING_ON = f'<w:settings xmlns:w="{W_NS}"><w:trackRevisions/></w:settings>'
+_TRACKING_OFF = f'<w:settings xmlns:w="{W_NS}"><w:trackRevisions w:val="false"/></w:settings>'
+
+
+def _convert_tracked(rows, settings_xml):
+    roles = [role for role, _text in rows]
+    paragraphs = [
+        f'<w:p><w:pPr><w:pStyle w:val="{_GEOMETRY_ROLE_STYLE[role]}"/></w:pPr>'
+        f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+        for role, text in rows
+    ]
+    return plan_canadian_to_csi(
+        _document(paragraphs),
+        _geometry_styles_xml(),
+        _classifications(roles),
+        numbering_xml=_geometry_numbering_xml(),
+        settings_xml=settings_xml,
+        revision_date="2026-01-01T00:00:00Z",
+    )
+
+
+def test_markers_are_tracked_when_the_source_tracks_revisions() -> None:
+    """A document under review gets the application's work reviewed too.
+
+    Writing numbers into a spec with tracking on as plain accepted text puts
+    them beyond the reach of the review every other change in the file is
+    subject to -- and a validator asking "was anything changed outside a
+    revision" would name all of them.
+    """
+
+    plan = _convert_tracked([("PART", "GENERAL"), ("ARTICLE", "SUMMARY")], _TRACKING_ON)
+    assert plan.report.source_tracks_revisions is True
+    assert plan.report.markers_tracked is True
+    assert plan.report.marker_author == "Specification Formatter"
+    insertions = re.findall(
+        r'<w:ins\b[^>]*w:author="Specification Formatter"[^>]*>', plan.document_xml
+    )
+    assert len(insertions) == 2
+    assert plan.document_xml.count('w:date="2026-01-01T00:00:00Z"') == 2
+
+
+def test_markers_are_plain_text_when_tracking_is_off() -> None:
+    """Untracked stays untracked: the marker joins the paragraph's own run."""
+
+    plan = _convert_tracked([("PART", "GENERAL")], _TRACKING_OFF)
+    assert plan.report.source_tracks_revisions is False
+    assert plan.report.markers_tracked is False
+    assert plan.report.marker_author is None
+    assert "<w:ins" not in plan.document_xml
+
+
+def test_tracking_absent_from_settings_is_not_tracking() -> None:
+    plan = _convert_tracked([("PART", "GENERAL")], "")
+    assert plan.report.source_tracks_revisions is False
+
+
+def test_rejecting_the_tracked_markers_restores_the_source_text() -> None:
+    """The whole conversion is reversible in Word, which is the point.
+
+    A marker that cannot be rejected is a permanent edit wearing a revision's
+    clothing.
+    """
+
+    rows = [("PART", "GENERAL"), ("ARTICLE", "SUMMARY"), ("PARAGRAPH", "Body text.")]
+    plan = _convert_tracked(rows, _TRACKING_ON)
+    without_insertions = re.sub(
+        r"<w:ins\b[^>]*>.*?</w:ins>", "", plan.document_xml, flags=re.S
+    )
+    restored = [
+        paragraph_text_from_block(block)
+        for _s, _e, block in iter_paragraph_xml_blocks(without_insertions)
+    ]
+    assert restored == [text for _role, text in rows]
+
+
+def test_tracked_marker_run_precedes_the_original_run() -> None:
+    """The revision wraps its own run and is placed before, never inside.
+
+    A marker inside the paragraph's existing run could not be rejected
+    independently of the text around it.
+    """
+
+    plan = _convert_tracked([("PART", "GENERAL")], _TRACKING_ON)
+    body = plan.document_xml
+    assert body.index("<w:ins") < body.index("GENERAL")
+    assert re.search(r"<w:ins\b[^>]*><w:r><w:t[^>]*>PART 1</w:t><w:tab/></w:r></w:ins>", body)

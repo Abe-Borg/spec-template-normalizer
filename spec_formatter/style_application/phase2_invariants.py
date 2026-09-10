@@ -19,6 +19,7 @@ from .core.classification import (
     _effective_numbering_semantics,
     _effective_numpr,
 )
+from .core.canadian_to_csi import MARKER_REVISION_AUTHOR
 from .core.errors import EngineError
 from .core.xml_helpers import (
     iter_direct_child_xml_blocks,
@@ -1159,6 +1160,25 @@ def _verify_effective_paragraph_geometry(
             )
 
 
+
+_OWN_REVISION_RX = re.compile(
+    rf'<w:ins\b[^>]*w:author="{re.escape(MARKER_REVISION_AUTHOR)}"[^>]*'
+    r"(?:/>|>.*?</w:ins>)",
+    re.S,
+)
+
+
+def _without_own_revisions(paragraph_xml: str) -> str:
+    """Drop insertions this application authored, keeping everyone else's.
+
+    Scoped by author on purpose: a reviewer's pending edits must stay in the
+    comparison, because losing run formatting inside one of those is exactly
+    as damaging as losing it anywhere else.
+    """
+
+    return _OWN_REVISION_RX.sub("", paragraph_xml)
+
+
 def _styles_and_numbering(docx: Path) -> tuple:
     """Decoded ``styles.xml`` and ``numbering.xml``, empty when absent."""
 
@@ -1403,8 +1423,16 @@ def verify_phase2_invariants(
     before_paragraphs = [
         block for _start, _end, block in iter_paragraph_xml_blocks(before_doc)
     ]
+    # This application's own tracked marker insertions are projected back out
+    # before the comparison. A revision is a subtree, so a tracked marker has
+    # to be its own run, which shifts every later run index and sibling
+    # position -- and the run-property check keys on exactly those. Widening
+    # the check to tolerate an offset would blind it to the real losses it
+    # exists to catch; removing our own revisions restores the source's run
+    # structure exactly, so the unchanged check still means what it says.
     after_paragraphs = [
-        block for _start, _end, block in iter_paragraph_xml_blocks(after_doc)
+        _without_own_revisions(block)
+        for _start, _end, block in iter_paragraph_xml_blocks(after_doc)
     ]
     if len(before_paragraphs) != len(after_paragraphs):
         raise RuntimeError(

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -115,6 +116,17 @@ def _paragraph_mark_revision(paragraph_xml: str) -> Optional[str]:
     if re.search(r"<w:del\b", mark.group(1)):
         return "deletion"
     return None
+
+
+
+#: Revision ids must be unique within the document. The source's own ids are
+#: Word's, in the low thousands at most; starting well above that keeps the
+#: application's insertions from colliding with them without needing to scan.
+_MARKER_REVISION_ID_BASE = 900000
+
+
+def _utc_revision_date() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _escape(value: str) -> str:
@@ -314,18 +326,64 @@ def _suppress_automatic_numbering(
     return paragraph_xml[: match.start()] + rebuilt + paragraph_xml[match.end():]
 
 
-def _insert_marker(paragraph_xml: str, marker: str) -> str:
-    """Prepend *marker* and a tab inside the paragraph's first text run.
+#: Author recorded on marker insertions when the source is under review.
+#:
+#: Deliberately *not* the document author. Three things depend on it being
+#: distinguishable: Word's markup pane should show a machine conversion apart
+#: from a person's own edits; the run-structure invariant projects the app's
+#: revisions back out by author; and a reviewer validating that nothing changed
+#: the author's content outside a revision must not have that check pass
+#: trivially because the app signed the author's name to its own work.
+MARKER_REVISION_AUTHOR = "Specification Formatter"
 
-    The marker goes *into* the existing run rather than into new runs of its
-    own, for two reasons. It inherits that run's character formatting, so a
-    bold heading gets a bold number instead of a bare one in the document
-    default; and the paragraph's run structure is unchanged, which is what the
-    run-property invariant in ``phase2_invariants`` checks. Adding runs would
-    trip that check for a change that loses no formatting at all -- the right
-    answer is not to widen the invariant but not to add the runs.
+_TRACK_REVISIONS_RX = re.compile(
+    r"<w:trackRevisions\b(?![^>]*\bw:val=\"(?:0|false|off)\")"
+)
 
-    A run may hold several ``w:t`` and ``w:tab`` children, so the result is
+
+def source_tracks_revisions(settings_xml: str) -> bool:
+    """Whether ``settings.xml`` has revision tracking switched on.
+
+    ``<w:trackRevisions w:val="false"/>`` is the off state written explicitly,
+    so a bare element test would read it backwards.
+    """
+
+    return bool(_TRACK_REVISIONS_RX.search(settings_xml or ""))
+
+
+def _tracked_marker_run(marker: str, revision_id: int, date: str) -> str:
+    return (
+        f'<w:ins w:id="{revision_id}" w:author="{_escape_attribute(MARKER_REVISION_AUTHOR)}"'
+        f' w:date="{date}"><w:r><w:t xml:space="preserve">{_escape(marker)}</w:t>'
+        f"<w:tab/></w:r></w:ins>"
+    )
+
+
+def _insert_marker(
+    paragraph_xml: str,
+    marker: str,
+    *,
+    tracked: bool = False,
+    revision_id: int = 0,
+    revision_date: str = "",
+) -> str:
+    """Prepend *marker* and a tab at the start of the paragraph's text.
+
+    Untracked, the marker goes *into* the paragraph's existing first run rather
+    than into a run of its own, for two reasons. It inherits that run's
+    character formatting, so a bold heading gets a bold number instead of a
+    bare one in the document default; and the paragraph's run structure is
+    unchanged, which is what the run-property invariant in ``phase2_invariants``
+    checks. Adding runs would trip that check for a change that loses no
+    formatting at all.
+
+    Tracked, it cannot: a revision is a subtree, so the marker must be its own
+    run inside ``w:ins``. That does shift every following run index, and the
+    answer is still not to widen the invariant -- ``phase2_invariants`` runs the
+    unchanged check against the document with this application's own revisions
+    projected back out, where the run structure is identical again.
+
+    A run may hold several ``w:t`` and ``w:tab`` children, so both results are
     ordinary OOXML.
     """
 
@@ -350,6 +408,18 @@ def _insert_marker(paragraph_xml: str, marker: str) -> str:
                 f"result, so CSI marker {marker!r} could not be written where it "
                 "would survive. Accept the changes or unlink the field first.",
             )
+        if tracked:
+            # The revision wraps its own run, so it is placed before the run
+            # holding the first text rather than inside it.
+            run_start = unprotected.rfind("<w:r", 0, match.start())
+            if run_start < 0:
+                raise EngineError(
+                    _HIERARCHY,
+                    f"A paragraph classified for CSI marker {marker!r} has no run "
+                    "to place a tracked marker before.",
+                )
+            insertion = _tracked_marker_run(marker, revision_id, revision_date)
+            return unprotected[:run_start] + insertion + unprotected[run_start:]
         prefix = f'<w:t xml:space="preserve">{_escape(marker)}</w:t><w:tab/>'
         return unprotected[: match.start()] + prefix + unprotected[match.start():]
 
@@ -539,6 +609,8 @@ def plan_canadian_to_csi(
     classifications: Dict[str, Any],
     *,
     numbering_xml: str = "",
+    settings_xml: str = "",
+    revision_date: str = "",
 ) -> ConversionPlan:
     """Validate and build the complete document edit before writing anything."""
 
@@ -737,6 +809,13 @@ def plan_canadian_to_csi(
     _validate_source_sequence(evidence, describe=locate, error_code=_HIERARCHY)
 
     # --- Pass 2: walk the counters and build the edits ----------------------
+    # A document with revision tracking on is in an active review cycle, and
+    # writing 122 numbers into it as plain accepted text would put the
+    # application's own work beyond the reach of the review everything else in
+    # the document is subject to. Where the source says edits are tracked, the
+    # markers are tracked too.
+    tracked = source_tracks_revisions(settings_xml)
+    date = revision_date or _utc_revision_date()
     counters: Dict[int, int] = {}
     replacements: Dict[int, str] = {}
     edits: List[MarkerEdit] = []
@@ -779,7 +858,13 @@ def plan_canadian_to_csi(
             source_kind = "automatic"
             automatic_converted += 1
 
-        converted = _insert_marker(stripped, marker)
+        converted = _insert_marker(
+            stripped,
+            marker,
+            tracked=tracked,
+            revision_id=_MARKER_REVISION_ID_BASE + len(edits),
+            revision_date=date,
+        )
         _verify_marked_paragraph(index, converted, marker, body, describe=locate)
         replacements[index] = converted
         edits.append(
@@ -828,6 +913,9 @@ def plan_canadian_to_csi(
         unnumbered_paragraphs_numbered=0,
         edits=tuple(edits),
         warnings=tuple(warnings),
+        source_tracks_revisions=tracked,
+        markers_tracked=tracked and automatic_converted + literal_removed > 0,
+        marker_author=MARKER_REVISION_AUTHOR if tracked else None,
     )
     return ConversionPlan(converted_document, report)
 
@@ -842,12 +930,16 @@ def apply_canadian_to_csi(
     document_path = Path(extract_dir) / "word" / "document.xml"
     styles_path = Path(extract_dir) / "word" / "styles.xml"
     numbering_path = Path(extract_dir) / "word" / "numbering.xml"
+    settings_path = Path(extract_dir) / "word" / "settings.xml"
     plan = plan_canadian_to_csi(
         read_xml_text(document_path),
         read_xml_text(styles_path),
         classifications,
         numbering_xml=(
             read_xml_text(numbering_path) if numbering_path.is_file() else ""
+        ),
+        settings_xml=(
+            read_xml_text(settings_path) if settings_path.is_file() else ""
         ),
     )
     write_xml_text(document_path, plan.document_xml)
@@ -865,6 +957,7 @@ def apply_canadian_to_csi(
 
 
 __all__ = [
+    "MARKER_REVISION_AUTHOR",
     "apply_canadian_to_csi",
     "plan_canadian_to_csi",
 ]
