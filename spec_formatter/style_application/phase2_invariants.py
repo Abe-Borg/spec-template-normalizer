@@ -1113,7 +1113,7 @@ def _verify_effective_paragraph_geometry(
     after_numbering: str,
     *,
     applies_document_shell: bool = False,
-) -> None:
+) -> int:
     """Fail closed if a paragraph's effective indentation changed.
 
     **Differential, not absolute.** OOXML precedence between a paragraph
@@ -1143,16 +1143,19 @@ def _verify_effective_paragraph_geometry(
     before_blocks = [b for _s, _e, b in iter_paragraph_xml_blocks(before_document_xml)]
     after_blocks = [b for _s, _e, b in iter_paragraph_xml_blocks(after_document_xml)]
     if len(before_blocks) != len(after_blocks):
-        return  # paragraph-count changes are another invariant's failure to report
+        # Paragraph-count changes are another invariant's failure to report.
+        return 0
 
     before_levels = _numbering_level_ind_index(before_numbering)
     after_levels = _numbering_level_ind_index(after_numbering)
     before_defaults = _doc_defaults_ind(before_styles)
     after_defaults = _doc_defaults_ind(after_styles)
 
+    compared = 0
     for index, (before, after) in enumerate(zip(before_blocks, after_blocks)):
         if before == after and applies_document_shell:
             continue
+        compared += 1
         before_sources = _paragraph_geometry_sources(before, before_styles, before_levels)
         after_sources = _paragraph_geometry_sources(after, after_styles, after_levels)
         if (before_sources, before_defaults) == (after_sources, after_defaults):
@@ -1170,6 +1173,7 @@ def _verify_effective_paragraph_geometry(
                 f"{_resolve_geometry(before_sources, before_defaults, True)} and the "
                 f"output to {_resolve_geometry(after_sources, after_defaults, True)}.",
             )
+    return compared
 
 
 
@@ -1211,6 +1215,7 @@ def verify_phase2_invariants(
     policy: Optional["ApplicationPolicy"] = None,
     conversion_mode: Optional[str] = None,
     allowed_rpr_properties_by_paragraph: Optional[Dict[int, Set[str]]] = None,
+    verification_out: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Verify Phase 2 invariants:
@@ -1246,7 +1251,7 @@ def verify_phase2_invariants(
             if new_docx is not None
             else (before_styles, before_numbering)
         )
-        _verify_effective_paragraph_geometry(
+        compared = _verify_effective_paragraph_geometry(
             before_doc,
             after_doc,
             before_styles,
@@ -1255,6 +1260,12 @@ def verify_phase2_invariants(
             after_numbering,
             applies_document_shell=application_policy.apply_full_architect_shell,
         )
+        if verification_out is not None:
+            # Recorded on success as well as failure. An invariant that only
+            # speaks when it trips leaves a run unable to show it ran at all,
+            # which is indistinguishable from one where it was skipped.
+            verification_out["geometry_checked"] = True
+            verification_out["geometry_paragraphs_compared"] = compared
 
     before_records = _sectpr_records(before_doc)
     after_records = _sectpr_records(after_doc)

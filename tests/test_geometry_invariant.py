@@ -230,3 +230,49 @@ def test_an_edited_paragraph_is_checked_even_under_a_shell() -> None:
             applies_document_shell=True,
         )
     assert raised.value.code == "geometry_not_preserved"
+
+
+# --- Reporting ------------------------------------------------------------
+
+
+def test_the_check_reports_its_work_on_success() -> None:
+    """An invariant that only speaks when it trips cannot be shown to have run.
+
+    Silence is then indistinguishable from being skipped -- which is precisely
+    the state the engine was in before this check existed, and the reason a
+    flattened document shipped reporting complete success.
+    """
+
+    from spec_formatter.style_application.phase2_invariants import (
+        _verify_effective_paragraph_geometry as check,
+    )
+
+    compared = check(
+        _document(_IN_LIST, _NUMBERING_CANCELLED_WITH_IND),
+        _document(_NUMBERING_CANCELLED_WITH_IND, _NUMBERING_CANCELLED_WITH_IND),
+        _LEVEL_ONLY_STYLES,
+        _LEVEL_ONLY_STYLES,
+        _numbering(),
+        _numbering(),
+    )
+    assert compared == 2
+
+
+def test_paragraph_count_change_reports_zero_rather_than_guessing() -> None:
+    """Another invariant owns that failure; this one declines to comment."""
+
+    from spec_formatter.style_application.phase2_invariants import (
+        _verify_effective_paragraph_geometry as check,
+    )
+
+    assert (
+        check(
+            _document(_IN_LIST),
+            _document(_IN_LIST, _IN_LIST),
+            _LEVEL_ONLY_STYLES,
+            _LEVEL_ONLY_STYLES,
+            _numbering(),
+            _numbering(),
+        )
+        == 0
+    )

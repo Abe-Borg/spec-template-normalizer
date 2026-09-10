@@ -240,7 +240,14 @@ def test_batch_result_preserves_late_numbering_checkpoint_without_publishing_doc
         lambda *_args, **_kwargs: None,
     )
 
-    def fail_output(*_args, **_kwargs):
+    def fail_output(*_args, **kwargs):
+        # Mirrors the real shape of this failure: verify_phase2_invariants runs
+        # the geometry check early, so it has already reported by the time a
+        # later invariant refuses to publish.
+        collector = kwargs.get("verification_out")
+        if collector is not None:
+            collector["geometry_checked"] = True
+            collector["geometry_paragraphs_compared"] = 7
         raise RuntimeError("package validation failed")
 
     monkeypatch.setattr(batch_runner, "_build_and_patch_output", fail_output)
@@ -290,6 +297,20 @@ def test_batch_result_preserves_late_numbering_checkpoint_without_publishing_doc
     assert SECRET_TEXT not in json.dumps(result.audit)
     assert SECRET_TEXT not in json.dumps(result.numbering_checks)
     assert not kwargs["output_dir"].exists()
+
+    # A failed publication must still say whether the geometry check ran. Its
+    # metrics are attached in a finally, because diag.timed builds the failure
+    # event from the fields present before unwinding -- reporting only on
+    # success would make a failed run indistinguishable from one that skipped
+    # the check entirely.
+    build_output = next(
+        event
+        for event in result.diagnostics
+        if event.get("event") == "build_output"
+    )
+    assert build_output["fields"]["failed"] is True
+    assert build_output["fields"]["geometry_checked"] is True
+    assert build_output["fields"]["geometry_paragraphs_compared"] == 7
 
 
 def test_process_single_file_translates_staged_failure_diagnostics(
