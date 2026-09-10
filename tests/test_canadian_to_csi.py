@@ -15,6 +15,7 @@ from spec_formatter import builtin_scheme
 from spec_formatter.role_contract import ROLE_TO_ARCH_STYLE
 from spec_formatter.style_application.core.canadian_to_csi import (
     _csi_marker,
+    _verify_prediction,
     _int_to_alpha,
     plan_canadian_to_csi,
 )
@@ -726,3 +727,88 @@ def test_tracked_marker_run_precedes_the_original_run() -> None:
     body = plan.document_xml
     assert body.index("<w:ins") < body.index("GENERAL")
     assert re.search(r"<w:ins\b[^>]*><w:r><w:t[^>]*>PART 1</w:t><w:tab/></w:r></w:ins>", body)
+
+
+# --- Predict-first --------------------------------------------------------
+
+
+def _blocks(*texts: str):
+    """``(start, end, xml)`` triples shaped like ``iter_paragraph_xml_blocks``."""
+
+    return [
+        (0, 0, f'<w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>')
+        for text in texts
+    ]
+
+
+def test_prediction_catches_a_marker_that_was_never_written() -> None:
+    """A predicted paragraph that did not receive its marker fails closed.
+
+    The per-paragraph check inside the edit loop cannot see this: it compares
+    the marker it just wrote against the paragraph it just wrote it into, so it
+    is silent about a paragraph the loop never reached.
+    """
+
+    with pytest.raises(EngineError) as raised:
+        _verify_prediction(
+            _blocks("GENERAL", "SUMMARY"),
+            _blocks("PART 1\tGENERAL", "SUMMARY"),
+            [(0, "PART", "PART 1"), (1, "ARTICLE", "1.1")],
+            describe=lambda index: "",
+        )
+    assert raised.value.code == "conversion_prediction_mismatch"
+    assert "predicted to lead with" in str(raised.value)
+
+
+def test_prediction_catches_an_edit_nobody_asked_for() -> None:
+    """A paragraph outside the prediction must not change text at all."""
+
+    with pytest.raises(EngineError) as raised:
+        _verify_prediction(
+            _blocks("GENERAL", "Untouched prose."),
+            _blocks("PART 1\tGENERAL", "Quietly rewritten."),
+            [(0, "PART", "PART 1")],
+            describe=lambda index: "",
+        )
+    assert raised.value.code == "conversion_prediction_mismatch"
+    assert "no CSI marker was predicted" in str(raised.value)
+
+
+def test_prediction_accepts_the_document_it_predicted() -> None:
+    _verify_prediction(
+        _blocks("GENERAL", "Untouched prose."),
+        _blocks("PART 1\tGENERAL", "Untouched prose."),
+        [(0, "PART", "PART 1")],
+        describe=lambda index: "",
+    )
+
+
+def test_unchanged_text_still_satisfies_its_prediction() -> None:
+    """A typed ``PART 1`` converting to ``PART 1`` changes nothing, correctly.
+
+    The check therefore tests what the paragraph leads with, not whether it
+    moved -- a prediction keyed on "did this change" would fail every document
+    whose Canadian and CSI markers happen to coincide.
+    """
+
+    rows = [("PART", "PART 1", "GENERAL"), ("ARTICLE", "1.1", "SUMMARY")]
+    document = _document(
+        [
+            "<w:p><w:pPr/>"
+            f'<w:r><w:t xml:space="preserve">{marker}</w:t></w:r><w:r><w:tab/></w:r>'
+            f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+            for _role, marker, text in rows
+        ]
+    )
+    plan = plan_canadian_to_csi(
+        document,
+        builtin_scheme.build_styles_xml(),
+        _classifications([role for role, _m, _t in rows]),
+        numbering_xml="",
+    )
+    texts = [
+        paragraph_text_from_block(block)
+        for _s, _e, block in iter_paragraph_xml_blocks(plan.document_xml)
+    ]
+    assert texts[0].startswith("PART 1")
+    assert texts[1].startswith("1.1")

@@ -80,6 +80,7 @@ from .xml_helpers import (
 _HIERARCHY = "canadian_to_csi_hierarchy"
 _UNPROVABLE = "canadian_to_csi_numbering_unprovable"
 _TRACKED = "canadian_to_csi_tracked_hierarchy"
+_PREDICTION = "conversion_prediction_mismatch"
 
 #: Roles this converter writes a marker for. ``PART`` is included
 #: unconditionally, unlike in the forward direction: a CSI ``PART 1`` heading
@@ -548,6 +549,52 @@ def _level_geometry(level: Optional[ET.Element]) -> Tuple[str, ...]:
     return tuple(fragments)
 
 
+
+def _verify_prediction(
+    before_blocks: List[Any],
+    after_blocks: List[Any],
+    predicted: List[Tuple[int, str, str]],
+    *,
+    describe: Callable[[int], str],
+) -> None:
+    """Assert the finished document is exactly the document that was predicted.
+
+    Read back out of the assembled XML rather than off the edit list, so this
+    cannot pass by agreeing with the code that produced it. Two things are
+    checked and both matter:
+
+    * every predicted paragraph leads with its predicted marker -- tested on
+      the text rather than on whether the paragraph changed, because a typed
+      Canadian ``PART 1`` converts to a CSI ``PART 1`` and correctly leaves the
+      text untouched; and
+    * no paragraph outside the prediction changed its text at all, which is the
+      half that catches an edit nobody asked for.
+    """
+
+    expected = {index: marker for index, _role, marker in predicted}
+
+    for index, marker in expected.items():
+        actual = paragraph_text_from_block(after_blocks[index][2])
+        if not actual.startswith(marker):
+            raise EngineError(
+                _PREDICTION,
+                f"Paragraph {index}{describe(index)} was predicted to lead with "
+                f"CSI marker {marker!r} but does not.",
+            )
+
+    for index, (_start, _end, before) in enumerate(before_blocks):
+        if index in expected:
+            continue
+        if paragraph_text_from_block(before) != paragraph_text_from_block(
+            after_blocks[index][2]
+        ):
+            raise EngineError(
+                _PREDICTION,
+                f"Paragraph {index}{describe(index)} changed text but no CSI "
+                "marker was predicted for it.",
+            )
+
+
 def _validate_converted_list(
     numbering_xml: str,
     num_ids: set[str],
@@ -816,24 +863,34 @@ def plan_canadian_to_csi(
     # markers are tracked too.
     tracked = source_tracks_revisions(settings_xml)
     date = revision_date or _utc_revision_date()
-    counters: Dict[int, int] = {}
-    replacements: Dict[int, str] = {}
-    edits: List[MarkerEdit] = []
-    literal_removed = 0
-    automatic_converted = 0
 
+    # The counter walk runs to completion *before* any paragraph is touched,
+    # and the list it produces is then asserted against the finished document.
+    # Recording what an edit did after doing it only proves the recorder and
+    # the editor agree; committing to the whole answer first and checking the
+    # document against it is what makes the check independent of the code that
+    # produced it. Nothing here needs the document mutated to be computed, so
+    # this costs a loop and buys a real assertion.
+    counters: Dict[int, int] = {}
+    predicted: List[Tuple[int, str, str]] = []
     for index, role in sorted(effective_role_by_index.items()):
         if role not in _CONVERTIBLE_ROLES:
             continue
-        level = ROLE_LEVEL[role]
-        _advance(counters, level)
+        _advance(counters, ROLE_LEVEL[role])
         if role == "ARTICLE" and ROLE_LEVEL["PART"] not in counters:
             raise EngineError(
                 _HIERARCHY,
                 f"Paragraph {index}{locate(index)} is an ARTICLE with no preceding "
                 "PART, so its CSI article number cannot be formed.",
             )
-        marker = _csi_marker(role, counters)
+        predicted.append((index, role, _csi_marker(role, counters)))
+
+    replacements: Dict[int, str] = {}
+    edits: List[MarkerEdit] = []
+    literal_removed = 0
+    automatic_converted = 0
+
+    for index, role, marker in predicted:
         paragraph = blocks[index][2]
 
         literal = literal_indices.get(index)
@@ -902,6 +959,7 @@ def plan_canadian_to_csi(
         prepare_xml_text_for_utf8(converted_document),
         "word/document.xml (converted)",
     )
+    _verify_prediction(blocks, after_blocks, predicted, describe=locate)
 
     report = CanadianConversionReport(
         paragraphs_examined=sum(

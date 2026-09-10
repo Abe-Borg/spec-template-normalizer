@@ -71,6 +71,12 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "later accepted or rejected. Accept or reject the tracked changes on "
         "the reported paragraph, then convert."
     ),
+    "conversion_prediction_mismatch": (
+        "The converted document did not match the set of numbering edits the "
+        "converter committed to before writing, so the output was withheld. "
+        "This is a defect in the application rather than in your document; "
+        "please report the target."
+    ),
     "geometry_not_preserved": (
         "A paragraph's effective indentation changed during formatting, so the "
         "output was withheld. This is usually a template whose list styles take "
