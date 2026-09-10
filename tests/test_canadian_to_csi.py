@@ -679,7 +679,17 @@ def test_markers_are_tracked_when_the_source_tracks_revisions() -> None:
         r'<w:ins\b[^>]*w:author="Specification Formatter"[^>]*>', plan.document_xml
     )
     assert len(insertions) == 2
-    assert plan.document_xml.count('w:date="2026-01-01T00:00:00Z"') == 2
+    # Each paragraph carries two revisions, not one: the marker insertion and
+    # the property change that took its automatic numbering away. Tracking
+    # only the first would let a rejection strip the marker and leave the
+    # suppression, giving the paragraph no number at all.
+    changes = re.findall(
+        r'<w:pPrChange\b[^>]*w:author="Specification Formatter"[^>]*>', plan.document_xml
+    )
+    assert len(changes) == 2
+    assert plan.document_xml.count('w:date="2026-01-01T00:00:00Z"') == 4
+    ids = re.findall(r'w:id="(9\d+)"', plan.document_xml)
+    assert len(ids) == len(set(ids)), "revision ids must be unique"
 
 
 def test_markers_are_plain_text_when_tracking_is_off() -> None:
@@ -697,23 +707,65 @@ def test_tracking_absent_from_settings_is_not_tracking() -> None:
     assert plan.report.source_tracks_revisions is False
 
 
-def test_rejecting_the_tracked_markers_restores_the_source_text() -> None:
+def _reject_all(document_xml: str) -> str:
+    """Apply Word's reject-all to this application's revisions.
+
+    Rejecting drops the content of a ``w:ins`` and restores the properties a
+    ``w:pPrChange`` recorded -- both halves, which is the whole point of the
+    test below.
+
+    Splits paragraphs by regex, which is sound only because these fixtures
+    contain no text boxes. A real document nests ``w:p`` inside ``w:p`` through
+    ``w:txbxContent``, and a lazy ``</w:p>`` stops at the inner one. Verify a
+    real package over the DOM, not with this.
+    """
+
+    without_insertions = re.sub(
+        r"<w:ins\b[^>]*>.*?</w:ins>", "", document_xml, flags=re.S
+    )
+
+    # Restore per paragraph, never across the document. A lazy match anchored
+    # on w:pPrChange will happily start at one paragraph's w:pPr and end at a
+    # later paragraph's, deleting everything between -- which looks like a
+    # clean pass right up until the indices no longer line up.
+    def _restore_paragraph(paragraph: re.Match) -> str:
+        return re.sub(
+            r"<w:pPr\b[^>]*>.*?<w:pPrChange\b[^>]*>"
+            r"(<w:pPr\b[^>]*(?:/>|>.*?</w:pPr>))</w:pPrChange></w:pPr>",
+            lambda match: match.group(1),
+            paragraph.group(0),
+            flags=re.S,
+        )
+
+    return re.sub(
+        r"<w:p\b[^>]*(?:/>|>.*?</w:p>)",
+        _restore_paragraph,
+        without_insertions,
+        flags=re.S,
+    )
+
+
+def test_rejecting_the_tracked_conversion_restores_text_and_numbering() -> None:
     """The whole conversion is reversible in Word, which is the point.
 
-    A marker that cannot be rejected is a permanent edit wearing a revision's
-    clothing.
+    Text alone is not the test. The numbering suppression is a *property*
+    edit, so a conversion that tracked only its marker would pass a text
+    comparison while leaving every paragraph unnumbered on rejection -- worse
+    than either the source or the output.
     """
 
     rows = [("PART", "GENERAL"), ("ARTICLE", "SUMMARY"), ("PARAGRAPH", "Body text.")]
     plan = _convert_tracked(rows, _TRACKING_ON)
-    without_insertions = re.sub(
-        r"<w:ins\b[^>]*>.*?</w:ins>", "", plan.document_xml, flags=re.S
-    )
-    restored = [
-        paragraph_text_from_block(block)
-        for _s, _e, block in iter_paragraph_xml_blocks(without_insertions)
-    ]
-    assert restored == [text for _role, text in rows]
+    rejected = _reject_all(plan.document_xml)
+
+    blocks = [block for _s, _e, block in iter_paragraph_xml_blocks(rejected)]
+    assert [paragraph_text_from_block(b) for b in blocks] == [t for _r, t in rows]
+    for block in blocks:
+        assert "<w:numPr" not in block, block
+        assert "<w:ind" not in block, block
+    assert [
+        re.search(r'<w:pStyle w:val="([^"]+)"', b).group(1) for b in blocks
+    ] == [_GEOMETRY_ROLE_STYLE[role] for role, _text in rows]
 
 
 def test_tracked_marker_run_precedes_the_original_run() -> None:
@@ -812,3 +864,93 @@ def test_unchanged_text_still_satisfies_its_prediction() -> None:
     ]
     assert texts[0].startswith("PART 1")
     assert texts[1].startswith("1.1")
+
+
+def test_typed_marker_replacement_under_tracking_fails_closed() -> None:
+    """Half a tracked edit is the defect this mode exists to avoid.
+
+    The marker insertion can be tracked; the removal of the typed marker it
+    replaces cannot, without restructuring shared code both converters use.
+    Publishing a reviewable insertion beside an unrecorded deletion would be
+    exactly the silent, untracked text change the tracked path was added to
+    prevent, so the target is refused with an actionable remedy instead.
+    """
+
+    rows = [("PART", "PART 1", "GENERAL"), ("ARTICLE", "1.1", "SUMMARY")]
+    document = _document(
+        [
+            "<w:p><w:pPr/>"
+            f'<w:r><w:t xml:space="preserve">{marker}</w:t></w:r><w:r><w:tab/></w:r>'
+            f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+            for _role, marker, text in rows
+        ]
+    )
+    with pytest.raises(EngineError) as raised:
+        plan_canadian_to_csi(
+            document,
+            builtin_scheme.build_styles_xml(),
+            _classifications([role for role, _m, _t in rows]),
+            numbering_xml="",
+            settings_xml=_TRACKING_ON,
+        )
+    assert raised.value.code == "canadian_to_csi_tracked_hierarchy"
+    assert "Turn Track Changes off" in str(raised.value)
+
+
+def test_tracked_marker_inherits_the_formatting_of_the_run_it_precedes() -> None:
+    """A bold heading gets a bold number, tracked or not.
+
+    The untracked path gets this by joining the existing run. A tracked marker
+    must be its own run, and a bare one renders in the document defaults --
+    which the run-property invariant cannot catch, because it removes this
+    application's insertions before comparing.
+    """
+
+    paragraphs = [
+        '<w:p><w:pPr><w:pStyle w:val="Geo0"/></w:pPr>'
+        '<w:r><w:rPr><w:b/><w:sz w:val="28"/></w:rPr>'
+        '<w:t xml:space="preserve">GENERAL</w:t></w:r></w:p>',
+    ]
+    plan = plan_canadian_to_csi(
+        _document(paragraphs),
+        _geometry_styles_xml(),
+        _classifications(["PART"]),
+        numbering_xml=_geometry_numbering_xml(),
+        settings_xml=_TRACKING_ON,
+        revision_date="2026-01-01T00:00:00Z",
+    )
+    marker_run = re.search(r"<w:ins\b[^>]*>(.*?)</w:ins>", plan.document_xml, re.S)
+    assert marker_run is not None
+    assert "<w:b/>" in marker_run.group(1)
+    assert '<w:sz w:val="28"/>' in marker_run.group(1)
+
+
+def test_tracked_marker_run_is_bare_when_the_source_run_is() -> None:
+    """Nothing is invented: a run with no properties contributes none."""
+
+    plan = _convert_tracked([("PART", "GENERAL")], _TRACKING_ON)
+    marker_run = re.search(r"<w:ins\b[^>]*>(.*?)</w:ins>", plan.document_xml, re.S)
+    assert marker_run is not None
+    assert "<w:rPr" not in marker_run.group(1)
+
+
+def test_reject_simulation_does_not_swallow_neighbouring_paragraphs() -> None:
+    """Guard on the test helper itself.
+
+    A document-wide lazy match anchored on ``w:pPrChange`` will start at one
+    paragraph's ``w:pPr`` and end at a later paragraph's, deleting everything
+    between. That reads as a clean pass until the paragraph indices stop lining
+    up, so the helper restores per paragraph and this proves it.
+    """
+
+    unconverted = '<w:p><w:pPr><w:pStyle w:val="Geo2"/></w:pPr>'\
+                  '<w:r><w:t xml:space="preserve">Front matter.</w:t></w:r></w:p>'
+    plan = _convert_tracked([("PART", "GENERAL"), ("ARTICLE", "SUMMARY")], _TRACKING_ON)
+    document = plan.document_xml.replace("<w:body>", f"<w:body>{unconverted}", 1)
+
+    rejected = _reject_all(document)
+    texts = [
+        paragraph_text_from_block(block)
+        for _s, _e, block in iter_paragraph_xml_blocks(rejected)
+    ]
+    assert texts == ["Front matter.", "GENERAL", "SUMMARY"]

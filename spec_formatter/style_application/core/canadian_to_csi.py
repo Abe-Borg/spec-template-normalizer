@@ -274,6 +274,10 @@ def _suppress_automatic_numbering(
     paragraph_xml: str,
     ilvl: str = "0",
     level_geometry: Tuple[str, ...] = (),
+    *,
+    tracked: bool = False,
+    revision_id: int = 0,
+    revision_date: str = "",
 ) -> str:
     """Return *paragraph_xml* with its effective list membership cancelled.
 
@@ -300,8 +304,13 @@ def _suppress_automatic_numbering(
 
     numbering_off = _numbering_off(ilvl)
     match = _PPR_RX.search(paragraph_xml)
+    change = (
+        _ppr_change(match.group(0) if match else "", revision_id, revision_date)
+        if tracked
+        else ""
+    )
     if match is None:
-        inserted = numbering_off + "".join(level_geometry)
+        inserted = numbering_off + "".join(level_geometry) + change
         insert_at = paragraph_xml.index(">") + 1
         return (
             paragraph_xml[:insert_at]
@@ -310,11 +319,13 @@ def _suppress_automatic_numbering(
         )
     ppr = match.group(0)
     if ppr.endswith("/>"):
-        inserted = numbering_off + "".join(level_geometry)
+        inserted = numbering_off + "".join(level_geometry) + change
         rebuilt = ppr[:-2] + ">" + inserted + "</w:pPr>"
     else:
         rebuilt = _NUMPR_RX.sub("", ppr, count=1)
-        for fragment in (numbering_off,) + tuple(level_geometry):
+        for fragment in (numbering_off,) + tuple(level_geometry) + (
+            (change,) if change else ()
+        ):
             name = re.match(r"<(w:\w+)", fragment).group(1)
             open_end = rebuilt.index(">") + 1
             inner = rebuilt[open_end : rebuilt.rindex("</w:pPr>")]
@@ -352,10 +363,72 @@ def source_tracks_revisions(settings_xml: str) -> bool:
     return bool(_TRACK_REVISIONS_RX.search(settings_xml or ""))
 
 
-def _tracked_marker_run(marker: str, revision_id: int, date: str) -> str:
+#: ``w:pPr`` children that may not appear inside ``w:pPrChange``: its content
+#: model is ``CT_PPrBase``, which stops short of these three.
+_PPR_CHANGE_EXCLUDED = ("w:rPr", "w:sectPr", "w:pPrChange")
+
+
+def _revision_attributes(revision_id: int, date: str) -> str:
     return (
-        f'<w:ins w:id="{revision_id}" w:author="{_escape_attribute(MARKER_REVISION_AUTHOR)}"'
-        f' w:date="{date}"><w:r><w:t xml:space="preserve">{_escape(marker)}</w:t>'
+        f' w:id="{revision_id}"'
+        f' w:author="{_escape_attribute(MARKER_REVISION_AUTHOR)}"'
+        f' w:date="{date}"'
+    )
+
+
+def _ppr_change(original_ppr: str, revision_id: int, date: str) -> str:
+    """A ``w:pPrChange`` recording the paragraph properties as they were.
+
+    Suppressing numbering is a *property* edit, not a text edit, so wrapping
+    only the marker in ``w:ins`` tracks half the change: rejecting the revision
+    would take the typed marker away and leave ``numId=0`` behind, giving the
+    paragraph no number at all -- worse than either the source or the output.
+    ``w:pPrChange`` carries the previous properties, so a rejection restores
+    the paragraph's original numbering along with its original text.
+    """
+
+    inner = ""
+    if original_ppr:
+        body = original_ppr
+        if body.endswith("/>"):
+            inner = ""
+        else:
+            open_end = body.index(">") + 1
+            inner = body[open_end : body.rindex("</w:pPr>")]
+            for name in _PPR_CHANGE_EXCLUDED:
+                inner = re.sub(
+                    rf"<{name}\b[^>]*(?:/>|>.*?</{name}>)", "", inner, flags=re.S
+                )
+    return (
+        f"<w:pPrChange{_revision_attributes(revision_id, date)}>"
+        f"<w:pPr>{inner}</w:pPr></w:pPrChange>"
+    )
+
+
+_RUN_RPR_RX = re.compile(r"<w:rPr\b[^>]*(?:/>|>.*?</w:rPr>)", re.S)
+
+
+def _run_properties(run_xml: str) -> str:
+    """The ``w:rPr`` of a run, or empty when it carries none.
+
+    Copied onto a tracked marker run so the marker matches the text it
+    precedes. The untracked path gets this for free by joining the existing
+    run; a tracked marker must be its own run, and a bare one renders in the
+    document defaults -- a bold 14pt heading would get a plain number. The
+    run-property invariant cannot catch it either, because it removes this
+    application's insertions before comparing.
+    """
+
+    match = _RUN_RPR_RX.search(run_xml)
+    return match.group(0) if match else ""
+
+
+def _tracked_marker_run(
+    marker: str, revision_id: int, date: str, run_properties: str = ""
+) -> str:
+    return (
+        f"<w:ins{_revision_attributes(revision_id, date)}>"
+        f"<w:r>{run_properties}<w:t xml:space=\"preserve\">{_escape(marker)}</w:t>"
         f"<w:tab/></w:r></w:ins>"
     )
 
@@ -419,7 +492,13 @@ def _insert_marker(
                     f"A paragraph classified for CSI marker {marker!r} has no run "
                     "to place a tracked marker before.",
                 )
-            insertion = _tracked_marker_run(marker, revision_id, revision_date)
+            # The run this marker is placed before is the run it should look
+            # like, so its properties come along.
+            run_end = unprotected.find("</w:r>", run_start)
+            source_run = unprotected[run_start : run_end if run_end >= 0 else None]
+            insertion = _tracked_marker_run(
+                marker, revision_id, revision_date, _run_properties(source_run)
+            )
             return unprotected[:run_start] + insertion + unprotected[run_start:]
         prefix = f'<w:t xml:space="preserve">{_escape(marker)}</w:t><w:tab/>'
         return unprotected[: match.start()] + prefix + unprotected[match.start():]
@@ -895,6 +974,23 @@ def plan_canadian_to_csi(
 
         literal = literal_indices.get(index)
         if literal is not None:
+            if tracked:
+                # Replacing a typed marker is a text deletion plus a text
+                # insertion. The insertion is tracked below, but the deletion
+                # rewrites w:t contents in place inside shared code both
+                # converters use, and cannot be represented as w:del without
+                # restructuring that path. Rather than make half the edit
+                # reviewable and quietly drop the other half -- the same defect
+                # this mode was added to avoid -- the target fails closed and
+                # says what to do about it.
+                raise EngineError(
+                    _TRACKED,
+                    f"Paragraph {index}{locate(index)} carries the typed marker "
+                    f"{literal.marker!r}, and replacing it while revision "
+                    "tracking is on would delete text without recording the "
+                    "deletion as a revision. Turn Track Changes off for the "
+                    "conversion, or accept the existing markers first.",
+                )
             stripped, _tab_removed = _remove_literal_marker(paragraph, role)
             body = literal.body_text
             source_kind = "literal"
@@ -910,6 +1006,9 @@ def plan_canadian_to_csi(
                     paragraph,
                     styles_xml,
                 ),
+                tracked=tracked,
+                revision_id=_MARKER_REVISION_ID_BASE + 2 * len(edits) + 1,
+                revision_date=date,
             )
             body = paragraph_text_from_block(paragraph)
             source_kind = "automatic"
@@ -919,7 +1018,7 @@ def plan_canadian_to_csi(
             stripped,
             marker,
             tracked=tracked,
-            revision_id=_MARKER_REVISION_ID_BASE + len(edits),
+            revision_id=_MARKER_REVISION_ID_BASE + 2 * len(edits),
             revision_date=date,
         )
         _verify_marked_paragraph(index, converted, marker, body, describe=locate)

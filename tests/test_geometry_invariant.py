@@ -79,8 +79,14 @@ def test_cancelling_numbering_with_the_indent_restored_passes() -> None:
     _verify(_IN_LIST, _NUMBERING_CANCELLED_WITH_IND)
 
 
-def test_untouched_paragraphs_are_not_examined() -> None:
-    """An identical paragraph cannot have moved, so it costs nothing to skip."""
+def test_identical_paragraph_and_identical_parts_is_a_pass() -> None:
+    """Unchanged everywhere is unchanged.
+
+    Note what this does *not* say: an identical paragraph on its own proves
+    nothing, because it resolves through styles, numbering and docDefaults that
+    the run may have replaced. It is the parts being identical too that makes
+    this one safe -- see the shared-part cases at the end of this module.
+    """
 
     _verify(_IN_LIST, _IN_LIST)
 
@@ -148,3 +154,79 @@ def test_direct_indent_is_reported_by_index() -> None:
     message = str(raised.value)
     assert "paragraph index 1" in message
     assert "Body" not in message
+
+
+# --- Paragraphs the engine never edited -----------------------------------
+#
+# A paragraph's own XML being untouched does not prove it still renders where
+# it did: it resolves through styles, numbering and docDefaults, all shared.
+# Whether that movement is a defect depends on the mode.
+
+
+def _doc_defaults(ind: str) -> str:
+    return (
+        f'<w:styles xmlns:w="{W_NS}"><w:docDefaults><w:pPrDefault><w:pPr>{ind}'
+        f"</w:pPr></w:pPrDefault></w:docDefaults>"
+        f'<w:style w:type="paragraph" w:styleId="Body"><w:name w:val="Body"/></w:style>'
+        f"</w:styles>"
+    )
+
+
+_PLAIN = _para('<w:pStyle w:val="Body"/>', "Untouched.")
+
+
+def test_untouched_paragraph_moved_by_doc_defaults_fails_without_a_shell() -> None:
+    """Nothing global should move a paragraph when no shell is being applied.
+
+    The architect-free modes import nothing, so a changed ``docDefaults`` here
+    means something moved the target's own geometry -- exactly what this check
+    is for, and invisible in the paragraph's own XML.
+    """
+
+    with pytest.raises(EngineError) as raised:
+        _verify_effective_paragraph_geometry(
+            _document(_PLAIN),
+            _document(_PLAIN),
+            _doc_defaults('<w:ind w:left="0"/>'),
+            _doc_defaults('<w:ind w:left="1440"/>'),
+            "",
+            "",
+            applies_document_shell=False,
+        )
+    assert raised.value.code == "geometry_not_preserved"
+
+
+def test_untouched_paragraph_moved_by_the_architect_shell_is_expected() -> None:
+    """Applying the architect's document-global shell is meant to reflow.
+
+    The guide is explicit that leaving a paragraph's XML unedited proves the
+    engine did not touch it, not that it renders identically, and that
+    shell-driven reflow of untouched content is expected behaviour. Failing it
+    here would refuse every legitimate architect run.
+    """
+
+    _verify_effective_paragraph_geometry(
+        _document(_PLAIN),
+        _document(_PLAIN),
+        _doc_defaults('<w:ind w:left="0"/>'),
+        _doc_defaults('<w:ind w:left="1440"/>'),
+        "",
+        "",
+        applies_document_shell=True,
+    )
+
+
+def test_an_edited_paragraph_is_checked_even_under_a_shell() -> None:
+    """The shell exemption covers untouched paragraphs, not edited ones."""
+
+    with pytest.raises(EngineError) as raised:
+        _verify_effective_paragraph_geometry(
+            _document(_IN_LIST),
+            _document(_NUMBERING_CANCELLED),
+            _LEVEL_ONLY_STYLES,
+            _LEVEL_ONLY_STYLES,
+            _numbering(),
+            _numbering(),
+            applies_document_shell=True,
+        )
+    assert raised.value.code == "geometry_not_preserved"

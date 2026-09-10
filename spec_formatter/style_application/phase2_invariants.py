@@ -1111,6 +1111,8 @@ def _verify_effective_paragraph_geometry(
     after_styles: str,
     before_numbering: str,
     after_numbering: str,
+    *,
+    applies_document_shell: bool = False,
 ) -> None:
     """Fail closed if a paragraph's effective indentation changed.
 
@@ -1126,6 +1128,16 @@ def _verify_effective_paragraph_geometry(
     precedence is stable, whichever one Word actually implements; and a
     document that changed under only one is exactly the case where this module
     cannot honestly claim a defect, so it does not.
+
+    A paragraph whose own XML is untouched can still move, because the parts it
+    resolves through are shared: replacing ``docDefaults`` or a style reflows
+    content the engine never edited. Whether that is a defect depends on the
+    mode. Applying the architect's document-global shell is *meant* to reflow
+    the target -- the guide states as much -- so under
+    ``applies_document_shell`` an untouched paragraph is left alone. Without a
+    shell nothing global should be moving anything, so every paragraph is
+    compared, and ``docDefaults`` is part of the comparison rather than a
+    tiebreak consulted only after the per-paragraph sources already differ.
     """
 
     before_blocks = [b for _s, _e, b in iter_paragraph_xml_blocks(before_document_xml)]
@@ -1139,11 +1151,11 @@ def _verify_effective_paragraph_geometry(
     after_defaults = _doc_defaults_ind(after_styles)
 
     for index, (before, after) in enumerate(zip(before_blocks, after_blocks)):
-        if before == after:
+        if before == after and applies_document_shell:
             continue
         before_sources = _paragraph_geometry_sources(before, before_styles, before_levels)
         after_sources = _paragraph_geometry_sources(after, after_styles, after_levels)
-        if before_sources == after_sources:
+        if (before_sources, before_defaults) == (after_sources, after_defaults):
             continue
         for level_first in (True, False):
             if _resolve_geometry(before_sources, before_defaults, level_first) == (
@@ -1241,6 +1253,7 @@ def verify_phase2_invariants(
             after_styles,
             before_numbering,
             after_numbering,
+            applies_document_shell=application_policy.apply_full_architect_shell,
         )
 
     before_records = _sectpr_records(before_doc)

@@ -419,6 +419,23 @@ revision must not pass trivially. `source_tracks_revisions`, `markers_tracked`
 and `marker_author` are always recorded, so "these markers are plain text" is a
 visible decision rather than an absent field.
 
+**Tracking the marker is only half the edit.** Suppressing the numbering is a
+*property* change, so a `w:ins` around the marker alone would let a rejection
+strip the marker and leave `numId=0` behind -- a paragraph with no number at
+all, worse than either the source or the output. Each converted paragraph
+therefore carries two revisions: the `w:ins` and a `w:pPrChange` holding the
+properties as they were. Reject-all then restores text, numbering and indent
+together. The tracked marker run also copies the `w:rPr` of the run it precedes,
+because a marker in its own bare run renders in the document defaults where the
+untracked path would have inherited bold or size by joining the run -- and the
+run-property invariant cannot catch that, since it removes this application's
+insertions before comparing.
+
+Replacing a *typed* marker under tracking fails closed instead. The insertion is
+trackable but the deletion rewrites `w:t` contents inside shared code both
+converters use; publishing a reviewable insertion beside an unrecorded deletion
+would be the same silent untracked change this mode exists to prevent.
+
 **The conversion is asserted against a prediction, not described afterwards.**
 The counter walk runs to completion before any paragraph is touched, and
 `_verify_prediction` then checks the assembled document against that list --
@@ -610,6 +627,16 @@ Return the source-to-final style-ID map to every body/header/footer consumer.
   paragraphs onto a different list's level indents, so their geometry is meant
   to change; they say so with `ApplicationPolicy.reindents_converted_paragraphs`
   rather than being exempted at the check.
+
+  A paragraph whose own XML is untouched can still move, because the parts it
+  resolves through are shared -- replacing `docDefaults` or a style reflows
+  content the engine never edited. Whether that is a defect depends on the
+  mode, so the check takes `applies_document_shell`: applying the architect's
+  document-global shell is *meant* to reflow the target (see invariant 2), so
+  untouched paragraphs are left alone there, while an architect-free mode
+  imports nothing and compares every paragraph. `docDefaults` is part of the
+  comparison rather than a tiebreak consulted only after the per-paragraph
+  sources already differ, which would hide exactly this case.
 - `docx_decomposer.py` extracts targets safely; `docx_patch.py` assembles and
   validates replacements before publication.
 
