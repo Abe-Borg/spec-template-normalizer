@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 
@@ -176,6 +177,16 @@ def test_sanitized_154_paragraph_format_only_regression(tmp_path: Path) -> None:
         names = set(package.namelist())
     assert "word/header9.xml" not in names
     assert {"word/header1.xml", "word/header2.xml", "word/header3.xml"} <= names
+
+    # This target resolved entirely without the model, and the run must say so
+    # in the one place cost is read from. An absent target scope would be
+    # indistinguishable from a run whose counters never arrived, so the
+    # explicit zero has to survive the engine, the pipeline, and the manifest.
+    manifest = json.loads(Path(run.manifest_path).read_text(encoding="utf-8"))
+    target_usage = manifest["diagnostics"]["usage"]["target"]
+    assert target_usage["requests_attempted"] == 0
+    assert target_usage["usage_complete"] is True
+    assert result.usage["requests_attempted"] == 0
 
 
 def test_final_verifier_rejects_uncontracted_run_property_loss(

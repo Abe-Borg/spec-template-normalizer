@@ -329,12 +329,20 @@ discovery still excludes as legacy output.
 ### `spec_formatter/style_application/batch_runner.py`
 
 - Loads one validated profile and prepares/classifies targets.
-- `_apply_classified_target()` is the shared application path for
-  `process_single_file()` and the prepared-file path (`_prepare_file_for_batch`
-  / `_apply_batch_result`); do not duplicate environment/numbering/style
-  sequencing.
+- `process_single_file()` is the one entry point a target reaches, and
+  `_apply_classified_target()` is the shared application path underneath it; do
+  not duplicate environment/numbering/style sequencing. The prepared-file path
+  (`PreparedFile` / `_prepare_file_for_batch` / `_apply_batch_result`) was
+  removed with the Batch API classifier it existed to serve: it took an
+  already-classified payload as an argument, so it had no observed usage to
+  report and could not satisfy the accounting contract below. Do not reintroduce
+  a second entry point without carrying `usage` on **both** of its returns.
 - Captures target styles/numbering before shell mutation, applies the selected
   policy, produces audit/numbering checks, validates, and packages the result.
+  Both returns of `process_single_file()` carry `usage`: a successful target
+  costs as much as a failed one, and `DiagnosticsRecorder.record_usage` ignores
+  an empty snapshot, so omitting it on either branch silently publishes a run
+  with no target usage at all.
 - `load_and_validate_shared_config()` accepts only a complete `.phase1` bundle.
   The retired `run_batch_concurrent` / `run_batch_api` entry points, the
   Anthropic Batch API classifier, and the `allow_legacy_bundle` opt-in (which

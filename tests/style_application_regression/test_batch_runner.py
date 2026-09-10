@@ -101,21 +101,6 @@ def test_direct_format_only_output_name_matches_the_pipeline_suffix(monkeypatch,
     assert _plan_output_paths([source], tmp_path / "planned")[source].name == output.name
 
 
-def test_file_key_is_short_safe_and_path_unique():
-    # PreparedFile keys must match [a-zA-Z0-9_-]{1,64}; CSI spec filenames are
-    # long and dotted, so the stem must be sanitized and bounded.
-    import re as _re
-
-    from spec_formatter.style_application.batch_runner import _build_file_key
-
-    long_dotted = Path("/specs/23 05 13 Common Motor Requirements for HVAC Equipment v2.1 FINAL.docx")
-    custom_id = f"{_build_file_key(long_dotted)}__chunk12"
-    assert _re.fullmatch(r"[A-Za-z0-9_-]{1,64}", custom_id)
-
-    # Truncation must not collapse distinct paths with identical long stems.
-    same_stem = "x" * 80 + ".docx"
-    assert _build_file_key(Path("/a") / same_stem) != _build_file_key(Path("/b") / same_stem)
-
 def test_target_header_tokens_are_not_patched_without_imported_architect_parts(
     monkeypatch, tmp_path
 ):
