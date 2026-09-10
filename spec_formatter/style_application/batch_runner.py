@@ -12,10 +12,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .. import builtin_scheme
 from .. import diagnostics as diag
 from ..llm_usage import usage_from_exception
 from .arch_env_applier import apply_environment_to_target
-from .core.classification import apply_phase2_classifications, build_phase2_slim_bundle
+from .core.canadian_to_csi import apply_canadian_to_csi
+from .core.classification import (
+    ApplyReport,
+    apply_phase2_classifications,
+    build_phase2_slim_bundle,
+)
 from .core.application_policy import ApplicationPolicy, application_policy_for_mode
 from .core.csi_to_canadian import (
     FORMAT_ONLY,
@@ -203,10 +209,15 @@ class SharedConfig:
     arch_styles_xml: str
     available_roles: List[str]
     source_tokens: Dict[str, str]
-    arch_root: Path
+    #: The validated ``.phase1`` directory, or ``None`` for the built-in
+    #: scheme, which is generated in-process and has no bundle on disk. Only
+    #: the shell stages read it, and those do not run without an architect.
+    arch_root: Optional[Path]
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None
     bundle_manifest: Optional[Dict[str, Any]] = None
     legacy_mode: bool = False
+    #: True when this config came from :func:`builtin_shared_config`.
+    builtin_scheme: bool = False
 
 
 def _coverage_counts(bundle: Dict[str, Any], classifications: Dict[str, Any]) -> tuple[int, int, int]:
@@ -326,6 +337,69 @@ def load_and_validate_shared_config(arch_path: Path) -> SharedConfig:
         role_specs=role_specs,
         bundle_manifest=bundle_manifest,
         legacy_mode=legacy_mode,
+    )
+
+
+def builtin_shared_config() -> SharedConfig:
+    """Return the shared config for a run with no architect template.
+
+    This is a second *constructor* for :class:`SharedConfig`, not a second
+    application path: ``process_single_file()`` remains the one entry point a
+    target reaches and ``_apply_classified_target()`` the one shared path
+    beneath it. What changes is only where the styles and numbering came from.
+
+    The built-in scheme is put through the same preflight the bundle loader
+    runs, minus the two shell checks it has nothing to answer (see
+    ``applies_shell``), and through the same numbering-import planning, so a
+    scheme that could not actually be imported fails here rather than midway
+    through a target.
+    """
+
+    arch_registry = builtin_scheme.build_arch_registry()
+    env_registry = builtin_scheme.build_env_registry()
+    arch_styles_xml = builtin_scheme.build_styles_xml()
+    role_specs = builtin_scheme.build_role_specs()
+
+    preflight_errors = preflight_validate_registries(
+        arch_registry,
+        env_registry,
+        additional_known_style_ids=set(arch_registry.values()),
+        applies_shell=False,
+    )
+    if preflight_errors:  # pragma: no cover - a constant-only bug
+        report = "\n".join(f"  - {error}" for error in preflight_errors)
+        raise EngineError(
+            "builtin_scheme_contract",
+            f"Built-in scheme failed preflight ({len(preflight_errors)} error(s)):\n{report}",
+        )
+
+    if not HAS_NUMBERING_IMPORTER:
+        raise attach_engine_error(
+            ImportError("numbering_importer is required for the built-in scheme"),
+            "numbering_importer_unavailable",
+        )
+    build_numbering_import_plan(
+        env_registry,
+        arch_styles_xml,
+        '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:numbering>',
+        sorted(set(arch_registry.values())),
+        role_specs=role_specs,
+        roles_to_apply=sorted(role_specs),
+    )
+
+    return SharedConfig(
+        arch_registry=arch_registry,
+        env_registry=env_registry,
+        arch_styles_xml=arch_styles_xml,
+        available_roles=builtin_scheme.available_roles(),
+        # No architect headers or footers exist, so there are no section
+        # metadata tokens to substitute and nothing to patch.
+        source_tokens={},
+        arch_root=None,
+        role_specs=role_specs,
+        bundle_manifest=None,
+        legacy_mode=False,
+        builtin_scheme=True,
     )
 
 
@@ -767,28 +841,54 @@ def _apply_classified_target_impl(
             classifications,
             conversion_report,
         )
+    elif policy.convert_to_csi:
+        checkpoint.stage = "canadian_to_csi_conversion"
+        log.append("Converting Canadian CSC PageFormat hierarchy to typed CSI markers...")
+        with diag.timed(diag_events, "target", "canadian_to_csi") as phase:
+            conversion_report = apply_canadian_to_csi(extract_dir, classifications, log)
+            phase.set(
+                paragraphs_examined=conversion_report.paragraphs_examined,
+                paragraphs_converted=conversion_report.paragraphs_converted,
+                literal_markers_removed=conversion_report.literal_markers_removed,
+                automatic_numbering_retargeted=(
+                    conversion_report.automatic_numbering_retargeted
+                ),
+                warnings=len(conversion_report.warnings),
+            )
+        checkpoint.conversion_report = conversion_report
+
     checkpoint.stage = "environment_application"
-    with diag.timed(diag_events, "target", "apply_environment") as phase:
-        env_result = apply_environment_to_target(
-            target_extract_dir=extract_dir,
-            registry=env_registry,
-            log=log,
-            registry_dir=arch_root,
+    if policy.apply_full_architect_shell:
+        with diag.timed(diag_events, "target", "apply_environment") as phase:
+            env_result = apply_environment_to_target(
+                target_extract_dir=extract_dir,
+                registry=env_registry,
+                log=log,
+                registry_dir=arch_root,
+            )
+            _hf_import = env_result.get("header_footer_import", {}) if isinstance(env_result, dict) else {}
+            phase.set(
+                header_footer_parts=len(_hf_import.get("part_names", set()) or set()),
+                header_footer_media=len(_hf_import.get("media_names", set()) or set()),
+            )
+        log.append("Applied environment")
+        checkpoint.stage = "header_footer_token_patch"
+        _patch_header_footer_tokens_if_imported(
+            extract_dir,
+            env_result,
+            source_tokens,
+            target_tokens,
+            log,
         )
-        _hf_import = env_result.get("header_footer_import", {}) if isinstance(env_result, dict) else {}
-        phase.set(
-            header_footer_parts=len(_hf_import.get("part_names", set()) or set()),
-            header_footer_media=len(_hf_import.get("media_names", set()) or set()),
+    else:
+        # No architect template, so there is no shell to apply. The target
+        # keeps its own theme, defaults, page geometry, headers and footers,
+        # and with no imported header/footer parts there is nothing to patch
+        # section tokens into either.
+        env_result = {}
+        log.append(
+            "No architect template: the target's own document shell is left unchanged"
         )
-    log.append("Applied environment")
-    checkpoint.stage = "header_footer_token_patch"
-    _patch_header_footer_tokens_if_imported(
-        extract_dir,
-        env_result,
-        source_tokens,
-        target_tokens,
-        log,
-    )
 
     used_roles = {
         item.get("csi_role")
@@ -808,7 +908,12 @@ def _apply_classified_target_impl(
     numbering_roles = sorted(used_roles) if policy.import_body_numbering else []
     checkpoint.stage = "numbering_import"
     with diag.timed(diag_events, "target", "numbering_import") as phase:
-        if HAS_NUMBERING_IMPORTER:
+        if not policy.imports_parts:
+            # Typed CSI markers are literal text. Nothing is imported, and the
+            # converter has already cancelled the target's own list membership
+            # on every paragraph it rewrote.
+            phase.set(importer_available=bool(HAS_NUMBERING_IMPORTER), skipped=True)
+        elif HAS_NUMBERING_IMPORTER:
             numbering_contract = import_numbering(
                 target_extract_dir=extract_dir,
                 arch_template_registry=env_registry,
@@ -827,14 +932,15 @@ def _apply_classified_target_impl(
             _check_numbering_module_needed(arch_styles_xml, numbering_style_ids)
             if hf_direct_num_ids:
                 raise ImportError("numbering_importer is required by architect headers/footers")
-        phase.set(
-            importer_available=bool(HAS_NUMBERING_IMPORTER),
-            styles_considered=len(numbering_style_ids),
-            roles_considered=len(numbering_roles),
-            num_id_remaps=len(num_id_remap),
-            style_numid_remaps=len(style_numid_remap),
-            role_numpr_remaps=len(role_numpr_remap),
-        )
+        if policy.imports_parts:
+            phase.set(
+                importer_available=bool(HAS_NUMBERING_IMPORTER),
+                styles_considered=len(numbering_style_ids),
+                roles_considered=len(numbering_roles),
+                num_id_remaps=len(num_id_remap),
+                style_numid_remaps=len(style_numid_remap),
+                role_numpr_remaps=len(role_numpr_remap),
+            )
 
     checkpoint.stage = "header_footer_numbering_remap"
     remap_header_footer_numids(
@@ -844,53 +950,73 @@ def _apply_classified_target_impl(
         log,
     )
     checkpoint.stage = "style_import"
+    applied_arch_registry: Dict[str, str] = {}
     with diag.timed(diag_events, "target", "style_import") as phase:
-        style_result = import_arch_styles_into_target(
-            target_extract_dir=extract_dir,
-            arch_styles_xml=arch_styles_xml,
-            needed_style_ids=needed_style_ids,
-            log=log,
-            style_numid_remap=style_numid_remap,
-            format_only_body_style_ids=(body_style_ids if policy.preserve_target_numbering else None),
-            shell_style_ids=hf_style_ids,
-            namespace_seed=hashlib.sha256(arch_styles_xml.encode("utf-8")).hexdigest(),
+        if not policy.applies_role_styles:
+            phase.set(requested_styles=0, skipped=True)
+        else:
+            style_result = import_arch_styles_into_target(
+                target_extract_dir=extract_dir,
+                arch_styles_xml=arch_styles_xml,
+                needed_style_ids=needed_style_ids,
+                log=log,
+                style_numid_remap=style_numid_remap,
+                format_only_body_style_ids=(body_style_ids if policy.preserve_target_numbering else None),
+                shell_style_ids=hf_style_ids,
+                namespace_seed=hashlib.sha256(arch_styles_xml.encode("utf-8")).hexdigest(),
+            )
+            phase.set(
+                requested_styles=len(needed_style_ids),
+                body_style_ids=len(body_style_ids),
+                header_footer_style_ids=len(hf_style_ids),
+                namespaced_collisions=sum(
+                    1 for src, dst in style_result.style_id_map.items() if src != dst
+                ),
+            )
+            applied_arch_registry = {
+                role: style_result.body_style_id_map.get(style_id, style_id)
+                for role, style_id in arch_registry.items()
+            }
+    if policy.applies_role_styles:
+        checkpoint.stage = "header_footer_style_remap"
+        _remap_imported_header_footer_style_ids(
+            extract_dir,
+            list(hf_manifest.get("part_names", set())),
+            style_result.style_id_map,
+            log,
         )
-        phase.set(
-            requested_styles=len(needed_style_ids),
-            body_style_ids=len(body_style_ids),
-            header_footer_style_ids=len(hf_style_ids),
-            namespaced_collisions=sum(
-                1 for src, dst in style_result.style_id_map.items() if src != dst
-            ),
-        )
-    applied_arch_registry = {
-        role: style_result.body_style_id_map.get(style_id, style_id)
-        for role, style_id in arch_registry.items()
-    }
-    checkpoint.stage = "header_footer_style_remap"
-    _remap_imported_header_footer_style_ids(
-        extract_dir,
-        list(hf_manifest.get("part_names", set())),
-        style_result.style_id_map,
-        log,
-    )
-    log.append(f"Imported {len(needed_style_ids)} requested styles collision-safely")
+        log.append(f"Imported {len(needed_style_ids)} requested styles collision-safely")
+    else:
+        log.append("No role styles applied; every paragraph keeps its own formatting")
 
     checkpoint.stage = "stability_snapshot"
     snap = snapshot_stability(extract_dir)
     checkpoint.stage = "classification_application"
     with diag.timed(diag_events, "target", "apply_classifications") as phase:
-        apply_report = apply_phase2_classifications(
-            extract_dir=extract_dir,
-            classifications=application_classifications,
-            arch_style_registry=applied_arch_registry,
-            log=log,
-            role_specs=role_specs,
-            role_numpr_remap=role_numpr_remap,
-            source_styles_xml=source_styles_xml,
-            source_numbering_xml=source_numbering_xml,
-            policy=policy,
-        )
+        if not policy.imports_parts:
+            # Nothing to apply: the markers are already in the text and the
+            # target's own styles stay exactly as authored. The report is
+            # reconstructed rather than faked -- it records that every
+            # classified paragraph was examined and none was restyled, which
+            # is the truth, and its empty run-property contract authorises no
+            # rPr removal in the invariant check that follows.
+            apply_report = ApplyReport(
+                requested=len(application_classifications.get("classifications", [])),
+                modified=0,
+                ignored=len(application_classifications.get("ignored_paragraphs", [])),
+            )
+        else:
+            apply_report = apply_phase2_classifications(
+                extract_dir=extract_dir,
+                classifications=application_classifications,
+                arch_style_registry=applied_arch_registry,
+                log=log,
+                role_specs=role_specs,
+                role_numpr_remap=role_numpr_remap,
+                source_styles_xml=source_styles_xml,
+                source_numbering_xml=source_numbering_xml,
+                policy=policy,
+            )
         phase.set(
             requested=apply_report.requested,
             modified=apply_report.modified,

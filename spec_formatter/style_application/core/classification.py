@@ -1757,6 +1757,27 @@ def apply_phase2_classifications(
         if not isinstance(role, str):
             raise ValueError(f"Invalid csi_role type at paragraph {idx}: {role!r}")
 
+        if not application_policy.applies_role_styles:
+            # Numbering-only application, for a run with no architect template.
+            # Nothing about the paragraph's own formatting is touched: no style
+            # swap, no direct-property stripping, no run-property replacement.
+            # The paragraph keeps whatever its own style gave it and gains the
+            # list membership its role calls for, which is the whole of what
+            # these modes promise to change.
+            remap = (role_numpr_remap or {}).get(role)
+            if isinstance(remap, dict):
+                para_blocks[idx] = _inject_direct_numpr(
+                    para_blocks[idx],
+                    int(remap["new_numId"]),
+                    int(remap.get("ilvl", 0)),
+                )
+            elif role in _NUMBERED_APPLICATION_ROLES:
+                raise ValueError(
+                    f"Missing imported direct numbering mapping for role: {role}"
+                )
+            report.modified += 1
+            continue
+
         style_id = arch_style_registry.get(role)
         if not style_id:
             report.unmapped_roles.append((idx, role))
@@ -1983,6 +2004,12 @@ def apply_phase2_classifications(
     out.append(doc_text[last:])
     write_xml_text(doc_path, "".join(out))
     return report
+
+
+#: Roles a numbering-only application must be able to number. The section
+#: identity and closing lines carry no list membership, so a missing remap
+#: for those is expected rather than an error.
+_NUMBERED_APPLICATION_ROLES = frozenset(BODY_HIERARCHY_ROLES)
 
 
 @dataclass

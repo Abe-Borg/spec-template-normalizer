@@ -55,6 +55,21 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "way the converter cannot prove. Use numbering that starts at 1 without "
         "level overrides or explicit restarts."
     ),
+    "canadian_to_csi_hierarchy": (
+        "The target's Canadian PART, article, and list levels do not form a "
+        "hierarchy that can be rewritten as CSI markers. Check the heading and "
+        "list levels around the reported paragraph."
+    ),
+    "canadian_to_csi_numbering_unprovable": (
+        "A paragraph's Canadian number could not be proven from the target's "
+        "own numbering, so no CSI marker could be written for it. Check that "
+        "the paragraph is a real list item with numbering that starts at 1."
+    ),
+    "builtin_scheme_contract": (
+        "The built-in Canadian CSC PageFormat scheme failed its own contract "
+        "check. This is a defect in the application rather than in your "
+        "document; please report it."
+    ),
     "classification_invalid_payload": (
         "The classification result was malformed (an unknown, duplicate, or "
         "invalid paragraph disposition). Run the target again; if it repeats, "
@@ -95,6 +110,7 @@ ENGINE_STAGES: tuple[str, ...] = (
     "source_catalog_snapshot",
     "target_token_extraction",
     "csi_conversion",
+    "canadian_to_csi_conversion",
     "canadian_classification_mapping",
     "environment_application",
     "header_footer_token_patch",

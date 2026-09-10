@@ -18,7 +18,7 @@ output files may be changed.
 `spec_formatter.pipeline.format_specifications()` owns the business flow:
 
 ```text
-architect DOCX
+architect DOCX  (only for format_only and csi_to_canadian)
   -> immutable snapshot and bounded package extraction
   -> styled/ignored role classification and source-derived portable styles
   -> bounded shell capture (styles, theme/defaults, settings, layout, headers/footers)
@@ -31,6 +31,9 @@ target DOCX files
   -> one immutable ApplicationPolicy
        format_only: target-owned text and numbering
        csi_to_canadian: fail-closed hierarchy conversion
+       csi_to_canadian_standalone: the same conversion onto the built-in
+         CSC list, with no architect and no shell application
+       canadian_to_csi: the inverse, writing typed CSI markers
   -> collision-safe style import and full architect shell application
   -> mode-specific content, numbering, structure, and package invariants
   -> atomic DOCX publication in one timestamped run directory
@@ -57,12 +60,21 @@ spec_formatter/llm_usage.py
     the one observed-usage contract for both classifiers, including failures
 spec_formatter/resources.py
     one root for shipped prompts and notices (sys._MEIPASS when frozen)
+spec_formatter/builtin_scheme.py
+    the committed CSC PageFormat numbering, styles, and role contracts used
+    when a run has no architect template
 spec_formatter/template_analysis.py
     namespaced facade over architect analysis and bundle validation
 spec_formatter/style_application/
     target extraction, shell application, numbering/header import, invariants
+spec_formatter/style_application/core/conversion_modes.py
+    the closed set of conversion-mode strings and their validator
 spec_formatter/style_application/core/application_policy.py
     immutable mode-dependent mutation contract
+spec_formatter/style_application/core/marker_tools.py
+    leading-marker machinery shared by both hierarchy converters
+spec_formatter/style_application/core/canadian_to_csi.py
+    Canadian -> typed CSI marker conversion
 spec_formatter/style_application/core/classification.py
     numbering-aware target dispositions and paragraph application
 spec_formatter/style_application/core/style_import.py
@@ -79,6 +91,10 @@ tests/fixtures/
     example classifier instructions and the sanitized format-only corpus
 tests/test_sanitized_format_only_corpus.py
     offline realistic-corpus regression against this repository's engine
+tests/test_builtin_scheme.py
+    proves the built-in scheme passes the unmodified architect validators
+tests/test_canadian_to_csi.py, tests/test_architect_free_modes.py
+    the reverse converter and both architect-free modes end to end
 ```
 
 `phase1_pipeline.run_phase1()` remains a compatibility and internal profile
@@ -105,7 +121,22 @@ validation. Do not recreate mode checks independently in downstream modules.
   does not import architect body numbering.
 - `csi_to_canadian` performs only the existing fail-closed supported hierarchy
   conversion and may import architect numbering for classified roles.
-- Both modes apply the architect's complete shell.
+- `csi_to_canadian_standalone` runs that same conversion against the built-in
+  CSC PageFormat scheme instead of an architect template.
+- `canadian_to_csi` is the inverse: it resolves each paragraph's current
+  Canadian number and writes it into the text as a literal CSI marker.
+- The two architect modes apply the architect's complete shell. The two
+  architect-free modes apply **no** shell at all.
+
+`requires_architect_template` and `numbering_scheme` on the policy are the one
+place that says which of those a mode is. The pipeline must not accept an
+architect template for a mode that does not use one: it fails with
+`input_architect_not_accepted` rather than ignoring the selection, because a
+user who chose a template and watched a run succeed would reasonably believe
+it had been applied. `accepted_output_suffixes` is the matching concession in
+the other direction -- `canadian_to_csi` legitimately consumes this
+application's own `_CANADIAN.docx` and `_CANADIAN_FORMATTED.docx` output, so
+those must not be refused as "already formatted".
 
 What Format-only preserves is **semantic, not byte-level**, and the guarantee
 is scoped to the **body**. `_verify_format_only_body_invariants` compares
@@ -251,6 +282,114 @@ per-target outcomes, and the raised error carries `run_dir` and
 `manifest_path`. Profile provenance for `run.json` is captured on
 `TemplateProfile.provenance` when the profile is selected, not by
 re-validating the bundle after the outputs are already published.
+
+## Runs without an architect template
+
+`csi_to_canadian_standalone` and `canadian_to_csi` take a target and nothing
+else. Two things make that safe rather than merely convenient.
+
+**The built-in scheme is validated, not trusted.** `spec_formatter/builtin_scheme.py`
+generates a nine-level CSC PageFormat list (`PART %1`, `%1.%2`, `.%3` ... `.%9`,
+every level `decimal`, starting at 1, no `lvlRestart`) plus the twelve
+`CSI_*__ARCH` role styles and their role contracts, all from constants in that
+file. `tests/test_builtin_scheme.py` then runs those through the *unmodified*
+`_validate_canadian_role_contract`, `_validate_complete_article_hierarchy`, and
+`_validate_architect_numbering` from `core/csi_to_canadian.py` -- the same
+gate a real architect template must pass. Do not add a parallel, more
+forgiving check for the built-in scheme's benefit; if the scheme cannot pass
+the architect's contract, the scheme is wrong.
+
+**The numbering is applied directly, never through a style.** The built-in
+role contracts declare `direct_numpr`, so `apply_phase2_classifications` gives
+a classified paragraph `w:numPr` in its own `w:pPr` and leaves its `pStyle`
+alone. `ApplicationPolicy.applies_role_styles` is the switch, and it is False
+for both architect-free modes.
+
+That is not a detail. Swapping a paragraph's style for a generated one that
+carries no `rPr` silently flattens whatever its own style supplied -- a heading
+that was Cambria bold 14pt falls back to the document defaults -- which
+contradicts the mode's whole promise that only numbering and hierarchy change.
+Per-level indents therefore live in `numbering.xml`, not in the styles, so the
+hierarchy still reads correctly. The generated stylesheet remains as internal
+scaffolding for the role contract, the registry cross-checks and the numbering
+import plan; nothing from it is imported into a target.
+
+**It is not dressed up as a `.phase1` bundle.** A bundle manifest exists to
+prove an analyzed artifact on disk was not altered between analysis and use. A
+scheme generated in-process from committed constants has no such gap -- no API
+call, no cache, no disk round-trip -- and giving it a manifest would mean
+inventing a `producer.classifier`, prompt hashes, and an engine fingerprint for
+work that never ran, which makes every manifest mean less. Instead
+`batch_runner.builtin_shared_config()` is a second **constructor** for the
+existing `SharedConfig`. That is not a second application path:
+`process_single_file()` is still the one entry point a target reaches and
+`_apply_classified_target()` the one shared path beneath it. `SharedConfig.arch_root`
+is `None` for these runs and `builtin_scheme` is True.
+
+`preflight_validate_registries(..., applies_shell=False)` skips the two
+shell-only checks (page layout and the header/footer contract) because there is
+no shell to check. That narrows the check for one caller; it does not weaken it
+for anyone else, and a test asserts the page-layout check still fires by
+default.
+
+`run.json` records `numbering_scheme` (`architect`, `builtin_csc`, or
+`typed_csi`) alongside `architect_template` and `builtin_scheme`. All three keys
+are always present, with nulls rather than omissions, so an absent template can
+never be mistaken for one that simply was not recorded. Only a mode that
+actually renders from the built-in list quotes its digest: `canadian_to_csi`
+writes literal markers and imports no numbering, so its `builtin_scheme` is
+null.
+
+### Canadian to CSI
+
+`core/canadian_to_csi.py` is the inverse of `core/csi_to_canadian.py`, and the
+asymmetry matters: **writing a number is a stronger claim than removing one.**
+Removing a typed marker needs only the marker; writing one needs the counter
+Word would have rendered, and a wrong number becomes literal text in a document
+a reader will trust.
+
+The counter walk is therefore only performed inside the same fence the forward
+converter already builds: every converted paragraph on one list instance, that
+instance starting at 1 with no `lvlRestart` and no level override, and every
+paragraph on it converted. Under those conditions a counter is a plain
+per-level tally -- increment this level, delete the deeper ones -- and anything
+outside them fails closed. A numbered role with no number in the source is
+preserved unchanged and reported as a warning; no marker is invented for it.
+
+**The classified role must agree with the level Word is rendering.** The walk
+is keyed on `ROLE_LEVEL[role]`, so a paragraph classified `ARTICLE` while
+sitting at `ilvl` 0 would be written `1.1` when the document actually shows
+`PART 2` -- a number it never displayed, committed as permanent text. Both
+converters therefore share `_validate_automatic_source` (in `marker_tools`,
+with the error code parameterised), and the reverse converter additionally
+requires `ilvl == ROLE_LEVEL[role]`. Every document this application's Canadian
+conversion produces satisfies that, because
+`_validate_complete_article_hierarchy` already requires it of the architect.
+
+Two placement rules the automatic branch must keep. The marker may not be
+written inside a field result or a tracked insertion: the numbering
+suppression sits on `w:pPr`, outside any such subtree, so updating the field or
+rejecting the revision would delete the marker and leave the paragraph with no
+number at all. And `w:numPr` goes after `w:pStyle`, because `CT_PPr` is a
+sequence -- the reverse order is invalid OOXML even where Word tolerates it.
+
+Markers are `PART 1`, `1.1`, `A.`, `1.`, `a.`, `1)`, `a)`, `(1)`, `(a)`. An
+alphabetic level that runs past `z` fails closed rather than writing `aa.`,
+because the shared `_ROLE_MARKERS` tables only ever match a single letter, so
+`aa.` would produce a document this application could not read back.
+
+The marker is inserted **into the paragraph's existing first text run**, not as
+new runs. It then inherits that run's character formatting (a bold heading gets
+a bold number), and the paragraph's run structure is unchanged, which is what
+the run-property invariant in `phase2_invariants.py` checks. Adding runs would
+trip that invariant for a change that loses no formatting at all; the answer is
+not to widen the invariant.
+
+Note that a round trip is not byte-exact through `PART`: the forward converter
+treats a dash or colon after `PART n` as part of the typed marker and removes
+it with the marker, so `PART 1 - GENERAL` returns as `PART 1 GENERAL`. That is
+existing `csi_to_canadian` behaviour, not a loss introduced coming back, and
+requirement text itself is untouched in both directions.
 
 ## Bundle contract
 
@@ -528,7 +667,9 @@ Current codes: `header_footer_target_section_id_required`,
 `header_footer_target_section_title_required`, `header_footer_token_residual`,
 `canadian_architect_contract`, `canadian_target_hierarchy`,
 `canadian_target_markup`, `canadian_numbering_unprovable`,
-`classification_invalid_payload`, `classification_deterministic_override`,
+`canadian_to_csi_hierarchy`, `canadian_to_csi_numbering_unprovable`,
+`builtin_scheme_contract`, `classification_invalid_payload`,
+`classification_deterministic_override`,
 `classification_coverage_incomplete`, `numbering_importer_unavailable`,
 `template_section_shell_conflict`, `template_default_section_conflict`,
 `template_duplicate_section_index`.
@@ -540,7 +681,7 @@ Current codes: `header_footer_target_section_id_required`,
 - engine (shared application path, in order): `classification_ready`,
   `disposition_verification`, `application_policy`,
   `classification_checkpoint`, `source_catalog_snapshot`,
-  `target_token_extraction`, `csi_conversion`,
+  `target_token_extraction`, `csi_conversion`, `canadian_to_csi_conversion`,
   `canadian_classification_mapping`, `environment_application`,
   `header_footer_token_patch`, `numbering_import`,
   `header_footer_numbering_remap`, `style_import`,
@@ -718,6 +859,8 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 python gui.py
 python -m pytest tests/test_sanitized_format_only_corpus.py -q
+python -m pytest tests/test_builtin_scheme.py tests/test_canadian_to_csi.py \
+    tests/test_architect_free_modes.py -q
 ```
 
 The GUI tests (`tests/test_gui_modes.py`) import `gui.py`, which needs
@@ -743,14 +886,29 @@ result = format_specifications(
 print(result.run_dir, result.manifest_path, result.output_paths)
 ```
 
+The two architect-free modes pass ``None`` for the template. It stays the first
+parameter and must still be passed explicitly, so every existing caller is
+unaffected:
+
+```python
+result = format_specifications(
+    architect_template=None,
+    target_specs=[Path("21 13 13 Sprinklers.docx")],
+    output_dir=Path("output"),
+    api_key="...",
+    conversion_mode="csi_to_canadian_standalone",  # or "canadian_to_csi"
+)
+```
+
 ## Change checklist
 
 Before considering a formatter change complete:
 
 1. Confirm architect and target sources remain unchanged.
 2. Confirm every classifiable target paragraph is styled or ignored exactly once.
-3. Exercise both application policies; prove Format-only text and numbering are
-   unchanged and Canadian conversion still fails closed.
+3. Exercise all four application policies; prove Format-only text and numbering
+   are unchanged, both Canadian conversions still fail closed, and the
+   architect-free modes leave the target's shell alone.
 4. Confirm generated style inheritance, collision remapping, and header/footer
    style references resolve correctly without replacing target style IDs.
 5. Validate the complete architect bundle and versioned cache compatibility.
@@ -772,6 +930,19 @@ Before considering a formatter change complete:
 - Treating the selected output root as the concrete run directory.
 - Writing loose formatted files or logs directly into the output root.
 - Reimplementing mode checks outside `ApplicationPolicy`.
+- Accepting an architect template in a mode that does not use one, instead of
+  rejecting it.
+- Giving the built-in scheme its own, easier validators instead of the
+  architect's.
+- Applying an architect shell, or any generated one, in an architect-free mode.
+- Inventing a CSI marker for a paragraph the source never numbered.
+- Adding runs to carry a marker rather than joining the paragraph's first run.
+- Writing a marker from the classified role without proving it matches the
+  list level the document actually renders.
+- Placing a generated marker inside a field result or tracked insertion.
+- Writing `w:numPr` before `w:pStyle` inside `w:pPr`.
+- Swapping a paragraph's own style for a generated one in a mode that promises
+  to change only numbering.
 - Importing architect body numbering in Format-only.
 - Treating visible text as stronger evidence than effective Word numbering.
 - Restyling an ignored paragraph or silently dropping it from coverage.

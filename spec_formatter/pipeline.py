@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from . import __version__ as APPLICATION_VERSION
+from . import builtin_scheme
 from . import diagnostics as diag
 from . import template_analysis
 from .llm_usage import usage_from_exception
@@ -32,6 +33,7 @@ from .resources import TARGET_PROMPT_FILES, architect_prompt_dir, target_prompt_
 from .style_application.batch_runner import (
     BatchResult,
     SharedConfig,
+    builtin_shared_config,
     load_and_validate_shared_config,
     process_single_file,
 )
@@ -40,12 +42,14 @@ from .style_application.core.application_policy import (
     application_policy_for_mode,
 )
 from .style_application.core.errors import remediation_for as engine_remediation_for
-from .style_application.core.csi_to_canadian import (
+from .style_application.core.conversion_modes import (
+    CANADIAN_TO_CSI,
     CSI_TO_CANADIAN,
+    CSI_TO_CANADIAN_STANDALONE,
     FORMAT_ONLY,
-    CanadianConversionReport,
     validate_conversion_mode,
 )
+from .style_application.core.csi_to_canadian import CanadianConversionReport
 
 
 ProgressCallback = Callable[[str], None]
@@ -60,6 +64,8 @@ TargetProcessor = Callable[..., BatchResult]
 _FORMATTED_SUFFIXES = (
     "_FORMATTED.DOCX",
     "_CANADIAN_FORMATTED.DOCX",
+    "_CANADIAN.DOCX",
+    "_CSI.DOCX",
     "_PHASE2_FORMATTED.DOCX",
 )
 _MAX_WORKERS = 6
@@ -136,7 +142,9 @@ class TargetFormatResult:
 class FormatRunResult:
     """Consolidated result returned by :func:`format_specifications`."""
 
-    template_profile: TemplateProfile
+    #: The validated architect profile, or ``None`` for a run that used the
+    #: built-in scheme and therefore analyzed no template.
+    template_profile: Optional[TemplateProfile]
     output_dir: Path
     targets: tuple[TargetFormatResult, ...]
     run_id: str = ""
@@ -255,14 +263,30 @@ def _friendly_template_progress(message: str) -> str:
     return message
 
 
-def _is_formatted_output(path: Path) -> bool:
-    return path.name.upper().endswith(_FORMATTED_SUFFIXES)
+def _is_formatted_output(
+    path: Path,
+    accepted_suffixes: Sequence[str] = (),
+) -> bool:
+    """Whether *path* is one of this application's own output files.
+
+    ``accepted_suffixes`` names outputs the selected mode legitimately takes as
+    input. It is checked first and wins outright, because the general suffixes
+    overlap: ``_CANADIAN_FORMATTED.docx`` also ends with ``_FORMATTED.docx``,
+    so a mode that accepts the former has to say so in a way the latter cannot
+    override.
+    """
+
+    name = path.name.upper()
+    if accepted_suffixes and name.endswith(tuple(accepted_suffixes)):
+        return False
+    return name.endswith(_FORMATTED_SUFFIXES)
 
 
 def collect_target_specs(
     inputs: Iterable[Path],
     *,
     exclude_discovered: Optional[Path] = None,
+    accepted_output_suffixes: Sequence[str] = (),
 ) -> tuple[Path, ...]:
     """Expand DOCX files and folders into a stable, deduplicated target list.
 
@@ -271,6 +295,11 @@ def collect_target_specs(
     ``exclude_discovered`` is ignored only during folder expansion; an
     explicitly supplied matching file remains in the result so input
     validation can reject selecting the architect as a target.
+
+    ``accepted_output_suffixes`` comes from the selected mode's policy and
+    names outputs this application produced that the mode nonetheless takes as
+    input, so pointing the reverse conversion at a folder of Canadian outputs
+    finds them instead of skipping every one.
     """
 
     excluded_key = (
@@ -286,7 +315,7 @@ def collect_target_specs(
                 candidate
                 for candidate in path.glob("*.docx")
                 if not candidate.name.startswith("~$")
-                and not _is_formatted_output(candidate)
+                and not _is_formatted_output(candidate, accepted_output_suffixes)
                 and os.path.normcase(str(candidate.resolve())) != excluded_key
             )
         else:
@@ -313,32 +342,62 @@ def default_template_cache_dir() -> Path:
 
 
 def _validate_inputs(
-    architect_template: Path,
+    architect_template: Optional[Path],
     target_specs: Sequence[Path],
     output_dir: Path,
-) -> tuple[Path, tuple[Path, ...], Path]:
-    architect = Path(architect_template).expanduser().resolve()
-    if not architect.is_file():
-        raise _attach_safe_error_diagnostic(
-            FileNotFoundError(f"Architect template does not exist: {architect}"),
-            code="input_architect_missing",
-            message="Architect template does not exist.",
-        )
-    if architect.suffix.lower() != ".docx":
-        raise _attach_safe_error_diagnostic(
-            ValueError(f"Architect template must be a .docx file: {architect}"),
-            code="input_architect_not_docx",
-            message="Architect template must be a .docx file.",
-        )
-    if architect.name.startswith("~$"):
-        message = "Select the saved architect DOCX, not Word's temporary lock file."
-        raise _attach_safe_error_diagnostic(
-            ValueError(message),
-            code="input_architect_lock_file",
-            message=message,
-        )
+    *,
+    requires_architect: bool = True,
+    accepted_output_suffixes: Sequence[str] = (),
+) -> tuple[Optional[Path], tuple[Path, ...], Path]:
+    architect: Optional[Path] = None
+    if not requires_architect:
+        # Accepting and quietly ignoring a template the user chose would be the
+        # worst answer available: they would watch a run finish and reasonably
+        # believe their template had been applied.
+        if architect_template is not None:
+            message = (
+                "This conversion mode uses the built-in Canadian CSC PageFormat "
+                "scheme and does not take an architect template."
+            )
+            raise _attach_safe_error_diagnostic(
+                ValueError(message),
+                code="input_architect_not_accepted",
+                message=message,
+            )
+    else:
+        if architect_template is None:
+            message = "Choose the architect's DOCX template for this conversion mode."
+            raise _attach_safe_error_diagnostic(
+                ValueError(message),
+                code="input_architect_missing",
+                message=message,
+            )
+        architect = Path(architect_template).expanduser().resolve()
+        if not architect.is_file():
+            raise _attach_safe_error_diagnostic(
+                FileNotFoundError(f"Architect template does not exist: {architect}"),
+                code="input_architect_missing",
+                message="Architect template does not exist.",
+            )
+        if architect.suffix.lower() != ".docx":
+            raise _attach_safe_error_diagnostic(
+                ValueError(f"Architect template must be a .docx file: {architect}"),
+                code="input_architect_not_docx",
+                message="Architect template must be a .docx file.",
+            )
+        if architect.name.startswith("~$"):
+            message = "Select the saved architect DOCX, not Word's temporary lock file."
+            raise _attach_safe_error_diagnostic(
+                ValueError(message),
+                code="input_architect_lock_file",
+                message=message,
+            )
 
-    targets = collect_target_specs(target_specs, exclude_discovered=architect)
+    targets = collect_target_specs(
+        target_specs,
+        exclude_discovered=architect,
+        accepted_output_suffixes=accepted_output_suffixes,
+    )
     if not targets:
         message = "Select at least one target specification DOCX file."
         raise _attach_safe_error_diagnostic(
@@ -347,7 +406,7 @@ def _validate_inputs(
             message=message,
         )
 
-    architect_key = os.path.normcase(str(architect))
+    architect_key = os.path.normcase(str(architect)) if architect is not None else None
     for target in targets:
         if not target.is_file():
             raise _attach_safe_error_diagnostic(
@@ -371,13 +430,13 @@ def _validate_inputs(
                 code="input_target_lock_file",
                 message="A selected target is a Word temporary lock file.",
             )
-        if _is_formatted_output(target):
+        if _is_formatted_output(target, accepted_output_suffixes):
             raise _attach_safe_error_diagnostic(
                 ValueError(f"Target is already a formatted output: {target}"),
                 code="input_target_already_formatted",
                 message="A selected target is already a formatted output.",
             )
-        if os.path.normcase(str(target)) == architect_key:
+        if architect_key is not None and os.path.normcase(str(target)) == architect_key:
             message = "The architect template cannot also be a target specification."
             raise _attach_safe_error_diagnostic(
                 ValueError(message),
@@ -982,8 +1041,12 @@ _KNOWN_SAFE_ERROR_MESSAGES = {
     "input_architect_is_target": (
         "The architect template cannot also be a target specification."
     ),
+    "input_architect_not_accepted": (
+        "This conversion mode uses the built-in Canadian CSC PageFormat scheme "
+        "and does not take an architect template."
+    ),
     "invalid_conversion_mode": (
-        "conversion_mode must be one of: csi_to_canadian, format_only"
+        "conversion_mode must be one of: canadian_to_csi, csi_to_canadian, csi_to_canadian_standalone, format_only"
     ),
     "invalid_max_workers": "max_workers must be an integer.",
     "output_create_failed": "Output directory could not be created.",
@@ -1468,6 +1531,39 @@ def _format_one_target(
         )
 
 
+def _numbering_source(
+    conversion_mode: str,
+    architect: Optional[Path],
+    architect_sha256: Optional[str] = None,
+) -> dict[str, Any]:
+    """Describe where this run's numbering came from, for ``run.json``.
+
+    The keys are always present. A run with no architect reports nulls for the
+    template and names the built-in scheme instead, so a reader can never
+    mistake an absent template for one that simply was not recorded.
+    """
+
+    policy = application_policy_for_mode(conversion_mode)
+    record: dict[str, Any] = {
+        "numbering_scheme": policy.numbering_scheme,
+        "architect_template": {
+            "path": str(architect) if architect is not None else None,
+            "sha256": architect_sha256,
+        },
+        "builtin_scheme": None,
+    }
+    if policy.uses_builtin_scheme:
+        # Only a mode that actually renders from the built-in list names it.
+        # ``canadian_to_csi`` writes literal markers and imports no numbering,
+        # so quoting a scheme digest for it would claim a provenance nothing
+        # in the output actually has.
+        record["builtin_scheme"] = {
+            "version": builtin_scheme.BUILTIN_SCHEME_VERSION,
+            "digest": builtin_scheme.scheme_digest(),
+        }
+    return record
+
+
 def _profile_provenance(profile: TemplateProfile) -> dict[str, Any]:
     provenance = getattr(profile, "provenance", None)
     if not isinstance(provenance, Mapping):
@@ -1597,8 +1693,8 @@ def _write_run_artifacts(
     conversion_mode: str,
     output_root: Path,
     run_dir: Path,
-    architect: Path,
-    profile: TemplateProfile,
+    architect: Optional[Path],
+    profile: Optional[TemplateProfile],
     template_model: str,
     target_model: str,
     started_utc: datetime,
@@ -1668,7 +1764,7 @@ def _write_run_artifacts(
 
     succeeded = sum(1 for item in audited_results if item.success)
     failed = len(audited_results) - succeeded
-    profile_metadata = _profile_provenance(profile)
+    profile_metadata = _profile_provenance(profile) if profile is not None else {}
     target_records: list[dict[str, Any]] = []
     for item in audited_results:
         error_diagnostic = _target_error_diagnostic(item, secrets)
@@ -1722,10 +1818,11 @@ def _write_run_artifacts(
             "run_log": str(run_log_path),
             "diagnostics_log": str(diagnostics_path),
         },
-        "architect_template": {
-            "path": str(architect),
-            "sha256": profile.source_sha256,
-        },
+        **_numbering_source(
+            conversion_mode,
+            architect,
+            profile.source_sha256 if profile is not None else None,
+        ),
         "template_profile": profile_metadata,
         "models": {
             "template": template_model,
@@ -1753,7 +1850,7 @@ def _write_initialization_failure_artifacts(
     conversion_mode: str,
     output_root: Path,
     run_dir: Path,
-    architect: Path,
+    architect: Optional[Path],
     targets: Sequence[Path],
     template_model: str,
     target_model: str,
@@ -1781,11 +1878,12 @@ def _write_initialization_failure_artifacts(
             code="untrusted_error",
             message="[untrusted detail omitted]",
         )
-    architect_hash: Optional[str]
-    try:
-        architect_hash = _stable_source_sha256(architect)
-    except Exception:
-        architect_hash = None
+    architect_hash: Optional[str] = None
+    if architect is not None:
+        try:
+            architect_hash = _stable_source_sha256(architect)
+        except Exception:
+            architect_hash = None
 
     target_records: list[dict[str, Any]] = []
     for index, target in enumerate(targets, start=1):
@@ -1914,7 +2012,7 @@ def _write_initialization_failure_artifacts(
             "run_log": str(run_log_path),
             "diagnostics_log": str(diagnostics_path),
         },
-        "architect_template": {"path": str(architect), "sha256": architect_hash},
+        **_numbering_source(conversion_mode, architect, architect_hash),
         "template_profile": None,
         "models": {"template": template_model, "target": target_model},
         "prompt_fingerprints": {"target": _target_prompt_fingerprints()},
@@ -1934,7 +2032,7 @@ def _write_initialization_failure_artifacts(
 
 
 def format_specifications(
-    architect_template: Path,
+    architect_template: Optional[Path],
     target_specs: Iterable[Path],
     output_dir: Path,
     api_key: str,
@@ -2055,7 +2153,7 @@ def format_specifications(
         _attach_safe_error_diagnostic(
             exc,
             code="invalid_conversion_mode",
-            message="conversion_mode must be one of: csi_to_canadian, format_only",
+            message="conversion_mode must be one of: canadian_to_csi, csi_to_canadian, csi_to_canadian_standalone, format_only",
         )
         raise
     if not isinstance(api_key, str):
@@ -2073,10 +2171,13 @@ def format_specifications(
             message=message,
         )
     normalized_api_key = api_key.strip()
+    policy = application_policy_for_mode(conversion_mode)
     architect, targets, destination = _validate_inputs(
         architect_template,
         tuple(target_specs),
         output_dir,
+        requires_architect=policy.requires_architect_template,
+        accepted_output_suffixes=policy.accepted_output_suffixes,
     )
     workers = max(1, min(max_workers, _MAX_WORKERS, len(targets)))
     profile_cache = (
@@ -2092,29 +2193,40 @@ def format_specifications(
         workers=workers,
         mode=conversion_mode,
     )
+    profile: Optional[TemplateProfile] = None
     try:
-        with recorder.timer("pipeline", "template_analysis") as phase:
-            profile = prepare_template_profile(
-                architect,
-                profile_cache,
-                normalized_api_key,
-                force_analysis=force_template_analysis,
-                model=template_model,
-                prompt_dir=template_prompt_dir,
-                progress=report,
-                classifier=template_classifier,
-                analyzer=_template_analyzer,
-            )
-            phase.set(reused=profile.reused)
-            recorder.record_usage("architect", dict(profile.usage))
-        if _stable_source_sha256(architect) != profile.source_sha256:
-            raise RuntimeError(
-                "The architect template changed during this run. Finish saving it and run again."
-            )
+        if policy.requires_architect_template:
+            assert architect is not None  # guaranteed by _validate_inputs
+            with recorder.timer("pipeline", "template_analysis") as phase:
+                profile = prepare_template_profile(
+                    architect,
+                    profile_cache,
+                    normalized_api_key,
+                    force_analysis=force_template_analysis,
+                    model=template_model,
+                    prompt_dir=template_prompt_dir,
+                    progress=report,
+                    classifier=template_classifier,
+                    analyzer=_template_analyzer,
+                )
+                phase.set(reused=profile.reused)
+                recorder.record_usage("architect", dict(profile.usage))
+            if _stable_source_sha256(architect) != profile.source_sha256:
+                raise RuntimeError(
+                    "The architect template changed during this run. Finish saving it and run again."
+                )
 
-        report("Validating the template profile...")
-        with recorder.timer("pipeline", "config_load"):
-            shared = _config_loader(profile.bundle_dir)
+            report("Validating the template profile...")
+            with recorder.timer("pipeline", "config_load"):
+                shared = _config_loader(profile.bundle_dir)
+        else:
+            # Nothing is analyzed, cached, or requested from the model: the
+            # scheme is built from committed constants, so there is no profile
+            # and no architect usage to record for this run.
+            report("Using the built-in Canadian CSC PageFormat scheme...")
+            with recorder.timer("pipeline", "builtin_scheme") as phase:
+                shared = builtin_shared_config()
+                phase.set(scheme_version=builtin_scheme.BUILTIN_SCHEME_VERSION)
         planned_outputs = _plan_output_paths(targets, run_dir, conversion_mode)
         _validate_output_plan(architect, targets, planned_outputs)
     except Exception as exc:
@@ -2333,7 +2445,9 @@ def format_specifications(
 
 __all__ = [
     "FormatRunResult",
+    "CANADIAN_TO_CSI",
     "CSI_TO_CANADIAN",
+    "CSI_TO_CANADIAN_STANDALONE",
     "FORMAT_ONLY",
     "ProgressEventCallback",
     "SafeErrorDiagnostic",
