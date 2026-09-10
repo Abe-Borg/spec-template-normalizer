@@ -592,6 +592,93 @@ def test_classifier_usage_becomes_classify_phase_diagnostics_not_payload(
     assert fields["cache_creation_input_tokens"] == 400
     assert "bogus" not in fields
 
+    # The phase event is per-phase detail; the field is what cost is read
+    # from, because events are level-filtered and totals must not be. This
+    # assertion was missing, so a success path that dropped the field
+    # entirely still passed.
+    assert result.usage["requests"] == 2
+    assert result.usage["input_tokens"] == 1200
+    assert result.usage["cache_read_input_tokens"] == 700
+
+
+
+def test_successful_target_reports_its_usage_on_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A deterministic-only target must report zero, not nothing.
+
+    "We sent no requests" and "we could not tell you what we sent" are
+    different answers and have to look different. The classifier returns an
+    explicit zero snapshot for a target it resolved locally; if the success
+    path drops it, ``record_usage`` sees an empty dict, ignores it, and
+    ``run.json`` carries no target scope at all -- indistinguishable from a
+    run whose counters never arrived.
+    """
+
+    from spec_formatter.llm_usage import UsageCollector
+
+    extract_dir = _seed_extract(tmp_path)
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source package")
+    zero = UsageCollector().snapshot()
+
+    class FakeDecomposer:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def extract(self, *, output_dir: Path) -> Path:
+            del output_dir
+            return extract_dir
+
+    monkeypatch.setattr(batch_runner, "DocxDecomposer", FakeDecomposer)
+    monkeypatch.setattr(
+        batch_runner,
+        "build_phase2_slim_bundle",
+        lambda *_args, **_kwargs: {
+            "paragraphs": [],
+            "deterministic_classifications": [
+                {"paragraph_index": 0, "csi_role": "PARAGRAPH"}
+            ],
+            "deterministic_ignored_paragraphs": [],
+        },
+    )
+    monkeypatch.setattr(
+        batch_runner,
+        "classify_target_document",
+        lambda **_kwargs: {
+            "classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}],
+            "ignored_paragraphs": [],
+            "notes": [],
+            "usage": dict(zero),
+        },
+    )
+    monkeypatch.setattr(
+        batch_runner,
+        "_apply_classified_target",
+        lambda **_kwargs: (
+            tmp_path / "out.docx",
+            None,
+            {"styled": 1, "ignored": 0, "out_of_scope": 0, "unresolved": 0},
+            {},
+            {},
+        ),
+    )
+
+    result = batch_runner.process_single_file(
+        docx_path=source,
+        arch_registry={"PARAGRAPH": "Body"},
+        env_registry={},
+        arch_styles_xml="<w:styles/>",
+        available_roles=["PARAGRAPH"],
+        api_key="",
+        output_dir=tmp_path / "output",
+    )
+
+    assert result.success is True
+    assert result.usage == zero
+    assert result.usage["requests_attempted"] == 0
+    assert result.usage["usage_complete"] is True
 
 
 def test_failed_classification_still_reports_what_it_spent(

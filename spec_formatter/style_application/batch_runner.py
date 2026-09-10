@@ -1151,6 +1151,11 @@ def process_single_file(
             numbering_checks=numbering_checks,
             stage="complete",
             diagnostics=per_file_diag,
+            # A successful target costs exactly as much as a failed one.
+            # The failure path below has always carried this; omitting it
+            # here meant every successful run published no target usage at
+            # all, because record_usage ignores an empty snapshot.
+            usage=observed_usage,
         )
     except Exception as exc:
         if isinstance(exc, ApplicationStageError):
