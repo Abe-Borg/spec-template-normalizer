@@ -30,6 +30,33 @@ _INVALID_MODE_MESSAGE = "conversion_mode must be one of: " + ", ".join(
 )
 
 
+def test_every_conversion_mode_is_importable_from_the_package_root():
+    """The package facade must export every mode, not just the original two.
+
+    ``spec_formatter/__init__.py`` resolves an attribute only ``if name in
+    __all__`` before forwarding to ``pipeline``, so a constant missing from that
+    list is invisible to ``from spec_formatter import X`` even though
+    ``from spec_formatter.pipeline import X`` works. That is how
+    ``CSI_TO_CANADIAN_STANDALONE`` and ``CANADIAN_TO_CSI`` were unreachable when
+    they were first added.
+
+    The expectation is derived from ``VALID_CONVERSION_MODES`` rather than
+    written out again, so adding a mode without exporting it fails here instead
+    of reaching a headless caller.
+    """
+
+    exported = {
+        value
+        for name in spec_formatter.__all__
+        if isinstance(value := getattr(spec_formatter, name), str)
+    }
+    missing = VALID_CONVERSION_MODES - exported
+    assert not missing, (
+        f"conversion modes not reachable from the package root: {sorted(missing)}; "
+        "add their constants to spec_formatter/__init__.py::__all__"
+    )
+
+
 def _write_input(path: Path, contents: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(contents)
