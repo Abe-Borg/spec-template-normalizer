@@ -16,7 +16,7 @@ from .conversion_modes import (
 # Contract 4: the architect template became optional for two modes, so
 # ``requires_architect_template`` and ``numbering_scheme`` now decide where a
 # run's numbering and shell come from.
-APPLICATION_POLICY_VERSION = "4"
+APPLICATION_POLICY_VERSION = "5"
 
 FORMAT_ONLY_OUTPUT_SUFFIX = "_FORMATTED.docx"
 CSI_TO_CANADIAN_OUTPUT_SUFFIX = "_CANADIAN_FORMATTED.docx"
@@ -73,6 +73,14 @@ class ApplicationPolicy:
     #: exactly as authored, which is the only honest option when there is no
     #: architect to take a shell from.
     apply_full_architect_shell: bool = True
+    #: Whether this mode deliberately moves converted paragraphs' indentation.
+    #: The two forward Canadian modes retarget every converted paragraph onto a
+    #: different list's level indents, so their geometry is *meant* to change
+    #: and the effective-geometry invariant would fire on every run. Every
+    #: other mode must leave a paragraph rendering where it rendered before,
+    #: and says so by leaving this False rather than by being exempted at the
+    #: check.
+    reindents_converted_paragraphs: bool = False
     contract_version: str = APPLICATION_POLICY_VERSION
 
     @property
@@ -113,6 +121,7 @@ def application_policy_for_mode(conversion_mode: str) -> ApplicationPolicy:
             convert_to_canadian=True,
             import_body_numbering=True,
             output_suffix=CSI_TO_CANADIAN_OUTPUT_SUFFIX,
+            reindents_converted_paragraphs=True,
         )
     if mode == CSI_TO_CANADIAN_STANDALONE:
         return ApplicationPolicy(
@@ -121,6 +130,7 @@ def application_policy_for_mode(conversion_mode: str) -> ApplicationPolicy:
             convert_to_canadian=True,
             import_body_numbering=True,
             output_suffix=CSI_TO_CANADIAN_STANDALONE_OUTPUT_SUFFIX,
+            reindents_converted_paragraphs=True,
             requires_architect_template=False,
             numbering_scheme=SCHEME_BUILTIN_CSC,
             applies_role_styles=False,

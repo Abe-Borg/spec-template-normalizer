@@ -522,7 +522,29 @@ Return the source-to-final style-ID map to every body/header/footer consumer.
   slots in just-imported parts, including mirrored DrawingML/VML text boxes;
   ambiguous shells or incomplete target tokens fail closed.
 - `phase2_invariants.py` verifies body, numbering, protected structure,
-  section, header/footer, relationship, and package contracts.
+  section, header/footer, relationship, and package contracts, plus
+  **effective paragraph geometry**. That last one covers the class every
+  other check is blind to: identical text, identical numbering semantics,
+  identical run structure and valid XSD, with every paragraph rendering
+  somewhere else. It is reachable because a numbering level's `w:pPr` applies
+  only while the paragraph is a list member, so cancelling the list drops the
+  level's `w:ind` -- and a stylesheet whose list styles carry `w:numPr` and no
+  `w:ind` keeps *all* its geometry there.
+
+  The check is **differential, not absolute**. OOXML precedence between a
+  paragraph style's `w:ind` and the `w:ind` of the numbering level it
+  references is genuinely unsettled: the spec's style hierarchy applies
+  paragraph styles after numbering, Word's observed behaviour for a directly
+  referenced list is the reverse. So geometry is resolved under *both*
+  readings and a paragraph fails only when it changed under both. A rendering
+  stable under either precedence is stable whichever one Word implements, and
+  a document that moved under only one is exactly where this module cannot
+  honestly claim a defect. Do not "fix" it by picking a precedence.
+
+  It runs for every mode. The two forward Canadian modes retarget converted
+  paragraphs onto a different list's level indents, so their geometry is meant
+  to change; they say so with `ApplicationPolicy.reindents_converted_paragraphs`
+  rather than being exempted at the check.
 - `docx_decomposer.py` extracts targets safely; `docx_patch.py` assembles and
   validates replacements before publication.
 
@@ -668,7 +690,7 @@ Current codes: `header_footer_target_section_id_required`,
 `canadian_architect_contract`, `canadian_target_hierarchy`,
 `canadian_target_markup`, `canadian_numbering_unprovable`,
 `canadian_to_csi_hierarchy`, `canadian_to_csi_numbering_unprovable`,
-`canadian_to_csi_tracked_hierarchy`,
+`canadian_to_csi_tracked_hierarchy`, `geometry_not_preserved`,
 `builtin_scheme_contract`, `classification_invalid_payload`,
 `classification_deterministic_override`,
 `classification_coverage_incomplete`, `numbering_importer_unavailable`,
@@ -688,7 +710,8 @@ Current codes: `header_footer_target_section_id_required`,
   `header_footer_numbering_remap`, `style_import`,
   `header_footer_style_remap`, `stability_snapshot`,
   `classification_application`, `stability_verification`,
-  `application_reporting`, `output_publication`, `complete`
+  `geometry_verification`, `application_reporting`, `output_publication`,
+  `complete`
 - runner (before the shared path): `validation`, `extraction`,
   `bundle_build`, `classification_preflight`, `classification`,
   `application`

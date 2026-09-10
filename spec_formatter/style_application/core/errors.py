@@ -71,6 +71,12 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "later accepted or rejected. Accept or reject the tracked changes on "
         "the reported paragraph, then convert."
     ),
+    "geometry_not_preserved": (
+        "A paragraph's effective indentation changed during formatting, so the "
+        "output was withheld. This is usually a template whose list styles take "
+        "their indents from the numbering definition; please report the target "
+        "and the reported paragraph index."
+    ),
     "builtin_scheme_contract": (
         "The built-in Canadian CSC PageFormat scheme failed its own contract "
         "check. This is a defect in the application rather than in your "
@@ -127,6 +133,7 @@ ENGINE_STAGES: tuple[str, ...] = (
     "stability_snapshot",
     "classification_application",
     "stability_verification",
+    "geometry_verification",
     "application_reporting",
     "output_publication",
     "complete",

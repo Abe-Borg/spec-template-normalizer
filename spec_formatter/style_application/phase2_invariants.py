@@ -17,13 +17,16 @@ from .core.style_import import WORD_BUILTIN_STYLE_IDS
 from .core.classification import (
     _build_numbering_catalog,
     _effective_numbering_semantics,
+    _effective_numpr,
 )
+from .core.errors import EngineError
 from .core.xml_helpers import (
     iter_direct_child_xml_blocks,
     iter_element_xml_blocks,
     iter_paragraph_xml_blocks,
     paragraph_text_from_block,
     strip_direct_run_properties,
+    strip_out_of_scope_subtrees,
 )
 
 if TYPE_CHECKING:
@@ -933,6 +936,241 @@ def _verify_target_header_footer_preserved(src_docx: Path, new_docx: Path) -> No
                 )
 
 
+
+# --- Effective paragraph geometry ----------------------------------------
+#
+# The one class of defect every other check in this module is blind to:
+# identical text, identical numbering semantics, identical run structure,
+# valid XSD -- and a visibly different document.
+#
+# It is reachable because a numbering level's ``w:pPr`` applies only while the
+# paragraph is a list member. Cancel the list and the level's ``w:ind`` goes
+# with it, so a stylesheet whose list styles carry ``w:numPr`` and no ``w:ind``
+# loses every indent in the document while proving, by every text-level
+# measure available, that nothing changed.
+
+_IND_ATTRIBUTES = ("left", "start", "right", "end", "firstLine", "hanging")
+
+_Geometry = Optional[Dict[str, str]]
+
+
+def _ind_values(ind_element: Optional[ET.Element]) -> _Geometry:
+    if ind_element is None:
+        return None
+    values = {
+        name: ind_element.attrib[f"{{{W_NS}}}{name}"]
+        for name in _IND_ATTRIBUTES
+        if f"{{{W_NS}}}{name}" in ind_element.attrib
+    }
+    return values or None
+
+
+def _ind_from_ppr_xml(ppr_xml: str) -> _Geometry:
+    match = re.search(r"<w:ind\b[^>]*/?>", ppr_xml)
+    if match is None:
+        return None
+    values = {
+        name: value
+        for name in _IND_ATTRIBUTES
+        for value in re.findall(rf'w:{name}="([^"]*)"', match.group(0))
+    }
+    return values or None
+
+
+def _direct_paragraph_ind(paragraph_xml: str) -> _Geometry:
+    ppr = re.search(r"<w:pPr\b[^>]*(?:/>|>.*?</w:pPr>)", paragraph_xml, re.S)
+    return _ind_from_ppr_xml(ppr.group(0)) if ppr else None
+
+
+def _style_chain_ind(styles_xml: str, style_id: Optional[str]) -> _Geometry:
+    """First ``w:ind`` found walking a style's ``basedOn`` chain."""
+
+    if not style_id or not styles_xml.strip():
+        return None
+    blocks = {
+        match.group(1): match.group(0)
+        for match in re.finditer(
+            r'<w:style\b[^>]*w:styleId="([^"]+)"[^>]*>.*?</w:style>', styles_xml, re.S
+        )
+    }
+    seen: Set[str] = set()
+    current: Optional[str] = style_id
+    while current and current not in seen:
+        seen.add(current)
+        block = blocks.get(current)
+        if block is None:
+            return None
+        ppr = re.search(r"<w:pPr\b[^>]*(?:/>|>.*?</w:pPr>)", block, re.S)
+        if ppr is not None:
+            values = _ind_from_ppr_xml(ppr.group(0))
+            if values is not None:
+                return values
+        based_on = re.search(r'<w:basedOn\b[^>]*w:val="([^"]+)"', block)
+        current = based_on.group(1) if based_on else None
+    return None
+
+
+def _doc_defaults_ind(styles_xml: str) -> _Geometry:
+    match = re.search(r"<w:pPrDefault\b[^>]*>.*?</w:pPrDefault>", styles_xml, re.S)
+    return _ind_from_ppr_xml(match.group(0)) if match else None
+
+
+def _numbering_level_ind_index(numbering_xml: str) -> Dict[tuple, _Geometry]:
+    """Map ``(numId, ilvl)`` to the ``w:ind`` its effective level supplies."""
+
+    if not numbering_xml.strip():
+        return {}
+    try:
+        root = parse_untrusted_xml(
+            prepare_xml_text_for_utf8(numbering_xml), "word/numbering.xml"
+        )
+    except UntrustedXmlError:
+        return {}
+    abstract_levels: Dict[str, Dict[str, _Geometry]] = {}
+    for abstract in root.findall(f"{{{W_NS}}}abstractNum"):
+        abstract_id = abstract.attrib.get(f"{{{W_NS}}}abstractNumId")
+        if abstract_id is None:
+            continue
+        levels: Dict[str, _Geometry] = {}
+        for level in abstract.findall(f"{{{W_NS}}}lvl"):
+            ilvl = level.attrib.get(f"{{{W_NS}}}ilvl")
+            level_ppr = level.find(f"{{{W_NS}}}pPr")
+            if ilvl is not None:
+                levels[ilvl] = _ind_values(
+                    level_ppr.find(f"{{{W_NS}}}ind") if level_ppr is not None else None
+                )
+        abstract_levels[abstract_id] = levels
+
+    index: Dict[tuple, _Geometry] = {}
+    for num in root.findall(f"{{{W_NS}}}num"):
+        num_id = num.attrib.get(f"{{{W_NS}}}numId")
+        if num_id is None:
+            continue
+        abstract_ref = num.find(f"{{{W_NS}}}abstractNumId")
+        abstract_id = (
+            abstract_ref.attrib.get(f"{{{W_NS}}}val")
+            if abstract_ref is not None
+            else None
+        )
+        for ilvl, values in abstract_levels.get(abstract_id, {}).items():
+            index[(num_id, ilvl)] = values
+        for override in num.findall(f"{{{W_NS}}}lvlOverride"):
+            ilvl = override.attrib.get(f"{{{W_NS}}}ilvl")
+            override_level = override.find(f"{{{W_NS}}}lvl")
+            if ilvl is None or override_level is None:
+                continue
+            level_ppr = override_level.find(f"{{{W_NS}}}pPr")
+            index[(num_id, ilvl)] = _ind_values(
+                level_ppr.find(f"{{{W_NS}}}ind") if level_ppr is not None else None
+            )
+    return index
+
+
+def _paragraph_geometry_sources(
+    paragraph_xml: str,
+    styles_xml: str,
+    level_index: Dict[tuple, _Geometry],
+) -> tuple:
+    """The three ``w:ind`` sources that can reach one paragraph, unresolved.
+
+    Returned separately rather than collapsed, because which of them Word
+    prefers is the ambiguity :func:`_verify_effective_paragraph_geometry`
+    exists to work around rather than to guess at.
+    """
+
+    analysis_xml = strip_out_of_scope_subtrees(paragraph_xml)
+    direct = _direct_paragraph_ind(analysis_xml)
+
+    numbering = _effective_numpr(analysis_xml, styles_xml)
+    level: _Geometry = None
+    if numbering is not None:
+        num_id = str(numbering.get("numId") or "")
+        # numId 0 is Word's "not in a list": no level, so no level geometry.
+        if num_id and num_id != "0":
+            level = level_index.get((num_id, str(numbering.get("ilvl") or "0")))
+
+    style_match = re.search(r'<w:pStyle\b[^>]*w:val="([^"]+)"', analysis_xml)
+    chain = _style_chain_ind(styles_xml, style_match.group(1) if style_match else None)
+    return direct, level, chain
+
+
+def _resolve_geometry(sources: tuple, defaults: _Geometry, level_first: bool) -> _Geometry:
+    direct, level, chain = sources
+    order = (direct, level, chain) if level_first else (direct, chain, level)
+    for candidate in (*order, defaults):
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _verify_effective_paragraph_geometry(
+    before_document_xml: str,
+    after_document_xml: str,
+    before_styles: str,
+    after_styles: str,
+    before_numbering: str,
+    after_numbering: str,
+) -> None:
+    """Fail closed if a paragraph's effective indentation changed.
+
+    **Differential, not absolute.** OOXML precedence between a paragraph
+    style's ``w:ind`` and the ``w:ind`` of the numbering level it references is
+    genuinely ambiguous -- the spec's style hierarchy puts paragraph styles
+    after numbering, Word's observed behaviour for a directly referenced list
+    is the reverse. An absolute "the indent should be X" check would have to
+    settle that to be usable at all.
+
+    So geometry is resolved under *both* readings and a paragraph fails only
+    when it changed under both. A rendering that is stable under either
+    precedence is stable, whichever one Word actually implements; and a
+    document that changed under only one is exactly the case where this module
+    cannot honestly claim a defect, so it does not.
+    """
+
+    before_blocks = [b for _s, _e, b in iter_paragraph_xml_blocks(before_document_xml)]
+    after_blocks = [b for _s, _e, b in iter_paragraph_xml_blocks(after_document_xml)]
+    if len(before_blocks) != len(after_blocks):
+        return  # paragraph-count changes are another invariant's failure to report
+
+    before_levels = _numbering_level_ind_index(before_numbering)
+    after_levels = _numbering_level_ind_index(after_numbering)
+    before_defaults = _doc_defaults_ind(before_styles)
+    after_defaults = _doc_defaults_ind(after_styles)
+
+    for index, (before, after) in enumerate(zip(before_blocks, after_blocks)):
+        if before == after:
+            continue
+        before_sources = _paragraph_geometry_sources(before, before_styles, before_levels)
+        after_sources = _paragraph_geometry_sources(after, after_styles, after_levels)
+        if before_sources == after_sources:
+            continue
+        for level_first in (True, False):
+            if _resolve_geometry(before_sources, before_defaults, level_first) == (
+                _resolve_geometry(after_sources, after_defaults, level_first)
+            ):
+                break
+        else:
+            raise EngineError(
+                "geometry_not_preserved",
+                "Effective paragraph indentation changed at paragraph index "
+                f"{index}: the source resolved to "
+                f"{_resolve_geometry(before_sources, before_defaults, True)} and the "
+                f"output to {_resolve_geometry(after_sources, after_defaults, True)}.",
+            )
+
+
+def _styles_and_numbering(docx: Path) -> tuple:
+    """Decoded ``styles.xml`` and ``numbering.xml``, empty when absent."""
+
+    parts = []
+    for name in ("word/styles.xml", "word/numbering.xml"):
+        raw = _read_optional_docx_part(docx, name)
+        parts.append(
+            decode_xml_bytes(raw, part_name=name) if raw is not None else ""
+        )
+    return tuple(parts)
+
+
 def verify_phase2_invariants(
     src_docx: Path,
     new_document_xml: bytes,
@@ -964,6 +1202,25 @@ def verify_phase2_invariants(
             before_doc,
             after_doc,
             new_docx,
+        )
+
+    # Unconditional, unlike the check above: every mode can move a paragraph's
+    # indentation, and the modes that do so deliberately say so on the policy
+    # rather than by being exempt from the check.
+    if not application_policy.reindents_converted_paragraphs:
+        before_styles, before_numbering = _styles_and_numbering(src_docx)
+        after_styles, after_numbering = (
+            _styles_and_numbering(new_docx)
+            if new_docx is not None
+            else (before_styles, before_numbering)
+        )
+        _verify_effective_paragraph_geometry(
+            before_doc,
+            after_doc,
+            before_styles,
+            after_styles,
+            before_numbering,
+            after_numbering,
         )
 
     before_records = _sectpr_records(before_doc)
