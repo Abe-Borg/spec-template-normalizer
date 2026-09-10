@@ -1048,19 +1048,28 @@ def _apply_classified_target_impl(
     checkpoint.stage = "output_publication"
     verification: Dict[str, Any] = {}
     with diag.timed(diag_events, "target", "build_output") as phase:
-        output_path = _build_and_patch_output(
-            docx_path,
-            extract_dir,
-            env_result,
-            output_dir,
-            arch_template_registry=env_registry,
-            conversion_mode=policy.conversion_mode,
-            allowed_rpr_properties_by_paragraph=(
-                apply_report.allowed_rpr_properties_by_paragraph
-            ),
-            verification_out=verification,
-        )
-        phase.set(**verification)
+        try:
+            output_path = _build_and_patch_output(
+                docx_path,
+                extract_dir,
+                env_result,
+                output_dir,
+                arch_template_registry=env_registry,
+                conversion_mode=policy.conversion_mode,
+                allowed_rpr_properties_by_paragraph=(
+                    apply_report.allowed_rpr_properties_by_paragraph
+                ),
+                verification_out=verification,
+            )
+        finally:
+            # Published on the failure path too. The geometry check runs early
+            # inside verify_phase2_invariants, so a later invariant can raise
+            # after it has already done its work -- and ``diag.timed`` builds
+            # its failure event from the fields attached *before* unwinding.
+            # Setting these only on success would leave a failed run looking
+            # exactly like one where the check never ran, which is the state
+            # this reporting exists to make impossible.
+            phase.set(**verification)
     class_coverage = (classified / total * 100) if total > 0 else 100.0
     expected_targetable = apply_report.requested - len(apply_report.skipped_sectpr)
     app_coverage = (
