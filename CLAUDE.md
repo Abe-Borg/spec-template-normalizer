@@ -366,24 +366,89 @@ requires `ilvl == ROLE_LEVEL[role]`. Every document this application's Canadian
 conversion produces satisfies that, because
 `_validate_complete_article_hierarchy` already requires it of the architect.
 
+**A paragraph whose own mark is an unresolved revision has no single number.**
+Reject an inserted paragraph mark and the paragraph disappears; accept a
+deleted one and it merges into the next. Automatic numbering renumbers itself
+either way, which is exactly the safety net a literal marker gives up, so every
+marker after such a paragraph would silently become wrong the moment somebody
+resolved the revision. `_paragraph_mark_revision` fails those closed with
+`canadian_to_csi_tracked_hierarchy`. It is scoped to `w:pPr/w:rPr`: a `w:ins`
+anywhere else marks inserted *text*, which is the ordinary state of a spec
+under review and changes no paragraph's position.
+
 Two placement rules the automatic branch must keep. The marker may not be
 written inside a field result or a tracked insertion: the numbering
 suppression sits on `w:pPr`, outside any such subtree, so updating the field or
 rejecting the revision would delete the marker and leave the paragraph with no
 number at all. And `w:numPr` goes after `w:pStyle`, because `CT_PPr` is a
 sequence -- the reverse order is invalid OOXML even where Word tolerates it.
+`_PPR_CHILD_ORDER` is the complete 36-element sequence from the ISO schema and
+`_ppr_insertion_point` is the one way anything is added to a `w:pPr`. Do not
+re-derive a shorter table for a particular element: a list abbreviated for
+`w:numPr` (#7) places `w:ind` (#23) immediately after `w:pStyle`, which is
+invalid, and only an XSD check notices.
+
+**Cancelling numbering cancels the level's geometry with it.** A numbering
+level's `w:pPr` -- its `w:ind` and its `w:tabs` num stop -- applies only while
+the paragraph is a list member, so `numId=0` takes the indentation too whenever
+it lived in `numbering.xml` rather than in the style. That is the ordinary
+shape of a Canadian PageFormat stylesheet: list styles carry `w:numPr` and no
+`w:ind`, so *every* indent in the document comes from the level and the whole
+outline flattens into one column while text, numbers and run structure stay
+provably intact. `_suppress_automatic_numbering` therefore materializes the
+level's geometry onto the paragraph in the same edit, which is what Word writes
+when a user turns numbering off by hand.
+
+Restoration is narrow on purpose. Precedence between a style's `w:ind` and its
+numbering level's is genuinely unsettled, so `_restorable_level_geometry`
+restores only what nothing else could have supplied -- no direct `w:ind` on the
+paragraph and none anywhere in its effective style chain. Guessing which source
+Word preferred would risk changing a rendering in order to protect it. The
+differential geometry invariant catches the residue.
+
+**Markers are tracked when the source is.** A working spec normally has
+`<w:trackRevisions/>` on and carries the author's own pending edits. Writing
+numbers into it as plain accepted text puts the application's work beyond the
+review every other change in the file is subject to. Where `settings.xml` says
+edits are tracked, each marker is written as `w:ins` authored
+`MARKER_REVISION_AUTHOR` (`"Specification Formatter"`) -- deliberately not the
+document author, because the invariant projects the application's revisions out
+by author, Word's markup pane should separate a machine conversion from a
+person's edits, and a check that nothing altered the author's content outside a
+revision must not pass trivially. `source_tracks_revisions`, `markers_tracked`
+and `marker_author` are always recorded, so "these markers are plain text" is a
+visible decision rather than an absent field.
+
+**The conversion is asserted against a prediction, not described afterwards.**
+The counter walk runs to completion before any paragraph is touched, and
+`_verify_prediction` then checks the assembled document against that list --
+read back out of the XML, so it cannot pass by agreeing with the code that
+produced it. It tests what each paragraph *leads with* rather than whether it
+changed, because a typed Canadian `PART 1` converts to a CSI `PART 1` and
+correctly changes nothing; and it separately proves no unpredicted paragraph
+changed text, which the per-paragraph check inside the edit loop structurally
+cannot see. Fails closed with `conversion_prediction_mismatch`.
 
 Markers are `PART 1`, `1.1`, `A.`, `1.`, `a.`, `1)`, `a)`, `(1)`, `(a)`. An
 alphabetic level that runs past `z` fails closed rather than writing `aa.`,
 because the shared `_ROLE_MARKERS` tables only ever match a single letter, so
 `aa.` would produce a document this application could not read back.
 
-The marker is inserted **into the paragraph's existing first text run**, not as
-new runs. It then inherits that run's character formatting (a bold heading gets
-a bold number), and the paragraph's run structure is unchanged, which is what
-the run-property invariant in `phase2_invariants.py` checks. Adding runs would
-trip that invariant for a change that loses no formatting at all; the answer is
-not to widen the invariant.
+An **untracked** marker is inserted **into the paragraph's existing first text
+run**, not as new runs. It then inherits that run's character formatting (a
+bold heading gets a bold number), and the paragraph's run structure is
+unchanged, which is what the run-property invariant in `phase2_invariants.py`
+checks. Adding runs would trip that invariant for a change that loses no
+formatting at all; the answer is not to widen the invariant.
+
+A **tracked** marker cannot do that -- a revision is a subtree, so it must be
+its own run inside `w:ins`, which shifts every later run index and sibling
+position. The answer is still not to widen the invariant: `phase2_invariants`
+runs the unchanged check against the output with this application's own
+revisions projected back out (`_without_own_revisions`), where the run
+structure is identical to the source again. The projection is scoped by author,
+so a reviewer's pending edits stay in the comparison -- losing run formatting
+inside one of those is as damaging as losing it anywhere else.
 
 Note that a round trip is not byte-exact through `PART`: the forward converter
 treats a dash or colon after `PART n` as part of the typed marker and removes
@@ -885,7 +950,26 @@ python gui.py
 python -m pytest tests/test_sanitized_format_only_corpus.py -q
 python -m pytest tests/test_builtin_scheme.py tests/test_canadian_to_csi.py \
     tests/test_architect_free_modes.py -q
+python -m pytest tests/test_geometry_invariant.py \
+    tests/test_conversion_verification.py -q
 ```
+
+`tests/test_conversion_verification.py` is deliberately written against the
+standard library alone and shares no helper code with the engine. Keep it that
+way: its value is that it can disagree with the engine's own invariants, which
+is exactly what a suite written from the same mental model cannot do.
+
+Rendered geometry is proved outside the test suite, because LibreOffice is not
+available everywhere and does not implement pStyle-linked numbering levels
+(a style whose `w:numPr` omits `w:ilvl` renders at level 0 there and at its
+real level in Word):
+
+```bash
+python scripts/proof_render.py reference.docx candidate.docx
+```
+
+Use it before trusting a formatting change on live work. Read a non-zero
+result as "look at this in Word", never as a verdict.
 
 The GUI tests (`tests/test_gui_modes.py`) import `gui.py`, which needs
 `customtkinter` and therefore a Python with `tkinter`. They skip automatically
@@ -960,10 +1044,20 @@ Before considering a formatter change complete:
   architect's.
 - Applying an architect shell, or any generated one, in an architect-free mode.
 - Inventing a CSI marker for a paragraph the source never numbered.
-- Adding runs to carry a marker rather than joining the paragraph's first run.
+- Adding runs to carry an *untracked* marker rather than joining the
+  paragraph's first run. (A tracked marker must be its own run; the invariant
+  is satisfied by projecting the application's revisions out, not by widening
+  it.)
 - Writing a marker from the classified role without proving it matches the
   list level the document actually renders.
 - Placing a generated marker inside a field result or tracked insertion.
+- Numbering a paragraph whose own mark is an unresolved tracked revision.
+- Writing numbers into a document with `w:trackRevisions` on as plain,
+  untracked text.
+- Cancelling automatic numbering without materializing the geometry the
+  numbering level was supplying.
+- Reusing a `w:pPr` order table abbreviated for one element to insert another.
+- Deriving a conversion's "expected diff" from what the conversion did.
 - Writing `w:numPr` before `w:pStyle` inside `w:pPr`.
 - Swapping a paragraph's own style for a generated one in a mode that promises
   to change only numbering.

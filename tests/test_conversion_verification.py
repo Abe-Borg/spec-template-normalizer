@@ -120,13 +120,18 @@ _ROOT_RELS = (
 )
 
 
-def _write_docx(path: Path, document_xml: str) -> None:
+_TRACKING_ON = f'<w:settings xmlns:w="{W}"><w:trackRevisions/></w:settings>'
+
+
+def _write_docx(path: Path, document_xml: str, settings_xml: str = "") -> None:
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml", _CONTENT_TYPES)
         z.writestr("_rels/.rels", _ROOT_RELS)
         z.writestr("word/document.xml", document_xml)
         z.writestr("word/styles.xml", _styles_xml())
         z.writestr("word/numbering.xml", _numbering_xml())
+        if settings_xml:
+            z.writestr("word/settings.xml", settings_xml)
 
 
 @pytest.fixture
@@ -377,3 +382,75 @@ def test_numbering_geometry_survives_in_the_output(converted) -> None:
         assert ind is not None, f"paragraph {index} lost its indentation"
         assert ind.get(_q("left")) == str(left)
         assert ind.get(_q("hanging")) == str(hanging)
+
+
+# --- The same document, converted with revision tracking on ---------------
+
+
+@pytest.fixture
+def converted_tracked(tmp_path: Path) -> tuple[Path, Path]:
+    before = tmp_path / "before.docx"
+    _write_docx(before, _document_xml(tracked_insertion_at=2), _TRACKING_ON)
+
+    plan = plan_canadian_to_csi(
+        _document_xml(tracked_insertion_at=2),
+        _styles_xml(),
+        {
+            "classifications": [
+                {"paragraph_index": index, "csi_role": role}
+                for index, (role, _text) in enumerate(_BODY)
+            ]
+        },
+        numbering_xml=_numbering_xml(),
+        settings_xml=_TRACKING_ON,
+        revision_date="2026-01-01T00:00:00Z",
+    )
+    after = tmp_path / "after.docx"
+    _write_docx(after, plan.document_xml, _TRACKING_ON)
+    return before, after
+
+
+def _insertions_by_author(path: Path, author: str) -> int:
+    with zipfile.ZipFile(path) as z:
+        blob = z.read("word/document.xml").decode("utf-8")
+    return len(re.findall(rf'<w:ins\b[^>]*w:author="{re.escape(author)}"', blob))
+
+
+def test_tracked_markers_add_exactly_one_revision_each(converted_tracked) -> None:
+    before, after = converted_tracked
+    assert _insertions_by_author(before, "Specification Formatter") == 0
+    assert _insertions_by_author(after, "Specification Formatter") == len(_BODY)
+    # The reviewer's own pending edit is neither removed nor duplicated.
+    assert _insertions_by_author(before, "Reviewer") == 1
+    assert _insertions_by_author(after, "Reviewer") == 1
+
+
+def test_rejecting_every_revision_restores_the_source_exactly(converted_tracked) -> None:
+    """The strongest statement available: the conversion is undoable in Word.
+
+    A marker that survives rejection is a permanent edit wearing a revision's
+    clothing, and would be discovered only by a reader who trusted it.
+    """
+
+    before, after = converted_tracked
+    assert _view(after, "reject") == _view(before, "reject")
+
+
+def test_accepting_every_revision_yields_the_numbered_document(converted_tracked) -> None:
+    _before, after = converted_tracked
+    markers = [
+        _MARKER.match(text).group(1)
+        for text in _view(after, "accept")
+        if _MARKER.match(text)
+    ]
+    assert markers == [
+        "PART 1", "1.1", "A.", "1.", "2.", "1.2", "A.", "PART 2", "2.1", "A.",
+    ]
+
+
+def test_tracked_markers_do_not_disturb_the_package(converted_tracked) -> None:
+    before, after = converted_tracked
+    before_members, after_members = _members(before), _members(after)
+    assert set(before_members) == set(after_members)
+    changed = {n for n in before_members if before_members[n] != after_members[n]}
+    assert changed == {"word/document.xml"}

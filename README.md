@@ -280,6 +280,25 @@ target's own formatting alone. The marker joins the paragraph's existing first
 run, so it picks up that run's character formatting rather than arriving in the
 document default.
 
+Taking the automatic numbering away also takes away anything the numbering
+definition was supplying, and in most Canadian templates that includes the
+indentation: the list styles set a numbering level and no indent of their own,
+so every indent in the document comes from the level. The conversion therefore
+writes that indentation onto the paragraph itself as it removes the numbering,
+which is what Word does when you switch numbering off on a paragraph by hand.
+Without it the outline would flatten into a single column with the text
+otherwise untouched — a change no word-by-word comparison can see, which is why
+the application now also checks, for every mode, that no paragraph's effective
+indentation moved.
+
+**If your document has Track Changes on, the markers arrive as tracked
+insertions** attributed to *Specification Formatter*, so they appear in Word's
+markup like any other proposed edit and you can accept or reject them as a
+group. Rejecting them all restores the file exactly. Your own pending edits are
+carried through untouched either way. With tracking off, the markers are
+written as ordinary text as before. Either way `run.json` records which
+happened, so it is never left to inference.
+
 Typed markers are the deliberate output. A spec whose numbering is literal text
 renders identically everywhere, survives being pasted into another editor, and
 can be checked line by line.
@@ -297,6 +316,16 @@ run past `z` stops the target instead of writing a marker the application could
 not read back; and a paragraph whose leading text sits inside a tracked change
 or a field result is refused, because a marker written there would disappear
 the moment the change was rejected or the field updated.
+
+A heading that is itself an unaccepted insertion or deletion is refused for a
+related reason: its number depends on whether that edit is later kept, and a
+typed number cannot renumber itself the way an automatic one can. Accept or
+reject the tracked changes on that paragraph first.
+
+Finally, the conversion decides every number before it edits anything, then
+checks the finished document against that list — including that no paragraph it
+did not plan to touch changed at all. A report written as the work happened
+could only tell you the tool agreed with itself.
 
 A round trip returns your markers, with one documented exception: converting
 *to* Canadian treats the dash in `PART 1 - GENERAL` as part of the typed marker
@@ -537,6 +566,13 @@ fails instead of publishing a header that still names the architect's section.
 - Imported architect styles never replace an existing target style ID.
 - Format-only verifies unchanged body text and effective target numbering and
   preserves every pre-existing target numbering definition.
+- Every mode verifies that no paragraph's effective indentation moved. This
+  catches the one class of damage a text comparison cannot: identical words,
+  identical numbering, identical formatting runs, and a visibly different page.
+  Because OOXML does not settle whether a paragraph style's indent or its
+  numbering level's indent wins, the check resolves both readings and fails
+  only when the paragraph moved under both — it will not claim a defect it
+  cannot prove.
 - The built-in Canadian scheme is generated from committed constants and then
   validated against the same fail-closed contract an architect template must
   satisfy; it is never given an easier check of its own.
@@ -579,6 +615,14 @@ reverse converter, mostly through the cases it must refuse.
 `tests/test_architect_free_modes.py` runs both template-free modes end to end
 over a real DOCX, including a full CSI → Canadian → CSI round trip, with no API
 key and no template.
+
+`tests/test_conversion_verification.py` re-checks a conversion using only the
+standard library, sharing no code with the engine. A suite written from the
+same mental model as the code can agree with it by making the same mistake;
+this one is built so it can disagree. `tests/test_geometry_invariant.py` covers
+the indentation check directly, and `scripts/proof_render.py` compares where
+words actually land in two rendered documents when a change warrants proving
+against a renderer rather than against the markup.
 
 `tests/test_sanitized_format_only_corpus.py` builds a tracked, non-proprietary
 154-paragraph reproduction of the supplied acceptance case and runs it through
