@@ -213,8 +213,12 @@ Inno Setup installer. On Windows, from the repo root:
 ```powershell
 .\venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-build.txt
 .\venv\Scripts\pyinstaller.exe packaging\windows\specification-formatter.spec --noconfirm --clean
-& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.0.0 packaging\windows\installer.iss
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.0.1 packaging\windows\installer.iss
 ```
+
+`MyAppVersion` must equal `__version__` in `spec_formatter/__init__.py`; on a
+real release `packaging/windows/check_release_version.py` fails the build if the
+git tag and that literal disagree.
 
 The app folder is written to `dist\SpecificationFormatter\` and the installer to
 `dist\installer\SpecificationFormatterSetup.exe`. Releases are normally built and
