@@ -65,6 +65,12 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "own numbering, so no CSI marker could be written for it. Check that "
         "the paragraph is a real list item with numbering that starts at 1."
     ),
+    "canadian_to_csi_tracked_hierarchy": (
+        "A heading or list paragraph is itself an unresolved tracked insertion "
+        "or deletion, so its CSI number depends on whether that revision is "
+        "later accepted or rejected. Accept or reject the tracked changes on "
+        "the reported paragraph, then convert."
+    ),
     "builtin_scheme_contract": (
         "The built-in Canadian CSC PageFormat scheme failed its own contract "
         "check. This is a defect in the application rather than in your "

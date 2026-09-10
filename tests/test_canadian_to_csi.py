@@ -549,3 +549,89 @@ def test_direct_paragraph_indent_outranks_the_level() -> None:
     ppr = _ppr_of(plan.document_xml, 0)
     assert 'w:left="2500"' in ppr, ppr
     assert 'w:left="1259"' not in ppr, ppr
+
+
+# --- Tracked revisions on the paragraph mark ------------------------------
+
+
+def test_tracked_inserted_paragraph_mark_is_refused() -> None:
+    """A heading that is itself an unresolved insertion has no single number.
+
+    Reject the insertion and the paragraph disappears; every literal marker
+    after it is then silently wrong, in a document a reader trusts, long after
+    this run is forgotten. Automatic numbering renumbers itself either way,
+    which is exactly the safety net a literal marker gives up.
+    """
+
+    rows = [("PART", "GENERAL"), ("ARTICLE", "SUMMARY"), ("ARTICLE", "REFERENCES")]
+    paragraphs = [
+        f'<w:p><w:pPr><w:pStyle w:val="{_GEOMETRY_ROLE_STYLE[role]}"/>'
+        + (
+            '<w:rPr><w:ins w:id="9" w:author="A" w:date="2026-01-01T00:00:00Z"/></w:rPr>'
+            if index == 1
+            else ""
+        )
+        + f'</w:pPr><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+        for index, (role, text) in enumerate(rows)
+    ]
+    with pytest.raises(EngineError) as raised:
+        plan_canadian_to_csi(
+            _document(paragraphs),
+            _geometry_styles_xml(),
+            _classifications([role for role, _t in rows]),
+            numbering_xml=_geometry_numbering_xml(),
+        )
+    assert raised.value.code == "canadian_to_csi_tracked_hierarchy"
+    assert "tracked insertion" in str(raised.value)
+
+
+def test_tracked_deleted_paragraph_mark_is_refused() -> None:
+    """Accepting a deleted mark merges the paragraph away -- same hazard."""
+
+    rows = [("PART", "GENERAL"), ("ARTICLE", "SUMMARY")]
+    paragraphs = [
+        f'<w:p><w:pPr><w:pStyle w:val="{_GEOMETRY_ROLE_STYLE[role]}"/>'
+        + (
+            '<w:rPr><w:del w:id="9" w:author="A" w:date="2026-01-01T00:00:00Z"/></w:rPr>'
+            if index == 1
+            else ""
+        )
+        + f'</w:pPr><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+        for index, (role, text) in enumerate(rows)
+    ]
+    with pytest.raises(EngineError) as raised:
+        plan_canadian_to_csi(
+            _document(paragraphs),
+            _geometry_styles_xml(),
+            _classifications([role for role, _t in rows]),
+            numbering_xml=_geometry_numbering_xml(),
+        )
+    assert raised.value.code == "canadian_to_csi_tracked_hierarchy"
+    assert "tracked deletion" in str(raised.value)
+
+
+def test_inline_tracked_insertion_still_converts() -> None:
+    """Tracked *text* inside a paragraph is not a tracked paragraph mark.
+
+    This is the ordinary case in a spec under review -- a sentence added to an
+    existing requirement -- and it changes no paragraph's position in the
+    sequence, so the mark guard is bounded to ``w:pPr`` precisely to let it
+    through instead of failing a whole document closed.
+    """
+
+    paragraphs = [
+        '<w:p><w:pPr><w:pStyle w:val="Geo0"/></w:pPr>'
+        '<w:r><w:t xml:space="preserve">GENERAL</w:t></w:r></w:p>',
+        '<w:p><w:pPr><w:pStyle w:val="Geo1"/></w:pPr>'
+        '<w:r><w:t xml:space="preserve">SUMMARY</w:t></w:r>'
+        '<w:ins w:id="9" w:author="A" w:date="2026-01-01T00:00:00Z">'
+        '<w:r><w:t xml:space="preserve"> AND SCOPE</w:t></w:r></w:ins></w:p>',
+    ]
+    plan = plan_canadian_to_csi(
+        _document(paragraphs),
+        _geometry_styles_xml(),
+        _classifications(["PART", "ARTICLE"]),
+        numbering_xml=_geometry_numbering_xml(),
+    )
+    assert plan.report.paragraphs_converted == 2
+    assert "1.1" in plan.document_xml

@@ -78,6 +78,7 @@ from .xml_helpers import (
 
 _HIERARCHY = "canadian_to_csi_hierarchy"
 _UNPROVABLE = "canadian_to_csi_numbering_unprovable"
+_TRACKED = "canadian_to_csi_tracked_hierarchy"
 
 #: Roles this converter writes a marker for. ``PART`` is included
 #: unconditionally, unlike in the forward direction: a CSI ``PART 1`` heading
@@ -88,6 +89,32 @@ _CONVERTIBLE_ROLES = frozenset(BODY_HIERARCHY_ROLES)
 _PPR_RX = re.compile(r"<w:pPr\b[^>]*(?:/>|>.*?</w:pPr>)", re.S)
 _NUMPR_RX = re.compile(r"<w:numPr\b[^>]*(?:/>|>.*?</w:numPr>)", re.S)
 _FIRST_TEXT_RX = re.compile(r"<w:t\b[^>]*>", re.S)
+
+
+
+_MARK_RPR_RX = re.compile(r"<w:rPr\b[^>]*(?:/>|>(.*?)</w:rPr>)", re.S)
+
+
+def _paragraph_mark_revision(paragraph_xml: str) -> Optional[str]:
+    """Return ``"insertion"``/``"deletion"`` if the paragraph *mark* is tracked.
+
+    Only ``w:pPr/w:rPr`` counts. A ``w:ins`` anywhere else in the paragraph
+    marks inserted *text*, which leaves the paragraph -- and therefore the
+    sequence -- intact under both accept and reject, so the search is bounded
+    to the ``w:pPr`` element rather than run against the whole paragraph.
+    """
+
+    ppr = _PPR_RX.search(paragraph_xml)
+    if ppr is None:
+        return None
+    mark = _MARK_RPR_RX.search(ppr.group(0))
+    if mark is None or not mark.group(1):
+        return None
+    if re.search(r"<w:ins\b", mark.group(1)):
+        return "insertion"
+    if re.search(r"<w:del\b", mark.group(1)):
+        return "deletion"
+    return None
 
 
 def _escape(value: str) -> str:
@@ -686,6 +713,25 @@ def plan_canadian_to_csi(
                 f"Unconverted paragraph {index}{locate(index)} shares automatic list "
                 f"numId={effective.get('numId')!r} with converted paragraphs; "
                 "leaving it numbered would desynchronise the sequence.",
+            )
+
+    # A paragraph whose *mark* is an unresolved tracked revision does not have
+    # one position in the sequence, it has two: reject an inserted mark and the
+    # paragraph disappears, accept a deleted one and it merges into the next.
+    # Automatic numbering renumbers itself either way. A literal marker cannot,
+    # so every marker after such a paragraph would silently become wrong the
+    # moment somebody resolved the revision -- in a document a reader trusts,
+    # long after this run is forgotten.
+    for index in sorted(effective_role_by_index):
+        if effective_role_by_index[index] not in _CONVERTIBLE_ROLES:
+            continue
+        revision = _paragraph_mark_revision(blocks[index][2])
+        if revision is not None:
+            raise EngineError(
+                _TRACKED,
+                f"Paragraph {index}{locate(index)} is classified as a numbered "
+                f"role but its paragraph mark is a tracked {revision}; its CSI "
+                "number would depend on whether that revision is accepted.",
             )
 
     _validate_source_sequence(evidence, describe=locate, error_code=_HIERARCHY)
