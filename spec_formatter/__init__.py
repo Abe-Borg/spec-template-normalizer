@@ -10,10 +10,12 @@ from typing import Any
 # this value, the in-app updater compares it against the release manifest, and
 # packaging/windows/check_release_version.py guards it against the git tag.
 # Bump this (only) when cutting a release; see docs/RELEASE_WINDOWS.md.
-__version__ = "1.1.0rc1"
+__version__ = "1.1.0"
 
 __all__ = [
+    "CANADIAN_TO_CSI",
     "CSI_TO_CANADIAN",
+    "CSI_TO_CANADIAN_STANDALONE",
     "FORMAT_ONLY",
     "FormatRunResult",
     "SafeErrorDiagnostic",
