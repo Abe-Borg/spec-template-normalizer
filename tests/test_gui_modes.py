@@ -14,7 +14,12 @@ import pytest
 pytest.importorskip("customtkinter")
 
 import gui  # noqa: E402
-from spec_formatter.pipeline import CSI_TO_CANADIAN, FORMAT_ONLY
+from spec_formatter.pipeline import (
+    CANADIAN_TO_CSI,
+    CSI_TO_CANADIAN,
+    CSI_TO_CANADIAN_STANDALONE,
+    FORMAT_ONLY,
+)
 from spec_formatter.style_application.core.csi_to_canadian import (
     CanadianConversionReport,
     ConversionIssue,
@@ -455,28 +460,107 @@ def test_format_worker_strips_the_api_key_once(monkeypatch):
     assert "key-with-spaces" not in payload["message"]
 
 
-def test_target_preview_excludes_the_architect_from_folder_discovery(monkeypatch):
-    captured = {}
-
-    def fake_collect(inputs, *, exclude_discovered=None):
-        captured["inputs"] = tuple(inputs)
-        captured["exclude"] = exclude_discovered
-        return (Path("a.docx"),)
-
-    monkeypatch.setattr(gui, "collect_target_specs", fake_collect)
+def _preview_app(mode: str):
     box = _FakeLogBox()
     box.delete = lambda *_args: None
-    app = SimpleNamespace(
+    return SimpleNamespace(
         target_box=box,
         target_inputs=[Path("specs")],
         architect_var=SimpleNamespace(get=lambda: "  C:/templates/Architect.docx  "),
+        conversion_mode_var=SimpleNamespace(get=lambda: mode),
     )
 
-    gui.App._refresh_target_preview(app)
+
+def test_target_preview_excludes_the_architect_from_folder_discovery(monkeypatch):
+    captured = {}
+
+    def fake_collect(inputs, *, exclude_discovered=None, accepted_output_suffixes=()):
+        captured["inputs"] = tuple(inputs)
+        captured["exclude"] = exclude_discovered
+        captured["accepted"] = tuple(accepted_output_suffixes)
+        return (Path("a.docx"),)
+
+    monkeypatch.setattr(gui, "collect_target_specs", fake_collect)
+
+    gui.App._refresh_target_preview(_preview_app(FORMAT_ONLY))
 
     assert captured["inputs"] == (Path("specs"),)
     assert captured["exclude"] == Path("C:/templates/Architect.docx")
+    assert captured["accepted"] == ()
     assert gui.preview_architect_exclusion("") is None
+
+
+def test_target_preview_ignores_a_template_in_the_architect_free_modes(monkeypatch):
+    captured = {}
+
+    def fake_collect(inputs, *, exclude_discovered=None, accepted_output_suffixes=()):
+        captured["exclude"] = exclude_discovered
+        captured["accepted"] = tuple(accepted_output_suffixes)
+        return (Path("a.docx"),)
+
+    monkeypatch.setattr(gui, "collect_target_specs", fake_collect)
+
+    gui.App._refresh_target_preview(_preview_app(CSI_TO_CANADIAN_STANDALONE))
+    assert captured["exclude"] is None
+    assert captured["accepted"] == ()
+
+    # The reverse mode must find this application's own Canadian outputs,
+    # otherwise a folder of them previews as empty and then runs fine.
+    gui.App._refresh_target_preview(_preview_app(CANADIAN_TO_CSI))
+    assert captured["exclude"] is None
+    assert captured["accepted"] == ("_CANADIAN.DOCX", "_CANADIAN_FORMATTED.DOCX")
+
+
+def test_only_the_template_modes_ask_for_a_template():
+    assert gui.mode_requires_architect(FORMAT_ONLY) is True
+    assert gui.mode_requires_architect(CSI_TO_CANADIAN) is True
+    assert gui.mode_requires_architect(CSI_TO_CANADIAN_STANDALONE) is False
+    assert gui.mode_requires_architect(CANADIAN_TO_CSI) is False
+
+
+def test_every_mode_choice_has_a_label_and_a_hint():
+    values = [value for _label, value in gui.MODE_CHOICES]
+    assert values == [
+        FORMAT_ONLY,
+        CSI_TO_CANADIAN,
+        CSI_TO_CANADIAN_STANDALONE,
+        CANADIAN_TO_CSI,
+    ]
+    for label, value in gui.MODE_CHOICES:
+        assert label.strip()
+        assert gui.output_mode_label(value) != "Format only" or value == FORMAT_ONLY
+        assert gui._mode_hint(value).strip()
+    # The two template-free modes say so where the user chooses them, not only
+    # in the hint underneath.
+    labels = dict((value, label) for label, value in gui.MODE_CHOICES)
+    assert "no template" in labels[CSI_TO_CANADIAN_STANDALONE]
+    assert "no template" in labels[CANADIAN_TO_CSI]
+
+
+def test_run_summary_names_the_numbering_source_when_there_is_no_template():
+    summary = gui.ActiveRunSummary(
+        architect_template=None,
+        target_inputs=(Path("one.docx"),),
+        output_root=Path("formatted"),
+        conversion_mode=CSI_TO_CANADIAN_STANDALONE,
+        reuse_template_analysis=True,
+        max_workers=1,
+    )
+    text = gui.active_run_summary_text(summary)
+    assert "built-in Canadian CSC PageFormat scheme" in text
+    assert "None" not in text.split("Template:")[1].split("\n")[0]
+
+    reverse = gui.active_run_summary_text(
+        gui.ActiveRunSummary(
+            architect_template=None,
+            target_inputs=(Path("one.docx"),),
+            output_root=Path("formatted"),
+            conversion_mode=CANADIAN_TO_CSI,
+            reuse_template_analysis=True,
+            max_workers=1,
+        )
+    )
+    assert "typed CSI markers" in reverse
 
 
 def test_keyring_save_failure_unchecks_remember_and_reports(monkeypatch):

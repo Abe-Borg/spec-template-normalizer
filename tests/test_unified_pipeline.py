@@ -14,10 +14,19 @@ import pytest
 import spec_formatter
 from spec_formatter import pipeline
 from spec_formatter.style_application.batch_runner import BatchResult, SharedConfig
+from spec_formatter.style_application.core.conversion_modes import (
+    VALID_CONVERSION_MODES,
+)
 from spec_formatter.style_application.core.csi_to_canadian import (
     CanadianConversionReport,
     ConversionIssue,
     MarkerEdit,
+)
+
+# Derived rather than spelled out, so adding a mode does not silently leave a
+# stale sentence asserted here while the application reports a different one.
+_INVALID_MODE_MESSAGE = "conversion_mode must be one of: " + ", ".join(
+    sorted(VALID_CONVERSION_MODES)
 )
 
 
@@ -783,9 +792,9 @@ def test_safe_error_diagnostic_extracts_only_allowlisted_internal_message() -> N
             "Select at least one target specification DOCX file.",
         ),
         (
-            "conversion_mode must be one of: csi_to_canadian, format_only",
+            _INVALID_MODE_MESSAGE,
             "invalid_conversion_mode",
-            "conversion_mode must be one of: csi_to_canadian, format_only",
+            _INVALID_MODE_MESSAGE,
         ),
         (
             "max_workers must be an integer.",
@@ -1387,7 +1396,7 @@ def test_invalid_conversion_mode_fails_before_analysis_or_filesystem_writes(
     assert pipeline.safe_error_diagnostic(raised.value) == (
         pipeline.SafeErrorDiagnostic(
             code="invalid_conversion_mode",
-            message="conversion_mode must be one of: csi_to_canadian, format_only",
+            message=_INVALID_MODE_MESSAGE,
         )
     )
 

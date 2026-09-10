@@ -4,12 +4,31 @@ One application takes an architect's Word specification template and one or
 more target specifications, then produces formatted target DOCX files. Users do
 not switch programs or manually transfer intermediate files.
 
+Two of its four modes need no architect template at all: they convert a spec to
+or from Canadian CSC PageFormat numbering on its own.
+
 The original template and target files are never modified.
+
+## The four modes
+
+| Mode | Architect template | Numbering comes from | Document shell |
+|---|---|---|---|
+| **Format only** | required | the target's own | the architect's |
+| **Convert CSI to Canadian** | required | the architect's proven Word list | the architect's |
+| **Convert CSI to Canadian, no template** | not used | the built-in CSC scheme | left as the target has it |
+| **Convert Canadian back to CSI** | not used | typed markers written into the text | left as the target has it |
+
+Choosing a mode that does not use a template disables the template field. If
+one is supplied anyway through the API, the run is refused rather than quietly
+ignoring it — a run that succeeded while silently discarding your template
+would be the worst possible answer.
 
 ## What the app does
 
 1. Analyzes the architect's `.docx` template and captures its CSI paragraph
    styles, numbering, fonts, headers, footers, settings, and page layout.
+   *(Skipped entirely in the two modes that take no template — nothing is
+   analyzed, cached, or sent to the model.)*
 2. Validates and caches that template analysis by the template's SHA-256 hash,
    engine version, prompt hashes, classifier model, and profile-contract
    version.
@@ -21,9 +40,16 @@ The original template and target files are never modified.
      counters, and restart semantics.
    - **Canadian CSC PageFormat** converts supported CSI hierarchy to the
      architect's demonstrated automatic numbering.
+   - **Canadian CSC PageFormat, no template** runs the same conversion against
+     the application's built-in `PART 1 / 1.1 / .1` scheme.
+   - **Canadian back to CSI** resolves each paragraph's current Canadian number
+     and writes it into the text as a literal `PART 1 / 1.1 / A. / 1. / a.`
+     marker.
 5. Applies the architect's complete document shell: source-derived CSI
    formatting, theme/defaults, compatibility settings, page layout, and
-   default/even/first headers and footers.
+   default/even/first headers and footers. *(The two template-free modes apply
+   no shell: your fonts, page size, margins, headers, and footers stay exactly
+   as you wrote them.)*
 6. Validates content, numbering, protected structure, and the complete DOCX
    package before publishing it.
 
@@ -79,9 +105,10 @@ pre-filled from the `ANTHROPIC_API_KEY` environment variable when set.
 
 In the single window:
 
-1. Choose the architect's template DOCX.
-2. Add target DOCX files, or add a folder containing target specs.
-3. Choose **Format only** or **Convert CSI hierarchy to Canadian CSC PageFormat**.
+1. Choose the output mode. The two "no template" modes grey out the template
+   field; the other two need it.
+2. Choose the architect's template DOCX, if the mode uses one.
+3. Add target DOCX files, or add a folder containing target specs.
 4. Choose the output folder.
 5. Enter the Anthropic API key when needed.
 6. Click **Format Specs**.
@@ -91,7 +118,9 @@ Each run creates an isolated directory below the selected output root:
 ```text
 <UTC timestamp>_<mode>_<run-id>/
   <target>_FORMATTED.docx              # Format only
-  <target>_CANADIAN_FORMATTED.docx     # Canadian mode
+  <target>_CANADIAN_FORMATTED.docx     # Canadian mode, with a template
+  <target>_CANADIAN.docx               # Canadian mode, built-in scheme
+  <target>_CSI.docx                    # Canadian back to CSI
   target-<sequence>-<source-hash>.audit.json
   run.log
   diagnostics.jsonl
@@ -122,10 +151,16 @@ identifiers -- never document text or secrets -- and the verbosity is set with
 `diagnostics_level` (`debug`/`info`/`warning`/`error`, default `info`) or the
 `SPEC_FORMATTER_DIAGNOSTICS_LEVEL` environment variable, which overrides it.
 
-Folder discovery ignores Word lock files, current `_FORMATTED.docx` outputs,
+Folder discovery ignores Word lock files, this application's own outputs
+(`_FORMATTED.docx`, `_CANADIAN_FORMATTED.docx`, `_CANADIAN.docx`, `_CSI.docx`),
 and legacy `_PHASE2_FORMATTED.docx` outputs. If the architect is present in a
 selected folder it is excluded from discovery; explicitly selecting the
 architect as a target remains an error.
+
+The one deliberate exception is **Convert Canadian back to CSI**, which takes
+`_CANADIAN.docx` and `_CANADIAN_FORMATTED.docx` files as input — converting a
+spec to Canadian and later bringing it back is the point of that mode, so its
+own earlier output is not refused as "already formatted".
 
 ## Format-only mode
 
@@ -205,6 +240,57 @@ This mode converts numbering hierarchy and presentation only. It does **not**
 reorder articles, replace US codes or standards, convert units, change spelling
 or terminology, revise technical requirements, or certify NMS compliance.
 
+## Canadian CSC PageFormat without a template
+
+Choose **Convert CSI to Canadian, no template** when a spec has to go to CSC
+PageFormat and no architect template is in the picture. The conversion is the
+same one described above, with one difference: the numbering comes from a
+built-in nine-level CSC list — `PART 1`, then `1.1`, then `.1` at every level
+below it — rather than from a template you supply.
+
+Nothing is analyzed, cached, or sent to the model for the scheme itself; it is
+built from constants in the application. It is not, however, taken on trust: it
+is put through the *same* fail-closed contract a real architect template must
+pass — decimal numbering, starting at 1, no restarts, and one coherent
+Part/article/list hierarchy — and a test proves it, so a future change to the
+scheme fails the build rather than a document.
+
+The target keeps its own document shell. No fonts, page size, margins, theme,
+headers, or footers are imposed, because there is no template to take them
+from and inventing them would not be honest. Only the numbering and hierarchy
+change. Targets still need an API key for any paragraph the deterministic rules
+cannot classify locally.
+
+## Convert Canadian back to CSI
+
+**Convert Canadian back to CSI** is the inverse. It works out the number each
+paragraph currently shows and writes it into the text as an ordinary typed
+marker — `PART 1`, `1.1`, `A.`, `1.`, `a.`, and the deeper `1)`, `a)`, `(1)`,
+`(a)` levels — then removes the automatic numbering so Word does not number the
+paragraph twice. Like the mode above it needs no template and leaves the
+target's own formatting alone. The marker joins the paragraph's existing first
+run, so it picks up that run's character formatting rather than arriving in the
+document default.
+
+Typed markers are the deliberate output. A spec whose numbering is literal text
+renders identically everywhere, survives being pasted into another editor, and
+can be checked line by line.
+
+Writing a number is a stronger claim than removing one, so this direction is at
+least as strict as the forward one. It converts only where it can prove the
+counter: every converted paragraph on one Word list, that list starting at 1
+with no restarts or level overrides, and every paragraph on it converted — one
+left behind would push every later number out of step. A paragraph the source
+never numbered is preserved unchanged and reported as a warning rather than
+given an invented marker, and an alphabetic level that would run past `z` stops
+the target instead of writing a marker the application could not read back.
+
+A round trip returns your markers, with one documented exception: converting
+*to* Canadian treats the dash in `PART 1 - GENERAL` as part of the typed marker
+and removes it with the marker, so it comes back as `PART 1 GENERAL`. That is
+the forward conversion's long-standing behaviour, not a loss on the way back.
+Requirement text is untouched in both directions.
+
 ## Build the Windows installer
 
 The distributable Windows app is a PyInstaller **one-folder** build wrapped by an
@@ -264,6 +350,26 @@ print(result.output_root, result.run_dir, result.manifest_path)
 print(result.diagnostics_path)  # diagnostics.jsonl for this run
 ```
 
+The two template-free modes pass `None` for the template. It remains the first
+parameter and must still be passed explicitly, so existing callers are
+unaffected:
+
+```python
+result = format_specifications(
+    architect_template=None,
+    target_specs=[Path("21 13 13 Sprinklers.docx")],
+    output_dir=Path("Formatted Specs"),
+    api_key="...",
+    conversion_mode="csi_to_canadian_standalone",  # or "canadian_to_csi"
+)
+```
+
+Passing a template to one of those modes raises rather than ignoring it
+(`input_architect_not_accepted`). `run.json` records `numbering_scheme`
+(`architect`, `builtin_csc`, or `typed_csi`) beside `architect_template` and
+`builtin_scheme`; all three keys are always present, with nulls rather than
+omissions.
+
 Target inputs may be individual DOCX paths or folders. Folder expansion is
 non-recursive. Multi-file runs are independent: one corrupt target is reported
 as a failure without discarding valid outputs from other targets.
@@ -311,7 +417,9 @@ target specification DOCX files
     -> bounded extraction
     -> deterministic/AI styled-or-ignored paragraph dispositions
     -> immutable application policy selected at the orchestration boundary
-    -> target-owned numbering preservation OR fail-closed Canadian conversion
+    -> target-owned numbering preservation, fail-closed Canadian conversion
+       (from the architect template or from the built-in CSC scheme), or the
+       inverse conversion back to typed CSI markers
     -> collision-safe styles and complete architect shell application
     -> mode-specific content, numbering, stability, and package validation
     -> atomic publication into an isolated, manifested run directory
@@ -416,6 +524,16 @@ fails instead of publishing a header that still names the architect's section.
 - Imported architect styles never replace an existing target style ID.
 - Format-only verifies unchanged body text and effective target numbering and
   preserves every pre-existing target numbering definition.
+- The built-in Canadian scheme is generated from committed constants and then
+  validated against the same fail-closed contract an architect template must
+  satisfy; it is never given an easier check of its own.
+- A mode that uses no architect template refuses one that is supplied rather
+  than ignoring it, and applies no document shell of any kind, so the target's
+  fonts, page geometry, headers, and footers are left exactly as authored.
+- Canadian-to-CSI writes a marker only where the source counter can be proven:
+  one Word list, starting at 1, without restarts or level overrides, and with
+  every paragraph on that list converted. An unnumbered paragraph is preserved
+  rather than given an invented marker.
 - Canadian conversion edits only recognized leading numbering markers in
   classified paragraphs and verifies that substantive text and protected OOXML
   remain unchanged. When it fails closed, the detailed message names the
@@ -441,6 +559,13 @@ and cache tests, and offline end-to-end DOCX round trips that verify styles,
 numbering, settings, headers/footers, page layout, tables, text boxes, source
 immutability, ignored dispositions, mode separation, partial-failure isolation,
 run provenance, long paths, and package validity.
+
+`tests/test_builtin_scheme.py` proves the built-in Canadian scheme passes the
+unmodified architect validators. `tests/test_canadian_to_csi.py` covers the
+reverse converter, mostly through the cases it must refuse.
+`tests/test_architect_free_modes.py` runs both template-free modes end to end
+over a real DOCX, including a full CSI → Canadian → CSI round trip, with no API
+key and no template.
 
 `tests/test_sanitized_format_only_corpus.py` builds a tracked, non-proprietary
 154-paragraph reproduction of the supplied acceptance case and runs it through

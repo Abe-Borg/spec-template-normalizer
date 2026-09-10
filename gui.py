@@ -18,13 +18,18 @@ from tkinter import filedialog, messagebox
 from spec_formatter import __version__, secrets, updates
 from spec_formatter.app_paths import default_config_dir
 from spec_formatter.pipeline import (
+    CANADIAN_TO_CSI,
     CSI_TO_CANADIAN,
+    CSI_TO_CANADIAN_STANDALONE,
     FORMAT_ONLY,
     FormatRunResult,
     collect_target_specs,
     default_template_cache_dir,
     format_specifications,
     safe_error_diagnostic,
+)
+from spec_formatter.style_application.core.application_policy import (
+    application_policy_for_mode,
 )
 
 
@@ -61,9 +66,80 @@ KEYRING_UNAVAILABLE_STATUS = (
 )
 
 
-def preview_architect_exclusion(architect_value: str) -> Optional[Path]:
+#: Radio-button labels, in display order. The two built-in modes say so in
+#: their label, because "which of these needs my template?" is the first
+#: question the screen has to answer.
+MODE_CHOICES: tuple[tuple[str, str], ...] = (
+    ("Format only", FORMAT_ONLY),
+    ("Convert CSI hierarchy to Canadian CSC PageFormat", CSI_TO_CANADIAN),
+    ("Convert CSI to Canadian - no template", CSI_TO_CANADIAN_STANDALONE),
+    ("Convert Canadian back to CSI - no template", CANADIAN_TO_CSI),
+)
+
+
+_MODE_HINTS = {
+    FORMAT_ONLY: (
+        "Format only keeps each target's own text, list markers, levels and "
+        "counters, and applies the architect template's styles, page layout, "
+        "headers and footers."
+    ),
+    CSI_TO_CANADIAN: (
+        "Canadian mode converts recognized CSI numbering and hierarchy before "
+        "formatting. The architect template must use automatic Canadian 1.1/.1 "
+        "numbering; each target article needs a preceding Part, and the architect "
+        "must use one coherent automatic Part/list hierarchy. It does not revise "
+        "codes, standards, units, terminology, or technical requirements."
+    ),
+    CSI_TO_CANADIAN_STANDALONE: (
+        "Converts CSI numbering to Canadian CSC PageFormat using the built-in "
+        "1.1/.1 numbering scheme, so no architect template is needed. The "
+        "target keeps its own fonts, page layout, headers and footers - only "
+        "the numbering and hierarchy change."
+    ),
+    CANADIAN_TO_CSI: (
+        "Converts Canadian CSC PageFormat numbering back to typed CSI markers "
+        "(PART 1, 1.1, A., 1., a.). No architect template is needed and the "
+        "target keeps all of its own formatting; the numbers become ordinary "
+        "text rather than an automatic Word list."
+    ),
+}
+
+
+def _mode_hint(conversion_mode: str) -> str:
+    return _MODE_HINTS.get(conversion_mode, _MODE_HINTS[FORMAT_ONLY])
+
+
+def mode_requires_architect(conversion_mode: str) -> bool:
+    """Whether *conversion_mode* takes an architect template.
+
+    Read from the one policy that owns the answer rather than re-listing the
+    modes here, so the window and the pipeline can never disagree about which
+    runs need a template.
+    """
+
+    try:
+        return application_policy_for_mode(conversion_mode).requires_architect_template
+    except ValueError:
+        return True
+
+
+def preview_accepted_output_suffixes(conversion_mode: str) -> tuple[str, ...]:
+    """Output suffixes *conversion_mode* takes as input, from its policy."""
+
+    try:
+        return application_policy_for_mode(conversion_mode).accepted_output_suffixes
+    except ValueError:
+        return ()
+
+
+def preview_architect_exclusion(
+    architect_value: str,
+    conversion_mode: str = FORMAT_ONLY,
+) -> Optional[Path]:
     """The architect path to exclude from folder discovery in the preview."""
 
+    if not mode_requires_architect(conversion_mode):
+        return None
     value = (architect_value or "").strip()
     return Path(value) if value else None
 
@@ -112,7 +188,7 @@ def conversion_report_log_lines(item: object) -> tuple[str, ...]:
 class ActiveRunSummary:
     """Values captured for a run, excluding the API key by design."""
 
-    architect_template: Path
+    architect_template: Optional[Path]
     target_inputs: tuple[Path, ...]
     output_root: Path
     conversion_mode: str
@@ -120,12 +196,28 @@ class ActiveRunSummary:
     max_workers: int
 
 
+_MODE_LABELS = {
+    CSI_TO_CANADIAN: "Canadian CSC PageFormat conversion",
+    CSI_TO_CANADIAN_STANDALONE: "Canadian CSC PageFormat (built-in scheme)",
+    CANADIAN_TO_CSI: "Canadian to CSI markers",
+    FORMAT_ONLY: "Format only",
+}
+
+
 def output_mode_label(conversion_mode: str) -> str:
     """Return the user-facing label for a pipeline conversion mode."""
 
-    if conversion_mode == CSI_TO_CANADIAN:
-        return "Canadian CSC PageFormat conversion"
-    return "Format only"
+    return _MODE_LABELS.get(conversion_mode, "Format only")
+
+
+def _summary_template_line(summary: ActiveRunSummary) -> str:
+    """What to show on the Template line, including when there is no template."""
+
+    if summary.architect_template is not None:
+        return str(summary.architect_template)
+    if summary.conversion_mode == CANADIAN_TO_CSI:
+        return "none - typed CSI markers, target formatting unchanged"
+    return "none - built-in Canadian CSC PageFormat scheme"
 
 
 def active_run_summary_text(summary: ActiveRunSummary, *, active: bool = True) -> str:
@@ -142,7 +234,7 @@ def active_run_summary_text(summary: ActiveRunSummary, *, active: bool = True) -
         f"{output_mode_label(summary.conversion_mode)} | "
         f"{len(summary.target_inputs)} target selection(s) | "
         f"{summary.max_workers} worker(s) | {analysis}\n"
-        f"Template: {summary.architect_template}\n"
+        f"Template: {_summary_template_line(summary)}\n"
         f"Output root: {summary.output_root}"
     )
 
@@ -203,7 +295,7 @@ class FormatWorker(threading.Thread):
 
     def __init__(
         self,
-        architect_template: Path,
+        architect_template: Optional[Path],
         target_inputs: tuple[Path, ...],
         output_dir: Path,
         api_key: str,
@@ -317,6 +409,9 @@ class App(ctk.CTk):
         # The target preview excludes the architect from folder discovery, so
         # it must be re-rendered whenever the architect changes.
         self.architect_var.trace_add("write", lambda *_args: self._refresh_target_preview())
+        # Switching mode can turn the architect row off entirely and changes
+        # which files folder discovery would exclude, so both follow it.
+        self.conversion_mode_var.trace_add("write", lambda *_args: self._on_mode_changed())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_events)
         # Silent once-a-day update check, shortly after the window paints.
@@ -378,7 +473,7 @@ class App(ctk.CTk):
         )
         card.pack(fill="x")
 
-        self._section_label(card, "1   Architect template")
+        self.architect_label = self._section_label(card, "1   Architect template")
         self.architect_entry, self.architect_button = self._path_row(
             card,
             self.architect_var,
@@ -453,10 +548,9 @@ class App(ctk.CTk):
         self._section_label(card, "3   Output mode", top=18)
         mode_row = ctk.CTkFrame(card, fg_color="transparent")
         mode_row.pack(fill="x", padx=22)
-        for label, value in (
-            ("Format only", FORMAT_ONLY),
-            ("Convert CSI hierarchy to Canadian CSC PageFormat", CSI_TO_CANADIAN),
-        ):
+        # Four modes do not fit on one line at the 820px minimum width, so they
+        # wrap into a grid instead of a row.
+        for position, (label, value) in enumerate(MODE_CHOICES):
             control = ctk.CTkRadioButton(
                 mode_row,
                 text=label,
@@ -467,23 +561,24 @@ class App(ctk.CTk):
                 fg_color=COLORS["accent"],
                 hover_color=COLORS["accent_hover"],
             )
-            control.pack(side="left", padx=(0, 28))
+            control.grid(
+                row=position // 2,
+                column=position % 2,
+                sticky="w",
+                padx=(0, 28),
+                pady=(0, 4),
+            )
             self.mode_controls.append(control)
             self.run_affecting_controls.append(control)
-        ctk.CTkLabel(
+        self.mode_hint_label = ctk.CTkLabel(
             card,
-            text=(
-                "Canadian mode converts recognized CSI numbering and hierarchy before "
-                "formatting. The architect template must use automatic Canadian 1.1/.1 "
-                "numbering; each target article needs a preceding Part, and the architect "
-                "must use one coherent automatic Part/list hierarchy. It does not revise "
-                "codes, standards, units, terminology, or technical requirements."
-            ),
+            text=_mode_hint(FORMAT_ONLY),
             wraplength=870,
             justify="left",
             text_color=COLORS["muted"],
             font=_font(12),
-        ).pack(anchor="w", padx=22, pady=(7, 0))
+        )
+        self.mode_hint_label.pack(anchor="w", padx=22, pady=(7, 0))
 
         self._section_label(card, "4   Output folder", top=18)
         self.output_entry, self.output_button = self._path_row(
@@ -624,13 +719,17 @@ class App(ctk.CTk):
         self.log_box.pack(fill="both", expand=True)
         self.log_box.configure(state="disabled")
 
-    def _section_label(self, parent: ctk.CTkFrame, text: str, top: int = 20) -> None:
-        ctk.CTkLabel(
+    def _section_label(
+        self, parent: ctk.CTkFrame, text: str, top: int = 20
+    ) -> ctk.CTkLabel:
+        label = ctk.CTkLabel(
             parent,
             text=text,
             text_color=COLORS["text"],
             font=_font(14, "bold"),
-        ).pack(anchor="w", padx=22, pady=(top, 8))
+        )
+        label.pack(anchor="w", padx=22, pady=(top, 8))
+        return label
 
     def _path_row(
         self,
@@ -729,6 +828,37 @@ class App(ctk.CTk):
             self.output_is_automatic = False
         self._refresh_target_preview()
 
+    def _on_mode_changed(self) -> None:
+        """Show the mode's guidance and enable the architect row only if used."""
+
+        # The trace is registered before the widgets are built, so a very early
+        # write would arrive with nothing to configure.
+        if not hasattr(self, "mode_hint_label"):
+            return
+
+        mode = self.conversion_mode_var.get()
+        needed = mode_requires_architect(mode)
+        try:
+            self.mode_hint_label.configure(text=_mode_hint(mode))
+            self.architect_label.configure(
+                text=(
+                    "1   Architect template"
+                    if needed
+                    else "1   Architect template (not used in this mode)"
+                ),
+                text_color=COLORS["text"] if needed else COLORS["muted"],
+            )
+            # A run locks every input; leaving the row alone here keeps the
+            # lock authoritative instead of re-enabling a control mid-run.
+            if not self._locked_run_control_states:
+                state = "normal" if needed else "disabled"
+                for control in (self.architect_entry, self.architect_button):
+                    control.configure(state=state)
+        except Exception:
+            # Only while the window is being torn down.
+            pass
+        self._refresh_target_preview()
+
     def _refresh_target_preview(self) -> None:
         self.target_box.configure(state="normal")
         self.target_box.delete("1.0", "end")
@@ -736,9 +866,18 @@ class App(ctk.CTk):
             text = "No target specifications selected. Add files or a folder."
         else:
             try:
+                mode = self.conversion_mode_var.get()
                 targets = collect_target_specs(
                     self.target_inputs,
-                    exclude_discovered=preview_architect_exclusion(self.architect_var.get()),
+                    exclude_discovered=preview_architect_exclusion(
+                        self.architect_var.get(),
+                        mode,
+                    ),
+                    # The reverse mode consumes this application's own Canadian
+                    # outputs, so the preview has to find them or it would show
+                    # nothing for a run that would happily process a folder
+                    # full of them.
+                    accepted_output_suffixes=preview_accepted_output_suffixes(mode),
                 )
                 lines = [f"{len(targets)} target specification(s)"]
                 lines.extend(f"  • {item.name}" for item in targets[:6])
@@ -808,9 +947,11 @@ class App(ctk.CTk):
     def _start(self) -> None:
         if self.worker is not None and self.worker.is_alive():
             return
+        conversion_mode = self.conversion_mode_var.get()
+        needs_architect = mode_requires_architect(conversion_mode)
         architect = self.architect_var.get().strip()
         output = self.output_var.get().strip()
-        if not architect:
+        if needs_architect and not architect:
             messagebox.showerror("Missing architect template", "Choose the architect's DOCX template.")
             return
         if not self.target_inputs:
@@ -820,9 +961,12 @@ class App(ctk.CTk):
             messagebox.showerror("Missing output folder", "Choose an output folder.")
             return
 
-        conversion_mode = self.conversion_mode_var.get()
         active_run = ActiveRunSummary(
-            architect_template=Path(architect),
+            # A path typed before switching to a built-in mode is dropped
+            # here, not passed on: the pipeline rejects a template these modes
+            # cannot use, and silently sending one would fail a run the user
+            # had every reason to expect to work.
+            architect_template=Path(architect) if (needs_architect and architect) else None,
             target_inputs=tuple(self.target_inputs),
             output_root=Path(output),
             conversion_mode=conversion_mode,

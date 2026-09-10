@@ -1613,6 +1613,7 @@ def preflight_validate_registries(
     template_registry: Dict[str, Any],
     *,
     additional_known_style_ids: Optional[Set[str]] = None,
+    applies_shell: bool = True,
 ) -> List[str]:
     """
     Validate both Phase 2 contract files before any mutation.
@@ -1625,6 +1626,13 @@ def preflight_validate_registries(
         template_registry: full dict from arch_template_registry.json.
         additional_known_style_ids: style IDs validated from a strict bundle's
             portable stylesheet. Legacy callers should leave this unset.
+        applies_shell: whether this run will apply a document shell. False for
+            the built-in scheme, which carries styles and numbering but no
+            page layout, headers, or footers. The two shell-only checks are
+            then skipped because there is no shell to check -- not relaxed:
+            demanding a ``sectPr`` here would only push someone to invent one,
+            and an invented page geometry is exactly what these modes promise
+            not to impose on the target.
 
     Returns:
         List of error strings.  Empty list means the contract is valid.
@@ -1638,9 +1646,10 @@ def preflight_validate_registries(
     _validate_compat_xml(template_registry, errors)
     _validate_top_level_xml_fragments(template_registry, errors)
     _validate_embedded_fonts(template_registry, errors)
-    _validate_header_footer_contract(template_registry, errors)
     _validate_style_cross_ref(style_registry, known_style_ids, errors)
     _validate_numbering_consistency(template_registry, errors)
-    _validate_page_layout(template_registry, errors)
+    if applies_shell:
+        _validate_header_footer_contract(template_registry, errors)
+        _validate_page_layout(template_registry, errors)
 
     return errors
