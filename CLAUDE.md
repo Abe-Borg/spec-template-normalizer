@@ -628,6 +628,16 @@ Return the source-to-final style-ID map to every body/header/footer consumer.
   to change; they say so with `ApplicationPolicy.reindents_converted_paragraphs`
   rather than being exempted at the check.
 
+  It runs inside `verify_phase2_invariants`, which the packaging step calls
+  under the `output_publication` stage -- it is not a checkpoint of its own,
+  and there is no `geometry_verification` stage. It reports
+  `geometry_checked` and `geometry_paragraphs_compared` through
+  `verification_out` into the `build_output` diagnostics event on **success**
+  as well as failure: an invariant that only speaks when it trips leaves a run
+  unable to show it ran, which is indistinguishable from one where it was
+  skipped -- the exact state that let a flattened document report complete
+  success.
+
   A paragraph whose own XML is untouched can still move, because the parts it
   resolves through are shared -- replacing `docDefaults` or a style reflows
   content the engine never edited. Whether that is a defect depends on the
@@ -802,8 +812,7 @@ Current codes: `header_footer_target_section_id_required`,
   `header_footer_numbering_remap`, `style_import`,
   `header_footer_style_remap`, `stability_snapshot`,
   `classification_application`, `stability_verification`,
-  `geometry_verification`, `application_reporting`, `output_publication`,
-  `complete`
+  `application_reporting`, `output_publication`, `complete`
 - runner (before the shared path): `validation`, `extraction`,
   `bundle_build`, `classification_preflight`, `classification`,
   `application`

@@ -664,6 +664,7 @@ def _build_and_patch_output(
     arch_template_registry: Optional[Dict[str, Any]] = None,
     conversion_mode: str = FORMAT_ONLY,
     allowed_rpr_properties_by_paragraph: Optional[Dict[int, set[str]]] = None,
+    verification_out: Optional[Dict[str, Any]] = None,
 ) -> Path:
     conversion_mode = validate_conversion_mode(conversion_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -729,6 +730,7 @@ def _build_and_patch_output(
             allowed_rpr_properties_by_paragraph=(
                 allowed_rpr_properties_by_paragraph
             ),
+            verification_out=verification_out,
         )
         os.replace(temp_output_path, output_path)
     except Exception:
@@ -1044,7 +1046,8 @@ def _apply_classified_target_impl(
     # Atomic packaging is deliberately last: if any earlier stage fails there
     # is no output path to publish, and the builder itself removes its temp file.
     checkpoint.stage = "output_publication"
-    with diag.timed(diag_events, "target", "build_output"):
+    verification: Dict[str, Any] = {}
+    with diag.timed(diag_events, "target", "build_output") as phase:
         output_path = _build_and_patch_output(
             docx_path,
             extract_dir,
@@ -1055,7 +1058,9 @@ def _apply_classified_target_impl(
             allowed_rpr_properties_by_paragraph=(
                 apply_report.allowed_rpr_properties_by_paragraph
             ),
+            verification_out=verification,
         )
+        phase.set(**verification)
     class_coverage = (classified / total * 100) if total > 0 else 100.0
     expected_targetable = apply_report.requested - len(apply_report.skipped_sectpr)
     app_coverage = (

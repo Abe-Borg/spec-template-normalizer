@@ -139,7 +139,6 @@ ENGINE_STAGES: tuple[str, ...] = (
     "stability_snapshot",
     "classification_application",
     "stability_verification",
-    "geometry_verification",
     "application_reporting",
     "output_publication",
     "complete",
