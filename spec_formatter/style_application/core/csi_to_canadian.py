@@ -10,18 +10,12 @@ with Canadian numeric signatures.
 from __future__ import annotations
 
 import re
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from spec_formatter.numbering_roles import (
-    role_from_numbering_catalog,
-    role_from_numbering_signature,
-)
 from spec_formatter.role_contract import (
     BODY_HIERARCHY_ROLES,
-    ROLE_FALLBACKS,
     ROLE_LEVEL,
 )
 
@@ -38,10 +32,10 @@ from .marker_tools import (
     _find_numbering_level,
     _has_heading_like_article_body,
     _marker_markup_delimiter,
-    _no_locator,
     _paragraph_locator,
     _remove_literal_marker,
     _SourceEvidence,
+    _validate_automatic_source,
     _validate_numbering_start,
     _validate_source_sequence,
     _verify_changed_paragraph,
@@ -294,64 +288,6 @@ _ROLE_LEVEL = ROLE_LEVEL
 
 #: Roles a designer counts as headings when locating a paragraph in Word.
 _LOCATOR_HEADING_ROLES = frozenset(NUMBERED_ROLES) | {"PART"}
-
-
-def _validate_automatic_source(
-    item: _SourceEvidence,
-    numbering_root: Optional[ET.Element],
-    numbering_catalog: Dict[str, Any],
-    available_roles: set[str],
-    *,
-    describe: Callable[[int], str] = _no_locator,
-) -> None:
-    where = describe(item.paragraph_index)
-    if numbering_root is None or item.automatic_numpr is None:
-        raise EngineError("canadian_numbering_unprovable", 
-            f"Paragraph {item.paragraph_index}{where} uses automatic numbering, but the "
-            "target numbering.xml is unavailable."
-        )
-    pattern = item.automatic_pattern
-    if not isinstance(pattern, dict):
-        raise EngineError("canadian_numbering_unprovable", 
-            f"Paragraph {item.paragraph_index}{where} automatic numbering cannot be "
-            "resolved."
-        )
-    num_id = str(item.automatic_numpr["numId"])
-    ilvl = str(item.automatic_numpr.get("ilvl", "0"))
-    inferred = role_from_numbering_catalog(
-        numbering_catalog,
-        num_id,
-        ilvl,
-    )
-    if inferred is None:
-        inferred = role_from_numbering_signature(
-            pattern.get("numFmt"), pattern.get("lvlText"), pattern.get("ilvl")
-        )
-    resolved = next(
-        (
-            candidate
-            for candidate in ROLE_FALLBACKS.get(inferred, (inferred,))
-            if candidate in available_roles
-        ),
-        None,
-    ) if inferred is not None else None
-    if resolved != item.role:
-        raise EngineError("canadian_numbering_unprovable", 
-            f"Paragraph {item.paragraph_index}{where} is classified as {item.role}, but its "
-            f"automatic numbering signature resolves to {inferred or 'no safe role'}"
-            + (
-                f" (available-role fallback: {resolved})."
-                if resolved is not None and resolved != inferred
-                else "."
-            )
-        )
-    level, override = _find_numbering_level(numbering_root, num_id, ilvl)
-    _validate_numbering_start(
-        level,
-        override,
-        context=f"Paragraph {item.paragraph_index}{where} source numbering",
-        reject_override=True,
-    )
 
 
 def _validate_architect_numbering(

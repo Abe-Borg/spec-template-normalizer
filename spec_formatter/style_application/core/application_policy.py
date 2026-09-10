@@ -56,6 +56,12 @@ class ApplicationPolicy:
     requires_architect_template: bool = True
     #: Where the run's numbering comes from -- one of the ``SCHEME_*`` values.
     numbering_scheme: str = SCHEME_ARCHITECT
+    #: Whether classified paragraphs are restyled with a role style. False
+    #: for the architect-free modes: with no architect there is no formatting
+    #: to apply, and swapping a paragraph's own style for a generated one that
+    #: supplies no character formatting would silently flatten whatever its
+    #: existing style gave it. Those modes apply numbering only.
+    applies_role_styles: bool = True
     #: Output suffixes this application produces that are nonetheless valid
     #: *input* for this mode. Converting a spec to Canadian and later bringing
     #: it back is the whole point of the reverse mode, so its own earlier
@@ -78,16 +84,14 @@ class ApplicationPolicy:
         return self.numbering_scheme == SCHEME_BUILTIN_CSC
 
     @property
-    def imports_architect_styles(self) -> bool:
-        """Whether a role-style closure is imported for this run.
+    def imports_parts(self) -> bool:
+        """Whether any architect or built-in part is imported into the target.
 
-        True for the architect modes and for the built-in Canadian scheme,
-        which supplies its own role styles. False for ``canadian_to_csi``,
-        which writes typed markers into the target's existing styles and
-        imports nothing.
+        ``canadian_to_csi`` writes literal markers and imports nothing at all;
+        every other mode brings in styles, numbering, or both.
         """
 
-        return self.numbering_scheme != SCHEME_TYPED_CSI
+        return self.applies_role_styles or self.import_body_numbering
 
 
 def application_policy_for_mode(conversion_mode: str) -> ApplicationPolicy:
@@ -119,6 +123,7 @@ def application_policy_for_mode(conversion_mode: str) -> ApplicationPolicy:
             output_suffix=CSI_TO_CANADIAN_STANDALONE_OUTPUT_SUFFIX,
             requires_architect_template=False,
             numbering_scheme=SCHEME_BUILTIN_CSC,
+            applies_role_styles=False,
             apply_full_architect_shell=False,
         )
     if mode == CANADIAN_TO_CSI:
@@ -135,6 +140,7 @@ def application_policy_for_mode(conversion_mode: str) -> ApplicationPolicy:
             ),
             requires_architect_template=False,
             numbering_scheme=SCHEME_TYPED_CSI,
+            applies_role_styles=False,
             apply_full_architect_shell=False,
         )
     raise AssertionError(f"Unhandled conversion mode: {mode}")

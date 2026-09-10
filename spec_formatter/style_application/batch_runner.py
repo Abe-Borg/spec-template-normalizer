@@ -908,7 +908,7 @@ def _apply_classified_target_impl(
     numbering_roles = sorted(used_roles) if policy.import_body_numbering else []
     checkpoint.stage = "numbering_import"
     with diag.timed(diag_events, "target", "numbering_import") as phase:
-        if not policy.imports_architect_styles:
+        if not policy.imports_parts:
             # Typed CSI markers are literal text. Nothing is imported, and the
             # converter has already cancelled the target's own list membership
             # on every paragraph it rewrote.
@@ -932,7 +932,7 @@ def _apply_classified_target_impl(
             _check_numbering_module_needed(arch_styles_xml, numbering_style_ids)
             if hf_direct_num_ids:
                 raise ImportError("numbering_importer is required by architect headers/footers")
-        if policy.imports_architect_styles:
+        if policy.imports_parts:
             phase.set(
                 importer_available=bool(HAS_NUMBERING_IMPORTER),
                 styles_considered=len(numbering_style_ids),
@@ -952,7 +952,7 @@ def _apply_classified_target_impl(
     checkpoint.stage = "style_import"
     applied_arch_registry: Dict[str, str] = {}
     with diag.timed(diag_events, "target", "style_import") as phase:
-        if not policy.imports_architect_styles:
+        if not policy.applies_role_styles:
             phase.set(requested_styles=0, skipped=True)
         else:
             style_result = import_arch_styles_into_target(
@@ -977,7 +977,7 @@ def _apply_classified_target_impl(
                 role: style_result.body_style_id_map.get(style_id, style_id)
                 for role, style_id in arch_registry.items()
             }
-    if policy.imports_architect_styles:
+    if policy.applies_role_styles:
         checkpoint.stage = "header_footer_style_remap"
         _remap_imported_header_footer_style_ids(
             extract_dir,
@@ -987,14 +987,14 @@ def _apply_classified_target_impl(
         )
         log.append(f"Imported {len(needed_style_ids)} requested styles collision-safely")
     else:
-        log.append("Typed CSI markers need no imported styles; the target keeps its own")
+        log.append("No role styles applied; every paragraph keeps its own formatting")
 
     checkpoint.stage = "stability_snapshot"
     snap = snapshot_stability(extract_dir)
     checkpoint.stage = "classification_application"
     with diag.timed(diag_events, "target", "apply_classifications") as phase:
-        if not policy.imports_architect_styles:
-            # Nothing to restyle: the markers are already in the text and the
+        if not policy.imports_parts:
+            # Nothing to apply: the markers are already in the text and the
             # target's own styles stay exactly as authored. The report is
             # reconstructed rather than faked -- it records that every
             # classified paragraph was examined and none was restyled, which

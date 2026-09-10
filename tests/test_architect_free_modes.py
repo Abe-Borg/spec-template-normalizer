@@ -240,6 +240,90 @@ def test_canadian_to_csi_writes_typed_markers(tmp_path: Path) -> None:
     assert lines == expected
 
 
+#: A stylesheet whose headings get their font, weight and size from their own
+#: paragraph style rather than from direct run properties.
+STYLES_WITH_A_STYLED_HEADING = (
+    f'<w:styles xmlns:w="{W_NS}">'
+    "<w:docDefaults><w:rPrDefault><w:rPr/></w:rPrDefault>"
+    "<w:pPrDefault><w:pPr/></w:pPrDefault></w:docDefaults>"
+    '<w:style w:type="paragraph" w:default="1" w:styleId="Normal">'
+    '<w:name w:val="Normal"/><w:qFormat/></w:style>'
+    '<w:style w:type="paragraph" w:styleId="SpecHeading">'
+    '<w:name w:val="Spec Heading"/><w:basedOn w:val="Normal"/>'
+    '<w:rPr><w:rFonts w:ascii="Cambria"/><w:b/><w:sz w:val="28"/></w:rPr>'
+    "</w:style></w:styles>"
+)
+
+
+def _write_docx_with_styled_headings(path: Path) -> Path:
+    """A target whose PART and ARTICLE headings carry a real paragraph style."""
+
+    body = []
+    for role, marker, text in CSI_LINES:
+        style = "SpecHeading" if role in {"PART", "ARTICLE"} else None
+        ppr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else "<w:pPr/>"
+        if marker:
+            body.append(
+                f"<w:p>{ppr}"
+                f'<w:r><w:t xml:space="preserve">{marker}</w:t></w:r>'
+                "<w:r><w:tab/></w:r>"
+                f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+            )
+        else:
+            body.append(f'<w:p>{ppr}<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>')
+    document = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}"><w:body>{"".join(body)}'
+        f"<w:sectPr>{TARGET_PAGE_SIZE}</w:sectPr></w:body></w:document>"
+    )
+    _write_docx(path, document=document)
+    parts = {}
+    with zipfile.ZipFile(path) as package:
+        for name in package.namelist():
+            parts[name] = package.read(name)
+    parts["word/styles.xml"] = STYLES_WITH_A_STYLED_HEADING.encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as package:
+        for name, payload in parts.items():
+            package.writestr(name, payload)
+    return path
+
+
+def test_standalone_mode_keeps_formatting_a_paragraph_style_supplies(
+    tmp_path: Path,
+) -> None:
+    """Regression: the mode promises only numbering and hierarchy change.
+
+    A heading whose Cambria/bold/14pt comes from its own paragraph style used
+    to have that style swapped for a generated one carrying no run properties,
+    so it silently fell back to the document defaults. The mode now applies
+    numbering directly and never touches the paragraph's style.
+    """
+
+    import re
+
+    source = _write_docx_with_styled_headings(tmp_path / "spec.docx")
+    run = _run(tmp_path, source, CSI_TO_CANADIAN_STANDALONE, "out")
+    assert run.success, "\n".join(run.targets[0].log)
+
+    with zipfile.ZipFile(run.targets[0].output_path) as package:
+        document = package.read("word/document.xml").decode("utf-8")
+        styles = package.read("word/styles.xml").decode("utf-8")
+
+    paragraphs = re.findall(r"<w:p[ >][\s\S]*?</w:p>", document)
+    part = paragraphs[2]
+    # Its own style survives, and the Canadian numbering was added to it.
+    assert 'w:pStyle w:val="SpecHeading"' in part
+    assert "<w:numPr>" in part
+    assert '<w:ilvl w:val="0"/>' in part
+    # ``CT_PPr`` is a sequence: pStyle before numPr.
+    assert part.index("<w:pStyle") < part.index("<w:numPr")
+    # The style itself is untouched, so the heading still renders as authored.
+    assert "Cambria" in styles and "<w:b/>" in styles and 'w:sz w:val="28"' in styles
+    # No generated role style was imported at all.
+    assert "CSI_Part__ARCH" not in document
+    assert "CSI_Part__ARCH" not in styles
+
+
 def test_supplying_a_template_to_a_builtin_mode_is_rejected(tmp_path: Path) -> None:
     source = _write_docx(tmp_path / "spec.docx")
     template = _write_docx(tmp_path / "architect.docx")

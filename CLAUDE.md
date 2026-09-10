@@ -299,10 +299,20 @@ gate a real architect template must pass. Do not add a parallel, more
 forgiving check for the built-in scheme's benefit; if the scheme cannot pass
 the architect's contract, the scheme is wrong.
 
-The role styles deliberately carry **no `rPr`**. Fonts, sizes, and colours stay
-with the target's own theme and document defaults, which is what makes
-"the shell is untouched" true on the page rather than only true of the headers
-and footers.
+**The numbering is applied directly, never through a style.** The built-in
+role contracts declare `direct_numpr`, so `apply_phase2_classifications` gives
+a classified paragraph `w:numPr` in its own `w:pPr` and leaves its `pStyle`
+alone. `ApplicationPolicy.applies_role_styles` is the switch, and it is False
+for both architect-free modes.
+
+That is not a detail. Swapping a paragraph's style for a generated one that
+carries no `rPr` silently flattens whatever its own style supplied -- a heading
+that was Cambria bold 14pt falls back to the document defaults -- which
+contradicts the mode's whole promise that only numbering and hierarchy change.
+Per-level indents therefore live in `numbering.xml`, not in the styles, so the
+hierarchy still reads correctly. The generated stylesheet remains as internal
+scaffolding for the role contract, the registry cross-checks and the numbering
+import plan; nothing from it is imported into a target.
 
 **It is not dressed up as a `.phase1` bundle.** A bundle manifest exists to
 prove an analyzed artifact on disk was not altered between analysis and use. A
@@ -345,6 +355,23 @@ paragraph on it converted. Under those conditions a counter is a plain
 per-level tally -- increment this level, delete the deeper ones -- and anything
 outside them fails closed. A numbered role with no number in the source is
 preserved unchanged and reported as a warning; no marker is invented for it.
+
+**The classified role must agree with the level Word is rendering.** The walk
+is keyed on `ROLE_LEVEL[role]`, so a paragraph classified `ARTICLE` while
+sitting at `ilvl` 0 would be written `1.1` when the document actually shows
+`PART 2` -- a number it never displayed, committed as permanent text. Both
+converters therefore share `_validate_automatic_source` (in `marker_tools`,
+with the error code parameterised), and the reverse converter additionally
+requires `ilvl == ROLE_LEVEL[role]`. Every document this application's Canadian
+conversion produces satisfies that, because
+`_validate_complete_article_hierarchy` already requires it of the architect.
+
+Two placement rules the automatic branch must keep. The marker may not be
+written inside a field result or a tracked insertion: the numbering
+suppression sits on `w:pPr`, outside any such subtree, so updating the field or
+rejecting the revision would delete the marker and leave the paragraph with no
+number at all. And `w:numPr` goes after `w:pStyle`, because `CT_PPr` is a
+sequence -- the reverse order is invalid OOXML even where Word tolerates it.
 
 Markers are `PART 1`, `1.1`, `A.`, `1.`, `a.`, `1)`, `a)`, `(1)`, `(a)`. An
 alphabetic level that runs past `z` fails closed rather than writing `aa.`,
@@ -910,6 +937,12 @@ Before considering a formatter change complete:
 - Applying an architect shell, or any generated one, in an architect-free mode.
 - Inventing a CSI marker for a paragraph the source never numbered.
 - Adding runs to carry a marker rather than joining the paragraph's first run.
+- Writing a marker from the classified role without proving it matches the
+  list level the document actually renders.
+- Placing a generated marker inside a field result or tracked insertion.
+- Writing `w:numPr` before `w:pStyle` inside `w:pPr`.
+- Swapping a paragraph's own style for a generated one in a mode that promises
+  to change only numbering.
 - Importing architect body numbering in Format-only.
 - Treating visible text as stronger evidence than effective Word numbering.
 - Restyling an ignored paragraph or silently dropping it from coverage.

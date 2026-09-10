@@ -258,8 +258,16 @@ scheme fails the build rather than a document.
 The target keeps its own document shell. No fonts, page size, margins, theme,
 headers, or footers are imposed, because there is no template to take them
 from and inventing them would not be honest. Only the numbering and hierarchy
-change. Targets still need an API key for any paragraph the deterministic rules
-cannot classify locally.
+change.
+
+That is meant literally: **your paragraph styles are not replaced.** The
+Canadian numbering is added to each classified paragraph directly, so a heading
+that gets its font, weight, or size from its own style keeps all of it and
+simply gains its number. The per-level indents come from the numbering
+definition, so the hierarchy still steps in correctly on the page.
+
+Targets still need an API key for any paragraph the deterministic rules cannot
+classify locally.
 
 ## Convert Canadian back to CSI
 
@@ -280,10 +288,15 @@ Writing a number is a stronger claim than removing one, so this direction is at
 least as strict as the forward one. It converts only where it can prove the
 counter: every converted paragraph on one Word list, that list starting at 1
 with no restarts or level overrides, and every paragraph on it converted — one
-left behind would push every later number out of step. A paragraph the source
-never numbered is preserved unchanged and reported as a warning rather than
-given an invented marker, and an alphabetic level that would run past `z` stops
-the target instead of writing a marker the application could not read back.
+left behind would push every later number out of step. It also checks that each
+paragraph's classified role matches the list level Word is actually rendering,
+so it can never write `1.1` onto a line the document shows as `PART 2`. A
+paragraph the source never numbered is preserved unchanged and reported as a
+warning rather than given an invented marker; an alphabetic level that would
+run past `z` stops the target instead of writing a marker the application could
+not read back; and a paragraph whose leading text sits inside a tracked change
+or a field result is refused, because a marker written there would disappear
+the moment the change was rejected or the field updated.
 
 A round trip returns your markers, with one documented exception: converting
 *to* Canadian treats the dash in `PART 1 - GENERAL` as part of the typed marker

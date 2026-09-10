@@ -7,6 +7,8 @@ tests the refusals rather than the conversions.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from spec_formatter import builtin_scheme
@@ -320,6 +322,68 @@ def test_alphabetic_levels_refuse_to_run_past_z() -> None:
     with pytest.raises(EngineError) as raised:
         _int_to_alpha(27)
     assert raised.value.code == "canadian_to_csi_numbering_unprovable"
+
+
+def test_a_role_that_disagrees_with_its_list_level_fails_closed() -> None:
+    """Regression: the marker must match the number the document shows.
+
+    Two paragraphs sit at ``ilvl`` 0, so Word renders "PART 1" and "PART 2".
+    Classifying the second as ARTICLE would previously write "1.1" over it --
+    a number the document never displayed, written as permanent text.
+    """
+
+    document = _document([_styled("PART", "GENERAL"), _styled("PART", "PRODUCTS")])
+    with pytest.raises(EngineError) as raised:
+        plan_canadian_to_csi(
+            document,
+            builtin_scheme.build_styles_xml(),
+            _classifications(["PART", "ARTICLE"]),
+            numbering_xml=builtin_scheme.build_numbering_xml(),
+        )
+    assert raised.value.code == "canadian_to_csi_numbering_unprovable"
+
+
+def test_marker_is_refused_inside_a_tracked_insertion() -> None:
+    """Regression: a marker inside a revision dies when the revision is rejected.
+
+    The numbering suppression lives on ``w:pPr``, outside the revision, so the
+    paragraph would be left with no number at all.
+    """
+
+    document = _document(
+        [
+            _styled("PART", "GENERAL"),
+            _styled("ARTICLE", "SUMMARY"),
+            f'<w:p><w:pPr><w:pStyle w:val="{ROLE_TO_ARCH_STYLE["PARAGRAPH"]}"/></w:pPr>'
+            '<w:ins w:id="7" w:author="a">'
+            '<w:r><w:t xml:space="preserve">Inserted requirement.</w:t></w:r>'
+            "</w:ins></w:p>",
+        ]
+    )
+    with pytest.raises(EngineError) as raised:
+        plan_canadian_to_csi(
+            document,
+            builtin_scheme.build_styles_xml(),
+            _classifications(["PART", "ARTICLE", "PARAGRAPH"]),
+            numbering_xml=builtin_scheme.build_numbering_xml(),
+        )
+    assert raised.value.code == "canadian_to_csi_hierarchy"
+    assert "tracked change or field" in str(raised.value)
+
+
+def test_suppressed_numbering_keeps_ooxml_ppr_child_order() -> None:
+    """Regression: ``w:numPr`` must not be written before ``w:pStyle``.
+
+    ``CT_PPr`` is a sequence, so the reverse order is invalid OOXML even where
+    Word tolerates it, and a stricter consumer may reject the file.
+    """
+
+    plan = _convert([("PART", "GENERAL"), ("ARTICLE", "SUMMARY")])
+    blocks = re.findall(r"<w:pPr>[\s\S]*?</w:pPr>", plan.document_xml)
+    assert blocks
+    for block in blocks:
+        if "<w:numPr" in block and "<w:pStyle" in block:
+            assert block.index("<w:pStyle") < block.index("<w:numPr"), block
 
 
 def test_article_number_follows_the_active_part() -> None:

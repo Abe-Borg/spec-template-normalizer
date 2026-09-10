@@ -31,7 +31,11 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
-from spec_formatter.role_contract import BODY_HIERARCHY_ROLES, ROLE_LEVEL
+from spec_formatter.role_contract import (
+    BODY_HIERARCHY_ROLES,
+    ROLE_LEVEL,
+    ROLE_ORDER,
+)
 
 from .classification import (
     _build_numbering_catalog,
@@ -47,12 +51,14 @@ from .csi_to_canadian import (
 )
 from .errors import EngineError
 from .marker_tools import (
+    _TRACKED_OR_FIELD_RX,
     _detect_any_literal_marker,
     _detect_literal_marker,
     _find_numbering_level,
     _paragraph_locator,
     _remove_literal_marker,
     _SourceEvidence,
+    _validate_automatic_source,
     _validate_numbering_start,
     _validate_source_sequence,
 )
@@ -143,6 +149,30 @@ def _csi_marker(role: str, counters: Dict[int, int]) -> str:
     raise AssertionError(f"Unhandled convertible role: {role}")
 
 
+#: The ``CT_PPr`` children that must precede ``w:numPr`` in schema order.
+#: ``w:numPr`` written before ``w:pStyle`` is invalid OOXML even though Word
+#: often renders it anyway, and a stricter consumer is entitled to reject the
+#: file, so the insertion point is chosen rather than assumed to be the front.
+_PPR_BEFORE_NUMPR = (
+    "w:pStyle",
+    "w:keepNext",
+    "w:keepLines",
+    "w:pageBreakBefore",
+    "w:framePr",
+    "w:widowControl",
+)
+
+
+def _numpr_insertion_point(ppr_inner: str) -> int:
+    """Offset inside a ``w:pPr`` body where ``w:numPr`` may legally be added."""
+
+    offset = 0
+    for name in _PPR_BEFORE_NUMPR:
+        for match in re.finditer(rf"<{name}\b[^>]*(?:/>|>.*?</{name}>)", ppr_inner, re.S):
+            offset = max(offset, match.end())
+    return offset
+
+
 def _suppress_automatic_numbering(paragraph_xml: str) -> str:
     """Return *paragraph_xml* with its effective list membership cancelled."""
 
@@ -160,7 +190,9 @@ def _suppress_automatic_numbering(paragraph_xml: str) -> str:
     else:
         without = _NUMPR_RX.sub("", ppr, count=1)
         open_end = without.index(">") + 1
-        rebuilt = without[:open_end] + _NUMBERING_OFF + without[open_end:]
+        inner = without[open_end : without.rindex("</w:pPr>")]
+        cut = open_end + _numpr_insertion_point(inner)
+        rebuilt = without[:cut] + _NUMBERING_OFF + without[cut:]
     return paragraph_xml[: match.start()] + rebuilt + paragraph_xml[match.end():]
 
 
@@ -186,6 +218,19 @@ def _insert_marker(paragraph_xml: str, marker: str) -> str:
                 _HIERARCHY,
                 f"A paragraph classified for CSI marker {marker!r} has no text run "
                 "to carry it.",
+            )
+        # The numbering suppression goes on ``w:pPr``, outside any field or
+        # revision subtree. If the marker went *inside* one, updating the field
+        # or rejecting the insertion would delete the marker and leave the
+        # paragraph with no number at all -- the automatic numbering that used
+        # to supply it is gone by then. The forward converter refuses the same
+        # markup for the mirror-image reason.
+        if _TRACKED_OR_FIELD_RX.search(unprotected[: match.start()]):
+            raise EngineError(
+                _HIERARCHY,
+                "A paragraph's leading text is inside a tracked change or field "
+                f"result, so CSI marker {marker!r} could not be written where it "
+                "would survive. Accept the changes or unlink the field first.",
             )
         prefix = f'<w:t xml:space="preserve">{_escape(marker)}</w:t><w:tab/>'
         return unprotected[: match.start()] + prefix + unprotected[match.start():]
@@ -392,6 +437,41 @@ def plan_canadian_to_csi(
             f"({sorted(num_ids)}); their counters cannot be proven together.",
         )
     _validate_converted_list(numbering_xml, num_ids, ilvls)
+
+    # The counter walk below is driven by the *classified* role's level, so a
+    # role that disagrees with the level Word is actually rendering would
+    # produce a number the document never showed -- writing "1.1" onto what
+    # Word renders as "PART 2", and writing it as permanent text. Prove the two
+    # agree first, with the same check the forward converter makes.
+    numbering_root = (
+        parse_untrusted_xml(
+            prepare_xml_text_for_utf8(numbering_xml),
+            "word/numbering.xml",
+        )
+        if numbering_xml.strip()
+        else None
+    )
+    for item in evidence:
+        if item.source_kind != "automatic":
+            continue
+        _validate_automatic_source(
+            item,
+            numbering_root,
+            numbering_catalog,
+            set(ROLE_ORDER),
+            describe=locate,
+            error_code=_UNPROVABLE,
+        )
+        expected_ilvl = str(ROLE_LEVEL[item.role])
+        actual_ilvl = str((item.automatic_numpr or {}).get("ilvl", "0"))
+        if actual_ilvl != expected_ilvl:
+            raise EngineError(
+                _UNPROVABLE,
+                f"Paragraph {item.paragraph_index}{locate(item.paragraph_index)} is "
+                f"classified as {item.role} (list level {expected_ilvl}) but sits at "
+                f"list level {actual_ilvl}; the CSI marker would not match the "
+                "number the document currently shows.",
+            )
 
     # Every paragraph on a converted list must be converted. One left behind
     # keeps its automatic number while its neighbours get literal ones, and the

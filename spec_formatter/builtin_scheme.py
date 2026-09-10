@@ -38,6 +38,20 @@ ilvl  role                     ``lvlText``  rendered
 Every level is ``decimal``, starts at 1, and declares no ``lvlRestart``,
 because the converter refuses source sequences it cannot prove and must not be
 handed a scheme whose counters it could not prove either.
+
+**The numbering is applied directly, not through a style.** The role contracts
+declare ``direct_numpr``, so a classified paragraph is given ``w:numPr`` in its
+own ``w:pPr`` and keeps the paragraph style it already had. Taking the numbering
+through a generated style would mean replacing that style, and a heading whose
+font, weight or size came from its own style would silently fall back to the
+document defaults -- precisely what this mode promises not to do. The per-level
+indents therefore live in ``numbering.xml`` rather than in the styles, so the
+hierarchy still reads correctly on the page.
+
+The generated stylesheet remains because the role contract, the registry
+cross-checks and the numbering import plan are all defined in terms of role
+styles. In these modes it is internal scaffolding: nothing from it is imported
+into a target.
 """
 
 from __future__ import annotations
@@ -160,10 +174,11 @@ def build_numbering_xml() -> str:
 def build_styles_xml() -> str:
     """Return the generated stylesheet holding the twelve CSI role styles.
 
-    Deliberately free of ``rPr``: no font, size, or colour is imposed. The
-    target keeps its own theme and document defaults, which is what makes
-    "the shell is left untouched" true on the page and not merely true of the
-    headers and footers.
+    Deliberately free of ``rPr``: no font, size, or colour is imposed. These
+    styles are not applied to a target -- numbering is injected directly and
+    the paragraph keeps its own style -- so this stylesheet exists to satisfy
+    the role contract, the registry cross-checks and the numbering import
+    plan, all of which are expressed in terms of role styles.
     """
 
     parts: List[str] = [
@@ -217,7 +232,12 @@ def build_role_specs() -> Dict[str, Dict[str, Any]]:
             "exemplar_paragraph_index": 0,
         }
         if role in BODY_HIERARCHY_ROLES:
-            spec["numbering_provenance"] = "style_numpr"
+            # ``direct_numpr``, not ``style_numpr``: the numbering is injected
+            # onto each paragraph so the paragraph keeps its own style. Taking
+            # it through a generated style would mean replacing that style, and
+            # a paragraph whose font or weight comes from its own style would
+            # lose it -- which is exactly what these modes promise not to do.
+            spec["numbering_provenance"] = "direct_numpr"
             spec["numbering_pattern"] = {
                 "numId": BUILTIN_NUM_ID,
                 "ilvl": str(ROLE_LEVEL[role]),

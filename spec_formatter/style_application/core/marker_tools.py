@@ -25,10 +25,15 @@ import html
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
+from spec_formatter.numbering_roles import (
+    role_from_numbering_catalog,
+    role_from_numbering_signature,
+)
 from spec_formatter.role_contract import (
     NUMBERED_BODY_ROLES,
+    ROLE_FALLBACKS,
     ROLE_LEVEL,
     ROLE_PARENT,
 )
@@ -615,6 +620,75 @@ def _validate_source_sequence(
         active[item.role] = counter
 
 
+def _validate_automatic_source(
+    item: _SourceEvidence,
+    numbering_root: Optional[ET.Element],
+    numbering_catalog: Dict[str, Any],
+    available_roles: set[str],
+    *,
+    describe: Callable[[int], str] = _no_locator,
+    error_code: str = "canadian_numbering_unprovable",
+) -> None:
+    """Prove a paragraph's automatic numbering really is the role it was given.
+
+    Both converters need this and for the same reason: the classified role and
+    the level Word is actually rendering must be the same thing. The forward
+    converter would otherwise retarget a paragraph to the wrong architect
+    level; the reverse converter would write the wrong number into the text as
+    literal characters, which is worse because nothing downstream can correct
+    it. ``error_code`` selects which converter's code the caller reports.
+    """
+
+    where = describe(item.paragraph_index)
+    if numbering_root is None or item.automatic_numpr is None:
+        raise EngineError(error_code, 
+            f"Paragraph {item.paragraph_index}{where} uses automatic numbering, but the "
+            "target numbering.xml is unavailable."
+        )
+    pattern = item.automatic_pattern
+    if not isinstance(pattern, dict):
+        raise EngineError(error_code, 
+            f"Paragraph {item.paragraph_index}{where} automatic numbering cannot be "
+            "resolved."
+        )
+    num_id = str(item.automatic_numpr["numId"])
+    ilvl = str(item.automatic_numpr.get("ilvl", "0"))
+    inferred = role_from_numbering_catalog(
+        numbering_catalog,
+        num_id,
+        ilvl,
+    )
+    if inferred is None:
+        inferred = role_from_numbering_signature(
+            pattern.get("numFmt"), pattern.get("lvlText"), pattern.get("ilvl")
+        )
+    resolved = next(
+        (
+            candidate
+            for candidate in ROLE_FALLBACKS.get(inferred, (inferred,))
+            if candidate in available_roles
+        ),
+        None,
+    ) if inferred is not None else None
+    if resolved != item.role:
+        raise EngineError(error_code, 
+            f"Paragraph {item.paragraph_index}{where} is classified as {item.role}, but its "
+            f"automatic numbering signature resolves to {inferred or 'no safe role'}"
+            + (
+                f" (available-role fallback: {resolved})."
+                if resolved is not None and resolved != inferred
+                else "."
+            )
+        )
+    level, override = _find_numbering_level(numbering_root, num_id, ilvl)
+    _validate_numbering_start(
+        level,
+        override,
+        context=f"Paragraph {item.paragraph_index}{where} source numbering",
+        reject_override=True,
+    )
+
+
 __all__ = [
     "NUMBERED_ROLES",
     "_ANY_MARKERS",
@@ -644,6 +718,7 @@ __all__ = [
     "_remove_marker_from_unprotected_xml",
     "_roman_to_int",
     "_text_skeleton",
+    "_validate_automatic_source",
     "_validate_numbering_start",
     "_validate_source_sequence",
     "_verify_changed_paragraph",
