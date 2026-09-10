@@ -95,6 +95,9 @@ tests/test_builtin_scheme.py
     proves the built-in scheme passes the unmodified architect validators
 tests/test_canadian_to_csi.py, tests/test_architect_free_modes.py
     the reverse converter and both architect-free modes end to end
+tests/test_error_location.py
+    proves a fail-closed failure reports the paragraph it is about, and that
+    the published location cannot be made to carry document text
 ```
 
 `phase1_pipeline.run_phase1()` remains a compatibility and internal profile
@@ -361,7 +364,11 @@ is keyed on `ROLE_LEVEL[role]`, so a paragraph classified `ARTICLE` while
 sitting at `ilvl` 0 would be written `1.1` when the document actually shows
 `PART 2` -- a number it never displayed, committed as permanent text. Both
 converters therefore share `_validate_automatic_source` (in `marker_tools`,
-with the error code parameterised), and the reverse converter additionally
+with the error code parameterised -- as are `_find_numbering_level` and
+`_validate_numbering_start` beneath it, which used to hard-code the forward
+code and so reported `canadian_numbering_unprovable`, with a remediation about
+Canadian conversion, for a `canadian_to_csi` failure), and the reverse
+converter additionally
 requires `ilvl == ROLE_LEVEL[role]`. Every document this application's Canadian
 conversion produces satisfies that, because
 `_validate_complete_article_hierarchy` already requires it of the architect.
@@ -779,13 +786,54 @@ The developer detail follows two conventions so a failure can be found in
 Word. Canadian architect-contract failures start with `Architect template:`
 and name the role. Target-side Canadian messages name the paragraph index
 and append a locator built by `_paragraph_locator()` in
-`core/csi_to_canadian.py`: `(Section 21 13 13, heading 5)` is the number on
+`core/marker_tools.py`: `(Section 21 13 13, heading 5)` is the number on
 the nearest preceding SectionID paragraph and the paragraph's ordinal among
 the PART and numbered-role headings after that SECTION line (`after heading
 5` for a non-heading paragraph, `before any SECTION line` when none
 precedes it). Locators carry section numbers and counts only, never body
 text. Run-property invariant failures in `phase2_invariants.py` likewise
 report property names and counts, never XML.
+
+### The location is published; the message is not
+
+A remediation sentence is fixed, so the most it can ever say is "check the
+reported paragraph" -- and for a long time nothing reported it. The locator
+above was built only for the developer detail, and that detail is discarded
+wholesale at the redaction boundary, so a user got a stable code, a sentence
+pointing at a paragraph, and no way to find it.
+
+`ErrorLocation` (`core/errors.py`) is the placement as its own value:
+`paragraph_index`, `section_number`, `heading_ordinal`, `placement`
+(`heading`/`after_heading`/`before_first_heading`/`unknown`) and
+`section_state` (`numbered`/`unnumbered`/`none`/`unknown`), plus the rendered
+`description`. `EngineError(code, detail, location)` carries it,
+`ApplicationStageError` forwards it beside the code, and
+`BatchResult.error_location` / `TargetFormatResult.error_location` /
+`SafeErrorDiagnostic.location` deliver it to `run.json`, every `audit.json`,
+the `WHERE:` line in `run.log`, and the GUI.
+
+**It is safe to publish because it cannot hold document text, not because the
+producer is careful.** `section_number` is re-validated in `__post_init__`
+through the one section-number grammar, every other field is a bounded scalar,
+and `safe_error_location()` accepts only a real `ErrorLocation` -- so an
+exception that merely claims the attribute cannot smuggle a payload into an
+artifact. Do not add a free-text field to this type, and do not publish the
+developer detail alongside it; the message is withheld precisely because it
+can quote the document, and the location exists so that withholding it no
+longer costs the user the one fact they need.
+
+The locator and the location come from **one** object resolving one set of
+index tables (`_ParagraphLocator.__call__` renders the message suffix,
+`.at()` returns the value). A message and an artifact that disagreed about
+which paragraph failed would be worse than either alone.
+
+Where the engine knows no placement -- a run that failed before any target was
+read -- the key is still written, as `null`. An absent location and an unknown
+one are different answers.
+
+A location is **not** a substitute for a code. It says where, never what: the
+code and its remediation stay the contract, and a location is only ever added
+to a failure that already has one.
 
 Current codes: `header_footer_target_section_id_required`,
 `header_footer_target_section_title_required`, `header_footer_token_residual`,
@@ -947,6 +995,19 @@ identity; model/prompt fingerprints; target/output hashes; audit paths;
 disposition counts; numbering checks; durations; a top-level `diagnostics`
 rollup; and redacted errors. It must not contain API keys or document text.
 
+Every failure record in `run.json` and in each `audit.json` also carries
+`error_location` beside `error_code` and `error` -- the validated placement
+described under "Error codes and stages", `null` when the engine knew none.
+`run.log` prints the same sentence on a `WHERE:` line under the error it
+belongs to, and the failing diagnostics phase event carries the bare
+`paragraph_index` (an int, so it survives the diagnostics field boundary that
+drops the section number for having whitespace in it). Both artifact schema
+versions are 3; version 3 is exactly this addition.
+
+`run.log` and `run.json` derive a target's failure identity from the same
+`target_error_diagnostic()`, so the log line, the manifest record and the GUI
+cannot disagree about a target's code, sentence, or location.
+
 `diagnostics.jsonl` is the structured detailed-diagnostics stream that
 complements the human-readable `run.log`: one JSON object per phase event with
 `seq`, `ts`, `level` (`DEBUG`/`INFO`/`WARNING`/`ERROR`), `component`, `event`,
@@ -973,9 +1034,10 @@ the historical `output_dir`, and adds `run_id`, `conversion_mode`,
 `output_root`, `run_dir`, `manifest_path`, and `diagnostics_path`.
 `TargetFormatResult` retains its historical fields and adds source/output
 SHA-256, `audit_path`, `audit_summary`, application audit details, numbering
-checks, and structured `diagnostics` events. `BatchResult` likewise carries a
-`diagnostics` list of engine phase events. Additive fields must keep safe
-defaults so existing test doubles and callers continue to work.
+checks, structured `diagnostics` events, and `error_location`. `BatchResult`
+likewise carries a `diagnostics` list of engine phase events and its own
+`error_location`. Additive fields must keep safe defaults so existing test
+doubles and callers continue to work.
 
 ## Development commands
 
@@ -988,6 +1050,7 @@ python -m pytest tests/test_builtin_scheme.py tests/test_canadian_to_csi.py \
     tests/test_architect_free_modes.py -q
 python -m pytest tests/test_geometry_invariant.py \
     tests/test_conversion_verification.py -q
+python -m pytest tests/test_error_location.py -q
 ```
 
 `tests/test_conversion_verification.py` is deliberately written against the
@@ -1110,6 +1173,11 @@ Before considering a formatter change complete:
 - Following an external relationship or a path that escapes the package.
 - Publishing before the DOCX is fully copied and revalidated.
 - Recording secrets or paragraph text in run metadata.
+- Adding a free-text field to `ErrorLocation`, or publishing an engine
+  failure's developer detail beside it.
+- Raising a fail-closed engine error that knows its paragraph without passing
+  the location, leaving the remediation's "reported paragraph" unreported.
+- Hard-coding one converter's error code in a helper both converters share.
 - Running a corpus check against a sibling checkout instead of the namespaced
   implementation in this repository.
 

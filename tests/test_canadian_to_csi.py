@@ -20,6 +20,7 @@ from spec_formatter.style_application.core.canadian_to_csi import (
     plan_canadian_to_csi,
 )
 from spec_formatter.style_application.core.errors import EngineError
+from spec_formatter.style_application.core.marker_tools import _no_locator
 from spec_formatter.style_application.core.xml_helpers import (
     iter_paragraph_xml_blocks,
     paragraph_text_from_block,
@@ -258,6 +259,12 @@ def test_a_paragraph_left_on_the_converted_list_fails_closed() -> None:
 
 
 def test_numbering_that_does_not_start_at_one_fails_closed() -> None:
+    """A reverse-mode failure reports the *reverse* code, not the forward one.
+
+    The shared numbering helpers used to hard-code ``canadian_numbering_unprovable``,
+    so a ``canadian_to_csi`` run was told to fix its Canadian conversion.
+    """
+
     numbering = builtin_scheme.build_numbering_xml().replace(
         '<w:start w:val="1"/>', '<w:start w:val="4"/>', 1
     )
@@ -266,7 +273,7 @@ def test_numbering_that_does_not_start_at_one_fails_closed() -> None:
             [("PART", "GENERAL"), ("ARTICLE", "SUMMARY")],
             numbering_xml=numbering,
         )
-    assert raised.value.code == "canadian_numbering_unprovable"
+    assert raised.value.code == "canadian_to_csi_numbering_unprovable"
 
 
 def test_missing_numbering_part_fails_closed() -> None:
@@ -806,7 +813,7 @@ def test_prediction_catches_a_marker_that_was_never_written() -> None:
             _blocks("GENERAL", "SUMMARY"),
             _blocks("PART 1\tGENERAL", "SUMMARY"),
             [(0, "PART", "PART 1"), (1, "ARTICLE", "1.1")],
-            describe=lambda index: "",
+            describe=_no_locator,
         )
     assert raised.value.code == "conversion_prediction_mismatch"
     assert "predicted to lead with" in str(raised.value)
@@ -820,7 +827,7 @@ def test_prediction_catches_an_edit_nobody_asked_for() -> None:
             _blocks("GENERAL", "Untouched prose."),
             _blocks("PART 1\tGENERAL", "Quietly rewritten."),
             [(0, "PART", "PART 1")],
-            describe=lambda index: "",
+            describe=_no_locator,
         )
     assert raised.value.code == "conversion_prediction_mismatch"
     assert "no CSI marker was predicted" in str(raised.value)
@@ -831,7 +838,7 @@ def test_prediction_accepts_the_document_it_predicted() -> None:
         _blocks("GENERAL", "Untouched prose."),
         _blocks("PART 1\tGENERAL", "Untouched prose."),
         [(0, "PART", "PART 1")],
-        describe=lambda index: "",
+        describe=_no_locator,
     )
 
 

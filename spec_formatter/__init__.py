@@ -23,9 +23,11 @@ __all__ = [
     "TemplateProfile",
     "collect_target_specs",
     "default_template_cache_dir",
+    "describe_error_location",
     "format_specifications",
     "prepare_template_profile",
     "safe_error_diagnostic",
+    "target_error_diagnostic",
 ]
 
 

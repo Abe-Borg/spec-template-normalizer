@@ -322,6 +322,20 @@ class _PhaseHandle:
         self.fields.update(fields)
 
 
+def _failure_paragraph_index(exc: BaseException) -> Optional[int]:
+    """Return the paragraph index a failure points at, when it carries one.
+
+    Read off the exception by attribute rather than by importing the engine's
+    error module: diagnostics sits underneath the engine, and this is the same
+    duck-typed contract ``safe_error_code`` already travels on. Only a plain
+    int is taken -- everything else stays out of the event, as with every other
+    diagnostics field.
+    """
+
+    index = getattr(getattr(exc, "safe_error_location", None), "paragraph_index", None)
+    return index if isinstance(index, int) and not isinstance(index, bool) else None
+
+
 @contextmanager
 def timed(
     collector: List[Dict[str, Any]],
@@ -348,6 +362,9 @@ def timed(
         duration_ms = round((time.monotonic() - start) * 1000.0, 3)
         merged = {**fields, **handle.fields, "duration_ms": duration_ms, "failed": True,
                   "error_type": _clean_name(type(exc).__name__.lower()), "t_ms": start_ms}
+        paragraph_index = _failure_paragraph_index(exc)
+        if paragraph_index is not None:
+            merged["paragraph_index"] = paragraph_index
         emit(collector, "ERROR", component, event, **merged)
         raise
     duration_ms = round((time.monotonic() - start) * 1000.0, 3)
@@ -457,6 +474,9 @@ class DiagnosticsRecorder:
                 "failed": True,
                 "error_type": type(exc).__name__.lower(),
             }
+            paragraph_index = _failure_paragraph_index(exc)
+            if paragraph_index is not None:
+                merged["paragraph_index"] = paragraph_index
             self._store(ERROR, component, event, target, sanitize_fields(merged))
             raise
         duration_ms = round((time.monotonic() - start) * 1000.0, 3)

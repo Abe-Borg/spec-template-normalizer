@@ -20,7 +20,7 @@ from .core.classification import (
     _effective_numpr,
 )
 from .core.canadian_to_csi import MARKER_REVISION_AUTHOR
-from .core.errors import EngineError
+from .core.errors import EngineError, ErrorLocation
 from .core.xml_helpers import (
     iter_direct_child_xml_blocks,
     iter_element_xml_blocks,
@@ -1172,6 +1172,10 @@ def _verify_effective_paragraph_geometry(
                 f"{index}: the source resolved to "
                 f"{_resolve_geometry(before_sources, before_defaults, True)} and the "
                 f"output to {_resolve_geometry(after_sources, after_defaults, True)}.",
+                # No role map reaches this check, so the placement is the bare
+                # index -- which is still what this code's remediation asks the
+                # user to report, and more than the artifacts carried before.
+                ErrorLocation(paragraph_index=index),
             )
     return compared
 

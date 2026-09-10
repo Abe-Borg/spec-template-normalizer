@@ -25,8 +25,10 @@ from spec_formatter.pipeline import (
     FormatRunResult,
     collect_target_specs,
     default_template_cache_dir,
+    describe_error_location,
     format_specifications,
     safe_error_diagnostic,
+    target_error_diagnostic,
 )
 from spec_formatter.style_application.core.application_policy import (
     application_policy_for_mode,
@@ -353,6 +355,9 @@ class FormatWorker(threading.Thread):
             else:
                 message = diagnostic.message
                 error_code = diagnostic.code
+                where = describe_error_location(diagnostic.location)
+                if where:
+                    message = f"{message} ({where})"
             self.events.put(
                 (
                     "error",
@@ -1070,7 +1075,12 @@ class App(ctk.CTk):
             if item.success and item.output_path is not None:
                 self._append_log(f"Output: {item.output_path}")
             else:
-                diagnostic = safe_error_diagnostic(getattr(item, "error", None))
+                # Pass the key as a secret: a target whose failure carried no
+                # engine code falls back to classifying its own error text,
+                # which is the one path that can echo what it was given.
+                diagnostic = target_error_diagnostic(
+                    item, (self.api_key_var.get().strip(),)
+                )
                 if diagnostic is None:
                     self._append_log(f"Failed: {item.source_path.name}")
                 else:
@@ -1078,6 +1088,12 @@ class App(ctk.CTk):
                         f"Failed [{diagnostic.code}]: {item.source_path.name} "
                         f"— {diagnostic.message}"
                     )
+                    # The remediation says "the reported paragraph"; without
+                    # this line nothing reports it and the user is left to
+                    # search the document by hand.
+                    where = describe_error_location(diagnostic.location)
+                    if where:
+                        self._append_log(f"    Where: {where}")
         self.open_button.configure(state="normal" if run_dir is not None else "disabled")
         if run_dir is not None:
             self._append_log(f"Persisted run log: {run_dir / 'run.log'}")

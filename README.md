@@ -140,6 +140,39 @@ stopped and, when the engine failed on a known condition, a stable
 the closed sets are listed in CLAUDE.md. API keys and document text are never
 written to run metadata.
 
+### Finding the paragraph a failure is about
+
+A remediation sentence is fixed, so on its own it can only say "check the
+reported paragraph". Every failure record therefore also carries
+`error_location` — where in the document the engine stopped, in terms you can
+act on in Word:
+
+```json
+"error_code": "canadian_to_csi_numbering_unprovable",
+"error_location": {
+  "paragraph_index": 119,
+  "section_number": "21 30 00",
+  "heading_ordinal": 5,
+  "placement": "after_heading",
+  "section_state": "numbered",
+  "description": "Section 21 30 00, after heading 5, paragraph index 119"
+}
+```
+
+Read it as: open section 21 30 00, count five numbered headings (PART lines and
+numbered headings) down from the SECTION line, and the paragraph after that one
+is the problem. `run.log` prints the same sentence on a `WHERE:` line under the
+error, the GUI prints it under the failed target, and `diagnostics.jsonl`
+carries the bare `paragraph_index` on the failing phase event.
+
+The key is always present, and is `null` when the engine had no placement to
+report (a run that failed before any target was read, for instance) — an
+absent location and an unknown one are different answers.
+
+A location holds counts, a paragraph index, and a section number validated
+through the application's one section-number grammar. It cannot carry document
+text, which is why it can be published where the failure's own message cannot.
+
 `diagnostics.jsonl` is the detailed, structured diagnostics stream: one JSON
 object per phase event (`seq`, `ts`, `level`, `component`, `event`, and a
 `fields` object of counts/timings such as per-phase `duration_ms`, styles
@@ -589,8 +622,10 @@ fails instead of publishing a header that still names the architect's section.
   paragraph by its nearest SECTION number and heading ordinal (for example
   `Paragraph 143 (Section 21 13 13, heading 5)`), and a failure in the
   architect template's numbering contract starts with `Architect template:`.
-  Run artifacts still record only the stable error code and remediation
-  sentence.
+  Run artifacts record the stable error code, the remediation sentence, and
+  that same placement as the validated `error_location` described above — the
+  detailed message itself is still withheld, because it can quote the
+  document.
 - Short generated temporary paths avoid carrying user-controlled deep paths
   into Windows staging.
 - Every output is fully validated before atomic publication into its run folder.
@@ -615,6 +650,11 @@ reverse converter, mostly through the cases it must refuse.
 `tests/test_architect_free_modes.py` runs both template-free modes end to end
 over a real DOCX, including a full CSI → Canadian → CSI round trip, with no API
 key and no template.
+
+`tests/test_error_location.py` covers the published `error_location`: that a
+fail-closed decision reports the paragraph it is about, and that the location
+cannot be made to carry document text. Both halves matter — a location that
+could quote the document would be a redaction hole rather than a diagnostic.
 
 `tests/test_conversion_verification.py` re-checks a conversion using only the
 standard library, sharing no code with the engine. A suite written from the
