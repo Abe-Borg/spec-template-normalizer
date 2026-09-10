@@ -42,6 +42,7 @@ from .style_application.core.application_policy import (
     application_policy_for_mode,
 )
 from .style_application.core.errors import (
+    ErrorLocation,
     remediation_for as engine_remediation_for,
     safe_error_location as engine_error_location,
 )
@@ -1334,6 +1335,38 @@ def describe_error_location(location: Optional[dict]) -> str:
     return description if isinstance(description, str) else ""
 
 
+def validated_error_location(value: Any) -> Optional[dict]:
+    """Rebuild a location payload through ``ErrorLocation`` before publishing it.
+
+    A location is safe to publish *because it was validated*, not because its
+    producer was careful -- and by the time a payload reaches here it has
+    crossed a boundary this module does not own. ``BatchResult`` is a plain
+    dataclass, the target processor is injectable, and ``_redact_json``
+    replaces configured secrets only, so an arbitrary dict accepted here would
+    put its ``description`` verbatim into ``run.json``, ``audit.json``,
+    ``run.log`` and the GUI. That is the redaction hole the type exists to
+    close, so the dict is reconstructed rather than trusted.
+
+    ``description`` is re-rendered from the validated scalars instead of being
+    carried across, so a spoofed one is discarded even when every other field
+    is well formed. A payload that will not round-trip is dropped whole: a
+    half-trusted location is worth less than none.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    try:
+        return ErrorLocation(
+            paragraph_index=value.get("paragraph_index"),
+            section_number=value.get("section_number"),
+            heading_ordinal=value.get("heading_ordinal"),
+            placement=value.get("placement", "unknown"),
+            section_state=value.get("section_state", "unknown"),
+        ).as_dict()
+    except (TypeError, ValueError):
+        return None
+
+
 def target_error_diagnostic(
     item: TargetFormatResult,
     secrets: Sequence[str],
@@ -1341,17 +1374,19 @@ def target_error_diagnostic(
     """Prefer the engine's stable code and remediation over classified text."""
 
     code = getattr(item, "error_code", None)
-    location = getattr(item, "error_location", None)
+    # Public function: a caller can hand it any ``TargetFormatResult``, so the
+    # location is re-validated here as well as at the runner boundary.
+    location = validated_error_location(getattr(item, "error_location", None))
     if isinstance(code, str) and code:
         remediation = engine_remediation_for(code)
         if remediation:
             return SafeErrorDiagnostic(
                 code=code,
                 message=remediation,
-                location=location if isinstance(location, dict) else None,
+                location=location,
             )
     diagnostic = safe_error_diagnostic(item.error, secrets)
-    if diagnostic is not None and diagnostic.location is None and isinstance(location, dict):
+    if diagnostic is not None and diagnostic.location is None and location is not None:
         return replace(diagnostic, location=location)
     return diagnostic
 
@@ -1516,7 +1551,9 @@ def _format_one_target(
                 log=processor_log,
                 error=result.error or "Target formatting failed.",
                 error_code=getattr(result, "error_code", None),
-                error_location=getattr(result, "error_location", None),
+                error_location=validated_error_location(
+                    getattr(result, "error_location", None)
+                ),
                 duration_seconds=result.duration_seconds,
                 conversion_report=conversion_report,
                 source_sha256=snapshot_sha256,
@@ -2518,4 +2555,5 @@ __all__ = [
     "describe_error_location",
     "safe_error_diagnostic",
     "target_error_diagnostic",
+    "validated_error_location",
 ]

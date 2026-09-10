@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 
 from spec_formatter import builtin_scheme
-from spec_formatter.pipeline import describe_error_location
+from spec_formatter.pipeline import describe_error_location, validated_error_location
 from spec_formatter.role_contract import ROLE_TO_ARCH_STYLE
 from spec_formatter.style_application.core.canadian_to_csi import plan_canadian_to_csi
 from spec_formatter.style_application.core.errors import (
@@ -136,6 +136,46 @@ def test_only_a_real_location_can_be_published() -> None:
         "section_state": "unknown",
         "description": "paragraph index 7",
     }
+
+
+def test_a_payload_is_rebuilt_through_the_type_before_publication() -> None:
+    """The boundary is validation, not the producer's good behaviour.
+
+    ``BatchResult`` is a plain dataclass and the target processor is
+    injectable, so by the time a location payload reaches the pipeline it has
+    crossed a boundary the pipeline does not own. Accepting any dict there
+    would put its ``description`` verbatim into ``run.json``, ``audit.json``,
+    ``run.log`` and the GUI -- the exact hole ``ErrorLocation`` exists to
+    close, reopened one layer up.
+    """
+
+    good = ErrorLocation(
+        paragraph_index=119,
+        section_number="21 13 13",
+        heading_ordinal=5,
+        placement="after_heading",
+        section_state="numbered",
+    ).as_dict()
+
+    # A well-formed location survives untouched.
+    assert validated_error_location(good) == good
+    assert validated_error_location(ErrorLocation(paragraph_index=7).as_dict()) == (
+        ErrorLocation(paragraph_index=7).as_dict()
+    )
+
+    # ``description`` is re-rendered from the validated scalars, so a spoofed
+    # one is discarded even when every other field is well formed.
+    assert validated_error_location({**good, "description": SECRET_BODY}) == good
+
+    # Anything that will not round-trip is dropped whole. A half-trusted
+    # location is worth less than none.
+    assert validated_error_location(
+        {"paragraph_index": 1, "section_number": SECRET_BODY, "section_state": "numbered"}
+    ) is None
+    assert validated_error_location({"paragraph_index": SECRET_BODY}) is None
+    assert validated_error_location({"paragraph_index": 3, "placement": "sideways"}) is None
+    assert validated_error_location(SECRET_BODY) is None
+    assert validated_error_location(None) is None
 
 
 def test_a_location_renders_the_same_sentence_everywhere() -> None:

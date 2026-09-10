@@ -822,6 +822,19 @@ developer detail alongside it; the message is withheld precisely because it
 can quote the document, and the location exists so that withholding it no
 longer costs the user the one fact they need.
 
+That guarantee has to survive the boundary the payload crosses, so it is
+enforced twice. `BatchResult.error_location` is a plain dict on a plain
+dataclass and the target processor is injectable, so `pipeline.py` rebuilds
+it with `validated_error_location()` before anything is written -- once where
+the engine's result becomes a `TargetFormatResult`, and again inside
+`target_error_diagnostic()`, which is public and takes whatever a caller
+hands it. `description` is re-rendered from the validated scalars rather than
+carried across, so a tampered sentence is discarded even when every other
+field is well formed, and a payload that will not round-trip is dropped whole.
+Accepting `isinstance(value, dict)` there would reopen the hole one layer up:
+`_redact_json` replaces configured secrets only, so the sentence would reach
+`run.json`, `audit.json`, `run.log` and the GUI verbatim.
+
 The locator and the location come from **one** object resolving one set of
 index tables (`_ParagraphLocator.__call__` renders the message suffix,
 `.at()` returns the value). A message and an artifact that disagreed about
