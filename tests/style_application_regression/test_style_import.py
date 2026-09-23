@@ -8,6 +8,7 @@ from spec_formatter.style_application.core.style_import import (
     _extract_basedOn,
     _find_style_numpr_in_chain,
     _collect_style_deps_from_arch,
+    _rewrite_style_id_and_references,
 )
 
 
@@ -320,6 +321,138 @@ class TestCollectStyleDeps:
         seen = set()
         _collect_style_deps_from_arch(styles, "Ghost", seen)
         assert seen == {"Ghost"}
+
+    def test_follows_references_in_either_quoting(self):
+        """Read with the grammar the clones are rewritten with, so a
+        single-quoted or spaced reference is followed. An empty one names no
+        style."""
+        styles = '''
+<w:styles>
+  <w:style w:type="paragraph" w:styleId="Child">
+    <w:basedOn w:val='Parent'/>
+    <w:link w:val = "ChildChar"/>
+    <w:next w:val=''/>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Parent">
+    <w:name w:val="Parent"/>
+  </w:style>
+  <w:style w:type="character" w:styleId="ChildChar">
+    <w:name w:val="Child Char"/>
+  </w:style>
+</w:styles>
+'''
+        seen = set()
+        _collect_style_deps_from_arch(styles, "Child", seen)
+        assert seen == {"Child", "Parent", "ChildChar"}
+
+
+# ── _rewrite_style_id_and_references ────────────────────────────────────────
+
+class TestRewriteStyleIdAndReferences:
+    def test_double_quoted_references_are_rewritten_exactly_as_before(self):
+        block = (
+            '<w:style w:type="paragraph" w:styleId="Role">'
+            '<w:name w:val="Base"/><w:basedOn w:val="Base"/>'
+            '<w:link w:val="RoleChar"/><w:next w:val="Unmapped"/>'
+            '</w:style>'
+        )
+
+        result = _rewrite_style_id_and_references(
+            block, "Role", "SF_role", {"Base": "SF_base", "RoleChar": "SF_char"}
+        )
+
+        # w:name is not a reference, and an unmapped reference is kept.
+        assert result == (
+            '<w:style w:type="paragraph" w:styleId="SF_role">'
+            '<w:name w:val="Base"/><w:basedOn w:val="SF_base"/>'
+            '<w:link w:val="SF_char"/><w:next w:val="Unmapped"/>'
+            '</w:style>'
+        )
+
+    @pytest.mark.parametrize("tag", ["basedOn", "link", "next"])
+    @pytest.mark.parametrize(
+        "reference",
+        ["w:val='Base'", 'w:val = "Base"', "w:val = 'Base'"],
+        ids=["single_quoted", "spaced_equals", "single_quoted_spaced"],
+    )
+    def test_single_quoted_and_spaced_references_are_remapped_canonically(
+        self, tag, reference
+    ):
+        # Legal XML that Word never writes. It used to be skipped, so a
+        # clone kept inheriting from the target's same-named style.
+        block = f'<w:style w:type="paragraph" w:styleId="Role"><w:{tag} {reference}/></w:style>'
+
+        result = _rewrite_style_id_and_references(block, "Role", "SF_role", {"Base": "SF_base"})
+
+        assert result == (
+            f'<w:style w:type="paragraph" w:styleId="SF_role"><w:{tag} w:val="SF_base"/></w:style>'
+        )
+
+    @pytest.mark.parametrize("empty", ['w:val=""', "w:val=''"])
+    def test_empty_references_are_left_as_written(self, empty):
+        # An empty w:val names no style, whatever the map says, and does not
+        # stop the reference after it from being remapped.
+        block = (
+            '<w:style w:type="paragraph" w:styleId="Role">'
+            f"<w:basedOn {empty}/><w:next w:val='Base'/></w:style>"
+        )
+
+        result = _rewrite_style_id_and_references(
+            block, "Role", "SF_role", {"": "SF_nothing", "Base": "SF_base"}
+        )
+
+        assert result == (
+            '<w:style w:type="paragraph" w:styleId="SF_role">'
+            f'<w:basedOn {empty}/><w:next w:val="SF_base"/></w:style>'
+        )
+
+    def test_references_with_no_new_destination_keep_their_own_form(self):
+        block = (
+            '<w:style w:type="paragraph" w:styleId="Role">'
+            "<w:basedOn w:val = 'Normal' /><w:link w:val='Unmapped'/>"
+            '</w:style>'
+        )
+
+        result = _rewrite_style_id_and_references(
+            block, "Role", "SF_role", {"Normal": "Normal"}
+        )
+
+        assert result == block.replace('w:styleId="Role"', 'w:styleId="SF_role"')
+
+    def test_a_lookalike_inside_another_attribute_is_not_a_reference(self):
+        # Values are matched whole: the ">" cannot end the tag early and the
+        # w:val="Base" inside w:note is text, not the element's reference.
+        block = (
+            '<w:style w:type="paragraph" w:styleId="Role">'
+            "<w:basedOn w:note='w:val=\"Base\" > ' w:val='Base'/></w:style>"
+        )
+
+        result = _rewrite_style_id_and_references(block, "Role", "SF_role", {"Base": "SF_base"})
+
+        assert result == (
+            '<w:style w:type="paragraph" w:styleId="SF_role">'
+            "<w:basedOn w:note='w:val=\"Base\" > ' w:val=\"SF_base\"/></w:style>"
+        )
+
+    def test_style_ids_are_spliced_literally_not_read_as_templates(self):
+        block = '<w:style w:type="paragraph" w:styleId="Role"><w:basedOn w:val="Base"/></w:style>'
+
+        result = _rewrite_style_id_and_references(block, "Role", r"SF\1", {"Base": r"SF\2"})
+
+        assert result == (
+            r'<w:style w:type="paragraph" w:styleId="SF\1"><w:basedOn w:val="SF\2"/></w:style>'
+        )
+
+    @pytest.mark.parametrize(
+        "destination",
+        ["", 'SF" w:injected="1', "SF<x", None],
+        ids=["empty", "quote", "less_than", "none"],
+    )
+    def test_a_destination_that_cannot_be_written_is_refused(self, destination):
+        block = '<w:style w:type="paragraph" w:styleId="Role"><w:basedOn w:val="Base"/></w:style>'
+
+        with pytest.raises(ValueError, match="Cannot point style reference 'Base'"):
+            _rewrite_style_id_and_references(block, "Role", "SF_role", {"Base": destination})
 
 
 # ── Additional materialize_arch_style_block tests ──────────────────────────
@@ -672,6 +805,47 @@ def test_nonconflicting_architect_graph_is_always_app_namespaced(tmp_path):
     assert role is not None
     assert f'<w:basedOn w:val="{result.style_id_map["Base"]}"' in role
     assert f'<w:next w:val="{result.style_id_map["Base"]}"' in role
+
+
+def test_single_quoted_references_point_the_clone_at_architect_clones(tmp_path):
+    # The closure used to miss a single-quoted basedOn, so the architect's
+    # Base was never cloned and the Role clone silently inherited the
+    # target's own Base. Both ends now read the reference the same way.
+    from spec_formatter.style_application.core.style_import import (
+        extract_style_block_raw,
+        import_arch_styles_into_target,
+    )
+
+    word_dir = tmp_path / "word"
+    word_dir.mkdir()
+    (word_dir / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Base"><w:rPr><w:b/></w:rPr></w:style>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    arch = (
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Base"><w:rPr><w:i/></w:rPr></w:style>'
+        '<w:style w:type="character" w:styleId="RoleChar"><w:rPr><w:caps/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Role">'
+        "<w:basedOn w:val='Base'/><w:link w:val = 'RoleChar'/>"
+        '</w:style></w:styles>'
+    )
+
+    result = import_arch_styles_into_target(tmp_path, arch, ["Role"], [])
+    out = (word_dir / "styles.xml").read_text(encoding="utf-8")
+
+    assert set(result.style_id_map) == {"Role", "Base", "RoleChar"}
+    role = extract_style_block_raw(out, result.style_id_map["Role"])
+    base = extract_style_block_raw(out, result.style_id_map["Base"])
+    assert role is not None and base is not None
+    assert f'<w:basedOn w:val="{result.style_id_map["Base"]}"/>' in role
+    assert f'<w:link w:val="{result.style_id_map["RoleChar"]}"/>' in role
+    assert "<w:i/>" in base
+    target_base = extract_style_block_raw(out, "Base")
+    assert target_base is not None
+    assert "<w:b/>" in target_base and "<w:i/>" not in target_base
 
 
 def test_shared_body_and_shell_style_gets_distinct_safe_clones(tmp_path):

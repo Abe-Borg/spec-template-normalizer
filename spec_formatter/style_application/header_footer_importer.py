@@ -50,6 +50,7 @@ from .core.sectpr_tools import (
     replace_nth_sectpr_block,
     strip_tag_block,
 )
+from .core.style_import import CONTENT_STYLE_REFERENCES, referenced_style_ids
 from .core.xml_helpers import (
     edit_preserving_out_of_scope_subtrees,
     iter_element_xml_blocks,
@@ -324,9 +325,9 @@ def _write_hf_parts(
         part_path.parent.mkdir(parents=True, exist_ok=True)
         part_path.write_text(prepare_xml_text_for_utf8(xml_content), encoding="utf-8")
         result.part_names.add(part_name)
-        result.style_ids.update(
-            re.findall(r'<w:(?:pStyle|rStyle|tblStyle)\b[^>]*w:val="([^"]+)"', xml_content)
-        )
+        # The reader paired with the rewriter that later points these
+        # references at their clones: a reference missed here would get none.
+        result.style_ids.update(referenced_style_ids(xml_content, CONTENT_STYLE_REFERENCES))
         result.direct_num_ids.update(
             int(value)
             for value in re.findall(r'<w:numId\b[^>]*w:val="(\d+)"', xml_content)
