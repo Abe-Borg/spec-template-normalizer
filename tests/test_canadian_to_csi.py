@@ -559,6 +559,61 @@ def test_direct_paragraph_indent_outranks_the_level() -> None:
     assert 'w:left="1259"' not in ppr, ppr
 
 
+@pytest.mark.parametrize(
+    "based_on",
+    ['w:val="Geo2"', "w:val='Geo2'", "w:val = 'Geo2'"],
+    ids=["double_quoted", "single_quoted", "spaced"],
+)
+def test_a_list_member_numbered_through_basedOn_is_counted(based_on: str) -> None:
+    """A paragraph whose style takes its list from a parent is still a member.
+
+    The counter walk and the fence around it find members through the style's
+    basedOn chain. A chain they could not follow left the paragraph out of the
+    count, so the next marker was written one short -- "B." where the source
+    showed "C." -- and the paragraph kept its automatic number on a list whose
+    other members had all been cancelled, reported only as a numbered role
+    with no number to preserve.
+    """
+
+    styles = _geometry_styles_xml().replace(
+        "</w:styles>",
+        '<w:style w:type="paragraph" w:styleId="Geo2Alt"><w:name w:val="Geo 2 Alt"/>'
+        f"<w:basedOn {based_on}/></w:style></w:styles>",
+    )
+    rows = [
+        ("PART", "Geo0", "GENERAL"),
+        ("ARTICLE", "Geo1", "SUMMARY"),
+        ("PARAGRAPH", "Geo2", "First."),
+        ("PARAGRAPH", "Geo2Alt", "Second."),
+        ("PARAGRAPH", "Geo2", "Third."),
+    ]
+    paragraphs = [
+        f'<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr>'
+        f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+        for _role, style, text in rows
+    ]
+
+    plan = plan_canadian_to_csi(
+        _document(paragraphs),
+        styles,
+        _classifications([role for role, _style, _text in rows]),
+        numbering_xml=_geometry_numbering_xml(),
+    )
+
+    assert _lines(plan.document_xml) == [
+        "PART 1 GENERAL",
+        "1.1 SUMMARY",
+        "A. First.",
+        "B. Second.",
+        "C. Third.",
+    ]
+    assert [issue.code for issue in plan.report.warnings] == []
+    # Taken off the list like its siblings, keeping the level's indent.
+    ppr = _ppr_of(plan.document_xml, 3)
+    assert '<w:numId w:val="0"/>' in ppr, ppr
+    assert 'w:left="1259"' in ppr, ppr
+
+
 # --- Tracked revisions on the paragraph mark ------------------------------
 
 

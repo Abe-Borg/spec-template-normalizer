@@ -641,3 +641,178 @@ def test_single_quoted_architect_style_references_reach_their_clones(
         assert by_id["HeaderEmphasis"].find(f"{{{W_NS}}}rPr/{{{W_NS}}}i") is not None
     else:
         assert not {"Header", "HeaderBase", "HeaderEmphasis"} & set(by_id)
+
+
+@pytest.mark.parametrize(
+    "based_on",
+    ['w:val="TargetListBase"', "w:val='TargetListBase'", "w:val = 'TargetListBase'"],
+    ids=["double_quoted", "single_quoted", "spaced"],
+)
+def test_target_numbering_inherited_through_basedOn_survives_format_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, based_on: str
+) -> None:
+    """Format-only writes a paragraph's inherited numPr onto the paragraph
+    before changing its style. The basedOn walk that finds it used to stop at
+    a single-quoted reference, and the numbering invariant walks the same
+    chain, so it saw no list before the edit and none after. Once a model had
+    classified the paragraph its numbering no longer identified, the run
+    reported success and the paragraph had silently left its list."""
+    from spec_formatter.llm_usage import UsageCollector
+    from spec_formatter.style_application import batch_runner
+    from spec_formatter.style_application.core.llm_classifier import (
+        coerce_to_final_classifications,
+    )
+
+    architect = tmp_path / "architect.docx"
+    target = tmp_path / "target.docx"
+    _write_docx(architect, architect=True)
+    _write_docx(target, architect=False)
+    _replace_docx_parts(
+        target,
+        {
+            "word/styles.xml": _styles_xml(target=False).replace(
+                "</w:styles>",
+                '<w:style w:type="paragraph" w:styleId="TargetListBase">'
+                '<w:name w:val="Target List Base"/><w:basedOn w:val="Normal"/>'
+                '<w:pPr><w:numPr><w:ilvl w:val="2"/><w:numId w:val="17"/>'
+                "</w:numPr></w:pPr></w:style>"
+                '<w:style w:type="paragraph" w:styleId="TargetLevel2">'
+                f'<w:name w:val="Target Level 2"/><w:basedOn {based_on}/></w:style>'
+                "</w:styles>",
+            ),
+        },
+    )
+
+    asked: list[int] = []
+
+    def stand_in_model(slim_bundle, available_roles, api_key, model="stand-in"):
+        # Answers as a model plausibly would, merged by the real classifier code.
+        answers = [
+            {"paragraph_index": paragraph["paragraph_index"], "csi_role": "SUBPARAGRAPH"}
+            for paragraph in slim_bundle.get("paragraphs", [])
+        ]
+        asked.extend(answer["paragraph_index"] for answer in answers)
+        merged = coerce_to_final_classifications(
+            slim_bundle,
+            {"classifications": answers, "ignored_paragraphs": [], "notes": []},
+            available_roles,
+        )
+        merged["usage"] = UsageCollector().snapshot()
+        return merged
+
+    monkeypatch.setattr(batch_runner, "classify_target_document", stand_in_model)
+
+    bundle = _run_phase1(architect, tmp_path / "phase1-output")
+    shared = load_and_validate_shared_config(bundle)
+    result = process_single_file(
+        docx_path=target,
+        arch_registry=shared.arch_registry,
+        env_registry=shared.env_registry,
+        arch_styles_xml=shared.arch_styles_xml,
+        available_roles=shared.available_roles,
+        api_key="stand-in-key",
+        output_dir=tmp_path / "phase2-output",
+        source_tokens=shared.source_tokens,
+        arch_root=shared.arch_root,
+        role_specs=shared.role_specs,
+    )
+    assert result.success, "\n".join(result.log)
+    assert result.output_path is not None
+    with zipfile.ZipFile(result.output_path) as package:
+        document = ET.fromstring(package.read("word/document.xml"))
+
+    paragraph = next(
+        node for node in document.iter(f"{{{W_NS}}}p")
+        if "".join(t.text or "" for t in node.iter(f"{{{W_NS}}}t")) == "Architect paragraph two"
+    )
+    num_pr = paragraph.find(f"{{{W_NS}}}pPr/{{{W_NS}}}numPr")
+    assert num_pr is not None, "the paragraph left its list"
+    assert num_pr.find(f"{{{W_NS}}}ilvl").attrib[f"{{{W_NS}}}val"] == "2"
+    assert num_pr.find(f"{{{W_NS}}}numId").attrib[f"{{{W_NS}}}val"] == "17"
+    # Its numbering identified it, as it does through a double-quoted chain,
+    # so no paragraph was left for the model.
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    "target_has_the_number",
+    [True, False],
+    ids=["target_has_the_number", "target_lacks_the_number"],
+)
+def test_single_quoted_header_numbering_reaches_its_imported_list(
+    tmp_path: Path, target_has_the_number: bool
+) -> None:
+    """A header's direct numbering names an architect list by numId, which
+    decides the list imported and is then remapped to the import. Both used
+    to read only ``w:val="..."``. Single-quoted, the list was never imported
+    and the header kept the architect's number: where the target had a list
+    of that number the header silently took it, and where it had none a
+    valid template failed publication."""
+    architect = tmp_path / "architect.docx"
+    target = tmp_path / "target.docx"
+    _write_docx(architect, architect=True)
+    _write_docx(target, architect=False)
+    _replace_docx_parts(
+        architect,
+        {
+            "word/header2.xml": (
+                f'<w:hdr xmlns:w="{W_NS}"><w:p><w:pPr><w:numPr>'
+                "<w:ilvl w:val='0'/><w:numId w:val='5'/>"
+                "</w:numPr></w:pPr><w:r><w:t>First header</w:t></w:r></w:p></w:hdr>"
+            ),
+        },
+    )
+    target_num_ids = {"17"}
+    if target_has_the_number:
+        _replace_docx_parts(
+            target,
+            {
+                "word/numbering.xml": _numbering_xml(target=True).replace(
+                    "</w:numbering>",
+                    '<w:num w:numId="5"><w:abstractNumId w:val="42"/></w:num></w:numbering>',
+                ),
+            },
+        )
+        target_num_ids.add("5")
+
+    bundle = _run_phase1(architect, tmp_path / "phase1-output")
+    registry = json.loads((bundle / "arch_template_registry.json").read_text(encoding="utf-8"))
+    captured_header = next(
+        item for item in registry["headers_footers"]["headers"]
+        if item["part_name"] == "word/header2.xml"
+    )
+    # The capture does not re-serialize, so the single-quoted form reaches Phase 2.
+    assert "<w:numId w:val='5'/>" in captured_header["xml"]
+
+    shared = load_and_validate_shared_config(bundle)
+    result = process_single_file(
+        docx_path=target,
+        arch_registry=shared.arch_registry,
+        env_registry=shared.env_registry,
+        arch_styles_xml=shared.arch_styles_xml,
+        available_roles=shared.available_roles,
+        api_key="",
+        output_dir=tmp_path / "phase2-output",
+        source_tokens=shared.source_tokens,
+        arch_root=shared.arch_root,
+        role_specs=shared.role_specs,
+    )
+    assert result.success, "\n".join(result.log)
+    assert result.output_path is not None
+    validate_docx_package(result.output_path)
+    with zipfile.ZipFile(result.output_path) as package:
+        header = ET.fromstring(package.read("word/header2.xml"))
+        numbering = ET.fromstring(package.read("word/numbering.xml"))
+
+    abstract_of = {
+        num.attrib[f"{{{W_NS}}}numId"]: num.find(f"{{{W_NS}}}abstractNumId").attrib[f"{{{W_NS}}}val"]
+        for num in numbering.findall(f"{{{W_NS}}}num")
+    }
+    header_num_id = header.find(f".//{{{W_NS}}}numId").attrib[f"{{{W_NS}}}val"]
+    # An imported copy of the architect's list, not one the target already had.
+    assert header_num_id not in target_num_ids
+    assert abstract_of[header_num_id] != "42"
+    # The target's own lists are untouched.
+    assert {num_id: abstract_of[num_id] for num_id in target_num_ids} == {
+        num_id: "42" for num_id in target_num_ids
+    }

@@ -361,6 +361,45 @@ def test_automatic_csi_numbering_is_retargeted_without_text_edits():
     assert plan.report.edits[0].source_kind == "automatic"
 
 
+@pytest.mark.parametrize(
+    "based_on",
+    ['w:val="TargetAlpha"', "w:val='TargetAlpha'", "w:val = 'TargetAlpha'"],
+    ids=["double_quoted", "single_quoted", "spaced"],
+)
+def test_automatic_numbering_inherited_through_basedOn_is_retargeted(based_on):
+    """A list member whose style takes the list from its parent converts.
+
+    The conversion, and the fence that refuses to leave a list member behind,
+    find automatic numbering through the style's basedOn chain. A chain
+    neither could follow left the paragraph on the source list, reported only
+    as a numbered role with no number, while its siblings moved to the
+    architect's list.
+    """
+    styles = _styles(
+        '<w:style w:type="paragraph" w:styleId="TargetAlpha"><w:pPr><w:numPr>'
+        '<w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="TargetAlphaAlt">'
+        f"<w:basedOn {based_on}/></w:style>"
+    )
+    source = _document(
+        _paragraph("First", '<w:pStyle w:val="TargetAlpha"/>'),
+        _paragraph("Second", '<w:pStyle w:val="TargetAlphaAlt"/>'),
+        _paragraph("Third", '<w:pStyle w:val="TargetAlpha"/>'),
+    )
+
+    plan = plan_csi_to_canadian(
+        source,
+        styles,
+        _classifications("PARAGRAPH", "PARAGRAPH", "PARAGRAPH"),
+        _canadian_role_specs("PARAGRAPH"),
+        numbering_xml=_source_numbering("7"),
+    )
+
+    assert plan.report.automatic_numbering_retargeted == 3
+    assert [edit.paragraph_index for edit in plan.report.edits] == [0, 1, 2]
+    assert [issue.code for issue in plan.report.warnings] == []
+
+
 def test_automatic_deep_role_uses_closest_available_architect_fallback():
     styles = "".join(
         f'<w:style w:type="paragraph" w:styleId="PR{offset}"><w:pPr><w:numPr>'

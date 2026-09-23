@@ -891,6 +891,69 @@ def test_import_reports_and_remaps_direct_header_numbering(tmp_path):
     assert '<w:numId w:val="42"/>' in out
 
 
+def _numbered_header_registry(paragraphs: str) -> dict:
+    return {
+        "headers_footers": {
+            "headers": [{
+                "part_name": "word/header1.xml",
+                "rid": "rId10",
+                "xml": (
+                    '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    f"{paragraphs}</w:hdr>"
+                ),
+            }]
+        },
+        "page_layout": {"default_section": {"header_refs": {"default": "rId10"}}},
+    }
+
+
+def test_direct_header_numbering_is_reported_and_remapped_in_either_quoting(tmp_path):
+    # These numIds decide which architect lists are imported, and the remap
+    # then points each reference at its import. Both used to expect
+    # w:val="...", so a single-quoted reference was never imported and kept
+    # its architect numId: silently the target's own list of that number, or
+    # an unresolved reference that failed publication.
+    extract = _seed_extract(tmp_path)
+    registry = _numbered_header_registry(
+        "<w:p><w:pPr><w:numPr><w:ilvl w:val='0'/><w:numId w:val='7'/></w:numPr></w:pPr></w:p>"
+        '<w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val = "8"/></w:numPr></w:pPr></w:p>'
+        "<w:p><w:pPr><w:numPr><w:numId w:val='0'/></w:numPr></w:pPr></w:p>"
+    )
+
+    result = import_headers_footers(extract, registry, [])
+    assert result.direct_num_ids == {7, 8}
+
+    log = []
+    remap_header_footer_numids(extract, list(result.part_names), {7: 42, 8: 43}, log)
+    out = (extract / "word" / "header1.xml").read_text(encoding="utf-8")
+    assert "<w:ilvl w:val='0'/><w:numId w:val=\"42\"/>" in out
+    assert '<w:ilvl w:val="1"/><w:numId w:val="43"/>' in out
+    assert "<w:numId w:val='0'/>" in out
+    assert log == ["Remapped 2 direct numbering reference(s) in word/header1.xml"]
+
+
+def test_numbering_shaped_text_outside_header_markup_is_left_alone(tmp_path):
+    # Comments, CDATA and processing instructions hold text: a lookalike in
+    # one is neither imported nor rewritten, as with style references.
+    extract = _seed_extract(tmp_path)
+    registry = _numbered_header_registry(
+        '<!-- <w:numId w:val="9"/> --><?pi <w:numId w:val="9"/> ?>'
+        "<w:p><w:pPr><w:numPr><w:numId w:val='7'/></w:numPr></w:pPr>"
+        '<w:r><w:t><![CDATA[<w:numId w:val="7"/>]]></w:t></w:r></w:p>'
+    )
+
+    result = import_headers_footers(extract, registry, [])
+    assert result.direct_num_ids == {7}
+
+    remap_header_footer_numids(extract, list(result.part_names), {7: 42, 9: 43}, [])
+    out = (extract / "word" / "header1.xml").read_text(encoding="utf-8")
+    assert out.endswith(
+        '<!-- <w:numId w:val="9"/> --><?pi <w:numId w:val="9"/> ?>'
+        '<w:p><w:pPr><w:numPr><w:numId w:val="42"/></w:numPr></w:pPr>'
+        '<w:r><w:t><![CDATA[<w:numId w:val="7"/>]]></w:t></w:r></w:p></w:hdr>'
+    )
+
+
 def test_import_rejects_header_part_path_traversal(tmp_path):
     extract = _seed_extract(tmp_path)
     registry = {

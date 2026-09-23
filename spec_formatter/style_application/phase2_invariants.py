@@ -13,7 +13,7 @@ from .core.ooxml_namespaces import CT_NS, PKG_REL_NS, R_NS, W_NS
 from .core.ooxml_text import decode_xml_bytes, prepare_xml_text_for_utf8
 from .core.section_mapping import choose_section_sources
 from .core.sectpr_tools import extract_all_sectpr_blocks, iter_document_sectpr_blocks
-from .core.style_import import WORD_BUILTIN_STYLE_IDS
+from .core.style_import import WORD_BUILTIN_STYLE_IDS, _extract_basedOn
 from .core.classification import (
     _build_numbering_catalog,
     _effective_numbering_semantics,
@@ -984,7 +984,13 @@ def _direct_paragraph_ind(paragraph_xml: str) -> _Geometry:
 
 
 def _style_chain_ind(styles_xml: str, style_id: Optional[str]) -> _Geometry:
-    """First ``w:ind`` found walking a style's ``basedOn`` chain."""
+    """First ``w:ind`` found walking a style's ``basedOn`` chain.
+
+    Each hop is read by the style importer's ``_extract_basedOn``, so a
+    single-quoted ``basedOn`` is followed. Stopping there saw no indent on
+    either side of an edit, which let a paragraph move unnoticed and refused
+    one that had not moved.
+    """
 
     if not style_id or not styles_xml.strip():
         return None
@@ -1006,8 +1012,7 @@ def _style_chain_ind(styles_xml: str, style_id: Optional[str]) -> _Geometry:
             values = _ind_from_ppr_xml(ppr.group(0))
             if values is not None:
                 return values
-        based_on = re.search(r'<w:basedOn\b[^>]*w:val="([^"]+)"', block)
-        current = based_on.group(1) if based_on else None
+        current = _extract_basedOn(block)
     return None
 
 

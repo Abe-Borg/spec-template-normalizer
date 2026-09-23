@@ -156,6 +156,93 @@ def test_direct_indent_is_reported_by_index() -> None:
     assert "Body" not in message
 
 
+# --- Geometry inherited through basedOn -----------------------------------
+#
+# The chain is walked with the grammar the style importer reads references
+# with, so a single-quoted or spaced basedOn is followed. A walk that stops
+# there sees no geometry on either side of an edit, which hides a paragraph
+# that moved and refuses one that did not.
+
+_BASED_ON_FORMS = pytest.mark.parametrize(
+    "based_on",
+    ['w:val="Parent"', "w:val='Parent'", "w:val = 'Parent'"],
+    ids=["double_quoted", "single_quoted", "spaced"],
+)
+
+
+def _inheriting_styles(based_on: str, parent_ppr: str, *extra_styles: str) -> str:
+    return (
+        f'<w:styles xmlns:w="{W_NS}">'
+        f'<w:style w:type="paragraph" w:styleId="Parent"><w:name w:val="Parent"/>'
+        f"<w:pPr>{parent_ppr}</w:pPr></w:style>"
+        f'<w:style w:type="paragraph" w:styleId="Child"><w:name w:val="Child"/>'
+        f"<w:basedOn {based_on}/></w:style>"
+        f'{"".join(extra_styles)}</w:styles>'
+    )
+
+
+_CHILD = _para('<w:pStyle w:val="Child"/>')
+
+
+@_BASED_ON_FORMS
+def test_an_indent_inherited_through_basedOn_is_seen_leaving(based_on: str) -> None:
+    styles = _inheriting_styles(
+        based_on,
+        '<w:ind w:left="720"/>',
+        '<w:style w:type="paragraph" w:styleId="Plain"><w:name w:val="Plain"/></w:style>',
+    )
+
+    with pytest.raises(EngineError) as raised:
+        _verify_effective_paragraph_geometry(
+            _document(_CHILD),
+            _document(_para('<w:pStyle w:val="Plain"/>')),
+            styles,
+            styles,
+            "",
+            "",
+            applies_document_shell=True,
+        )
+    assert raised.value.code == "geometry_not_preserved"
+
+
+@_BASED_ON_FORMS
+def test_an_indent_inherited_through_basedOn_is_seen_staying(based_on: str) -> None:
+    """Restyled onto a clone carrying the same indent: nothing moved."""
+
+    styles = _inheriting_styles(
+        based_on,
+        '<w:ind w:left="720"/>',
+        '<w:style w:type="paragraph" w:styleId="Clone"><w:name w:val="Clone"/>'
+        '<w:pPr><w:ind w:left="720"/></w:pPr></w:style>',
+    )
+
+    _verify_effective_paragraph_geometry(
+        _document(_CHILD),
+        _document(_para('<w:pStyle w:val="Clone"/>')),
+        styles,
+        styles,
+        "",
+        "",
+        applies_document_shell=True,
+    )
+
+
+@_BASED_ON_FORMS
+def test_cancelling_numbering_inherited_through_basedOn_fails(based_on: str) -> None:
+    """The defect this check exists for, with the list one hop up the chain."""
+
+    styles = _inheriting_styles(
+        based_on, '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="4"/></w:numPr>'
+    )
+    cancelled = _para(
+        '<w:pStyle w:val="Child"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>'
+    )
+
+    with pytest.raises(EngineError) as raised:
+        _verify(_CHILD, cancelled, styles=styles)
+    assert raised.value.code == "geometry_not_preserved"
+
+
 # --- Paragraphs the engine never edited -----------------------------------
 #
 # A paragraph's own XML being untouched does not prove it still renders where
