@@ -391,6 +391,53 @@ def test_single_quoted_target_pstyle_is_restyled(tmp_path, conversion_mode):
     assert "TargetBody" not in first_paragraph
 
 
+@pytest.mark.parametrize("existing_style", ["Body", "Other"])
+def test_paired_target_pstyle_is_restyled_ahead_of_its_numbering(
+    tmp_path, existing_style
+):
+    # A paired <w:pStyle ...></w:pStyle> is legal XML that Word never writes.
+    # The writer replaces it with the self-closing form, which the diff
+    # contract has to accept even when the style is unchanged, and numbering
+    # materialized before the swap has to land after it: CT_PPr puts pStyle
+    # first.
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Body"/>'
+        '<w:style w:type="paragraph" w:styleId="Other"/>'
+        '</w:styles>'
+    )
+    extract = _seed_extract(tmp_path, styles)
+    (extract / "word" / "numbering.xml").write_text(
+        FORMAT_ONLY_MATRIX_NUMBERING, encoding="utf-8"
+    )
+    doc_path = extract / "word" / "document.xml"
+    doc_path.write_text(
+        DOC_XML.replace(
+            '<w:pPr><w:spacing w:after="120"/></w:pPr>',
+            f'<w:pPr><w:pStyle w:val="{existing_style}"></w:pStyle>'
+            '<w:numPr><w:ilvl w:val="2"/><w:numId w:val="5"/></w:numPr></w:pPr>',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    report = apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+    )
+
+    first_paragraph = doc_path.read_text(encoding="utf-8").split("</w:p>", 1)[0]
+    assert report.modified == 1
+    assert report.numbering_checks["effective_numbering_preserved"] is True
+    assert (
+        '<w:pPr><w:pStyle w:val="Body"/>'
+        '<w:numPr><w:ilvl w:val="2"/><w:numId w:val="5"/></w:numPr></w:pPr>'
+    ) in first_paragraph
+
+
 def test_paragraph_left_without_its_style_fails_closed_at_its_location(
     tmp_path, monkeypatch
 ):

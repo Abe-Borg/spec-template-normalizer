@@ -38,6 +38,27 @@ class TestNormalizeParagraphForContract:
         without_ppr = '<w:p><w:r><w:t>X</w:t></w:r></w:p>'
         assert _normalize_paragraph_for_contract(with_ppr) == _normalize_paragraph_for_contract(without_ppr)
 
+    def test_paired_pstyle_normalizes_like_the_self_closing_form(self):
+        """The writer replaces a paired pStyle with the self-closing form, so
+        the two must compare equal; tracked history is still left alone."""
+        history = (
+            '<w:pPrChange w:id="3"><w:pPr><w:pStyle w:val="Old"></w:pStyle>'
+            '</w:pPr></w:pPrChange>'
+        )
+        paired = (
+            f'<w:p><w:pPr><w:pStyle w:val="Body"></w:pStyle>{history}</w:pPr>'
+            '<w:r><w:t>X</w:t></w:r></w:p>'
+        )
+        self_closing = (
+            f'<w:p><w:pPr><w:pStyle w:val="Body"/>{history}</w:pPr>'
+            '<w:r><w:t>X</w:t></w:r></w:p>'
+        )
+
+        result = _normalize_paragraph_for_contract(paired)
+
+        assert result == _normalize_paragraph_for_contract(self_closing)
+        assert result == f'<w:p><w:pPr>{history}</w:pPr><w:r><w:t>X</w:t></w:r></w:p>'
+
     def test_removes_empty_ppr_with_whitespace(self):
         """pPr with only whitespace inside after stripping should be removed."""
         p = '<w:p><w:pPr>  \n  </w:pPr><w:r><w:t>Hi</w:t></w:r></w:p>'

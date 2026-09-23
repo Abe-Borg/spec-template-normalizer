@@ -1282,8 +1282,10 @@ def _normalize_paragraph_for_contract_unprotected(
         p_xml,
         ("w:pPrChange", "w:sectPr"),
     )
-    # Strip pStyle (we change this)
+    # Strip pStyle (we change this) in either element form: the writer
+    # replaces a paired <w:pStyle ...></w:pStyle> with the self-closing one.
     out = re.sub(r"<w:pStyle\b[^>]*/>", "", out)
+    out = re.sub(r"<w:pStyle\b[^>]*>[\s\S]*?</w:pStyle>", "", out, flags=re.S)
     properties = (
         {"numPr", "jc", "ind", "spacing"}
         if allowed_ppr_properties is None
@@ -1355,9 +1357,11 @@ def _inject_direct_numpr(paragraph_xml: str, num_id: int, ilvl: int) -> str:
             f'<w:numPr><w:ilvl w:val="{ilvl}"/>'
             f'<w:numId w:val="{num_id}"/></w:numPr>'
         )
-        pstyle = re.search(r"<w:pStyle\b[^>]*/>", out)
-        if pstyle:
-            return out[:pstyle.end()] + numpr + out[pstyle.end():]
+        # CT_PPr puts numPr after pStyle. Found structurally, so a paired
+        # <w:pStyle ...></w:pStyle> is not missed and numPr put first.
+        pstyle = next(iter_element_xml_blocks(out, "w:pStyle"), None)
+        if pstyle is not None:
+            return out[:pstyle[1]] + numpr + out[pstyle[1]:]
         if re.search(r"<w:pPr\b[^>]*>", out):
             return re.sub(r"(<w:pPr\b[^>]*>)", rf"\1{numpr}", out, count=1)
         return re.sub(
