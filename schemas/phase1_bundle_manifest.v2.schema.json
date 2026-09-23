@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Phase 1 template bundle manifest (v1)",
+  "title": "Phase 1 template bundle manifest (v2)",
   "type": "object",
   "additionalProperties": false,
   "required": [

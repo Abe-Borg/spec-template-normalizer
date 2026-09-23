@@ -11,8 +11,6 @@ import zipfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-import pytest
-
 from spec_formatter.style_application.batch_runner import load_and_validate_shared_config, process_single_file
 from spec_formatter.style_application.phase2_invariants import validate_docx_package
 
@@ -42,25 +40,9 @@ TEXTBOX_BLOCK = (
 )
 
 
-def _normalizer_repo() -> Path:
-    candidates = []
-    configured = os.environ.get("SPEC_TEMPLATE_NORMALIZER_REPO")
-    if configured:
-        candidates.append(Path(configured))
-    candidates.extend(
-        [
-            Path.cwd().parent / "spec-template-normalizer",
-            Path(__file__).resolve().parents[2] / "spec-template-normalizer",
-            Path(r"C:\Github-Repos\spec-template-normalizer"),
-        ]
-    )
-    for candidate in candidates:
-        if (candidate / "phase1_pipeline.py").is_file():
-            return candidate.resolve()
-    pytest.skip(
-        "Cross-repository fixture requires spec-template-normalizer; set "
-        "SPEC_TEMPLATE_NORMALIZER_REPO to its checkout"
-    )
+# Phase 1 runs from this checkout: the code under test, never a copy found
+# elsewhere on the machine.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _utf16_xml(body: str, *, little_endian: bool) -> bytes:
@@ -290,7 +272,7 @@ def _write_docx(path: Path, *, architect: bool) -> None:
             package.writestr(name, payload)
 
 
-def _run_phase1(architect: Path, output_root: Path, normalizer: Path) -> Path:
+def _run_phase1(architect: Path, output_root: Path) -> Path:
     script = r'''
 import json
 import sys
@@ -338,7 +320,7 @@ def deterministic_classifier(**kwargs):
             }
             for paragraph, role, style_id, _name in role_rows
         },
-        "notes": ["deterministic cross-repository fixture"],
+        "notes": ["deterministic round-trip fixture"],
     }
 
 
@@ -346,23 +328,20 @@ result = run_phase1(
     Path(sys.argv[1]),
     Path(sys.argv[2]),
     api_key="",
-    model="cross-repository-fixture",
+    model="round-trip-fixture",
     classifier=deterministic_classifier,
 )
 validate_bundle_directory(result.bundle_dir, expected_source_sha256=result.source_sha256)
 print("PHASE1_BUNDLE=" + str(result.bundle_dir))
 '''
     env = os.environ.copy()
-    search_paths = [str(normalizer)]
-    normalizer_venv = normalizer / "venv" / "Lib" / "site-packages"
-    if normalizer_venv.is_dir():
-        search_paths.append(str(normalizer_venv))
+    search_paths = [str(REPO_ROOT)]
     if env.get("PYTHONPATH"):
         search_paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(search_paths)
     completed = subprocess.run(
         [sys.executable, "-c", script, str(architect), str(output_root)],
-        cwd=normalizer,
+        cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
@@ -402,7 +381,6 @@ def _relationship_map(payload: bytes) -> dict[str, ET.Element]:
 
 
 def test_generated_phase1_bundle_round_trips_through_phase2_without_api(tmp_path: Path) -> None:
-    normalizer = _normalizer_repo()
     architect = tmp_path / "architect.docx"
     target = tmp_path / "target.docx"
     _write_docx(architect, architect=True)
@@ -413,7 +391,7 @@ def test_generated_phase1_bundle_round_trips_through_phase2_without_api(tmp_path
     with zipfile.ZipFile(target) as package:
         target_document_before = package.read("word/document.xml")
 
-    bundle = _run_phase1(architect, tmp_path / "phase1-output", normalizer)
+    bundle = _run_phase1(architect, tmp_path / "phase1-output")
     assert _sha256(architect) == architect_sha
 
     manifest = json.loads((bundle / "phase1_bundle_manifest.json").read_text(encoding="utf-8"))

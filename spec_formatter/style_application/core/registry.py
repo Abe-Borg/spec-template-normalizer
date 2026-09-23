@@ -840,15 +840,15 @@ def load_arch_style_registry(arch_extract_dir: Path) -> Dict[str, str]:
     if not reg_path.exists():
         raise FileNotFoundError(
             f"arch_style_registry.json not found at {reg_path}. "
-            f"Run Phase 1 on the architect template and copy the extracted folder here."
+            "Regenerate the template profile."
         )
 
     reg = json.loads(reg_path.read_text(encoding="utf-8"))
     if not isinstance(reg, dict):
         raise ValueError("arch_style_registry.json must be a JSON object")
 
-    # Expected shape:
-    # { "version": 1, "source_docx": "...", "roles": { "PART": { "style_id": "X", ... }, ... } }
+    # Expected shape (only "roles" is read here):
+    # { "version": 2, ..., "roles": { "PART": { "style_id": "X", ... }, ... } }
     roles = reg.get("roles")
     if not isinstance(roles, dict):
         raise ValueError("arch_style_registry.json missing 'roles' object")

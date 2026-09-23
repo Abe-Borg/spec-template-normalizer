@@ -929,6 +929,26 @@ previous run's. Concurrent misses are not by themselves a correctness bug, and
 serializing requests to manufacture hits trades latency for them -- measure
 before assuming that trade is worth making.
 
+**There is no target-classification cache, and the obvious key is wrong.**
+None exists because classification spend was judged immaterial. Keying one on
+the target's hash plus the available role names would serve a *wrong*
+classification, not a stale one: `build_phase2_slim_bundle` matches paragraphs
+deterministically against each role's portable numbering pattern and counter
+constraints (`role_specs`), so two templates with the same role names but
+different numbering produce different dispositions and a different request. If
+one is ever built, cache only model-derived dispositions for an exact request;
+rebuild the target bundle and deterministic dispositions every run and reapply
+every validator, override check, and coverage check; key on the target's
+identity and paragraph universe, the exact role definitions including
+numbering patterns and counter constraints, every piece of evidence sent to
+the model, the instructions with role ordering and response schema, the
+provider, model, effort, and output limits, the chunking, re-ask,
+preprocessing, and merge semantics, and an explicit cache contract version
+(the architect engine digest does not cover target preprocessing); and never
+cache formatted DOCX output or bypass snapshots, run isolation, policy,
+validation, or publication. Accept it only with a two-template,
+same-role-list regression that fails under the naive key.
+
 ## Observed model usage
 
 `spec_formatter/llm_usage.py` owns the one counting contract for both

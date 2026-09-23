@@ -1,9 +1,12 @@
 """Headless, transactional Phase 1 orchestration.
 
-The GUI is deliberately a thin caller of this module.  One run snapshots the
-selected DOCX, analyzes only that immutable snapshot, produces a validated
-artifact set, and publishes it as a versioned bundle by atomic directory rename.
-The architect document and extracted package are never normalized in place.
+``spec_formatter.pipeline.format_specifications()`` reaches this module through
+``spec_formatter.template_analysis``; ``run_phase1()`` is the internal profile
+builder and a compatibility surface, not a public entry point.  One run
+snapshots the selected DOCX, analyzes only that immutable snapshot, produces a
+validated artifact set, and publishes it as a versioned bundle by atomic
+directory rename.  The architect document and extracted package are never
+normalized in place.
 """
 
 from __future__ import annotations
