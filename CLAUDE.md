@@ -586,6 +586,22 @@ discovery still excludes as legacy output.
 - Applies only styled entries, leaves ignored entries exact, resolves effective
   architect paragraph properties through `basedOn`, and enforces Format-only
   text/numbering invariants.
+- Reads every styled paragraph's live `pStyle` back with
+  `paragraph_pstyle_from_block` before counting it as modified, and fails
+  closed with `paragraph_style_not_applied` if it is not the classified
+  style. No later check would notice: the diff contract strips `pStyle`
+  before comparing, so a writer that returned a paragraph on its old style
+  used to pass every check.
+
+`xml_helpers.apply_pstyle_to_paragraph_block` takes the style ID as a value
+and escapes it. It always writes the form every reader in the engine
+matches, `<w:pStyle w:val="..."/>`, replacing an existing live `pStyle`
+whole whatever its quoting, value, or shape, and splices by position so the
+ID is never read as a regex replacement template. The rest of the target
+engine still matches style IDs as raw attribute text while the Phase 1
+catalog decodes them, so an architect style ID containing `&`, `<` or `"`,
+which the source has to escape, still fails closed before it reaches the
+writer.
 
 Paragraph indices are tied to the `word/document.xml` paragraph sequence.
 Preserve that index and visible-text contract when changing XML parsing.
@@ -856,7 +872,8 @@ Current codes: `header_footer_target_section_id_required`,
 `canadian_to_csi_tracked_hierarchy`, `geometry_not_preserved`,
 `conversion_prediction_mismatch`, `builtin_scheme_contract`, `classification_invalid_payload`,
 `classification_deterministic_override`,
-`classification_coverage_incomplete`, `numbering_importer_unavailable`,
+`classification_coverage_incomplete`, `paragraph_style_not_applied`,
+`numbering_importer_unavailable`,
 `template_section_shell_conflict`, `template_default_section_conflict`,
 `template_duplicate_section_index`.
 
@@ -1196,6 +1213,9 @@ Before considering a formatter change complete:
 - Importing architect body numbering in Format-only.
 - Treating visible text as stronger evidence than effective Word numbering.
 - Restyling an ignored paragraph or silently dropping it from coverage.
+- Counting a paragraph as restyled without reading its `pStyle` back.
+- Passing raw attribute text, as the engine's regex captures return it, to
+  `apply_pstyle_to_paragraph_block`, which escapes its argument.
 - Replacing a target style merely because an architect style uses the same ID.
 - Inspecting only a direct style's `pPr` and ignoring its `basedOn` chain.
 - Describing the two registries as the complete handoff.

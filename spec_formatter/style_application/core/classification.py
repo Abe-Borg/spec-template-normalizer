@@ -4,6 +4,7 @@ building slim bundles for LLM input, and boilerplate filtering.
 """
 
 import functools
+import html
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -42,6 +43,7 @@ from .ooxml_text import read_xml_text, write_xml_text
 from .section_numbers import LABELED_SECTION_RE, SECTION_HEADING_RE
 from .untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .errors import EngineError
+from .marker_tools import _paragraph_locator
 
 
 def _load_prompt_text(filename: str) -> str:
@@ -1280,8 +1282,10 @@ def _normalize_paragraph_for_contract_unprotected(
         p_xml,
         ("w:pPrChange", "w:sectPr"),
     )
-    # Strip pStyle (we change this)
+    # Strip pStyle (we change this) in either element form: the writer
+    # replaces a paired <w:pStyle ...></w:pStyle> with the self-closing one.
     out = re.sub(r"<w:pStyle\b[^>]*/>", "", out)
+    out = re.sub(r"<w:pStyle\b[^>]*>[\s\S]*?</w:pStyle>", "", out, flags=re.S)
     properties = (
         {"numPr", "jc", "ind", "spacing"}
         if allowed_ppr_properties is None
@@ -1353,9 +1357,11 @@ def _inject_direct_numpr(paragraph_xml: str, num_id: int, ilvl: int) -> str:
             f'<w:numPr><w:ilvl w:val="{ilvl}"/>'
             f'<w:numId w:val="{num_id}"/></w:numPr>'
         )
-        pstyle = re.search(r"<w:pStyle\b[^>]*/>", out)
-        if pstyle:
-            return out[:pstyle.end()] + numpr + out[pstyle.end():]
+        # CT_PPr puts numPr after pStyle. Found structurally, so a paired
+        # <w:pStyle ...></w:pStyle> is not missed and numPr put first.
+        pstyle = next(iter_element_xml_blocks(out, "w:pStyle"), None)
+        if pstyle is not None:
+            return out[:pstyle[1]] + numpr + out[pstyle[1]:]
         if re.search(r"<w:pPr\b[^>]*>", out):
             return re.sub(r"(<w:pPr\b[^>]*>)", rf"\1{numpr}", out, count=1)
         return re.sub(
@@ -1585,6 +1591,49 @@ def _effective_numbering_semantics(
         },
         "pattern": _resolve_numbering_pattern(effective, numbering_catalog),
     }
+
+
+def _require_applied_style(
+    paragraph_xml: str,
+    style_id: str,
+    index: int,
+    blocks: List[Tuple[int, int, str]],
+    items: List[Any],
+) -> None:
+    """Fail closed unless the paragraph's live pStyle is now ``style_id``.
+
+    The writer's result is read back rather than trusted. A substitution
+    that matched nothing used to hand the paragraph back with its old style
+    while the caller still counted it as modified, and no later check looks:
+    the diff contract strips pStyle before it compares. The read-back uses
+    the engine's own pStyle reader, so the style is also one every later
+    stage will see.
+    """
+
+    written = paragraph_pstyle_from_block(paragraph_xml)
+    found = None if written is None else html.unescape(written)
+    if found == style_id:
+        return
+    # Invalid indices are reported only after the application loop, so the
+    # locator is given the entries that loop accepts, never a stray -1.
+    locate = _paragraph_locator(
+        blocks,
+        {
+            item["paragraph_index"]: item["csi_role"]
+            for item in items
+            if isinstance(item, dict)
+            and isinstance(item.get("paragraph_index"), int)
+            and 0 <= item["paragraph_index"] < len(blocks)
+            and isinstance(item.get("csi_role"), str)
+        },
+    )
+    raise EngineError(
+        "paragraph_style_not_applied",
+        f"Paragraph {index} does not carry its classified style after "
+        f"application: expected pStyle {style_id!r}, found {found!r}"
+        f"{locate(index)}.",
+        locate.at(index),
+    )
 
 
 def apply_phase2_classifications(
@@ -1883,6 +1932,9 @@ def apply_phase2_classifications(
             if not isinstance(remap, dict):
                 raise ValueError(f"Missing imported direct numbering mapping for role: {role}")
             pb = _inject_direct_numpr(pb, int(remap["new_numId"]), int(remap.get("ilvl", 0)))
+        # Counted as modified only once the finished paragraph is proven to
+        # carry its style.
+        _require_applied_style(pb, style_id, idx, blocks, items)
         para_blocks[idx] = pb
         report.modified += 1
 

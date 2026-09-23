@@ -1,5 +1,7 @@
 """Tests for core.xml_helpers — paragraph-level XML manipulation."""
 
+import xml.etree.ElementTree as ET
+
 import pytest
 from spec_formatter.style_application.core.xml_helpers import (
     apply_pstyle_to_paragraph_block,
@@ -12,6 +14,8 @@ from spec_formatter.style_application.core.xml_helpers import (
     paragraph_numpr_from_block,
     strip_conflicting_direct_ppr,
 )
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
 # ── apply_pstyle_to_paragraph_block ──────────────────────────────────────────
@@ -61,6 +65,98 @@ class TestApplyPstyle:
         result = apply_pstyle_to_paragraph_block(p, "MyStyle")
         assert '<w:pStyle w:val="MyStyle"/>' in result
         assert sectpr in result
+
+    def test_single_quoted_pstyle_is_replaced(self):
+        # Legal XML that Word never writes. The old substitution expected
+        # w:val="..." and handed the paragraph back with its old style. The
+        # tracked history beside it must still come back byte-for-byte.
+        historical = (
+            "<w:pPrChange w:id=\"7\"><w:pPr><w:pStyle w:val='HistoricalList'/>"
+            "</w:pPr></w:pPrChange>"
+        )
+        p = (
+            "<w:p><w:pPr><w:pStyle w:val='OldStyle'/><w:jc w:val=\"center\"/>"
+            f"{historical}</w:pPr><w:r><w:t>Hello</w:t></w:r></w:p>"
+        )
+
+        result = apply_pstyle_to_paragraph_block(p, "NewStyle")
+
+        assert result == (
+            '<w:p><w:pPr><w:pStyle w:val="NewStyle"/><w:jc w:val="center"/>'
+            f"{historical}</w:pPr><w:r><w:t>Hello</w:t></w:r></w:p>"
+        )
+        assert paragraph_pstyle_from_block(result) == "NewStyle"
+
+    @pytest.mark.parametrize("empty_value", ['w:val=""', "w:val=''"])
+    def test_empty_pstyle_value_is_replaced(self, empty_value):
+        p = f'<w:p><w:pPr><w:pStyle {empty_value}/></w:pPr><w:r><w:t>Hello</w:t></w:r></w:p>'
+
+        result = apply_pstyle_to_paragraph_block(p, "NewStyle")
+
+        assert result == (
+            '<w:p><w:pPr><w:pStyle w:val="NewStyle"/></w:pPr>'
+            '<w:r><w:t>Hello</w:t></w:r></w:p>'
+        )
+
+    @pytest.mark.parametrize(
+        "existing",
+        [
+            '<w:pStyle w:val = "OldStyle" />',
+            '<w:pStyle w:val="OldStyle"></w:pStyle>',
+            '<w:pStyle/>',
+        ],
+        ids=["spaced_equals", "paired_element", "missing_value"],
+    )
+    def test_unusual_pstyle_shapes_are_replaced_whole(self, existing):
+        p = f'<w:p><w:pPr>{existing}<w:jc w:val="center"/></w:pPr></w:p>'
+
+        result = apply_pstyle_to_paragraph_block(p, "NewStyle")
+
+        assert result == (
+            '<w:p><w:pPr><w:pStyle w:val="NewStyle"/><w:jc w:val="center"/>'
+            '</w:pPr></w:p>'
+        )
+
+    @pytest.mark.parametrize(
+        "paragraph",
+        [
+            '<w:p><w:pPr><w:pStyle w:val="OldStyle"/></w:pPr><w:r><w:t>Hi</w:t></w:r></w:p>',
+            '<w:p><w:pPr/><w:r><w:t>Hi</w:t></w:r></w:p>',
+            '<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Hi</w:t></w:r></w:p>',
+            '<w:p><w:r><w:t>Hi</w:t></w:r></w:p>',
+        ],
+        ids=["replace", "self_closing_ppr", "open_ppr", "no_ppr"],
+    )
+    def test_style_id_is_escaped_and_paragraph_parses(self, paragraph):
+        style_id = 'R&D <Draft> "Notes"'
+
+        result = apply_pstyle_to_paragraph_block(paragraph, style_id)
+
+        assert 'w:val="R&amp;D &lt;Draft&gt; &quot;Notes&quot;"' in result
+        root = ET.fromstring(result.replace("<w:p", f'<w:p xmlns:w="{W_NS}"', 1))
+        live = root.findall(f"{{{W_NS}}}pPr/{{{W_NS}}}pStyle")
+        assert [element.get(f"{{{W_NS}}}val") for element in live] == [style_id]
+
+    def test_style_id_is_written_literally_not_as_a_replacement_template(self):
+        # The old writer passed the ID to re.sub as a replacement template, so
+        # a backslash was read as an escape or a group reference.
+        p = '<w:p><w:pPr><w:pStyle w:val="OldStyle"/></w:pPr></w:p>'
+
+        result = apply_pstyle_to_paragraph_block(p, r"Dept\Sub\1")
+
+        assert result == r'<w:p><w:pPr><w:pStyle w:val="Dept\Sub\1"/></w:pPr></w:p>'
+
+    def test_self_closing_paragraph_is_opened_to_hold_its_properties(self):
+        result = apply_pstyle_to_paragraph_block('<w:p w:rsidR="00AB"/>', "MyStyle")
+
+        assert result == (
+            '<w:p w:rsidR="00AB"><w:pPr><w:pStyle w:val="MyStyle"/></w:pPr></w:p>'
+        )
+
+    @pytest.mark.parametrize("style_id", ["", None])
+    def test_missing_style_id_is_refused(self, style_id):
+        with pytest.raises(ValueError, match="non-empty string"):
+            apply_pstyle_to_paragraph_block("<w:p><w:r><w:t>Hi</w:t></w:r></w:p>", style_id)
 
 
 # ── strip_run_font_formatting ────────────────────────────────────────────────
