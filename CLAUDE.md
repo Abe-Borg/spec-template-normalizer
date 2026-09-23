@@ -600,7 +600,8 @@ Return the source-to-final style-ID map to every body/header/footer consumer.
 Style references (`pStyle`/`rStyle`/`tblStyle` in content, `basedOn`/`link`/
 `next` in a style) are read by `referenced_style_ids` and rewritten by
 `remap_style_references`, one grammar that accepts either quoting and spaces
-around `=`. The dependency closure and the header/footer importer decide what
+around `=` and never matches inside a comment, CDATA section or processing
+instruction. The dependency closure and the header/footer importer decide what
 is cloned with the reader; the clone and header/footer remaps use the writer.
 A reference one side misses keeps its architect ID: it resolves silently to
 the target's same-named style, or fails publication if there is none. Values

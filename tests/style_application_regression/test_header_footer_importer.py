@@ -440,6 +440,31 @@ def test_import_reports_styles_referenced_in_either_quoting(tmp_path):
     assert result.style_ids == {"ArchitectTable", "ArchitectHeader", "ArchitectHeaderChar"}
 
 
+def test_import_ignores_reference_shaped_text_outside_markup(tmp_path):
+    # Comments, CDATA and processing instructions hold text. Collecting the
+    # Ghost lookalikes would make import demand styles the architect lacks.
+    extract = _seed_extract(tmp_path)
+    registry = {
+        "headers_footers": {
+            "headers": [{
+                "part_name": "word/header1.xml",
+                "rid": "rId10",
+                "xml": (
+                    '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    "<!-- <w:pStyle w:val='Ghost'/> --><?pi <w:rStyle w:val='Ghost'/> ?>"
+                    "<w:p><w:pPr><w:pStyle w:val='ArchitectHeader'/></w:pPr>"
+                    "<w:r><w:t><![CDATA[<w:pStyle w:val='Ghost'/>]]></w:t></w:r></w:p>"
+                    "</w:hdr>"
+                ),
+            }],
+        },
+        "page_layout": {"default_section": {"header_refs": {"default": "rId10"}}},
+    }
+
+    result = import_headers_footers(extract, registry, [])
+    assert result.style_ids == {"ArchitectHeader"}
+
+
 def test_token_patching_covers_headers_and_footers(tmp_path):
     word_dir = tmp_path / "word"
     word_dir.mkdir(parents=True)

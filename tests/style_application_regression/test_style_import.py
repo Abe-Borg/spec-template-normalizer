@@ -345,6 +345,42 @@ class TestCollectStyleDeps:
         _collect_style_deps_from_arch(styles, "Child", seen)
         assert seen == {"Child", "Parent", "ChildChar"}
 
+    def test_reference_shaped_text_outside_markup_is_not_followed(self):
+        """A commented-out reference names no dependency. Following it would
+        demand a style the architect does not have and fail the import."""
+        styles = '''
+<w:styles>
+  <w:style w:type="paragraph" w:styleId="Child">
+    <!-- <w:basedOn w:val='Ghost'/> -->
+    <w:basedOn w:val='Parent'/>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Parent">
+    <w:name w:val="Parent"/>
+  </w:style>
+</w:styles>
+'''
+        seen = set()
+        _collect_style_deps_from_arch(styles, "Child", seen)
+        assert seen == {"Child", "Parent"}
+
+    @pytest.mark.parametrize(
+        "unterminated",
+        ["<!-- <w:basedOn w:val='Ghost'/>", "<![CDATA[ <w:basedOn w:val='Ghost'/>",
+         "<?pi <w:basedOn w:val='Ghost'/>"],
+        ids=["comment", "cdata", "processing_instruction"],
+    )
+    def test_an_unterminated_region_hides_everything_after_it(self, unterminated):
+        # Malformed XML fails package validation later; until then nothing
+        # after the region's start may be taken for a reference.
+        from spec_formatter.style_application.core.style_import import (
+            STYLE_DEFINITION_REFERENCES,
+            referenced_style_ids,
+        )
+
+        text = f"<w:basedOn w:val='Parent'/>{unterminated}"
+
+        assert referenced_style_ids(text, STYLE_DEFINITION_REFERENCES) == ["Parent"]
+
 
 # ── _rewrite_style_id_and_references ────────────────────────────────────────
 
@@ -432,6 +468,22 @@ class TestRewriteStyleIdAndReferences:
         assert result == (
             '<w:style w:type="paragraph" w:styleId="SF_role">'
             "<w:basedOn w:note='w:val=\"Base\" > ' w:val=\"SF_base\"/></w:style>"
+        )
+
+    def test_reference_shaped_text_outside_markup_is_left_alone(self):
+        # A comment or processing instruction holds text, not markup.
+        block = (
+            '<w:style w:type="paragraph" w:styleId="Role">'
+            "<!-- <w:basedOn w:val='Base'/> --><?pi <w:next w:val=\"Base\"/> ?>"
+            "<w:basedOn w:val='Base'/></w:style>"
+        )
+
+        result = _rewrite_style_id_and_references(block, "Role", "SF_role", {"Base": "SF_base"})
+
+        assert result == (
+            '<w:style w:type="paragraph" w:styleId="SF_role">'
+            "<!-- <w:basedOn w:val='Base'/> --><?pi <w:next w:val=\"Base\"/> ?>"
+            '<w:basedOn w:val="SF_base"/></w:style>'
         )
 
     def test_style_ids_are_spliced_literally_not_read_as_templates(self):

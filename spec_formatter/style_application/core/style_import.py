@@ -68,16 +68,25 @@ STYLE_DEFINITION_REFERENCES = ("basedOn", "link", "next")
 _ATTRIBUTE = r"""\s+[^\s=/>"']+\s*=\s*(?:"[^"]*"|'[^']*')"""
 _ATTRIBUTE_OTHER_THAN_VAL = r"""\s+(?!w:val\s*=)[^\s=/>"']+\s*=\s*(?:"[^"]*"|'[^']*')"""
 
+# Comments, CDATA sections and processing instructions hold text, not markup,
+# the same three regions ``iter_element_xml_blocks`` steps over. They are
+# matched only so that a reference-shaped string inside one is skipped whole.
+# An unterminated one runs to the end, so nothing after its start counts.
+_NON_MARKUP = r"<!--.*?(?:-->|\Z)|<!\[CDATA\[.*?(?:\]\]>|\Z)|<\?.*?(?:\?>|\Z)"
+
 
 @functools.lru_cache(maxsize=8)
 def _style_reference_re(elements: Tuple[str, ...]) -> "re.Pattern[str]":
-    """The opening tag of one of ``elements``, capturing its ``w:val``."""
+    """A non-markup region, or the opening tag of one of ``elements``
+    with its ``w:val`` captured."""
 
     names = "|".join(re.escape(name) for name in elements)
     return re.compile(
-        rf"<w:(?:{names})(?=[\s/>])(?:{_ATTRIBUTE_OTHER_THAN_VAL})*"
+        rf"(?P<skip>{_NON_MARKUP})"
+        rf"|<w:(?:{names})(?=[\s/>])(?:{_ATTRIBUTE_OTHER_THAN_VAL})*"
         r"""\s+(?P<val>w:val\s*=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)'))"""
-        rf"(?:{_ATTRIBUTE})*\s*/?>"
+        rf"(?:{_ATTRIBUTE})*\s*/?>",
+        re.S,
     )
 
 
@@ -89,9 +98,13 @@ def _iter_style_references(
 
     ``start`` and ``end`` span the ``w:val`` attribute from its name to its
     closing quote; ``value`` is the raw attribute text between the quotes.
+    Text inside a comment, CDATA section or processing instruction is never
+    a reference, even when it is shaped like one.
     """
 
     for match in _style_reference_re(tuple(elements)).finditer(xml_text):
+        if match.group("skip") is not None:
+            continue
         value = match.group("double")
         if value is None:
             value = match.group("single")

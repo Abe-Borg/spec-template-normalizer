@@ -300,3 +300,24 @@ def test_imported_header_references_with_nothing_to_remap_are_left_as_written(tm
         f'<w:hdr xmlns:w="{W_NS}">{kept}'
         '<w:p><w:pPr><w:pStyle w:val="SF_header"/></w:pPr></w:p></w:hdr>'
     )
+
+
+def test_imported_header_text_shaped_like_a_reference_is_left_alone(tmp_path):
+    # CDATA is visible header text, and a comment or processing instruction
+    # is no markup at all: rewriting any of them would change the document,
+    # not point a reference at a clone.
+    kept = (
+        "<!-- <w:pStyle w:val='Header'/> -->"
+        '<?pi <w:rStyle w:val="Header"/> ?>'
+        "<w:p><w:r><w:t><![CDATA[<w:pStyle w:val='Header'/>]]></w:t></w:r></w:p>"
+    )
+    part = _write_header(tmp_path, kept + "<w:p><w:pPr><w:pStyle w:val='Header'/></w:pPr></w:p>")
+
+    _remap_imported_header_footer_style_ids(
+        tmp_path, ["word/header1.xml"], {"Header": "SF_header"}, []
+    )
+
+    assert part.read_text(encoding="utf-8") == (
+        f'<w:hdr xmlns:w="{W_NS}">{kept}'
+        '<w:p><w:pPr><w:pStyle w:val="SF_header"/></w:pPr></w:p></w:hdr>'
+    )
