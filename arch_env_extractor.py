@@ -2,11 +2,9 @@
 """
 arch_env_extractor.py — Phase 1 Environment Capture
 
-Extracts the complete formatting environment from an architect's Word template
-and produces arch_template_registry.json — the "VM snapshot" that Phase 2 uses
-to recreate the rendering context.
-
-This captures everything Word uses to render a document BEYOND style definitions:
+Captures the architect template's formatting environment beyond its style
+definitions and produces arch_template_registry.json, the bounded, normalized
+record the target engine applies the architect's shell and numbering from:
 - docDefaults (default rPr/pPr)
 - Theme (fonts, colors)
 - Settings + compat flags
@@ -15,10 +13,16 @@ This captures everything Word uses to render a document BEYOND style definitions
 - Headers/footers
 - Font table
 
-This module is imported as a library by gui.py and phase1_smoke_test.py.
-It has no CLI entry point.
+XML fragments are source-derived but normalized: volatile rsid attributes and
+proofing markers are stripped (see ``capture_policy`` in the output), so they
+are not raw XML. The byte-exact styles and settings parts are published
+separately as source_styles.xml and source_settings.xml.
 
-The output JSON follows the arch_template_registry schema (v1.0.0).
+This module is a library imported by phase1_pipeline.py. It has no CLI entry
+point.
+
+The output records ``meta.schema_version`` 1.0.0, which
+phase1_validator.validate_template_registry() checks.
 """
 
 from __future__ import annotations

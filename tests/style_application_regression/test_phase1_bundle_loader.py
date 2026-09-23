@@ -204,7 +204,6 @@ def test_strict_loader_verifies_bundle_and_uses_portable_styles(tmp_path):
     assert 'w:styleId="CSI-Part"' in shared.arch_styles_xml
     assert shared.source_tokens == {"SectionTitle": "AIR TERMINALS"}
     assert shared.bundle_manifest["manifest_version"] == 2
-    assert shared.legacy_mode is False
 
 
 def test_strict_loader_accepts_declared_generated_portable_role_style(tmp_path):

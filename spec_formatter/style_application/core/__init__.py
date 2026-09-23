@@ -44,10 +44,8 @@ from .classification import (
 )
 
 from .registry import (
-    resolve_arch_extract_root,
     load_available_roles_from_registry,
     load_arch_style_registry,
     write_phase2_preflight,
-    build_arch_styles_xml_from_registry,
     preflight_validate_registries,
 )

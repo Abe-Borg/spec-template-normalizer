@@ -39,7 +39,6 @@ from .core.llm_classifier import classify_target_document
 from .core.ooxml_text import read_xml_text, write_xml_text
 from .core.registry import (
     PHASE1_MANIFEST_FILENAME,
-    build_arch_styles_xml_from_registry,
     load_arch_style_registry,
     load_available_roles_from_registry,
     load_role_specs_from_registry,
@@ -222,7 +221,6 @@ class SharedConfig:
     arch_root: Optional[Path]
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None
     bundle_manifest: Optional[Dict[str, Any]] = None
-    legacy_mode: bool = False
     #: True when this config came from :func:`builtin_shared_config`.
     builtin_scheme: bool = False
 
@@ -283,7 +281,6 @@ def load_and_validate_shared_config(arch_path: Path) -> SharedConfig:
     candidate_root = requested_path.parent if requested_path.is_file() else requested_path
     manifest_path = candidate_root / PHASE1_MANIFEST_FILENAME
 
-    legacy_mode = False
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Strict Phase 1 bundle required: {manifest_path} was not found. "
@@ -297,10 +294,7 @@ def load_and_validate_shared_config(arch_path: Path) -> SharedConfig:
     portable_styles_path = artifact_paths["portable_styles"]
 
     arch_registry = load_arch_style_registry(style_registry_path)
-    # Legacy registries predate the numbering provenance contract. Passing
-    # their partial role records into the strict numbering path turns an
-    # explicitly opted-in compatibility mode into a runtime failure.
-    role_specs = None if legacy_mode else load_role_specs_from_registry(style_registry_path)
+    role_specs = load_role_specs_from_registry(style_registry_path)
     available_roles = load_available_roles_from_registry(style_registry_path)
     if not available_roles:
         raise ValueError("Could not load architect registry")
@@ -310,7 +304,7 @@ def load_and_validate_shared_config(arch_path: Path) -> SharedConfig:
     preflight_errors = preflight_validate_registries(
         arch_registry,
         env_registry,
-        additional_known_style_ids=(set(arch_registry.values()) if not legacy_mode else None),
+        additional_known_style_ids=set(arch_registry.values()),
     )
     if preflight_errors:
         error_report = "\n".join(f"  - {e}" for e in preflight_errors)
@@ -318,26 +312,22 @@ def load_and_validate_shared_config(arch_path: Path) -> SharedConfig:
             f"Preflight validation failed ({len(preflight_errors)} error(s)):\n{error_report}"
         )
 
-    if portable_styles_path.exists():
-        arch_styles_xml = portable_styles_path.read_text(encoding="utf-8")
-    else:
-        arch_styles_xml = build_arch_styles_xml_from_registry(env_registry)
-    if not legacy_mode:
-        if not HAS_NUMBERING_IMPORTER:
-            raise ImportError("numbering_importer is required for strict Phase 1 bundles")
-        all_style_ids = {
-            item.get("style_id")
-            for item in env_registry.get("styles", {}).get("style_defs", [])
-            if isinstance(item, dict) and isinstance(item.get("style_id"), str)
-        } | set(arch_registry.values())
-        build_numbering_import_plan(
-            env_registry,
-            arch_styles_xml,
-            '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:numbering>',
-            sorted(all_style_ids),
-            role_specs=role_specs,
-            roles_to_apply=sorted(role_specs or {}),
-        )
+    arch_styles_xml = portable_styles_path.read_text(encoding="utf-8")
+    if not HAS_NUMBERING_IMPORTER:
+        raise ImportError("numbering_importer is required for strict Phase 1 bundles")
+    all_style_ids = {
+        item.get("style_id")
+        for item in env_registry.get("styles", {}).get("style_defs", [])
+        if isinstance(item, dict) and isinstance(item.get("style_id"), str)
+    } | set(arch_registry.values())
+    build_numbering_import_plan(
+        env_registry,
+        arch_styles_xml,
+        '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:numbering>',
+        sorted(all_style_ids),
+        role_specs=role_specs,
+        roles_to_apply=sorted(role_specs or {}),
+    )
     raw_style_registry = json.loads(style_registry_path.read_text(encoding="utf-8"))
     source_tokens = raw_style_registry.get("source_tokens", {})
     return SharedConfig(
@@ -349,7 +339,6 @@ def load_and_validate_shared_config(arch_path: Path) -> SharedConfig:
         arch_root=arch_root,
         role_specs=role_specs,
         bundle_manifest=bundle_manifest,
-        legacy_mode=legacy_mode,
     )
 
 
@@ -411,7 +400,6 @@ def builtin_shared_config() -> SharedConfig:
         arch_root=None,
         role_specs=role_specs,
         bundle_manifest=None,
-        legacy_mode=False,
         builtin_scheme=True,
     )
 

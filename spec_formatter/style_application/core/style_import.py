@@ -589,8 +589,8 @@ def import_arch_styles_into_target(
     Copy specific style blocks from architect styles.xml into target styles.xml (idempotent),
     including basedOn dependencies.
 
-    arch_styles_xml: synthetic or real styles.xml content as a string
-    (built from arch_template_registry.json via build_arch_styles_xml_from_registry).
+    arch_styles_xml: the architect styles as a string -- the bundle's
+    ``portable_styles.xml``. The architect-free modes never import styles.
     """
     tgt_styles_path = target_extract_dir / "word" / "styles.xml"
 

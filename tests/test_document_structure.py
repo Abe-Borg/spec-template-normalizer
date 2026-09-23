@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from docx_decomposer import (
-    apply_pstyle_to_paragraph_block,
     build_portable_styles_xml,
     build_slim_bundle,
     extract_document_sectpr_blocks,
@@ -24,6 +23,9 @@ from docx_decomposer import (
     strip_pstyle_from_paragraph,
 )
 from llm_classifier import classify_document
+from spec_formatter.style_application.core.xml_helpers import (
+    apply_pstyle_to_paragraph_block,
+)
 
 
 def test_nested_table_context_is_xml_aware(tmp_path: Path):

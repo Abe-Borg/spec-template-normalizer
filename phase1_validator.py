@@ -488,12 +488,10 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
         raise ValueError("Style registry must be a JSON object")
 
     version = registry.get("version")
-    if version not in (1, 2):
-        raise ValueError("style registry version must be 1 or 2")
+    if version != 2:
+        raise ValueError("style registry version must be 2")
 
-    allowed_top_level = {"version", "source_docx", "roles"}
-    if version == 2:
-        allowed_top_level.update({"source_tokens", "source_sha256"})
+    allowed_top_level = {"version", "source_docx", "roles", "source_tokens", "source_sha256"}
     extra_top_level = set(registry) - allowed_top_level
     if extra_top_level:
         raise ValueError(f"style registry contains unknown keys: {sorted(extra_top_level)}")
@@ -503,36 +501,30 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
         raise ValueError("style registry source_docx must be a non-empty string")
 
     source_sha256 = registry.get("source_sha256")
-    if version == 2 and source_sha256 is None:
+    if source_sha256 is None:
         raise ValueError("style registry version 2 requires source_sha256")
-    if source_sha256 is not None:
-        if version != 2:
-            raise ValueError("style registry source_sha256 is supported only in version 2")
-        if not isinstance(source_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None:
-            raise ValueError("style registry source_sha256 must be a lowercase SHA-256 digest")
+    if not isinstance(source_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None:
+        raise ValueError("style registry source_sha256 must be a lowercase SHA-256 digest")
 
     roles = registry.get("roles")
     if not isinstance(roles, dict):
         raise ValueError("style registry roles must be an object")
-    if version == 2 and not roles:
+    if not roles:
         raise ValueError("style registry version 2 roles must not be empty")
 
     source_tokens = registry.get("source_tokens")
-    if version == 2 and source_tokens is None:
+    if source_tokens is None:
         raise ValueError("style registry version 2 requires source_tokens")
-    if source_tokens is not None:
-        if version != 2:
-            raise ValueError("style registry source_tokens is supported only in version 2")
-        if not isinstance(source_tokens, dict):
-            raise ValueError("style registry source_tokens must be an object")
-        unknown_tokens = set(source_tokens) - {"SectionID", "SectionTitle"}
-        if unknown_tokens:
-            raise ValueError(f"style registry source_tokens contains unknown keys: {sorted(unknown_tokens)}")
-        for token_role, token in source_tokens.items():
-            if not isinstance(token, str) or not token:
-                raise ValueError(
-                    f"style registry source_tokens['{token_role}'] must be a non-empty string"
-                )
+    if not isinstance(source_tokens, dict):
+        raise ValueError("style registry source_tokens must be an object")
+    unknown_tokens = set(source_tokens) - {"SectionID", "SectionTitle"}
+    if unknown_tokens:
+        raise ValueError(f"style registry source_tokens contains unknown keys: {sorted(unknown_tokens)}")
+    for token_role, token in source_tokens.items():
+        if not isinstance(token, str) or not token:
+            raise ValueError(
+                f"style registry source_tokens['{token_role}'] must be a non-empty string"
+            )
 
     for role, spec in roles.items():
         if role not in _ALLOWED_ROLES:
@@ -572,36 +564,32 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
             raise ValueError(f"roles['{role}'].warning must be a string when present")
 
         provenance = spec.get("numbering_provenance")
-        if version == 2 and provenance is None:
+        if provenance is None:
             raise ValueError(
                 f"roles['{role}'].numbering_provenance is required in version 2"
             )
-        if provenance is not None:
-            allowed = (
-                ("style_numpr", "text_literal", "none")
-                if version == 1
-                else ("style_numpr", "direct_numpr", "text_literal", "none")
+        if provenance not in ("style_numpr", "direct_numpr", "text_literal", "none"):
+            raise ValueError(
+                f"roles['{role}'].numbering_provenance must be one of: "
+                "style_numpr, direct_numpr, text_literal, none"
             )
-            if provenance not in allowed:
-                raise ValueError(
-                    f"roles['{role}'].numbering_provenance must be one of: "
-                    "style_numpr, direct_numpr, text_literal, none"
-                )
 
         numbering_pattern = spec.get("numbering_pattern")
         if numbering_pattern is not None:
             if not isinstance(numbering_pattern, dict):
                 raise ValueError(f"roles['{role}'].numbering_pattern must be an object when present")
-            allowed_pattern_keys = {"numId", "ilvl", "numFmt", "lvlText"}
-            if version == 2:
-                allowed_pattern_keys.update({
-                    "abstractNumId",
-                    "start",
-                    "lvlRestart",
-                    "suff",
-                    "isLgl",
-                    "startOverride",
-                })
+            allowed_pattern_keys = {
+                "numId",
+                "ilvl",
+                "numFmt",
+                "lvlText",
+                "abstractNumId",
+                "start",
+                "lvlRestart",
+                "suff",
+                "isLgl",
+                "startOverride",
+            }
             unknown_pattern_keys = set(numbering_pattern) - allowed_pattern_keys
             if unknown_pattern_keys:
                 raise ValueError(
@@ -613,12 +601,12 @@ def validate_style_registry(registry: Dict[str, Any]) -> None:
                     raise ValueError(
                         f"roles['{role}'].numbering_pattern.{field} must be a string"
                     )
-        if version == 2 and provenance in {"style_numpr", "direct_numpr"}:
+        if provenance in {"style_numpr", "direct_numpr"}:
             if not isinstance(numbering_pattern, dict) or not numbering_pattern.get("numId"):
                 raise ValueError(
                     f"roles['{role}'] provenance {provenance} requires numbering_pattern.numId"
                 )
-        elif version == 2 and numbering_pattern is not None:
+        elif numbering_pattern is not None:
             raise ValueError(
                 f"roles['{role}'] provenance {provenance} must not define numbering_pattern"
             )
