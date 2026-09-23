@@ -2,11 +2,13 @@ from pathlib import Path
 
 import pytest
 
+import spec_formatter.style_application.core.classification as classification_module
 from spec_formatter.style_application.core.classification import apply_phase2_classifications
 from spec_formatter.style_application.core.classification import (
     _build_numbering_catalog,
     _effective_numbering_semantics,
 )
+from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS, EngineError
 from spec_formatter.style_application.core.xml_helpers import (
     iter_paragraph_xml_blocks,
     paragraph_text_from_block,
@@ -358,6 +360,101 @@ def test_visible_drawing_host_is_styled_while_textbox_subtree_is_byte_exact(tmp_
     # font remains authoritative.
     assert "HostFont" in outer_before_textbox
     assert 'w:after="120"' not in outer_before_textbox
+
+
+@pytest.mark.parametrize("conversion_mode", ["format_only", "csi_to_canadian"])
+def test_single_quoted_target_pstyle_is_restyled(tmp_path, conversion_mode):
+    # The old writer's substitution matched nothing here: the paragraph kept
+    # its own style while the report still counted it as modified.
+    extract = _seed_extract(tmp_path, STYLE_WITHOUT_PPR)
+    doc_path = extract / "word" / "document.xml"
+    doc_path.write_text(
+        DOC_XML.replace(
+            '<w:pPr><w:spacing w:after="120"/>',
+            "<w:pPr><w:pStyle w:val='TargetBody'/><w:spacing w:after=\"120\"/>",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    report = apply_phase2_classifications(
+        extract,
+        {"classifications": [{"paragraph_index": 0, "csi_role": "PARAGRAPH"}]},
+        {"PARAGRAPH": "Body"},
+        [],
+        conversion_mode=conversion_mode,
+    )
+
+    first_paragraph = doc_path.read_text(encoding="utf-8").split("</w:p>", 1)[0]
+    assert report.modified == 1
+    assert '<w:pStyle w:val="Body"/>' in first_paragraph
+    assert "TargetBody" not in first_paragraph
+
+
+def test_paragraph_left_without_its_style_fails_closed_at_its_location(
+    tmp_path, monkeypatch
+):
+    # Stands in for any writer defect. A paragraph handed back without the
+    # style it was classified for must stop the target, not be counted.
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="SectionStyle"/>'
+        '<w:style w:type="paragraph" w:styleId="PartStyle"/>'
+        '<w:style w:type="paragraph" w:styleId="Body"/>'
+        '</w:styles>'
+    )
+    extract = _seed_extract(tmp_path, styles)
+    doc_path = extract / "word" / "document.xml"
+    document = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:body>'
+        '<w:p><w:r><w:t>SECTION 21 13 13</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>PART 1 - GENERAL</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>Scope of work.</w:t></w:r></w:p>'
+        '</w:body></w:document>'
+    )
+    doc_path.write_text(document, encoding="utf-8")
+    real_writer = classification_module.apply_pstyle_to_paragraph_block
+    monkeypatch.setattr(
+        classification_module,
+        "apply_pstyle_to_paragraph_block",
+        lambda paragraph, style_id: (
+            paragraph if style_id == "Body" else real_writer(paragraph, style_id)
+        ),
+    )
+
+    with pytest.raises(EngineError) as raised:
+        apply_phase2_classifications(
+            extract,
+            {
+                "classifications": [
+                    {"paragraph_index": 0, "csi_role": "SectionID"},
+                    {"paragraph_index": 1, "csi_role": "PART"},
+                    {"paragraph_index": 2, "csi_role": "PARAGRAPH"},
+                ]
+            },
+            {"SectionID": "SectionStyle", "PART": "PartStyle", "PARAGRAPH": "Body"},
+            [],
+        )
+
+    error = raised.value
+    assert error.code == "paragraph_style_not_applied"
+    assert error.safe_error_message == ERROR_REMEDIATIONS["paragraph_style_not_applied"]
+    # PART and every numbered role count as headings, so the PARAGRAPH is the
+    # second one after its SECTION line.
+    assert error.location.as_dict() == {
+        "paragraph_index": 2,
+        "section_number": "21 13 13",
+        "heading_ordinal": 2,
+        "placement": "heading",
+        "section_state": "numbered",
+        "description": "Section 21 13 13, heading 2, paragraph index 2",
+    }
+    assert "(Section 21 13 13, heading 2)" in str(error)
+    # The target fails before document.xml is rewritten.
+    assert doc_path.read_text(encoding="utf-8") == document
 
 
 def test_direct_run_properties_are_removed_only_when_effective_style_replaces_them(

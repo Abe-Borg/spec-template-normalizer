@@ -114,6 +114,12 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "Not every classifiable paragraph received exactly one disposition. Run "
         "the target again; if it repeats, report the target."
     ),
+    "paragraph_style_not_applied": (
+        "A classified paragraph did not carry its assigned style after "
+        "formatting, so the output was withheld. This is a defect in the "
+        "application rather than in your document; please report the target "
+        "and the reported paragraph."
+    ),
     "numbering_importer_unavailable": (
         "The architect styles need numbering definitions but the numbering "
         "importer is not installed with this build. Reinstall the application."

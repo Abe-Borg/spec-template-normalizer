@@ -8,6 +8,7 @@ to preserve byte-level fidelity.
 import html
 import re
 from typing import Dict, Any, Callable, Generator, Iterable, List, Optional, Tuple
+from xml.sax.saxutils import escape as xml_escape
 
 _QUALIFIED_NAME_RE = re.compile(r"[A-Za-z_][\w.-]*:[A-Za-z_][\w.-]*")
 _TAG_NAME_RE = re.compile(r"<\s*(?P<close>/)?\s*(?P<name>[A-Za-z_][\w.:-]*)(?=\s|/?>)")
@@ -446,45 +447,59 @@ def paragraph_ppr_hints_from_block(p_xml: str) -> Dict[str, Any]:
     return hints
 
 def apply_pstyle_to_paragraph_block(p_xml: str, styleId: str) -> str:
+    """Return the paragraph block with ``styleId`` as its live style.
+
+    ``styleId`` is the style ID itself, not attribute text: it is escaped
+    here, so passing text that is already escaped would escape it twice.
+
+    The element is always written the way Word writes it,
+    ``<w:pStyle w:val="..."/>``, because every pStyle reader in this engine
+    matches that form. An existing live ``w:pStyle`` is therefore replaced
+    whole rather than having its value substituted. A substitution that
+    expected ``w:val="..."`` matched nothing for ``w:val='Old'`` or
+    ``w:val=""`` and silently returned the paragraph with its old style.
+
+    Everything is spliced by position, so the style ID is never read as a
+    regex replacement template. Out-of-scope subtrees (text boxes, drawings,
+    tracked property changes) are protected, so their own ``w:pStyle`` is
+    never taken for the live one and they come back byte-for-byte.
+    """
+
+    if not isinstance(styleId, str) or not styleId:
+        raise ValueError(f"Paragraph style ID must be a non-empty string: {styleId!r}")
+    # &, < and " cannot appear literally in a double-quoted attribute. > is
+    # escaped as well because the engine's tag patterns stop at the first >.
+    value = xml_escape(styleId, {'"': "&quot;"})
+    pstyle = f'<w:pStyle w:val="{value}"/>'
+
     p_xml, preserved = _protect_out_of_scope_subtrees(p_xml)
-    # If pStyle already exists, replace its value
-    if re.search(r"<w:pStyle\b", p_xml):
-        p_xml = re.sub(
-            r'(<w:pStyle\b[^>]*w:val=")([^"]+)(")',
-            rf'\g<1>{styleId}\g<3>',
-            p_xml,
-            count=1
-        )
-        return _restore_out_of_scope_subtrees(p_xml, preserved)
+    ppr = next(iter_element_xml_blocks(p_xml, "w:pPr"), None)
+    if ppr is None:
+        # No pPr at all: create one as the paragraph's first child.
+        opening = re.match(r"<w:p\b[^>]*>", p_xml)
+        if opening is None:
+            raise ValueError("Paragraph block does not start with a <w:p> element")
+        tag = opening.group(0)
+        closing = ""
+        if _SELF_CLOSING_RE.search(tag):
+            # An empty <w:p/> must be opened up, or the pPr lands outside it.
+            tag = _SELF_CLOSING_RE.sub(">", tag)
+            closing = "</w:p>"
+        edited = f"{tag}<w:pPr>{pstyle}</w:pPr>{closing}{p_xml[opening.end():]}"
+        return _restore_out_of_scope_subtrees(edited, preserved)
 
-    # Handle self-closing pPr: <w:pPr/> or <w:pPr />
-    if re.search(r"<w:pPr\b[^>]*/>", p_xml):
-        p_xml = re.sub(
-            r"<w:pPr\b[^>]*/>",
-            rf'<w:pPr><w:pStyle w:val="{styleId}"/></w:pPr>',
-            p_xml,
-            count=1
-        )
-        return _restore_out_of_scope_subtrees(p_xml, preserved)
-
-    # If pPr exists as a normal open/close element, insert pStyle right after opening tag
-    if "<w:pPr" in p_xml:
-        p_xml = re.sub(
-            r'(<w:pPr\b[^>]*>)',
-            rf'\1<w:pStyle w:val="{styleId}"/>',
-            p_xml,
-            count=1
-        )
-        return _restore_out_of_scope_subtrees(p_xml, preserved)
-
-    # No pPr at all: create one right after <w:p ...>
-    p_xml = re.sub(
-        r'(<w:p\b[^>]*>)',
-        rf'\1<w:pPr><w:pStyle w:val="{styleId}"/></w:pPr>',
-        p_xml,
-        count=1
-    )
-    return _restore_out_of_scope_subtrees(p_xml, preserved)
+    start, end, block = ppr
+    if _SELF_CLOSING_RE.search(block):
+        block = f"<w:pPr>{pstyle}</w:pPr>"
+    else:
+        live = next(iter_element_xml_blocks(block, "w:pStyle"), None)
+        if live is not None:
+            block = block[:live[0]] + pstyle + block[live[1]:]
+        else:
+            # pStyle is the first child in CT_PPr's sequence.
+            opening_end = re.match(r"<w:pPr\b[^>]*>", block).end()
+            block = block[:opening_end] + pstyle + block[opening_end:]
+    return _restore_out_of_scope_subtrees(p_xml[:start] + block + p_xml[end:], preserved)
 
 def strip_direct_run_properties(
     p_xml: str,

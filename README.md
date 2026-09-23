@@ -596,6 +596,10 @@ fails instead of publishing a header that still names the architect's section.
   parts and verified across every mirrored Word compatibility branch.
 - Explicit ignored paragraphs receive no paragraph/run edits; unresolved or
   overlapping dispositions fail closed.
+- Every restyled paragraph is read back after the edit. One that does not
+  carry exactly the style it was classified for fails the target with
+  `paragraph_style_not_applied` and its location, rather than being published
+  on its old style.
 - Imported architect styles never replace an existing target style ID.
 - Format-only verifies unchanged body text and effective target numbering and
   preserves every pre-existing target numbering definition.
