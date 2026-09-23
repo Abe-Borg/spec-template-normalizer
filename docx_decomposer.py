@@ -1,22 +1,25 @@
 """
-PHASE 1 — Architect Template Normalization (Lean)
+PHASE 1 — Architect Template Analysis
 
-Library module providing pipeline functions for the Phase 1 DOCX CSI Normalizer.
-Called by gui.py — no CLI entry point.
+Library module for the architect side of the pipeline, imported by
+phase1_pipeline.py (and by arch_env_extractor.py for section-break scanning).
+It has no CLI entry point.
 
 Purpose
 - Run ONLY on an architect's DOCX template (e.g. MySpec.docx).
-- Produce formal contract artifacts for Phase 2:
-  - arch_style_registry.json
-  - arch_template_registry.json
+- Safely extract the package, build the slim bundle the classifier reads,
+  validate the classifier's instructions, and produce:
+  - arch_style_registry.json (role metadata)
+  - portable_styles.xml (styles derived from exemplar paragraphs)
+  arch_template_registry.json comes from arch_env_extractor.py.
 
 Hard invariants (enforced):
-- Pixel-identical output (we DO NOT emit a reconstructed docx in Phase 1)
+- Observational only: the architect DOCX is never modified, retagged, or
+  re-emitted, and nothing here writes classifications back into it
 - Never modify headers/footers
 - Never modify w:sectPr
 - Never modify numbering definitions (word/numbering.xml)
 - Never reconstruct DOCX XML (no parse/re-serialize of document.xml)
-- When applying, only insert/replace <w:pStyle> in document.xml
 - Styles are derived locally from exemplar paragraphs (LLM never specifies pPr/rPr)
 
 Note:
@@ -1361,43 +1364,6 @@ def insert_styles_into_styles_xml(styles_xml_text: str, style_blocks: List[str])
         raise ValueError("styles.xml does not contain </w:styles>")
     insertion = "\n" + "\n".join(filtered) + "\n"
     return styles_xml_text[:insert_point] + insertion + styles_xml_text[insert_point:]
-
-
-def apply_pstyle_to_paragraph_block(p_xml: str, styleId: str) -> str:
-    outer_xml = _mask_text_box_subtrees(p_xml)
-    escaped_style_id = xml_escape(styleId)
-    pstyle = re.search(
-        r"<w:pStyle\b[^>]*\bw:val=(?P<quote>['\"])(?P<value>[^'\"]*)(?P=quote)",
-        outer_xml,
-        flags=re.S,
-    )
-    if pstyle:
-        return p_xml[:pstyle.start("value")] + escaped_style_id + p_xml[pstyle.end("value"):]
-
-    self_closing_ppr = re.search(r"<w:pPr\b[^>]*/\s*>", outer_xml, flags=re.S)
-    if self_closing_ppr:
-        return (
-            p_xml[:self_closing_ppr.start()]
-            + f'<w:pPr><w:pStyle w:val="{escaped_style_id}"/></w:pPr>'
-            + p_xml[self_closing_ppr.end():]
-        )
-
-    opening_ppr = re.search(r"<w:pPr\b[^>]*>", outer_xml, flags=re.S)
-    if opening_ppr:
-        return (
-            p_xml[:opening_ppr.end()]
-            + f'<w:pStyle w:val="{escaped_style_id}"/>'
-            + p_xml[opening_ppr.end():]
-        )
-
-    opening_p = re.search(r"<w:p\b[^>]*>", outer_xml, flags=re.S)
-    if not opening_p:
-        return p_xml
-    return (
-        p_xml[:opening_p.end()]
-        + f'<w:pPr><w:pStyle w:val="{escaped_style_id}"/></w:pPr>'
-        + p_xml[opening_p.end():]
-    )
 
 
 def validate_instructions(instructions: Dict[str, Any], slim_bundle: Optional[Dict[str, Any]] = None) -> None:

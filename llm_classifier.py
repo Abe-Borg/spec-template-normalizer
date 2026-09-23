@@ -2,9 +2,10 @@
 LLM classifier module for automated CSI paragraph classification.
 
 Calls the Anthropic API with the master prompt + slim bundle to produce
-classification instructions (same schema as instructions.json).
+classification instructions (schemas/phase1_instructions.schema.json; an
+example is tests/fixtures/instructions.json).
 
-Design constraint: pure module with no CLI — imported by gui.py.
+Design constraint: pure module with no CLI — imported by phase1_pipeline.py.
 """
 from __future__ import annotations
 

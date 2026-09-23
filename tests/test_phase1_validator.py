@@ -128,35 +128,37 @@ def _minimal_template_registry():
     }
 
 
+def _role(style_id, exemplar_paragraph_index):
+    return {
+        "style_id": style_id,
+        "exemplar_paragraph_index": exemplar_paragraph_index,
+        "numbering_provenance": "none",
+    }
+
+
 def _minimal_style_registry():
     """Return a minimal valid style registry dict."""
     return {
-        "version": 1,
+        "version": 2,
         "source_docx": "test.docx",
+        "source_sha256": "a" * 64,
+        "source_tokens": {},
         "roles": {
-            "SectionTitle": {"style_id": "CSI_SectionTitle__ARCH", "exemplar_paragraph_index": 0},
-            "PART": {"style_id": "CSI_Part__ARCH", "exemplar_paragraph_index": 1},
-            "ARTICLE": {"style_id": "CSI_Article__ARCH", "exemplar_paragraph_index": 2},
-            "PARAGRAPH": {"style_id": "CSI_Paragraph__ARCH", "exemplar_paragraph_index": 3},
-            "SUBPARAGRAPH": {"style_id": "CSI_Subparagraph__ARCH", "exemplar_paragraph_index": 4},
-            "SUBSUBPARAGRAPH": {"style_id": "CSI_Subsubparagraph__ARCH", "exemplar_paragraph_index": 5},
+            "SectionTitle": _role("CSI_SectionTitle__ARCH", 0),
+            "PART": _role("CSI_Part__ARCH", 1),
+            "ARTICLE": _role("CSI_Article__ARCH", 2),
+            "PARAGRAPH": _role("CSI_Paragraph__ARCH", 3),
+            "SUBPARAGRAPH": _role("CSI_Subparagraph__ARCH", 4),
+            "SUBSUBPARAGRAPH": _role("CSI_Subsubparagraph__ARCH", 5),
         },
     }
 
 
 def _style_registry_without_subsubparagraph():
     """Return a valid style registry without the optional SUBSUBPARAGRAPH role."""
-    return {
-        "version": 1,
-        "source_docx": "test.docx",
-        "roles": {
-            "SectionTitle": {"style_id": "CSI_SectionTitle__ARCH", "exemplar_paragraph_index": 0},
-            "PART": {"style_id": "CSI_Part__ARCH", "exemplar_paragraph_index": 1},
-            "ARTICLE": {"style_id": "CSI_Article__ARCH", "exemplar_paragraph_index": 2},
-            "PARAGRAPH": {"style_id": "CSI_Paragraph__ARCH", "exemplar_paragraph_index": 3},
-            "SUBPARAGRAPH": {"style_id": "CSI_Subparagraph__ARCH", "exemplar_paragraph_index": 4},
-        },
-    }
+    registry = _minimal_style_registry()
+    del registry["roles"]["SUBSUBPARAGRAPH"]
+    return registry
 
 
 # ---------------------------------------------------------------------------
@@ -329,10 +331,11 @@ class TestValidateStyleRegistry:
     def test_valid_passes(self):
         validate_style_registry(_minimal_style_registry())
 
-    def test_wrong_version(self):
+    @pytest.mark.parametrize("version", [1, 99])
+    def test_wrong_version(self, version):
         reg = _minimal_style_registry()
-        reg["version"] = 99
-        with pytest.raises(ValueError, match="version must be 1 or 2"):
+        reg["version"] = version
+        with pytest.raises(ValueError, match="version must be 2"):
             validate_style_registry(reg)
 
     def test_empty_source_docx(self):
@@ -392,6 +395,7 @@ class TestValidateStyleRegistry:
     def test_numbering_provenance_valid(self):
         reg = _minimal_style_registry()
         reg["roles"]["PART"]["numbering_provenance"] = "style_numpr"
+        reg["roles"]["PART"]["numbering_pattern"] = {"numId": "1", "ilvl": "0"}
         validate_style_registry(reg)
 
     def test_numbering_provenance_invalid(self):
@@ -444,26 +448,22 @@ class TestValidateCrossRegistry:
         validate_cross_registry(style_reg, tmpl_reg)
 
     def test_missing_style_id_in_template(self):
+        # A role naming a source style the template registry lacks. Generated
+        # CSI_*__ARCH styles are exempt (see the test above); source styles
+        # are not.
         style_reg = _minimal_style_registry()
-        tmpl_reg = _minimal_template_registry()
-        # Remove CSI_Part__ARCH from template
-        tmpl_reg["styles"]["style_defs"] = [
-            s for s in tmpl_reg["styles"]["style_defs"]
-            if s["style_id"] != "CSI_Part__ARCH"
-        ]
-        with pytest.raises(ValueError, match="CSI_Part__ARCH"):
-            validate_cross_registry(style_reg, tmpl_reg)
+        style_reg["roles"]["PART"]["style_id"] = "ArchPart"
+        with pytest.raises(ValueError, match="ArchPart"):
+            validate_cross_registry(style_reg, _minimal_template_registry())
 
     def test_multiple_missing_ids(self):
         style_reg = _minimal_style_registry()
-        tmpl_reg = _minimal_template_registry()
-        # Keep only Normal in template
-        tmpl_reg["styles"]["style_defs"] = [
-            s for s in tmpl_reg["styles"]["style_defs"]
-            if s["style_id"] == "Normal"
-        ]
-        with pytest.raises(ValueError, match="not found in template registry"):
-            validate_cross_registry(style_reg, tmpl_reg)
+        style_reg["roles"]["PART"]["style_id"] = "ArchPart"
+        style_reg["roles"]["ARTICLE"]["style_id"] = "ArchArticle"
+        with pytest.raises(ValueError, match="not found in template registry") as excinfo:
+            validate_cross_registry(style_reg, _minimal_template_registry())
+        assert "ArchPart" in str(excinfo.value)
+        assert "ArchArticle" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -490,15 +490,11 @@ class TestValidatePhase1Contracts:
     def test_style_failure_after_template_passes(self):
         style_reg = _minimal_style_registry()
         style_reg["version"] = 99
-        with pytest.raises(ValueError, match="version must be 1 or 2"):
+        with pytest.raises(ValueError, match="version must be 2"):
             validate_phase1_contracts(style_reg, _minimal_template_registry())
 
     def test_cross_failure_after_both_pass(self):
         style_reg = _minimal_style_registry()
-        tmpl_reg = _minimal_template_registry()
-        tmpl_reg["styles"]["style_defs"] = [
-            s for s in tmpl_reg["styles"]["style_defs"]
-            if s["style_id"] == "Normal"
-        ]
+        style_reg["roles"]["PART"]["style_id"] = "ArchPart"
         with pytest.raises(ValueError, match="not found in template registry"):
-            validate_phase1_contracts(style_reg, tmpl_reg)
+            validate_phase1_contracts(style_reg, _minimal_template_registry())

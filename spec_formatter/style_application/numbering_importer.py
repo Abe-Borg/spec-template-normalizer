@@ -592,8 +592,8 @@ def import_numbering(
     """
     Main entry point: import architect's numbering into target.
 
-    arch_styles_xml: synthetic or real styles.xml content as a string
-    (built from arch_template_registry.json via build_arch_styles_xml_from_registry).
+    arch_styles_xml: the architect styles as a string -- the bundle's
+    ``portable_styles.xml``, or the built-in scheme's generated stylesheet.
 
     Returns style_numid_remap for use when importing styles.
     """
