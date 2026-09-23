@@ -72,20 +72,27 @@ _ATTRIBUTE_OTHER_THAN_VAL = r"""\s+(?!w:val\s*=)[^\s=/>"']+\s*=\s*(?:"[^"]*"|'[^
 # the same three regions ``iter_element_xml_blocks`` steps over. They are
 # matched only so that a reference-shaped string inside one is skipped whole.
 # An unterminated one runs to the end, so nothing after its start counts.
-_NON_MARKUP = r"<!--.*?(?:-->|\Z)|<!\[CDATA\[.*?(?:\]\]>|\Z)|<\?.*?(?:\?>|\Z)"
+# Written without their opening "<", which the pattern below matches once.
+_NON_MARKUP = r"!--.*?(?:-->|\Z)|!\[CDATA\[.*?(?:\]\]>|\Z)|\?.*?(?:\?>|\Z)"
 
 
 @functools.lru_cache(maxsize=8)
 def _style_reference_re(elements: Tuple[str, ...]) -> "re.Pattern[str]":
     """A non-markup region, or the opening tag of one of ``elements``
-    with its ``w:val`` captured."""
+    with its ``w:val`` captured.
+
+    Every alternative opens with "<", matched once ahead of them. A pattern
+    that starts with a literal lets the regex engine jump from one "<" to
+    the next instead of trying each alternative at every character, several
+    times faster on a style block. The ``basedOn`` walks run it on every hop.
+    """
 
     names = "|".join(re.escape(name) for name in elements)
     return re.compile(
-        rf"(?P<skip>{_NON_MARKUP})"
-        rf"|<w:(?:{names})(?=[\s/>])(?:{_ATTRIBUTE_OTHER_THAN_VAL})*"
+        rf"<(?:(?P<skip>{_NON_MARKUP})"
+        rf"|w:(?:{names})(?=[\s/>])(?:{_ATTRIBUTE_OTHER_THAN_VAL})*"
         r"""\s+(?P<val>w:val\s*=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)'))"""
-        rf"(?:{_ATTRIBUTE})*\s*/?>",
+        rf"(?:{_ATTRIBUTE})*\s*/?>)",
         re.S,
     )
 
@@ -139,12 +146,11 @@ def remap_style_references(
     double-quoted reference maps exactly as it always has.
 
     A remapped reference is written back as ``w:val="..."``, the form Word
-    writes, because the engine's regex readers match only that form. A
-    clone's ``basedOn`` left as ``w:val='...'``, for one, would be invisible
-    to every ``basedOn`` walk over the target's styles after import. A
-    reference that is empty, has no mapping, or maps to itself is left
-    exactly as written. Edits are spliced by position, so a style ID is
-    never read as a regex replacement template.
+    writes and the only one some of the engine's regex readers match, the
+    paragraph ``pStyle`` readers among them. A reference that is empty, has
+    no mapping, or maps to itself is left exactly as written. Edits are
+    spliced by position, so a style ID is never read as a regex replacement
+    template.
     """
 
     pieces: List[str] = []
@@ -242,8 +248,27 @@ def _extract_style_block(styles_xml_text: str, style_id: str) -> Optional[str]:
     return _style_block_index(styles_xml_text).get(style_id)
 
 def _extract_basedOn(style_block: str) -> Optional[str]:
-    m = re.search(r'<w:basedOn\b[^>]*w:val="([^"]+)"', style_block)
-    return m.group(1) if m else None
+    """The style ``style_block`` is based on, as raw attribute text.
+
+    Every ``basedOn`` walk takes its next hop from here, so it reads with the
+    grammar of ``referenced_style_ids``: the one the dependency closure
+    follows and the clone rewrite remaps. A walk that stopped at a
+    single-quoted reference lost the parent without failing anything. A
+    detached Format-only clone dropped the parent's formatting, a shell clone
+    pinned the document defaults over it, a target paragraph's inherited list
+    was invisible to the style swap that preserves it and to the invariant
+    that checks it, and the hierarchy converters left that paragraph behind
+    when they renumbered its list. The first non-empty reference wins.
+    """
+
+    # Most blocks, and the root style that ends most walks, have no basedOn.
+    # The grammar cannot match without this literal, so skip the scan.
+    if "<w:basedOn" not in style_block:
+        return None
+    for _start, _end, value in _iter_style_references(style_block, ("basedOn",)):
+        if value:
+            return value
+    return None
 
 def _extract_numpr_block(style_block: str) -> Optional[str]:
     m = re.search(r'(<w:numPr\b[^>]*>[\s\S]*?</w:numPr>)', style_block, flags=re.S)

@@ -9,7 +9,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Tuple
 
 from .core.ooxml_namespaces import (
     CT_NS,
@@ -50,7 +50,11 @@ from .core.sectpr_tools import (
     replace_nth_sectpr_block,
     strip_tag_block,
 )
-from .core.style_import import CONTENT_STYLE_REFERENCES, referenced_style_ids
+from .core.style_import import (
+    CONTENT_STYLE_REFERENCES,
+    _iter_style_references,
+    referenced_style_ids,
+)
 from .core.xml_helpers import (
     edit_preserving_out_of_scope_subtrees,
     iter_element_xml_blocks,
@@ -283,6 +287,24 @@ def _validate_part_relationship_references(
         )
 
 
+def _direct_num_id_references(xml_text: str) -> Iterator[Tuple[int, int, int]]:
+    """Yield ``(start, end, numId)`` for each direct numbering reference.
+
+    A ``w:numId`` names its list by ``w:val`` the way a ``w:pStyle`` names its
+    style, so it is read with the style references' grammar: either quoting,
+    spaces around ``=``, and never inside a comment, CDATA section or
+    processing instruction. The import decides which architect lists to copy
+    from these, and the remap points the same references at the copies. A
+    reference either side missed kept its architect numId, which resolved
+    silently to the target's own list of that number, or failed publication
+    where there was none. Only a decimal value names a list.
+    """
+
+    for start, end, value in _iter_style_references(xml_text, ("numId",)):
+        if re.fullmatch(r"\d+", value):
+            yield start, end, int(value)
+
+
 def _write_hf_parts(
     target_extract_dir: Path,
     entries: List[Tuple[str, Dict[str, Any]]],
@@ -329,9 +351,9 @@ def _write_hf_parts(
         # references at their clones: a reference missed here would get none.
         result.style_ids.update(referenced_style_ids(xml_content, CONTENT_STYLE_REFERENCES))
         result.direct_num_ids.update(
-            int(value)
-            for value in re.findall(r'<w:numId\b[^>]*w:val="(\d+)"', xml_content)
-            if int(value) != 0
+            num_id
+            for _start, _end, num_id in _direct_num_id_references(xml_content)
+            if num_id != 0
         )
         part_to_type[part_name] = kind
         log.append(f"Wrote {kind} part: {part_name}")
@@ -1860,7 +1882,12 @@ def remap_header_footer_numids(
     num_id_remap: Dict[int, int],
     log: List[str],
 ) -> None:
-    """Remap direct header/footer numIds to imported collision-safe IDs."""
+    """Remap direct header/footer numIds to imported collision-safe IDs.
+
+    References are found by ``_direct_num_id_references``, the reader that
+    decided which lists were imported, and each remapped one is written back
+    as ``w:val="..."``. Edits are spliced by position.
+    """
     for part_name in sorted(set(part_names)):
         if not is_allowed_header_footer_part_name(part_name):
             raise ValueError(f"Unsafe header/footer part name: {part_name!r}")
@@ -1869,19 +1896,19 @@ def remap_header_footer_numids(
             raise FileNotFoundError(f"Imported header/footer part is missing: {part_name}")
         xml = read_xml_text(path)
         replacements = 0
-
-        def _replace(match: re.Match[str]) -> str:
-            nonlocal replacements
-            old_id = int(match.group(2))
+        pieces: List[str] = []
+        cursor = 0
+        for start, end, old_id in _direct_num_id_references(xml):
             new_id = num_id_remap.get(old_id)
             if new_id is None:
-                return match.group(0)
+                continue
+            pieces.append(xml[cursor:start])
+            pieces.append(f'w:val="{new_id}"')
+            cursor = end
             replacements += 1
-            return f'{match.group(1)}{new_id}"'
-
-        updated = re.sub(r'(<w:numId\b[^>]*w:val=")(\d+)"', _replace, xml)
         if replacements:
-            updated = prepare_xml_text_for_utf8(updated)
+            pieces.append(xml[cursor:])
+            updated = prepare_xml_text_for_utf8("".join(pieces))
             parse_untrusted_xml(updated, part_name)
             path.write_text(updated, encoding="utf-8")
             log.append(f"Remapped {replacements} direct numbering reference(s) in {part_name}")

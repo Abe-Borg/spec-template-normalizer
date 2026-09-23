@@ -624,6 +624,21 @@ the target's same-named style, or fails publication if there is none. Values
 stay raw attribute text, and a remapped reference is written back as
 `w:val="..."`, the form the engine's other regex readers match.
 
+Every `basedOn` walk takes its next hop from `_extract_basedOn`, which reads
+with the same grammar: property materialization (the `_effective_*_in_arch`
+walks), the geometry invariant's `_style_chain_ind`, and
+`_find_style_numpr_in_chain`. The last serves the numbering importer's role
+check and `_effective_numpr`, which Format-only numbering preservation, its
+invariant, and both hierarchy converters rely on. A walk that stops early fails
+nothing. A detached Format-only clone loses its parent's formatting, a shell
+clone pins the document defaults over it, a target paragraph's inherited list
+disappears from both the style swap that preserves it and the invariant that
+checks it, and a converter leaves a list member behind -- `canadian_to_csi`
+then writes the markers after it at its level one short. The header/footer
+importer reads direct `w:numId` references with the grammar too
+(`_direct_num_id_references`), both to choose the architect lists it imports
+and to point the header at them.
+
 ### Target shell, packaging, and invariants
 
 - `arch_env_applier.py` applies document defaults, theme/settings,
@@ -1230,7 +1245,8 @@ Before considering a formatter change complete:
 - Replacing a target style merely because an architect style uses the same ID.
 - Inspecting only a direct style's `pPr` and ignoring its `basedOn` chain.
 - Collecting or remapping style references with a regex of one's own instead
-  of `referenced_style_ids` / `remap_style_references`.
+  of `referenced_style_ids` / `remap_style_references`, or following
+  `basedOn` without `_extract_basedOn`.
 - Describing the two registries as the complete handoff.
 - Calling normalized registry fragments "raw" or "complete VM state."
 - Filling missing classifications from adjacent paragraphs.

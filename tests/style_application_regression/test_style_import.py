@@ -1,5 +1,7 @@
 """Tests for core.style_import — style extraction and materialization."""
 
+import re
+
 import pytest
 from spec_formatter.style_application.core.style_import import (
     ensure_explicit_numpr_from_current_style,
@@ -133,6 +135,23 @@ class TestEnsureExplicitNumpr:
         result = ensure_explicit_numpr_from_current_style(p, STYLES_WITH_NUMPR)
 
         assert result == p
+
+    @pytest.mark.parametrize(
+        "based_on",
+        ["w:val='ListBullet'", "w:val = \"ListBullet\"", "w:val = 'ListBullet'"],
+        ids=["single_quoted", "spaced", "spaced_single_quoted"],
+    )
+    def test_numbering_inherited_through_basedOn_in_either_quoting(self, based_on):
+        # Format-only writes this numPr onto the paragraph before swapping its
+        # style. The walk used to stop at a reference it could not read, so
+        # the paragraph silently lost its list: the numbering invariant walks
+        # the same chain and saw no numbering before or after.
+        styles = STYLES_WITH_NUMPR.replace('w:val="ListBullet"/>', f"{based_on}/>")
+        assert based_on in styles
+        p = '<w:p><w:pPr><w:pStyle w:val="ListBullet3"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>'
+
+        assert '<w:numId w:val="1"/>' in _find_style_numpr_in_chain(styles, "ListBullet3")
+        assert '<w:numId w:val="1"/>' in ensure_explicit_numpr_from_current_style(p, styles)
 
     def test_live_style_materializes_around_byte_stable_historical_numpr(self):
         change = (
@@ -507,6 +526,56 @@ class TestRewriteStyleIdAndReferences:
             _rewrite_style_id_and_references(block, "Role", "SF_role", {"Base": destination})
 
 
+# ── _extract_basedOn ─────────────────────────────────────────────────────────
+
+class TestExtractBasedOn:
+    """Every basedOn walk takes its next hop from here, so it reads with the
+    grammar the dependency closure follows and the clone rewrite remaps."""
+
+    @pytest.mark.parametrize(
+        "based_on",
+        ['w:val="Base"', "w:val='Base'", 'w:val = "Base"'],
+        ids=["double_quoted", "single_quoted", "spaced"],
+    )
+    def test_reads_the_reference_in_either_quoting(self, based_on):
+        block = f'<w:style w:type="paragraph" w:styleId="Role"><w:basedOn {based_on}/></w:style>'
+
+        assert _extract_basedOn(block) == "Base"
+
+    def test_values_stay_raw_attribute_text(self):
+        # The raw text is the domain w:styleId attributes are indexed in.
+        block = "<w:style w:styleId=\"Role\"><w:basedOn w:val='R&amp;D'/></w:style>"
+
+        assert _extract_basedOn(block) == "R&amp;D"
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            '<w:style w:styleId="Role"><w:name w:val="Role"/></w:style>',
+            "<w:style w:styleId=\"Role\"><w:basedOn w:val=''/></w:style>",
+            '<w:style w:styleId="Role"><w:basedOn/></w:style>',
+        ],
+        ids=["absent", "empty", "no_value"],
+    )
+    def test_no_named_parent_is_none(self, block):
+        assert _extract_basedOn(block) is None
+
+    @pytest.mark.parametrize(
+        "based_on",
+        [
+            '<!-- <w:basedOn w:val="Ghost"/> --><w:basedOn w:val="Base"/>',
+            "<w:basedOn w:val=\"Base\" w:note='w:val=\"Ghost\"'/>",
+        ],
+        ids=["commented_out", "inside_another_attribute"],
+    )
+    def test_reference_shaped_text_is_not_taken_for_the_parent(self, based_on):
+        # Both lookalikes used to win over the real reference, so the walk
+        # materialized a style the dependency closure had never followed.
+        block = f'<w:style w:styleId="Role">{based_on}</w:style>'
+
+        assert _extract_basedOn(block) == "Base"
+
+
 # ── Additional materialize_arch_style_block tests ──────────────────────────
 
 class TestMaterializeArchStyleBlockExtended:
@@ -792,6 +861,105 @@ def test_format_only_body_style_is_self_contained_and_has_no_numbering(tmp_path)
     assert "<w:basedOn" not in block
     assert '<w:ind w:left="720"' in block
     assert '<w:spacing w:before="240"' in block
+
+
+@pytest.mark.parametrize(
+    "based_on",
+    ['w:val="Base"', "w:val='Base'", "w:val = 'Base'"],
+    ids=["double_quoted", "single_quoted", "spaced"],
+)
+def test_format_only_body_clone_materializes_its_parent_in_either_quoting(tmp_path, based_on):
+    # A detached body clone loses its basedOn, so whatever the walk does not
+    # reach is gone from the rendering. The walk used to stop at a
+    # single-quoted basedOn, and the clone silently lost the parent's indent
+    # and italic while every check passed.
+    from spec_formatter.style_application.core.style_import import (
+        extract_style_block_raw,
+        import_arch_styles_into_target,
+    )
+
+    word_dir = tmp_path / "word"
+    word_dir.mkdir()
+    (word_dir / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Normal"/>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    arch = (
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Base">'
+        '<w:pPr><w:ind w:left="720"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>'
+        f'<w:style w:type="paragraph" w:styleId="Role"><w:basedOn {based_on}/></w:style>'
+        '</w:styles>'
+    )
+
+    result = import_arch_styles_into_target(
+        tmp_path,
+        arch,
+        ["Role"],
+        [],
+        format_only_body_style_ids={"Role"},
+    )
+    out = (word_dir / "styles.xml").read_text(encoding="utf-8")
+    block = extract_style_block_raw(out, result.body_style_id_map["Role"])
+
+    assert block is not None
+    assert "<w:basedOn" not in block
+    assert '<w:ind w:left="720"' in block
+    # Materialized children are re-serialized by ElementTree as <w:i />.
+    assert re.search(r"<w:i\s*/>", block)
+
+
+@pytest.mark.parametrize(
+    "based_on",
+    ['w:val="Base"', "w:val='Base'", "w:val = 'Base'"],
+    ids=["double_quoted", "single_quoted", "spaced"],
+)
+def test_shell_clone_materializes_its_parent_not_document_defaults(tmp_path, based_on):
+    # A shell clone keeps its basedOn, pointed at the parent's clone, but the
+    # properties materialized into it win over anything inherited. The walk
+    # used to stop at a single-quoted basedOn and fall through to the
+    # document defaults, so the clone pinned Calibri 11pt and 8pt after over
+    # the parent's Arial 9pt and no spacing.
+    from spec_formatter.style_application.core.style_import import (
+        extract_style_block_raw,
+        import_arch_styles_into_target,
+    )
+
+    word_dir = tmp_path / "word"
+    word_dir.mkdir()
+    (word_dir / "styles.xml").write_text(
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Normal"/>'
+        '</w:styles>',
+        encoding="utf-8",
+    )
+    arch = (
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:docDefaults><w:rPrDefault><w:rPr>'
+        '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/>'
+        '</w:rPr></w:rPrDefault>'
+        '<w:pPrDefault><w:pPr><w:spacing w:after="160"/></w:pPr></w:pPrDefault>'
+        '</w:docDefaults>'
+        '<w:style w:type="paragraph" w:styleId="Base">'
+        '<w:pPr><w:spacing w:after="0"/></w:pPr>'
+        '<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="18"/></w:rPr>'
+        '</w:style>'
+        f'<w:style w:type="paragraph" w:styleId="Role"><w:basedOn {based_on}/></w:style>'
+        '</w:styles>'
+    )
+
+    result = import_arch_styles_into_target(tmp_path, arch, ["Role"], [])
+    out = (word_dir / "styles.xml").read_text(encoding="utf-8")
+    block = extract_style_block_raw(out, result.style_id_map["Role"])
+
+    assert block is not None
+    assert f'<w:basedOn w:val="{result.style_id_map["Base"]}"/>' in block
+    assert re.search(r'<w:spacing w:after="0"\s*/>', block)
+    assert '<w:rFonts w:ascii="Arial" w:hAnsi="Arial"/>' in block
+    assert '<w:sz w:val="18"/>' in block
+    assert "Calibri" not in block and 'w:after="160"' not in block
 
 
 def test_architect_dependency_collision_is_namespaced_and_target_normal_survives(tmp_path):
