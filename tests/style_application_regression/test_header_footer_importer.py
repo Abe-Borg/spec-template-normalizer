@@ -411,6 +411,60 @@ def test_import_reports_styles_referenced_by_header_footer_parts(tmp_path):
     assert result.style_ids == {"ArchitectHeader", "ArchitectHeaderChar"}
 
 
+def test_import_reports_styles_referenced_in_either_quoting(tmp_path):
+    # These IDs decide which architect styles are cloned. The batch runner
+    # later remaps references with the same grammar, so a reference missed
+    # here would get no clone and keep resolving to the target's own style
+    # of the same name. An empty w:val names no style.
+    extract = _seed_extract(tmp_path)
+    registry = {
+        "headers_footers": {
+            "headers": [{
+                "part_name": "word/header1.xml",
+                "rid": "rId10",
+                "xml": (
+                    '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    "<w:tbl><w:tblPr><w:tblStyle w:val='ArchitectTable'/></w:tblPr>"
+                    "<w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>"
+                    "<w:p><w:pPr><w:pStyle w:val='ArchitectHeader'/></w:pPr>"
+                    '<w:r><w:rPr><w:rStyle w:val = "ArchitectHeaderChar"/></w:rPr>'
+                    "<w:t>Header</w:t></w:r></w:p>"
+                    "<w:p><w:pPr><w:pStyle w:val=''/></w:pPr></w:p></w:hdr>"
+                ),
+            }],
+        },
+        "page_layout": {"default_section": {"header_refs": {"default": "rId10"}}},
+    }
+
+    result = import_headers_footers(extract, registry, [])
+    assert result.style_ids == {"ArchitectTable", "ArchitectHeader", "ArchitectHeaderChar"}
+
+
+def test_import_ignores_reference_shaped_text_outside_markup(tmp_path):
+    # Comments, CDATA and processing instructions hold text. Collecting the
+    # Ghost lookalikes would make import demand styles the architect lacks.
+    extract = _seed_extract(tmp_path)
+    registry = {
+        "headers_footers": {
+            "headers": [{
+                "part_name": "word/header1.xml",
+                "rid": "rId10",
+                "xml": (
+                    '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    "<!-- <w:pStyle w:val='Ghost'/> --><?pi <w:rStyle w:val='Ghost'/> ?>"
+                    "<w:p><w:pPr><w:pStyle w:val='ArchitectHeader'/></w:pPr>"
+                    "<w:r><w:t><![CDATA[<w:pStyle w:val='Ghost'/>]]></w:t></w:r></w:p>"
+                    "</w:hdr>"
+                ),
+            }],
+        },
+        "page_layout": {"default_section": {"header_refs": {"default": "rId10"}}},
+    }
+
+    result = import_headers_footers(extract, registry, [])
+    assert result.style_ids == {"ArchitectHeader"}
+
+
 def test_token_patching_covers_headers_and_footers(tmp_path):
     word_dir = tmp_path / "word"
     word_dir.mkdir(parents=True)

@@ -613,6 +613,17 @@ formatting, detach Format-only body styles from architect numbering, namespace
 every target-ID collision deterministically, and rewrite dependency references.
 Return the source-to-final style-ID map to every body/header/footer consumer.
 
+Style references (`pStyle`/`rStyle`/`tblStyle` in content, `basedOn`/`link`/
+`next` in a style) are read by `referenced_style_ids` and rewritten by
+`remap_style_references`, one grammar that accepts either quoting and spaces
+around `=` and never matches inside a comment, CDATA section or processing
+instruction. The dependency closure and the header/footer importer decide what
+is cloned with the reader; the clone and header/footer remaps use the writer.
+A reference one side misses keeps its architect ID: it resolves silently to
+the target's same-named style, or fails publication if there is none. Values
+stay raw attribute text, and a remapped reference is written back as
+`w:val="..."`, the form the engine's other regex readers match.
+
 ### Target shell, packaging, and invariants
 
 - `arch_env_applier.py` applies document defaults, theme/settings,
@@ -1218,6 +1229,8 @@ Before considering a formatter change complete:
   `apply_pstyle_to_paragraph_block`, which escapes its argument.
 - Replacing a target style merely because an architect style uses the same ID.
 - Inspecting only a direct style's `pPr` and ignoring its `basedOn` chain.
+- Collecting or remapping style references with a regex of one's own instead
+  of `referenced_style_ids` / `remap_style_references`.
 - Describing the two registries as the complete handoff.
 - Calling normalized registry fragments "raw" or "complete VM state."
 - Filling missing classifications from adjacent paragraphs.

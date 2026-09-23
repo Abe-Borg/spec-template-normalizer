@@ -5,9 +5,26 @@ from pathlib import Path
 from spec_formatter.style_application.batch_runner import (
     _build_and_patch_output,
     _patch_header_footer_tokens_if_imported,
+    _remap_imported_header_footer_style_ids,
     process_single_file,
 )
 from spec_formatter.style_application.core.csi_to_canadian import CSI_TO_CANADIAN
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+# Where each header/footer style reference lives.
+_REFERENCE_CONTEXTS = {
+    "pStyle": ("<w:p><w:pPr>", "</w:pPr></w:p>"),
+    "rStyle": ("<w:p><w:r><w:rPr>", "</w:rPr><w:t>x</w:t></w:r></w:p>"),
+    "tblStyle": ("<w:tbl><w:tblPr>", "</w:tblPr></w:tbl>"),
+}
+
+
+def _write_header(tmp_path, body):
+    part = tmp_path / "word" / "header1.xml"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_text(f'<w:hdr xmlns:w="{W_NS}">{body}</w:hdr>', encoding="utf-8")
+    return part
 
 
 def test_new_role_specs_parameter_does_not_break_existing_positional_callers():
@@ -202,3 +219,105 @@ def test_runner_wrapper_fails_closed_when_target_cannot_fill_an_imported_slot(tm
     assert footer.read_bytes() == original
     assert not any("preserved target tokens unchanged" in line for line in log)
 
+
+def test_imported_header_double_quoted_references_are_remapped_as_before(tmp_path):
+    # The form Word writes. A reference in tracked history names an
+    # architect style too, so it is pointed at the same clone.
+    body = (
+        '<w:p><w:pPr><w:pStyle w:val="Header"/>'
+        '<w:pPrChange w:id="1" w:author="A"><w:pPr><w:pStyle w:val="Header"/>'
+        '</w:pPr></w:pPrChange></w:pPr>'
+        '<w:r><w:rPr><w:rStyle w:val="HeaderChar"/></w:rPr><w:t>Header</w:t></w:r></w:p>'
+        '<w:p><w:pPr><w:pStyle w:val="Unmapped"/></w:pPr></w:p>'
+    )
+    part = _write_header(tmp_path, body)
+    log = []
+
+    _remap_imported_header_footer_style_ids(
+        tmp_path,
+        ["word/header1.xml"],
+        {"Header": "SF_header", "HeaderChar": "SF_header_char", "Normal": "Normal"},
+        log,
+    )
+
+    assert part.read_text(encoding="utf-8") == (
+        f'<w:hdr xmlns:w="{W_NS}">'
+        '<w:p><w:pPr><w:pStyle w:val="SF_header"/>'
+        '<w:pPrChange w:id="1" w:author="A"><w:pPr><w:pStyle w:val="SF_header"/>'
+        '</w:pPr></w:pPrChange></w:pPr>'
+        '<w:r><w:rPr><w:rStyle w:val="SF_header_char"/></w:rPr><w:t>Header</w:t></w:r></w:p>'
+        '<w:p><w:pPr><w:pStyle w:val="Unmapped"/></w:pPr></w:p>'
+        "</w:hdr>"
+    )
+    assert log == ["Remapped collision-safe style IDs in 1 imported header/footer parts"]
+
+
+@pytest.mark.parametrize("tag", sorted(_REFERENCE_CONTEXTS))
+@pytest.mark.parametrize(
+    "reference",
+    ["w:val='Header'", 'w:val = "Header"', "w:val = 'Header'"],
+    ids=["single_quoted", "spaced_equals", "single_quoted_spaced"],
+)
+def test_imported_header_reference_reaches_its_clone_whatever_its_quoting(
+    tmp_path, tag, reference
+):
+    # Legal XML that Word never writes. It used to be skipped, so the header
+    # kept resolving to the target's own Header rather than the clone.
+    opening, closing = _REFERENCE_CONTEXTS[tag]
+    part = _write_header(tmp_path, f"{opening}<w:{tag} {reference}/>{closing}")
+    log = []
+
+    _remap_imported_header_footer_style_ids(
+        tmp_path, ["word/header1.xml"], {"Header": "SF_header"}, log
+    )
+
+    # Written back in the double-quoted form every later reader matches.
+    assert part.read_text(encoding="utf-8") == (
+        f'<w:hdr xmlns:w="{W_NS}">{opening}<w:{tag} w:val="SF_header"/>{closing}</w:hdr>'
+    )
+    assert log == ["Remapped collision-safe style IDs in 1 imported header/footer parts"]
+
+
+def test_imported_header_references_with_nothing_to_remap_are_left_as_written(tmp_path):
+    # Empty, unmapped, and identity references keep their own form; none of
+    # them stops the single-quoted reference after them from being remapped.
+    kept = (
+        "<w:p><w:pPr><w:pStyle w:val=''/></w:pPr></w:p>"
+        '<w:p><w:pPr><w:pStyle w:val=""/></w:pPr></w:p>'
+        "<w:p><w:pPr><w:pStyle w:val = 'TargetOwned' /></w:pPr></w:p>"
+        "<w:p><w:pPr><w:pStyle w:val='Normal'/></w:pPr></w:p>"
+    )
+    part = _write_header(tmp_path, kept + "<w:p><w:pPr><w:pStyle w:val='Header'/></w:pPr></w:p>")
+
+    _remap_imported_header_footer_style_ids(
+        tmp_path,
+        ["word/header1.xml"],
+        {"": "SF_nothing", "Header": "SF_header", "Normal": "Normal"},
+        [],
+    )
+
+    assert part.read_text(encoding="utf-8") == (
+        f'<w:hdr xmlns:w="{W_NS}">{kept}'
+        '<w:p><w:pPr><w:pStyle w:val="SF_header"/></w:pPr></w:p></w:hdr>'
+    )
+
+
+def test_imported_header_text_shaped_like_a_reference_is_left_alone(tmp_path):
+    # CDATA is visible header text, and a comment or processing instruction
+    # is no markup at all: rewriting any of them would change the document,
+    # not point a reference at a clone.
+    kept = (
+        "<!-- <w:pStyle w:val='Header'/> -->"
+        '<?pi <w:rStyle w:val="Header"/> ?>'
+        "<w:p><w:r><w:t><![CDATA[<w:pStyle w:val='Header'/>]]></w:t></w:r></w:p>"
+    )
+    part = _write_header(tmp_path, kept + "<w:p><w:pPr><w:pStyle w:val='Header'/></w:pPr></w:p>")
+
+    _remap_imported_header_footer_style_ids(
+        tmp_path, ["word/header1.xml"], {"Header": "SF_header"}, []
+    )
+
+    assert part.read_text(encoding="utf-8") == (
+        f'<w:hdr xmlns:w="{W_NS}">{kept}'
+        '<w:p><w:pPr><w:pStyle w:val="SF_header"/></w:pPr></w:p></w:hdr>'
+    )

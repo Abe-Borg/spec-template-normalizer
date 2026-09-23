@@ -11,6 +11,8 @@ import zipfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+import pytest
+
 from spec_formatter.style_application.batch_runner import load_and_validate_shared_config, process_single_file
 from spec_formatter.style_application.phase2_invariants import validate_docx_package
 
@@ -512,3 +514,130 @@ def test_generated_phase1_bundle_round_trips_through_phase2_without_api(tmp_path
             ("header", "even"): "header3.xml",
             ("footer", "default"): "footer1.xml",
         }
+
+
+def _replace_docx_parts(path: Path, replacements: dict[str, bytes | str]) -> None:
+    with zipfile.ZipFile(path) as package:
+        parts: dict[str, bytes | str] = {name: package.read(name) for name in package.namelist()}
+    parts.update(replacements)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        for name, payload in parts.items():
+            package.writestr(name, payload)
+
+
+@pytest.mark.parametrize(
+    "target_has_same_named_styles",
+    [True, False],
+    ids=["target_has_the_names", "target_lacks_the_names"],
+)
+def test_single_quoted_architect_style_references_reach_their_clones(
+    tmp_path: Path, target_has_same_named_styles: bool
+) -> None:
+    """Word writes ``w:val="..."``, but single quotes are legal XML, and
+    Phase 1 keeps both the header part and the stylesheet as written. A
+    single-quoted reference used to be missed where styles are collected and
+    where references are remapped, so it kept its architect ID. Where the
+    target had a style of that name, the header silently took the target's
+    formatting and every check passed. Where it had none, a valid template
+    failed publication with an unresolved style reference."""
+    architect = tmp_path / "architect.docx"
+    target = tmp_path / "target.docx"
+    _write_docx(architect, architect=True)
+    _write_docx(target, architect=False)
+    _replace_docx_parts(
+        architect,
+        {
+            "word/styles.xml": _styles_xml(target=False).replace(
+                "</w:styles>",
+                '<w:style w:type="paragraph" w:styleId="HeaderBase">'
+                '<w:name w:val="Header Base"/><w:pPr><w:jc w:val="center"/></w:pPr></w:style>'
+                '<w:style w:type="paragraph" w:styleId="Header">'
+                "<w:name w:val=\"header\"/><w:basedOn w:val='HeaderBase'/></w:style>"
+                '<w:style w:type="character" w:styleId="HeaderEmphasis">'
+                '<w:name w:val="Header Emphasis"/><w:rPr><w:b/></w:rPr></w:style>'
+                "</w:styles>",
+            ),
+            "word/header2.xml": (
+                f'<w:hdr xmlns:w="{W_NS}"><w:p>'
+                "<w:pPr><w:pStyle w:val='Header'/></w:pPr>"
+                "<w:r><w:rPr><w:rStyle w:val = 'HeaderEmphasis'/></w:rPr>"
+                "<w:t>First header</w:t></w:r></w:p></w:hdr>"
+            ),
+        },
+    )
+    if target_has_same_named_styles:
+        _replace_docx_parts(
+            target,
+            {
+                "word/styles.xml": _styles_xml(target=True).replace(
+                    "</w:styles>",
+                    '<w:style w:type="paragraph" w:styleId="HeaderBase">'
+                    '<w:name w:val="Header Base"/><w:pPr><w:jc w:val="right"/></w:pPr></w:style>'
+                    '<w:style w:type="paragraph" w:styleId="Header">'
+                    '<w:name w:val="header"/><w:basedOn w:val="HeaderBase"/></w:style>'
+                    '<w:style w:type="character" w:styleId="HeaderEmphasis">'
+                    '<w:name w:val="Header Emphasis"/><w:rPr><w:i/></w:rPr></w:style>'
+                    "</w:styles>",
+                ),
+            },
+        )
+
+    bundle = _run_phase1(architect, tmp_path / "phase1-output")
+    registry = json.loads((bundle / "arch_template_registry.json").read_text(encoding="utf-8"))
+    captured_header = next(
+        item for item in registry["headers_footers"]["headers"]
+        if item["part_name"] == "word/header2.xml"
+    )
+    # Neither capture re-serializes, so the single-quoted form reaches Phase 2.
+    assert "<w:pStyle w:val='Header'/>" in captured_header["xml"]
+    portable_styles = (bundle / "portable_styles.xml").read_text(encoding="utf-8")
+    assert "<w:basedOn w:val='HeaderBase'/>" in portable_styles
+
+    shared = load_and_validate_shared_config(bundle)
+    result = process_single_file(
+        docx_path=target,
+        arch_registry=shared.arch_registry,
+        env_registry=shared.env_registry,
+        arch_styles_xml=shared.arch_styles_xml,
+        available_roles=shared.available_roles,
+        api_key="",
+        output_dir=tmp_path / "phase2-output",
+        source_tokens=shared.source_tokens,
+        arch_root=shared.arch_root,
+        role_specs=shared.role_specs,
+    )
+    assert result.success, "\n".join(result.log)
+    assert result.output_path is not None
+    validate_docx_package(result.output_path)
+    with zipfile.ZipFile(result.output_path) as package:
+        header = ET.fromstring(package.read("word/header2.xml"))
+        styles = ET.fromstring(package.read("word/styles.xml"))
+
+    by_id = {
+        style.attrib[f"{{{W_NS}}}styleId"]: style
+        for style in styles.findall(f"{{{W_NS}}}style")
+    }
+
+    def clone_of(source_id: str) -> str:
+        clones = [
+            style_id for style_id in by_id
+            if re.fullmatch(rf"SF_[0-9a-f]{{8}}_SHELL_{source_id}_[0-9a-f]{{8}}", style_id)
+        ]
+        assert len(clones) == 1, f"expected one clone of {source_id}, found {clones}"
+        return clones[0]
+
+    def val(parent: ET.Element, path: str) -> str | None:
+        node = parent.find(path)
+        return None if node is None else node.attrib.get(f"{{{W_NS}}}val")
+
+    assert val(header, f".//{{{W_NS}}}pStyle") == clone_of("Header")
+    assert val(header, f".//{{{W_NS}}}rStyle") == clone_of("HeaderEmphasis")
+    assert val(by_id[clone_of("Header")], f"{{{W_NS}}}basedOn") == clone_of("HeaderBase")
+    assert val(by_id[clone_of("HeaderBase")], f"{{{W_NS}}}pPr/{{{W_NS}}}jc") == "center"
+    if target_has_same_named_styles:
+        # The target's own same-named styles are still there, unchanged.
+        assert val(by_id["Header"], f"{{{W_NS}}}basedOn") == "HeaderBase"
+        assert val(by_id["HeaderBase"], f"{{{W_NS}}}pPr/{{{W_NS}}}jc") == "right"
+        assert by_id["HeaderEmphasis"].find(f"{{{W_NS}}}rPr/{{{W_NS}}}i") is not None
+    else:
+        assert not {"Header", "HeaderBase", "HeaderEmphasis"} & set(by_id)

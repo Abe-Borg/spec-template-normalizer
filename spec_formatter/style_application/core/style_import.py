@@ -11,7 +11,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Set, Optional
+from typing import Dict, Iterator, List, Set, Optional, Tuple
 
 from .ooxml_text import read_xml_text, write_xml_text
 from .xml_helpers import edit_preserving_out_of_scope_subtrees
@@ -57,29 +57,147 @@ def _namespaced_style_id(
     return f"SF_{graph_hash}_{safe_variant}_{safe}_{style_hash}"
 
 
+# Elements whose ``w:val`` names a style: content refers to one from a
+# paragraph, run, or table, and a style definition refers to another style.
+CONTENT_STYLE_REFERENCES = ("pStyle", "rStyle", "tblStyle")
+STYLE_DEFINITION_REFERENCES = ("basedOn", "link", "next")
+
+# One attribute in either quoting, with optional whitespace around "=". Each
+# value is matched whole, so a quote, a ">" or a w:val lookalike inside some
+# other attribute's value is never taken for the end of a tag or a reference.
+_ATTRIBUTE = r"""\s+[^\s=/>"']+\s*=\s*(?:"[^"]*"|'[^']*')"""
+_ATTRIBUTE_OTHER_THAN_VAL = r"""\s+(?!w:val\s*=)[^\s=/>"']+\s*=\s*(?:"[^"]*"|'[^']*')"""
+
+# Comments, CDATA sections and processing instructions hold text, not markup,
+# the same three regions ``iter_element_xml_blocks`` steps over. They are
+# matched only so that a reference-shaped string inside one is skipped whole.
+# An unterminated one runs to the end, so nothing after its start counts.
+_NON_MARKUP = r"<!--.*?(?:-->|\Z)|<!\[CDATA\[.*?(?:\]\]>|\Z)|<\?.*?(?:\?>|\Z)"
+
+
+@functools.lru_cache(maxsize=8)
+def _style_reference_re(elements: Tuple[str, ...]) -> "re.Pattern[str]":
+    """A non-markup region, or the opening tag of one of ``elements``
+    with its ``w:val`` captured."""
+
+    names = "|".join(re.escape(name) for name in elements)
+    return re.compile(
+        rf"(?P<skip>{_NON_MARKUP})"
+        rf"|<w:(?:{names})(?=[\s/>])(?:{_ATTRIBUTE_OTHER_THAN_VAL})*"
+        r"""\s+(?P<val>w:val\s*=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)'))"""
+        rf"(?:{_ATTRIBUTE})*\s*/?>",
+        re.S,
+    )
+
+
+def _iter_style_references(
+    xml_text: str,
+    elements: Tuple[str, ...],
+) -> Iterator[Tuple[int, int, str]]:
+    """Yield ``(start, end, value)`` for each reference in ``elements``.
+
+    ``start`` and ``end`` span the ``w:val`` attribute from its name to its
+    closing quote; ``value`` is the raw attribute text between the quotes.
+    Text inside a comment, CDATA section or processing instruction is never
+    a reference, even when it is shaped like one.
+    """
+
+    for match in _style_reference_re(tuple(elements)).finditer(xml_text):
+        if match.group("skip") is not None:
+            continue
+        value = match.group("double")
+        if value is None:
+            value = match.group("single")
+        yield match.start("val"), match.end("val"), value
+
+
+def referenced_style_ids(xml_text: str, elements: Tuple[str, ...]) -> List[str]:
+    """Every style ID named by a reference in ``elements``, in document order.
+
+    This is the reader paired with :func:`remap_style_references`. Whatever
+    decides which architect styles are imported must see exactly the
+    references that are later pointed at the clones. One it misses gets no
+    clone and keeps its architect ID, which then resolves silently to the
+    target's own style of that name, or fails publication if there is none.
+    An empty ``w:val`` names no style and is skipped.
+    """
+
+    return [value for _start, _end, value in _iter_style_references(xml_text, elements) if value]
+
+
+def remap_style_references(
+    xml_text: str,
+    elements: Tuple[str, ...],
+    style_id_map: Dict[str, str],
+) -> str:
+    """Point each style reference in ``elements`` at its mapped style ID.
+
+    A reference is found whatever its quoting and whatever whitespace
+    surrounds its ``=``. Its value is looked up as raw attribute text, the
+    domain in which the map's keys were collected and matched against the
+    architect's ``w:styleId`` attributes. Nothing is decoded, so a
+    double-quoted reference maps exactly as it always has.
+
+    A remapped reference is written back as ``w:val="..."``, the form Word
+    writes, because the engine's regex readers match only that form. A
+    clone's ``basedOn`` left as ``w:val='...'``, for one, would be invisible
+    to every ``basedOn`` walk over the target's styles after import. A
+    reference that is empty, has no mapping, or maps to itself is left
+    exactly as written. Edits are spliced by position, so a style ID is
+    never read as a regex replacement template.
+    """
+
+    pieces: List[str] = []
+    cursor = 0
+    for start, end, value in _iter_style_references(xml_text, elements):
+        if not value:
+            continue
+        destination = style_id_map.get(value, value)
+        if destination == value:
+            continue
+        if (
+            not isinstance(destination, str)
+            or not destination
+            or '"' in destination
+            or "<" in destination
+        ):
+            raise ValueError(
+                f"Cannot point style reference {value!r} at {destination!r}: "
+                "a destination must be a non-empty style ID that can stand "
+                "between double quotes"
+            )
+        pieces.append(xml_text[cursor:start])
+        pieces.append(f'w:val="{destination}"')
+        cursor = end
+    if not pieces:
+        return xml_text
+    pieces.append(xml_text[cursor:])
+    return "".join(pieces)
+
+
 def _rewrite_style_id_and_references(
     style_block: str,
     source_style_id: str,
     destination_style_id: str,
     style_id_map: Dict[str, str],
 ) -> str:
-    out = re.sub(
-        rf'(w:styleId="){re.escape(source_style_id)}(")',
-        rf"\g<1>{destination_style_id}\2",
-        style_block,
-        count=1,
-    )
-    for tag in ("basedOn", "link", "next"):
-        out = re.sub(
-            rf'(<w:{tag}\b[^>]*w:val=")([^"]+)(")',
-            lambda match: (
-                match.group(1)
-                + style_id_map.get(match.group(2), match.group(2))
-                + match.group(3)
-            ),
-            out,
+    """Give a cloned style block its new ID and point its references at clones.
+
+    ``basedOn``, ``link`` and ``next`` go through ``remap_style_references``,
+    the rewriter paired with the reader that built the dependency closure, so
+    a single-quoted reference is remapped like a double-quoted one. The
+    block's own ``w:styleId`` is matched only in its double-quoted form, the
+    one ``extract_style_block_raw`` found the block by.
+    """
+
+    own_id = re.search(rf'w:styleId="{re.escape(source_style_id)}"', style_block)
+    if own_id is not None:
+        style_block = (
+            style_block[:own_id.start()]
+            + f'w:styleId="{destination_style_id}"'
+            + style_block[own_id.end():]
         )
-    return out
+    return remap_style_references(style_block, STYLE_DEFINITION_REFERENCES, style_id_map)
 
 
 def _make_format_only_body_style_self_contained(style_block: str) -> str:
@@ -522,6 +640,9 @@ def materialize_arch_style_block(style_block: str, style_id: str, arch_styles_xm
 def _collect_style_deps_from_arch(arch_styles_text: str, style_id: str, seen: Set[str]) -> None:
     """
     Recursively collect styleId dependencies via basedOn, link, and next references.
+
+    References are read with ``referenced_style_ids``, the grammar the clones
+    are later rewritten with, so a reference in either quoting is followed.
     """
     if style_id in seen:
         return
@@ -531,12 +652,9 @@ def _collect_style_deps_from_arch(arch_styles_text: str, style_id: str, seen: Se
     if not blk:
         return
 
-    for tag in ('basedOn', 'link', 'next'):
-        m = re.search(rf'<w:{tag}\b[^>]*w:val="([^"]+)"', blk)
-        if m:
-            ref = m.group(1)
-            if ref and ref not in seen:
-                _collect_style_deps_from_arch(arch_styles_text, ref, seen)
+    for ref in referenced_style_ids(blk, STYLE_DEFINITION_REFERENCES):
+        if ref not in seen:
+            _collect_style_deps_from_arch(arch_styles_text, ref, seen)
 
 
 def collect_style_dependency_closure(

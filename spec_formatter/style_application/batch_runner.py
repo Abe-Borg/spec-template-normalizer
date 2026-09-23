@@ -46,7 +46,11 @@ from .core.registry import (
     validate_phase1_bundle_directory,
 )
 from .core.stability import snapshot_stability, verify_stability
-from .core.style_import import import_arch_styles_into_target
+from .core.style_import import (
+    CONTENT_STYLE_REFERENCES,
+    import_arch_styles_into_target,
+    remap_style_references,
+)
 from .docx_decomposer import DocxDecomposer
 from .docx_patch import patch_docx
 from .header_footer_importer import (
@@ -451,7 +455,13 @@ def _remap_imported_header_footer_style_ids(
     style_id_map: Dict[str, str],
     log: List[str],
 ) -> None:
-    """Point imported header/footer content at collision-safe style clones."""
+    """Point imported header/footer content at collision-safe style clones.
+
+    References are rewritten by ``remap_style_references`` with the same
+    grammar the header/footer importer collected them with, so a
+    single-quoted ``w:val`` is pointed at its clone like a double-quoted one
+    instead of keeping its architect ID.
+    """
 
     replacements = {
         source: destination
@@ -466,15 +476,7 @@ def _remap_imported_header_footer_style_ids(
         if not path.is_file() or path.suffix.lower() != ".xml":
             continue
         original = read_xml_text(path)
-        updated = re.sub(
-            r'(<w:(?:pStyle|rStyle|tblStyle)\b[^>]*w:val=")([^"]+)(")',
-            lambda match: (
-                match.group(1)
-                + replacements.get(match.group(2), match.group(2))
-                + match.group(3)
-            ),
-            original,
-        )
+        updated = remap_style_references(original, CONTENT_STYLE_REFERENCES, replacements)
         if updated != original:
             write_xml_text(path, updated)
             changed_parts += 1
