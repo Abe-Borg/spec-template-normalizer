@@ -22,7 +22,10 @@ from spec_formatter.style_application.core.xml_helpers import (
     ensure_root_declarations,
     prefixes_used,
     root_ignorable_prefixes,
+    root_namespace_additions,
     root_namespace_declarations,
+    root_opening_tag,
+    xml_unescape,
 )
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -254,3 +257,29 @@ def test_a_prefix_the_source_root_does_not_declare_is_refused():
 
     assert raised.value.prefix == "w14"
     assert raised.value.reason == "undeclared"
+
+
+# ── small readers ──────────────────────────────────────────────────────────
+
+
+def test_root_opening_tag_is_returned_exactly_as_written():
+    xml = f"<?xml version='1.0'?>\n<w:styles xmlns:w='{W_NS}' a=\"x > y\"><w:style/></w:styles>"
+
+    assert root_opening_tag(xml) == f"<w:styles xmlns:w='{W_NS}' a=\"x > y\">"
+
+
+def test_additions_report_new_declarations_and_ignorable_tokens_only():
+    before = f'<w:styles xmlns:w="{W_NS}" xmlns:mc="{MCE_NS}" mc:Ignorable="w15"/>'
+    after = ensure_root_declarations(
+        before, {"w14": W14_NS, "w15": W15_NS}, ignorable={"w14", "w15"}
+    )
+
+    assert root_namespace_additions(before, after) == ("w14", "w15", "mc:Ignorable=w14")
+    assert root_namespace_additions(after, after) == ()
+
+
+def test_xml_unescape_expands_xml_references_and_nothing_else():
+    assert xml_unescape("&lt;&gt;&amp;&quot;&apos;&#65;&#x42;") == "<>&\"'AB"
+    # HTML entities are not XML; they are left exactly as written.
+    assert xml_unescape("&nbsp;&copy;") == "&nbsp;&copy;"
+

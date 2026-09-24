@@ -95,15 +95,21 @@ ARCHITECT_DOCDEFAULT_LIGATURES = (
 
 def test_format_only_body_root_carries_docdefault_ligatures_and_declares_w14(tmp_path):
     styles_path = _target(tmp_path, BARE_TARGET_STYLES)
+    log: list = []
 
     result = import_arch_styles_into_target(
         tmp_path,
         ARCHITECT_DOCDEFAULT_LIGATURES,
         ["Role"],
-        [],
+        log,
         format_only_body_style_ids={"Role"},
     )
 
+    assert result.declared_namespace_prefixes == ("w14",)
+    assert (
+        "Added XML namespace declarations to the target styles.xml root "
+        "for imported architect styles: w14"
+    ) in log
     out = styles_path.read_text(encoding="utf-8")
     block = extract_style_block_raw(out, result.body_style_id_map["Role"])
     assert block is not None
@@ -190,10 +196,13 @@ def test_imports_that_use_no_new_prefix_leave_the_target_root_alone(tmp_path):
         "</w:styles>"
     )
 
-    import_arch_styles_into_target(tmp_path, architect, ["Role"], [])
+    log: list = []
+    result = import_arch_styles_into_target(tmp_path, architect, ["Role"], log)
 
     out = styles_path.read_text(encoding="utf-8")
     assert _root_tag(out) == f'<w:styles xmlns:w="{W_NS}">'
+    assert result.declared_namespace_prefixes == ()
+    assert not any("XML namespace" in line for line in log)
 
 
 # ── (c) a conflicting binding fails closed ─────────────────────────────────
@@ -253,10 +262,11 @@ IGNORABLE_ARCHITECT = ARCHITECT_DOCDEFAULT_LIGATURES.replace(
 def test_ignorable_w14_gains_mc_declaration_and_token_in_the_target(tmp_path):
     styles_path = _target(tmp_path, BARE_TARGET_STYLES)
 
-    import_arch_styles_into_target(
+    result = import_arch_styles_into_target(
         tmp_path, IGNORABLE_ARCHITECT, ["Role"], [], format_only_body_style_ids={"Role"}
     )
 
+    assert result.declared_namespace_prefixes == ("mc", "w14", "mc:Ignorable=w14")
     root_tag = _root_tag(styles_path.read_text(encoding="utf-8"))
     assert f'xmlns:w14="{W14_NS}"' in root_tag
     assert f'xmlns:mc="{MC_NS}"' in root_tag
@@ -381,13 +391,18 @@ def test_apply_doc_defaults_declares_what_the_architect_defaults_use():
     from spec_formatter.style_application.arch_env_applier import apply_doc_defaults
     from spec_formatter.style_application.core.xml_helpers import RootNamespaces
 
+    log: list = []
     out = apply_doc_defaults(
         TARGET_WITH_DEFAULTS,
         _registry_defaults(f'<w:rPr><w:rFonts w:ascii="Aptos"/>{LIGATURES}</w:rPr>'),
-        [],
+        log,
         architect_namespaces=RootNamespaces.of(IGNORABLE_ARCHITECT),
     )
 
+    assert (
+        "Added XML namespace declarations to the target styles.xml root "
+        "for the architect docDefaults: mc, w14, mc:Ignorable=w14"
+    ) in log
     root_tag = _root_tag(out)
     assert f'xmlns:w14="{W14_NS}"' in root_tag
     assert 'mc:Ignorable="w14"' in root_tag

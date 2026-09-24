@@ -781,6 +781,20 @@ def test_format_only_carries_extension_namespace_styles_into_a_bare_target_style
         output_document = package.read("word/document.xml")
 
     root = _assert_declares_ignorable_w14(output_styles)
+    # The defaults arrive first and declare w14; the imported styles then find
+    # it declared. Both steps say what they did, in the log and as counts.
+    run_log = (run.run_dir / "run.log").read_text(encoding="utf-8")
+    assert (
+        "Added XML namespace declarations to the target styles.xml root "
+        "for the architect docDefaults: mc, w14, mc:Ignorable=w14"
+    ) in run_log
+    events = {
+        event["event"]: event["fields"]
+        for event in map(json.loads, run.diagnostics_path.read_text(encoding="utf-8").splitlines())
+        if event.get("event") in {"apply_environment", "style_import"}
+    }
+    assert events["apply_environment"]["styles_namespace_additions"] == 3
+    assert events["style_import"]["styles_namespace_additions"] == 0
     body_clones = [
         style
         for style in root.findall(f"{{{W_NS}}}style")

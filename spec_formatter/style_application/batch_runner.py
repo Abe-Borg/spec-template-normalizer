@@ -51,6 +51,7 @@ from .core.style_import import (
     import_arch_styles_into_target,
     remap_style_references,
 )
+from .core.xml_helpers import RootNamespaces
 from .docx_decomposer import DocxDecomposer
 from .docx_patch import patch_docx
 from .header_footer_importer import (
@@ -863,6 +864,15 @@ def _apply_classified_target_impl(
         checkpoint.conversion_report = conversion_report
 
     checkpoint.stage = "environment_application"
+    # What each prefix in an architect fragment means, read once from the
+    # portable stylesheet's root and shared by docDefaults application and
+    # style import, the two steps that write architect fragments into the
+    # target's styles part.
+    architect_namespaces: Optional[RootNamespaces] = (
+        RootNamespaces.of(arch_styles_xml)
+        if policy.apply_full_architect_shell or policy.applies_role_styles
+        else None
+    )
     if policy.apply_full_architect_shell:
         with diag.timed(diag_events, "target", "apply_environment") as phase:
             env_result = apply_environment_to_target(
@@ -870,11 +880,16 @@ def _apply_classified_target_impl(
                 registry=env_registry,
                 log=log,
                 registry_dir=arch_root,
+                architect_namespaces=architect_namespaces,
             )
             _hf_import = env_result.get("header_footer_import", {}) if isinstance(env_result, dict) else {}
+            _ns_additions = (
+                env_result.get("styles_namespace_additions", ()) if isinstance(env_result, dict) else ()
+            )
             phase.set(
                 header_footer_parts=len(_hf_import.get("part_names", set()) or set()),
                 header_footer_media=len(_hf_import.get("media_names", set()) or set()),
+                styles_namespace_additions=len(_ns_additions or ()),
             )
         log.append("Applied environment")
         checkpoint.stage = "header_footer_token_patch"
@@ -969,6 +984,7 @@ def _apply_classified_target_impl(
                 format_only_body_style_ids=(body_style_ids if policy.preserve_target_numbering else None),
                 shell_style_ids=hf_style_ids,
                 namespace_seed=hashlib.sha256(arch_styles_xml.encode("utf-8")).hexdigest(),
+                architect_namespaces=architect_namespaces,
             )
             phase.set(
                 requested_styles=len(needed_style_ids),
@@ -976,6 +992,9 @@ def _apply_classified_target_impl(
                 header_footer_style_ids=len(hf_style_ids),
                 namespaced_collisions=sum(
                     1 for src, dst in style_result.style_id_map.items() if src != dst
+                ),
+                styles_namespace_additions=len(
+                    getattr(style_result, "declared_namespace_prefixes", ()) or ()
                 ),
             )
             applied_arch_registry = {

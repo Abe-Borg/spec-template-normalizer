@@ -243,6 +243,59 @@ def test_cancelling_numbering_inherited_through_basedOn_fails(based_on: str) -> 
     assert raised.value.code == "geometry_not_preserved"
 
 
+# --- Indent attributes in either quoting ----------------------------------
+#
+# Style import carries an architect style's property children as the source
+# wrote them, so an imported clone's w:ind keeps its quoting. Reading only the
+# double-quoted form took a single-quoted indent for no indent at all, which
+# refused a paragraph that had not moved and passed one that had.
+
+_IND_FORMS = pytest.mark.parametrize(
+    "ind",
+    ['<w:ind w:left="720"/>', "<w:ind w:left='720'/>", "<w:ind w:left = '720' />"],
+    ids=["double_quoted", "single_quoted", "spaced"],
+)
+
+
+def _clone(ind: str) -> str:
+    return (
+        '<w:style w:type="paragraph" w:styleId="Clone"><w:name w:val="Clone"/>'
+        f"<w:pPr>{ind}</w:pPr></w:style>"
+    )
+
+
+@_IND_FORMS
+def test_a_clone_indent_is_read_in_either_quoting(ind: str) -> None:
+    styles = _inheriting_styles('w:val="Parent"', '<w:ind w:left="720"/>', _clone(ind))
+
+    _verify_effective_paragraph_geometry(
+        _document(_CHILD),
+        _document(_para('<w:pStyle w:val="Clone"/>')),
+        styles,
+        styles,
+        "",
+        "",
+        applies_document_shell=True,
+    )
+
+
+@_IND_FORMS
+def test_an_indent_that_appears_in_either_quoting_is_seen(ind: str) -> None:
+    styles = _inheriting_styles('w:val="Parent"', '<w:spacing w:after="0"/>', _clone(ind))
+
+    with pytest.raises(EngineError) as raised:
+        _verify_effective_paragraph_geometry(
+            _document(_CHILD),
+            _document(_para('<w:pStyle w:val="Clone"/>')),
+            styles,
+            styles,
+            "",
+            "",
+            applies_document_shell=True,
+        )
+    assert raised.value.code == "geometry_not_preserved"
+
+
 # --- Paragraphs the engine never edited -----------------------------------
 #
 # A paragraph's own XML being untouched does not prove it still renders where
