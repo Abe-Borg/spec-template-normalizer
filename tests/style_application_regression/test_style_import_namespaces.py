@@ -8,9 +8,9 @@ must then hold:
 
 * materialization reads property children lexically, keyed by qualified
   name, and carries extension children after the ``w:`` children;
-* every part a fragment is written into declares the prefixes the fragment
-  uses, with the meaning they had in the architect (and the ``mc:Ignorable``
-  tokens the architect gave them);
+* the target stylesheet a fragment is written into declares the prefixes
+  the fragment uses, with the meaning they had in the architect's (and the
+  ``mc:Ignorable`` tokens the architect gave them);
 * a prefix the target already binds to a different namespace fails closed
   with ``style_import_namespace_conflict`` before anything is written.
 """

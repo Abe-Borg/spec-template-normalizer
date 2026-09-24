@@ -601,6 +601,13 @@ fails instead of publishing a header that still names the architect's section.
   `paragraph_style_not_applied` and its location, rather than being published
   on its old style.
 - Imported architect styles never replace an existing target style ID.
+- Imported architect styles and document defaults keep the Word extension
+  properties the template carries, such as the `w14:ligatures` that current
+  Word writes into every template. Each XML namespace prefix they use is
+  declared in the target's styles part with the meaning it had in the
+  template; a target that already uses that prefix for a different namespace
+  fails with `style_import_namespace_conflict` before its styles change,
+  rather than being published with markup that now means something else.
 - Format-only verifies unchanged body text and effective target numbering and
   preserves every pre-existing target numbering definition.
 - Every mode verifies that no paragraph's effective indentation moved. This

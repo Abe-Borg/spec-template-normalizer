@@ -790,7 +790,11 @@ def test_format_only_carries_extension_namespace_styles_into_a_bare_target_style
     ) in run_log
     events = {
         event["event"]: event["fields"]
-        for event in map(json.loads, run.diagnostics_path.read_text(encoding="utf-8").splitlines())
+        for event in (
+            json.loads(line)
+            for line in run.diagnostics_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
         if event.get("event") in {"apply_environment", "style_import"}
     }
     assert events["apply_environment"]["styles_namespace_additions"] == 3

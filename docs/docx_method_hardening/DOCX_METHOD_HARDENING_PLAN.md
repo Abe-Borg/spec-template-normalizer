@@ -431,13 +431,13 @@ passing.
 
 **Definition of done**
 
-- [ ] Both probes' `format_only` rows print OK; `probe_style_import_w14.py` exits 0.
-- [ ] Failing tests were added first and are now passing, including the end-to-end Format-only run.
-- [ ] Materialization keys by qualified name and carries extension children after `w:` children.
-- [ ] Target stylesheet roots gain the declarations (and `mc:Ignorable` tokens) the inserted fragments need; a prefix bound to a different URI fails closed with `style_import_namespace_conflict`.
-- [ ] `apply_doc_defaults` is covered by the same guarantee.
-- [ ] `CLAUDE.md` invariant 5, module notes, error-code list and README updated; `test_engine_errors.py` bound raised.
-- [ ] Full suite and corpus regression green on the PR.
+- [x] Both rows of `probe_style_import_w14.py` (`format_only` and `csi_to_canadian`) print OK, and the probe exits 0.
+- [x] Failing tests were added first and are now passing, including the end-to-end Format-only run.
+- [x] Materialization keys by qualified name and carries extension children after `w:` children.
+- [x] Target stylesheet roots gain the declarations (and `mc:Ignorable` tokens) the inserted fragments need; a prefix bound to a different URI fails closed with `style_import_namespace_conflict`.
+- [x] `apply_doc_defaults` is covered by the same guarantee.
+- [x] `CLAUDE.md` invariant 5, module notes, error-code list and README updated; `test_engine_errors.py` bound raised.
+- [x] Full suite and corpus regression green on the PR.
 
 ### WI-02: Exact run-content signature at the Format-only gate
 

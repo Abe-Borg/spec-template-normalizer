@@ -907,8 +907,8 @@ def test_format_only_body_clone_materializes_its_parent_in_either_quoting(tmp_pa
     assert block is not None
     assert "<w:basedOn" not in block
     assert '<w:ind w:left="720"' in block
-    # Materialized children are re-serialized by ElementTree as <w:i />.
-    assert re.search(r"<w:i\s*/>", block)
+    # Materialized children are carried exactly as the architect wrote them.
+    assert "<w:i/>" in block
 
 
 @pytest.mark.parametrize(
