@@ -131,6 +131,7 @@ def write_docx(path: Path, body: str) -> None:
 def main() -> int:
     workspace = Path(tempfile.mkdtemp(prefix="probe-format-only-gate-"))
     accepted = 0
+    control_accepted = False
     for index, (label, source_paragraph, mutated_paragraph, effect) in enumerate(CASES):
         source = workspace / f"source-{index}.docx"
         output = workspace / f"output-{index}.docx"
@@ -145,11 +146,18 @@ def main() -> int:
             verdict, note = "REJECTED", str(exc).splitlines()[0][:90]
         else:
             verdict, note = "ACCEPTED", effect
-            if not label.startswith("CONTROL"):
+            if label.startswith("CONTROL"):
+                # The gate has always caught a changed word. Accepting it
+                # means the gate regressed, which is a failure of its own,
+                # not a pass because the other rows happened to be rejected.
+                control_accepted = True
+            else:
                 accepted += 1
         print(f"{verdict:8}  {label:55}  {note}")
     print(f"\n{accepted} silent mutation(s) accepted by the Format-only gate.")
-    return 1 if accepted else 0
+    if control_accepted:
+        print("The control mutation was ACCEPTED: the gate no longer catches a changed word.")
+    return 1 if accepted or control_accepted else 0
 
 
 if __name__ == "__main__":

@@ -620,11 +620,13 @@ per-section and already handled.
    exact mistake the method documents record). Creating the minimal settings
    part when the target has none is already handled by `apply_settings`;
    reuse that path.
-3. Preflight: in `preflight_validate_registries` (`core/registry.py`),
-   when the shell applies and any mapped section references an `even`
-   header or footer, require the architect switch to be on; otherwise fail
-   with a new code `template_header_parity_conflict` (contract change: code
-   list, remediation, `test_engine_errors.py` bound).
+3. Do **not** add a preflight rejection for an architect whose sections
+   reference an `even` header or footer while its switch is off. That is a
+   valid and common state: Word keeps the even part dormant and renders the
+   default header on even pages, and step 2 reproduces exactly that in the
+   target by clearing the switch. The importer already wires the dormant
+   reference as it finds it; leave that alone. No new error code is needed
+   for this item.
 4. Invariant: in the header/footer section of `verify_phase2_invariants`,
    when architect header/footer data is present, require the output
    settings parity to equal the architect's; record `header_parity_checked`
@@ -634,13 +636,14 @@ per-section and already handled.
 even-header architect asserts `<w:evenAndOddHeaders/>` in the output
 settings; add the inverse (target has the switch, architect does not: it is
 removed); an architect-free mode leaves the target settings byte-identical;
-preflight rejects an architect mapping even references without the switch;
-a unit test for the schema-order insertion at each neighbour position
+an architect with a dormant even reference and the switch off imports the
+reference unchanged and leaves the target switch cleared; a unit test for
+the schema-order insertion at each neighbour position
 (before `w:bookFoldRevPrinting`, after `w:defaultTableStyle`, into an empty
 settings body).
 
 **Documentation.** `CLAUDE.md`: the shell description in invariant 2 and
-the `arch_env_applier.py` bullet; error-code list. README: Format-only and
+the `arch_env_applier.py` bullet. README: Format-only and
 Canadian mode sections mention that even/odd header parity follows the
 template.
 
@@ -648,10 +651,10 @@ template.
 
 - [ ] Parity derived from the registry's settings XML; set or cleared under the full shell only.
 - [ ] Insertion uses the complete `CT_Settings` order table, verified against the schema.
-- [ ] Preflight rejects inconsistent architects with `template_header_parity_conflict`.
+- [ ] A dormant even reference with the switch off is imported unchanged and the target switch is cleared; no preflight rejection was added.
 - [ ] Final gate verifies parity and records `header_parity_checked`.
 - [ ] Tests listed above added and passing; architect-free modes proven untouched.
-- [ ] `CLAUDE.md`, README, error-code list and `test_engine_errors.py` bound updated.
+- [ ] `CLAUDE.md` and README updated.
 - [ ] Full suite and corpus regression green on the PR.
 
 ### WI-05: Package-level change whitelist invariant
@@ -759,9 +762,16 @@ the document (revisions, bookmarks, comments), and a scan is one regex.
    every `w:id` attribute on annotation elements across `word/document.xml`
    and the header, footer, footnote, endnote and comment parts present in
    the extraction directory (bookmark and comment ranges included). Keep
-   allocation monotonic within one conversion. Assert in
-   `tests/test_conversion_verification.py` that every `w:id` in the output
-   is unique.
+   allocation monotonic within one conversion. Do **not** assert that every
+   `w:id` in the output is unique: valid OOXML repeats an id across paired
+   annotations (`w:bookmarkStart`/`w:bookmarkEnd`,
+   `w:commentRangeStart`/`w:commentRangeEnd`/`w:commentReference`), so that
+   assertion would reject ordinary documents. Assert instead, in
+   `tests/test_conversion_verification.py`, that every id the application
+   allocated is absent from the source's annotation ids, that the allocated
+   ids are distinct from each other, and that ids are unique among revision
+   elements (`w:ins`, `w:del`, `w:moveFrom`, `w:moveTo` and the
+   `w:*Change` family) in the output.
 
 **Tests.** Census happy paths per mode; a mutated output with one `w:del`
 removed fails; tracked reverse conversion reports the exact expected delta;
@@ -776,7 +786,7 @@ safety guarantees: revisions are counted and discarded ones are reported.
 
 - [ ] Revision census invariant with exact expected delta per mode; counters recorded on success.
 - [ ] Discarded and imported header/footer revisions counted, logged and recorded as counts.
-- [ ] Revision ids allocated above every existing annotation id; uniqueness asserted by the independent verifier.
+- [ ] Revision ids allocated above every existing annotation id; the independent verifier asserts the allocated ids collide with nothing and revision-element ids are unique, without requiring paired annotation ids to differ.
 - [ ] Tests listed above added and passing.
 - [ ] `CLAUDE.md` and README updated.
 - [ ] Full suite and corpus regression green on the PR.
@@ -846,7 +856,8 @@ For each mode assert, with its own extraction code: the package whitelist
 exact text including deleted text and structural children for every
 paragraph the mode did not predict to change, with predictions hand-written
 in the fixture and spelled out with `\t` and breaks; the revision census;
-`w:id` uniqueness; settings parity (WI-04); and that every output XML part
+revision-id uniqueness scoped as WI-06 defines it; settings parity (WI-04);
+and that every output XML part
 parses with its declared namespaces. The fixture predictions must be
 written before the engine is run, in the test source, not derived from
 output.
