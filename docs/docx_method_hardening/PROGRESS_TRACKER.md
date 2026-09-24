@@ -24,7 +24,7 @@ test's assertion messages before editing here. Rules, in short:
 | ID | Title | Status | Session | PR | Merge commit | Notes |
 |----|-------|--------|---------|----|--------------|-------|
 | WI-00 | Program scaffolding | merged | 00 | https://github.com/Abe-Borg/spec-template-normalizer/pull/60 | f2da16a | |
-| WI-01 | Extension-namespace-safe style import and shell application | in_progress | 01 | | | Hard failure on current-Word templates; do first. |
+| WI-01 | Extension-namespace-safe style import and shell application | in_review | 01 | https://github.com/Abe-Borg/spec-template-normalizer/pull/61 | | Hard failure on current-Word templates; do first. Adjacent defects found and left for later are listed in handoff 02. |
 | WI-02 | Exact run-content signature at the Format-only gate | not_started | | | | |
 | WI-03 | Final-gate text identity for every mode | not_started | | | | Depends on WI-02. |
 | WI-04 | Even-page header parity follows the architect | not_started | | | | |
@@ -45,4 +45,4 @@ test's assertion messages before editing here. Rules, in short:
 | Session | Date (UTC) | Work item | Outcome | PR | Handoff written |
 |---------|------------|-----------|---------|----|-----------------|
 | 00 | 2026-09-24 | WI-00 | plan, tracker, template, probes and tracker test created; PR opened, baseline suite 1306 passed / 1 skipped | https://github.com/Abe-Borg/spec-template-normalizer/pull/60 | handoffs/handoff-for-session-01.md |
-| 01 | 2026-09-24 | WI-01 | started; baseline suite 1306 passed / 1 skipped | | handoffs/handoff-for-session-02.md |
+| 01 | 2026-09-24 | WI-01 | extension-namespace style import and docDefaults fixed, new code style_import_namespace_conflict; PR opened; suite 1360 passed / 1 skipped (baseline 1306 / 1) | https://github.com/Abe-Borg/spec-template-normalizer/pull/61 | handoffs/handoff-for-session-02.md |
