@@ -203,7 +203,10 @@ numbering, including numbering inherited through a paragraph style. Imported
 body-role styles are detached from architect numbering, inherited target
 `numPr` is materialized where needed, and existing target numbering definitions
 remain intact. Publication fails if body text or effective list semantics
-change.
+change. Body text is compared exactly, run by run, not merely word for word: a
+dropped tab or line break, a lost soft hyphen, a non-breaking space turned into
+a plain one, a collapsed double space, a lost leading or trailing space, or a
+change to tracked-deleted text counts as a change.
 
 Only paragraphs with validated CSI roles receive paragraph/run formatting.
 Non-CSI and editorial content is returned as `ignored_paragraphs` with a reason
@@ -609,7 +612,11 @@ fails instead of publishing a header that still names the architect's section.
   fails with `style_import_namespace_conflict` before its styles change,
   rather than being published with markup that now means something else.
 - Format-only verifies unchanged body text and effective target numbering and
-  preserves every pre-existing target numbering definition.
+  preserves every pre-existing target numbering definition. Body text is
+  proven exactly: text, tracked deletions, field instructions, tabs, breaks,
+  hyphenation marks, symbols and space preservation are compared run by run,
+  so a lost tab or a non-breaking space made plain withholds the output
+  instead of publishing it.
 - Every mode verifies that no paragraph's effective indentation moved. This
   catches the one class of damage a text comparison cannot: identical words,
   identical numbering, identical formatting runs, and a visibly different page.
@@ -674,6 +681,12 @@ this one is built so it can disagree. `tests/test_geometry_invariant.py` covers
 the indentation check directly, and `scripts/proof_render.py` compares where
 words actually land in two rendered documents when a change warrants proving
 against a renderer rather than against the markup.
+
+`tests/style_application_regression/test_run_content_signature.py` covers the
+exact run-content comparison behind Format-only's body-text check, and
+`tests/style_application_regression/test_final_package_validation.py` keeps
+every mutation that a word-for-word comparison used to accept as a permanent
+failing case.
 
 `tests/test_sanitized_format_only_corpus.py` builds a tracked, non-proprietary
 154-paragraph reproduction of the supplied acceptance case and runs it through

@@ -9,9 +9,13 @@ Run from the repository root::
 
     python docs/docx_method_hardening/probes/probe_format_only_gate.py
 
-Before WI-02 every row but the control prints ``ACCEPTED``. After WI-02 every
-row must print ``REJECTED``. Keep this file runnable; WI-02 turns each row into
-a regression test.
+Before WI-02 every row but the control printed ``ACCEPTED``. Since WI-02 every
+row prints ``REJECTED``: the control through the normalized-text comparison,
+the others through the exact run-content signature, whose failure names the
+kind of item that changed. Keep this file runnable. WI-02 made each row a
+permanent test in
+``tests/style_application_regression/test_final_package_validation.py``, and a
+test there runs this probe and requires exit 0.
 """
 
 from __future__ import annotations
@@ -129,31 +133,33 @@ def write_docx(path: Path, body: str) -> None:
 
 
 def main() -> int:
-    workspace = Path(tempfile.mkdtemp(prefix="probe-format-only-gate-"))
     accepted = 0
     control_accepted = False
-    for index, (label, source_paragraph, mutated_paragraph, effect) in enumerate(CASES):
-        source = workspace / f"source-{index}.docx"
-        output = workspace / f"output-{index}.docx"
-        write_docx(source, source_paragraph)
-        write_docx(output, mutated_paragraph)
-        new_document_xml = zipfile.ZipFile(output).read("word/document.xml")
-        try:
-            verify_phase2_invariants(
-                source, new_document_xml, new_docx=output, conversion_mode="format_only"
-            )
-        except Exception as exc:  # noqa: BLE001 - the probe reports, it does not judge
-            verdict, note = "REJECTED", str(exc).splitlines()[0][:90]
-        else:
-            verdict, note = "ACCEPTED", effect
-            if label.startswith("CONTROL"):
-                # The gate has always caught a changed word. Accepting it
-                # means the gate regressed, which is a failure of its own,
-                # not a pass because the other rows happened to be rejected.
-                control_accepted = True
+    with tempfile.TemporaryDirectory(prefix="probe-format-only-gate-") as workspace_name:
+        workspace = Path(workspace_name)
+        for index, (label, source_paragraph, mutated_paragraph, effect) in enumerate(CASES):
+            source = workspace / f"source-{index}.docx"
+            output = workspace / f"output-{index}.docx"
+            write_docx(source, source_paragraph)
+            write_docx(output, mutated_paragraph)
+            with zipfile.ZipFile(output) as package:
+                new_document_xml = package.read("word/document.xml")
+            try:
+                verify_phase2_invariants(
+                    source, new_document_xml, new_docx=output, conversion_mode="format_only"
+                )
+            except Exception as exc:  # noqa: BLE001 - the probe reports, it does not judge
+                verdict, note = "REJECTED", str(exc).splitlines()[0][:100]
             else:
-                accepted += 1
-        print(f"{verdict:8}  {label:55}  {note}")
+                verdict, note = "ACCEPTED", effect
+                if label.startswith("CONTROL"):
+                    # The gate has always caught a changed word. Accepting it
+                    # means the gate regressed, which is a failure of its own,
+                    # not a pass because the other rows happened to be rejected.
+                    control_accepted = True
+                else:
+                    accepted += 1
+            print(f"{verdict:8}  {label:55}  {note}")
     print(f"\n{accepted} silent mutation(s) accepted by the Format-only gate.")
     if control_accepted:
         print("The control mutation was ACCEPTED: the gate no longer catches a changed word.")

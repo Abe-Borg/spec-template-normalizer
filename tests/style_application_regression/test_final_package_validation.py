@@ -1,4 +1,7 @@
+import importlib.util
+import io
 import zipfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import pytest
@@ -7,6 +10,7 @@ from spec_formatter.style_application.batch_runner import _build_and_patch_outpu
 from spec_formatter.style_application.phase2_invariants import validate_docx_package, verify_phase2_invariants
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -425,6 +429,265 @@ def test_format_only_invariant_preserves_all_existing_numbering_definitions(tmp_
             new_docx=output,
             conversion_mode="format_only",
         )
+
+
+# ── Format-only gate: exact run content ─────────────────────────────────────
+#
+# The normalized-text comparison above runs one whitespace-collapsing function
+# on both sides, so it cannot see a tab or break dropped beside a space, lost
+# xml:space="preserve", tracked-deleted text, a non-breaking space made plain,
+# a collapsed double space, or a dropped soft hyphen. The gate therefore also
+# compares an exact run-content signature for every paragraph that changed.
+
+# The first paragraph of _parts(): numbered and styled, identical on both sides
+# of every test below, so the paragraph under test is index 1 and the report
+# has to name it.
+_UNCHANGED_PARAGRAPH = (
+    '<w:p><w:pPr><w:pStyle w:val="Body"/>'
+    '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>'
+    "</w:pPr><w:r><w:t>Text</w:t></w:r></w:p>"
+)
+
+
+def _document_with(*paragraphs):
+    return (
+        f'<w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}"><w:body>'
+        + "".join(paragraphs)
+        + "<w:sectPr/></w:body></w:document>"
+    )
+
+
+def _verify_format_only_paragraph_edit(tmp_path, source_paragraph, output_paragraph, **kwargs):
+    source = tmp_path / "source-run-content.docx"
+    output = tmp_path / "output-run-content.docx"
+    source_parts = _parts()
+    source_parts["word/document.xml"] = _document_with(_UNCHANGED_PARAGRAPH, source_paragraph)
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = _document_with(_UNCHANGED_PARAGRAPH, output_paragraph)
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    verify_phase2_invariants(
+        source,
+        output_parts["word/document.xml"].encode("utf-8"),
+        new_docx=output,
+        conversion_mode="format_only",
+        **kwargs,
+    )
+
+
+# Every row of docs/docx_method_hardening/probes/probe_format_only_gate.py,
+# which the gate accepted before WI-02, with the kind its failure must name.
+FORMAT_ONLY_GATE_PROBE_ROWS = [
+    pytest.param(
+        '<w:p><w:r><w:t xml:space="preserve">Section </w:t><w:tab/><w:t>Title</w:t></w:r></w:p>',
+        '<w:p><w:r><w:t xml:space="preserve">Section </w:t><w:t>Title</w:t></w:r></w:p>',
+        "tab",
+        id="run-level-tab-dropped-beside-a-space",
+    ),
+    pytest.param(
+        '<w:p><w:r><w:t xml:space="preserve">Old </w:t></w:r>'
+        '<w:del w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z">'
+        "<w:r><w:delText>deleted words</w:delText></w:r></w:del>"
+        "<w:r><w:t>kept</w:t></w:r></w:p>",
+        '<w:p><w:r><w:t xml:space="preserve">Old </w:t></w:r>'
+        '<w:del w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z">'
+        "<w:r><w:delText></w:delText></w:r></w:del>"
+        "<w:r><w:t>kept</w:t></w:r></w:p>",
+        "deleted_text",
+        id="tracked-deleted-text-emptied",
+    ),
+    pytest.param(
+        '<w:p><w:r><w:t xml:space="preserve">Trailing </w:t></w:r><w:r><w:t>text</w:t></w:r></w:p>',
+        "<w:p><w:r><w:t>Trailing </w:t></w:r><w:r><w:t>text</w:t></w:r></w:p>",
+        "preserve_space",
+        id="preserve-removed-from-a-run-ending-in-a-space",
+    ),
+    pytest.param(
+        "<w:p><w:r><w:t>SECTION 21 13 13</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>SECTION 21 13 13</w:t></w:r></w:p>",
+        "text",
+        id="non-breaking-spaces-replaced-by-plain-spaces",
+    ),
+    pytest.param(
+        "<w:p><w:r><w:t>Double  space</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>Double space</w:t></w:r></w:p>",
+        "text",
+        id="double-space-collapsed",
+    ),
+    pytest.param(
+        "<w:p><w:r><w:t>Fire</w:t><w:softHyphen/><w:t>proofing</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>Fire</w:t><w:t>proofing</w:t></w:r></w:p>",
+        "soft_hyphen",
+        id="soft-hyphen-dropped",
+    ),
+    pytest.param(
+        '<w:p><w:r><w:t xml:space="preserve">line one </w:t><w:br/><w:t>line two</w:t></w:r></w:p>',
+        '<w:p><w:r><w:t xml:space="preserve">line one </w:t><w:t>line two</w:t></w:r></w:p>',
+        "break",
+        id="break-dropped-beside-a-space",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source_paragraph", "output_paragraph", "kind"),
+    FORMAT_ONLY_GATE_PROBE_ROWS,
+)
+def test_format_only_invariant_rejects_run_content_the_text_check_cannot_see(
+    tmp_path,
+    source_paragraph,
+    output_paragraph,
+    kind,
+):
+    verification = {}
+
+    # Matched whole: the failure names the kind and the index, never the
+    # text either side carried.
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            rf"^FORMAT_ONLY INVARIANT FAIL: target run content changed \({kind}\) "
+            r"at paragraph index 1$"
+        ),
+    ):
+        _verify_format_only_paragraph_edit(
+            tmp_path,
+            source_paragraph,
+            output_paragraph,
+            verification_out=verification,
+        )
+
+    # The check says it ran on the failure path too.
+    assert verification["body_signature_paragraphs_compared"] == 1
+
+
+def test_format_only_invariant_keeps_reporting_a_changed_word_as_body_text(tmp_path):
+    # The probe's control row. The normalized-text comparison runs first and
+    # keeps its message, which callers match on.
+    with pytest.raises(
+        RuntimeError,
+        match=r"^FORMAT_ONLY INVARIANT FAIL: target body text changed at paragraph index 1$",
+    ):
+        _verify_format_only_paragraph_edit(
+            tmp_path,
+            "<w:p><w:r><w:t>Text</w:t></w:r></w:p>",
+            "<w:p><w:r><w:t>Changed</w:t></w:r></w:p>",
+        )
+
+
+def test_format_only_invariant_accepts_the_edits_format_only_makes(tmp_path):
+    # A restyled paragraph: new pStyle, a direct tab-stop definition and
+    # justification the style now supplies stripped from w:pPr, and
+    # style-supplied run properties stripped under the contract -- one rPr
+    # emptied and removed, inside a tracked deletion. None of that is run
+    # content, so the signature must not fire on it, however much exact
+    # content (tabs, breaks, edge and double spaces, NBSP, soft hyphen,
+    # deleted text) the runs carry.
+    runs = (
+        '<w:t xml:space="preserve">Keep  both </w:t><w:tab/><w:t>exact</w:t>'
+        '<w:br/><w:t>SECTION 21 13</w:t><w:softHyphen/><w:t>listed</w:t>'
+    )
+    deleted = '<w:delText xml:space="preserve">old words </w:delText>'
+    source_paragraph = (
+        '<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs>'
+        '<w:jc w:val="both"/></w:pPr>'
+        f'<w:r><w:rPr><w:rFonts w:ascii="Arial"/><w:b/></w:rPr>{runs}</w:r>'
+        '<w:del w:id="5" w:author="A" w:date="2026-01-01T00:00:00Z">'
+        f'<w:r><w:rPr><w:sz w:val="20"/></w:rPr>{deleted}</w:r></w:del></w:p>'
+    )
+    output_paragraph = (
+        '<w:p><w:pPr><w:pStyle w:val="Body"/></w:pPr>'
+        f"<w:r><w:rPr><w:b/></w:rPr>{runs}</w:r>"
+        '<w:del w:id="5" w:author="A" w:date="2026-01-01T00:00:00Z">'
+        f"<w:r>{deleted}</w:r></w:del></w:p>"
+    )
+    verification = {}
+
+    _verify_format_only_paragraph_edit(
+        tmp_path,
+        source_paragraph,
+        output_paragraph,
+        allowed_rpr_properties_by_paragraph={1: {"rFonts", "sz"}},
+        verification_out=verification,
+    )
+
+    # Recorded on success, and only the changed paragraph was compared.
+    assert verification["body_signature_paragraphs_compared"] == 1
+
+
+def test_format_only_invariant_accepts_a_paragraph_whose_only_change_is_a_contracted_rpr_child(
+    tmp_path,
+):
+    runs = (
+        '<w:t xml:space="preserve">Trailing </w:t><w:tab/><w:br/>'
+        "<w:t>Double  space kept</w:t><w:softHyphen/>"
+    )
+    verification = {}
+
+    _verify_format_only_paragraph_edit(
+        tmp_path,
+        f'<w:p><w:r><w:rPr><w:rFonts w:ascii="Arial"/><w:i/></w:rPr>{runs}</w:r></w:p>',
+        f"<w:p><w:r><w:rPr><w:i/></w:rPr>{runs}</w:r></w:p>",
+        allowed_rpr_properties_by_paragraph={1: {"rFonts"}},
+        verification_out=verification,
+    )
+
+    assert verification["body_signature_paragraphs_compared"] == 1
+
+
+def test_run_content_check_reports_that_it_ran_when_a_later_check_fails(tmp_path):
+    source = tmp_path / "source-numbering-after-signature.docx"
+    output = tmp_path / "output-numbering-after-signature.docx"
+    source_parts = _parts()
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = source_parts["word/document.xml"].replace(
+        'w:numId w:val="1"',
+        'w:numId w:val="2"',
+    )
+    output_parts["word/numbering.xml"] = source_parts["word/numbering.xml"].replace(
+        "</w:numbering>",
+        '<w:num w:numId="2"><w:abstractNumId w:val="2"/></w:num></w:numbering>',
+    )
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+    verification = {}
+
+    with pytest.raises(RuntimeError, match="effective target numbering changed"):
+        verify_phase2_invariants(
+            source,
+            output_parts["word/document.xml"].encode("utf-8"),
+            new_docx=output,
+            conversion_mode="format_only",
+            verification_out=verification,
+        )
+
+    # The paragraph's run content was compared, and matched, before the
+    # numbering check refused it; the diagnostics event must be able to say so.
+    assert verification == {"body_signature_paragraphs_compared": 1}
+
+
+def test_format_only_gate_probe_rejects_every_row():
+    probe_path = (
+        REPO_ROOT / "docs" / "docx_method_hardening" / "probes" / "probe_format_only_gate.py"
+    )
+    spec = importlib.util.spec_from_file_location("probe_format_only_gate", probe_path)
+    assert spec is not None and spec.loader is not None
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+
+    printed = io.StringIO()
+    with redirect_stdout(printed):
+        exit_code = probe.main()
+
+    verdicts = [
+        line.split()[0]
+        for line in printed.getvalue().splitlines()
+        if line.startswith(("ACCEPTED", "REJECTED"))
+    ]
+    assert exit_code == 0, printed.getvalue()
+    assert verdicts == ["REJECTED"] * len(probe.CASES)
+    assert len(probe.CASES) == len(FORMAT_ONLY_GATE_PROBE_ROWS) + 1
 
 
 def test_final_invariant_allows_only_contracted_non_font_run_property_removal(
