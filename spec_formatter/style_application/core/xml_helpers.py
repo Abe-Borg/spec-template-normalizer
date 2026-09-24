@@ -7,7 +7,23 @@ to preserve byte-level fidelity.
 
 import html
 import re
-from typing import Dict, Any, Callable, Generator, Iterable, List, Optional, Tuple
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import (
+    AbstractSet,
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Generator,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+)
 from xml.sax.saxutils import escape as xml_escape
 
 _QUALIFIED_NAME_RE = re.compile(r"[A-Za-z_][\w.-]*:[A-Za-z_][\w.-]*")
@@ -147,6 +163,57 @@ def iter_element_xml_blocks(
         raise ValueError(f"Malformed XML: unclosed <{qualified_name}> element")
 
 
+def _scan_markup(xml_text: str, start: int) -> Tuple[int, str, Optional[str], bool, bool]:
+    """Scan the markup that begins with the ``<`` at ``start``.
+
+    Returns ``(end, kind, name, is_close, is_self_closing)``. ``kind`` is
+    ``"tag"`` for an element tag and ``"misc"`` for a comment, CDATA section,
+    processing instruction or any other ``<`` construct, which carry no
+    element name. Quoted attribute values are stepped over whole, so a ``>``
+    inside one never ends the tag.
+    """
+
+    if xml_text.startswith("<!--", start):
+        marker = xml_text.find("-->", start + 4)
+        if marker < 0:
+            raise ValueError("Malformed XML: unterminated comment")
+        return marker + 3, "misc", None, False, False
+    if xml_text.startswith("<![CDATA[", start):
+        marker = xml_text.find("]]>", start + 9)
+        if marker < 0:
+            raise ValueError("Malformed XML: unterminated CDATA")
+        return marker + 3, "misc", None, False, False
+    if xml_text.startswith("<?", start):
+        marker = xml_text.find("?>", start + 2)
+        if marker < 0:
+            raise ValueError("Malformed XML: unterminated processing instruction")
+        return marker + 2, "misc", None, False, False
+
+    quote: Optional[str] = None
+    tag_end = start + 1
+    while tag_end < len(xml_text):
+        char = xml_text[tag_end]
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == ">":
+            break
+        tag_end += 1
+    if tag_end >= len(xml_text):
+        raise ValueError(f"Malformed XML: unterminated tag at character {start}")
+
+    end = tag_end + 1
+    token = xml_text[start:end]
+    name_match = _TAG_NAME_RE.match(token)
+    if name_match is None:
+        return end, "misc", None, False, False
+    is_close = bool(name_match.group("close"))
+    is_self_closing = not is_close and bool(_SELF_CLOSING_RE.search(token))
+    return end, "tag", name_match.group("name"), is_close, is_self_closing
+
+
 def iter_direct_child_xml_blocks(
     element_xml_text: str,
 ) -> Generator[Tuple[int, int, str, str], None, None]:
@@ -157,57 +224,13 @@ def iter_direct_child_xml_blocks(
     matching descendant cannot be mistaken for a direct property child.
     """
 
-    def next_markup(start: int) -> Tuple[int, str, Optional[str], bool, bool]:
-        if element_xml_text.startswith("<!--", start):
-            marker = element_xml_text.find("-->", start + 4)
-            if marker < 0:
-                raise ValueError("Malformed XML: unterminated comment")
-            return marker + 3, "misc", None, False, False
-        if element_xml_text.startswith("<![CDATA[", start):
-            marker = element_xml_text.find("]]>", start + 9)
-            if marker < 0:
-                raise ValueError("Malformed XML: unterminated CDATA")
-            return marker + 3, "misc", None, False, False
-        if element_xml_text.startswith("<?", start):
-            marker = element_xml_text.find("?>", start + 2)
-            if marker < 0:
-                raise ValueError("Malformed XML: unterminated processing instruction")
-            return marker + 2, "misc", None, False, False
-
-        quote: Optional[str] = None
-        tag_end = start + 1
-        while tag_end < len(element_xml_text):
-            char = element_xml_text[tag_end]
-            if quote is not None:
-                if char == quote:
-                    quote = None
-            elif char in {'"', "'"}:
-                quote = char
-            elif char == ">":
-                break
-            tag_end += 1
-        if tag_end >= len(element_xml_text):
-            raise ValueError(f"Malformed XML: unterminated tag at character {start}")
-
-        end = tag_end + 1
-        token = element_xml_text[start:end]
-        name_match = re.match(
-            r"<\s*(?P<close>/)?\s*(?P<name>[A-Za-z_][\w.:-]*)(?=\s|/?>)",
-            token,
-        )
-        if name_match is None:
-            return end, "misc", None, False, False
-        is_close = bool(name_match.group("close"))
-        is_self_closing = not is_close and bool(re.search(r"/\s*>$", token))
-        return end, "tag", name_match.group("name"), is_close, is_self_closing
-
     cursor = 0
     root_name: Optional[str] = None
     while root_name is None:
         start = element_xml_text.find("<", cursor)
         if start < 0:
             raise ValueError("Malformed XML: element block has no opening tag")
-        end, kind, name, is_close, is_self_closing = next_markup(start)
+        end, kind, name, is_close, is_self_closing = _scan_markup(element_xml_text, start)
         cursor = end
         if kind == "misc":
             continue
@@ -224,7 +247,7 @@ def iter_direct_child_xml_blocks(
         start = element_xml_text.find("<", cursor)
         if start < 0:
             break
-        end, kind, name, is_close, is_self_closing = next_markup(start)
+        end, kind, name, is_close, is_self_closing = _scan_markup(element_xml_text, start)
         cursor = end
         if kind == "misc" or name is None:
             continue
@@ -622,3 +645,447 @@ def strip_conflicting_direct_ppr(
 
     result = re.sub(r'<w:pPr\b[^>]*>[\s\S]*?</w:pPr>', _strip_from_ppr, p_xml, count=1, flags=re.S)
     return _restore_out_of_scope_subtrees(result, preserved)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Namespace declarations for fragments that move between parts
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A fragment copied out of one part keeps its prefixes but not the
+# declarations that gave them meaning: those sit on the source part's root.
+# Written into another part it means whatever that part's root says, or
+# nothing at all (``unbound prefix``). Every current Word template puts
+# ``w14:ligatures`` in its document defaults, so this is the ordinary case,
+# not an exotic one.
+#
+# These helpers stay lexical like the rest of this module: the destination is
+# edited only in its root opening tag, and fragments are never re-serialized.
+# A prefix counts wherever the markup gives it meaning: in an element or
+# attribute name, and in the values of the markup-compatibility attributes that
+# list prefixes or qualified names (``Requires`` on ``Choice``, ``Ignorable``,
+# ``MustUnderstand``, ``ProcessContent``, ``PreserveElements``,
+# ``PreserveAttributes``). A prefix named only in such a value is still one an
+# MCE consumer must resolve; left undeclared, it silently takes the fallback or
+# drops the feature.
+
+#: Markup Compatibility and Extensibility (ECMA-376 Part 3).
+MCE_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+# ``xml`` is bound by definition and ``xmlns`` is not a prefix at all.
+_RESERVED_PREFIXES = frozenset({"xml", "xmlns"})
+
+# Markup-compatibility attributes (ECMA-376 Part 3) whose values name
+# prefixes: lists of prefixes, and lists of qualified names whose prefixes
+# count. ``Requires`` is the unqualified attribute of ``mc:Choice``.
+_MCE_PREFIX_LIST_ATTRIBUTES = frozenset({"Ignorable", "MustUnderstand"})
+_MCE_QNAME_LIST_ATTRIBUTES = frozenset({"ProcessContent", "PreserveElements", "PreserveAttributes"})
+_NO_BINDINGS: Mapping[str, str] = MappingProxyType({})
+
+# One attribute of a start tag: its name and its quoted value. Values are
+# matched whole, so a quote or ">" inside another value cannot end one early.
+_TAG_ATTRIBUTE_RE = re.compile(
+    r"""\s(?P<name>[^\s=/>"']+)\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
+    re.S,
+)
+_XML_REFERENCE_RE = re.compile(r"&(?:#x([0-9A-Fa-f]+)|#([0-9]+)|(lt|gt|amp|quot|apos));")
+_PREDEFINED_ENTITIES = {"lt": "<", "gt": ">", "amp": "&", "quot": '"', "apos": "'"}
+_TAG_CLOSE_RE = re.compile(r"\s*/?\s*>\Z")
+
+
+class NamespaceReconciliationError(ValueError):
+    """A fragment's prefix cannot keep its meaning in the part it moves into.
+
+    ``reason`` is ``"conflict"`` when the destination root already binds the
+    prefix to a different namespace, and ``"undeclared"`` when the source
+    root does not say what the prefix means. ``prefix`` is ``""`` for the
+    default namespace.
+    """
+
+    def __init__(self, prefix: str, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.prefix = prefix
+        self.reason = reason
+
+
+def xml_unescape(text: str) -> str:
+    """Expand XML's five predefined entities and numeric character references.
+
+    Deliberately not :func:`html.unescape`, which also expands HTML entities
+    such as ``&nbsp;`` that are not XML and cannot occur in well-formed
+    WordprocessingML.
+    """
+
+    def expand(match: "re.Match[str]") -> str:
+        hexadecimal, decimal, name = match.groups()
+        if hexadecimal is not None:
+            return chr(int(hexadecimal, 16))
+        if decimal is not None:
+            return chr(int(decimal))
+        return _PREDEFINED_ENTITIES[name]
+
+    return _XML_REFERENCE_RE.sub(expand, text)
+
+
+def _attribute_value(raw: str) -> str:
+    """An attribute's value as a parser reports it (XML 1.0, section 3.3.3)."""
+
+    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\t", " ").replace("\n", " ")
+    return xml_unescape(normalized)
+
+
+def _double_quoted(value: str) -> str:
+    """``value`` escaped to stand between double quotes in an attribute."""
+
+    return xml_escape(value, {'"': "&quot;"})
+
+
+def _tag_attributes(tag: str) -> Iterator["re.Match[str]"]:
+    name = _TAG_NAME_RE.match(tag)
+    return _TAG_ATTRIBUTE_RE.finditer(tag, name.end() if name is not None else 0)
+
+
+def _declared_prefix(attribute_name: str) -> Optional[str]:
+    """The prefix an ``xmlns`` attribute declares (``""`` for the default)."""
+
+    if attribute_name == "xmlns":
+        return ""
+    if attribute_name.startswith("xmlns:"):
+        return attribute_name[len("xmlns:"):]
+    return None
+
+
+def _tag_declarations(tag: str) -> Dict[str, str]:
+    declarations: Dict[str, str] = {}
+    for attribute in _tag_attributes(tag):
+        prefix = _declared_prefix(attribute.group("name"))
+        if prefix is not None:
+            declarations[prefix] = _attribute_value(attribute.group("value"))
+    return declarations
+
+
+def _mce_ignorable_attribute(
+    tag: str,
+    declarations: Mapping[str, str],
+) -> Optional["re.Match[str]"]:
+    """The tag's markup-compatibility ``Ignorable`` attribute, found by namespace.
+
+    Word 2007 bound markup compatibility to ``ve`` rather than ``mc``, so the
+    literal prefix proves nothing; an ``mc:Ignorable`` whose ``mc`` means
+    something else is not the attribute at all.
+    """
+
+    for attribute in _tag_attributes(tag):
+        prefix, _, local = attribute.group("name").partition(":")
+        if local == "Ignorable" and declarations.get(prefix) == MCE_NS:
+            return attribute
+    return None
+
+
+def _root_open_tag(xml_text: str) -> Tuple[int, int]:
+    """Locate the document element's opening tag, skipping the prolog."""
+
+    cursor = 0
+    while True:
+        start = xml_text.find("<", cursor)
+        if start < 0:
+            raise ValueError("XML part has no root element")
+        end, kind, name, is_close, _is_self_closing = _scan_markup(xml_text, start)
+        cursor = end
+        if kind == "misc":
+            if xml_text.startswith("<!", start) and not xml_text.startswith("<!--", start):
+                # A document type declaration: never legitimate in a package
+                # part, and rejected at every parse boundary.
+                raise ValueError("XML part declares a document type before its root element")
+            continue
+        if is_close or name is None:
+            raise ValueError("XML part starts with a closing tag")
+        return start, end
+
+
+def root_opening_tag(xml_text: str) -> str:
+    """The document element's opening tag, exactly as written."""
+
+    start, end = _root_open_tag(xml_text)
+    return xml_text[start:end]
+
+
+def root_namespace_declarations(xml_text: str) -> Dict[str, str]:
+    """Prefix -> namespace URI for every declaration on the root opening tag.
+
+    The default namespace is keyed by ``""``. Declarations on descendants are
+    not included: only the root's are in scope for a child written directly
+    beneath it.
+    """
+
+    start, end = _root_open_tag(xml_text)
+    return _tag_declarations(xml_text[start:end])
+
+
+def root_ignorable_prefixes(xml_text: str) -> FrozenSet[str]:
+    """The prefixes the root lists in its markup-compatibility ``Ignorable``."""
+
+    start, end = _root_open_tag(xml_text)
+    tag = xml_text[start:end]
+    attribute = _mce_ignorable_attribute(tag, _tag_declarations(tag))
+    if attribute is None:
+        return frozenset()
+    return frozenset(_attribute_value(attribute.group("value")).split())
+
+
+@dataclass(frozen=True)
+class RootNamespaces:
+    """The declarations and ignorable prefixes on one part's root element.
+
+    Built once from the architect's stylesheet and handed to every step that
+    writes an architect fragment into the target's, so each of them resolves
+    a prefix to the same namespace.
+    """
+
+    declarations: Mapping[str, str]
+    ignorable: FrozenSet[str] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "declarations", MappingProxyType(dict(self.declarations)))
+        object.__setattr__(self, "ignorable", frozenset(self.ignorable))
+
+    @classmethod
+    def of(cls, xml_text: str) -> "RootNamespaces":
+        return cls(root_namespace_declarations(xml_text), root_ignorable_prefixes(xml_text))
+
+
+def prefixes_used(fragment: str, context: Mapping[str, str] = _NO_BINDINGS) -> Set[str]:
+    """The prefixes a fragment needs from whatever encloses it.
+
+    Element and attribute names are read; ``xml`` and ``xmlns`` never need a
+    declaration. A prefix the fragment declares itself is not reported
+    within that declaration's scope, and is reported again if it is used
+    outside it. An unprefixed element needs the default namespace, reported
+    as ``""``; an unprefixed attribute is in no namespace and needs nothing.
+    Comments, CDATA sections and processing instructions are text.
+
+    Prefixes named in markup-compatibility values count as well (see the
+    section comment above). Those attributes are recognised by namespace, not
+    by the literal ``mc`` -- Word 2007 used ``ve`` -- so ``context``, the
+    declarations in scope around the fragment, is how one is recognised when
+    the fragment does not declare the markup-compatibility prefix itself.
+    ``context`` only identifies them: whatever the fragment does not declare
+    is reported, whether or not ``context`` declares it.
+    """
+
+    needed: Set[str] = set()
+    scopes: List[Dict[str, str]] = []
+
+    def in_scope(prefix: str) -> bool:
+        return any(prefix in scope for scope in scopes)
+
+    def resolve(prefix: str) -> Optional[str]:
+        for scope in reversed(scopes):
+            if prefix in scope:
+                return scope[prefix]
+        return context.get(prefix)
+
+    def need(prefix: str) -> None:
+        if prefix not in _RESERVED_PREFIXES and not in_scope(prefix):
+            needed.add(prefix)
+
+    cursor = 0
+    while True:
+        start = fragment.find("<", cursor)
+        if start < 0:
+            return needed
+        end, kind, name, is_close, is_self_closing = _scan_markup(fragment, start)
+        cursor = end
+        if kind != "tag" or name is None:
+            continue
+        if is_close:
+            if scopes:
+                scopes.pop()
+            continue
+        attributes = [
+            (match.group("name"), match.group("value"))
+            for match in _tag_attributes(fragment[start:end])
+        ]
+        declared_here: Dict[str, str] = {}
+        for attribute, value in attributes:
+            prefix = _declared_prefix(attribute)
+            if prefix is not None:
+                declared_here[prefix] = _attribute_value(value)
+        scopes.append(declared_here)
+
+        element_prefix, _, element_local = name.rpartition(":")
+        need(element_prefix)
+        is_mce_choice = element_local == "Choice" and resolve(element_prefix) == MCE_NS
+        for attribute, value in attributes:
+            if _declared_prefix(attribute) is not None:
+                continue
+            prefix, _, local = attribute.rpartition(":")
+            if prefix:
+                need(prefix)
+            named: List[str] = []
+            if prefix and resolve(prefix) == MCE_NS:
+                if local in _MCE_PREFIX_LIST_ATTRIBUTES:
+                    named = _attribute_value(value).split()
+                elif local in _MCE_QNAME_LIST_ATTRIBUTES:
+                    named = [
+                        token.partition(":")[0]
+                        for token in _attribute_value(value).split()
+                        if ":" in token
+                    ]
+            elif not prefix and local == "Requires" and is_mce_choice:
+                named = _attribute_value(value).split()
+            for named_prefix in named:
+                if named_prefix:
+                    need(named_prefix)
+        if is_self_closing:
+            scopes.pop()
+
+
+def _conflict(prefix: str, existing: str, wanted: str) -> NamespaceReconciliationError:
+    label = "the default namespace" if prefix == "" else f"prefix {prefix!r}"
+    return NamespaceReconciliationError(
+        prefix,
+        "conflict",
+        f"{label} is bound to {existing!r} in the destination root, "
+        f"but the inserted markup needs {wanted!r}",
+    )
+
+
+def ensure_root_declarations(
+    part_xml: str,
+    needed: Mapping[str, str],
+    ignorable: AbstractSet[str] = frozenset(),
+) -> str:
+    """Declare ``needed`` prefixes on the part's root and mark ``ignorable`` ones.
+
+    ``needed`` maps each prefix inserted markup uses to the namespace it must
+    mean. A prefix the root already binds to that namespace needs nothing; a
+    missing one gains an ``xmlns:`` declaration; one the root binds to a
+    different namespace raises :class:`NamespaceReconciliationError`, because
+    writing the markup would silently change what it says. The default
+    namespace (``""``) is compared but never added or changed: that would
+    change the meaning of every unprefixed name already in the part.
+
+    Each prefix in ``ignorable`` must be declared once ``needed`` is applied,
+    and is added to the root's markup-compatibility ``Ignorable`` list. An
+    existing list keeps its prefix, quoting and tokens; without one, the root
+    gains ``mc:Ignorable`` and, when no prefix is bound to the
+    markup-compatibility namespace yet, ``xmlns:mc``.
+
+    Only the root opening tag changes, and a part that needs nothing is
+    returned unchanged.
+    """
+
+    start, end = _root_open_tag(part_xml)
+    tag = part_xml[start:end]
+    declared = _tag_declarations(tag)
+    additions: List[Tuple[str, str]] = []
+    for prefix in sorted(needed):
+        wanted = needed[prefix]
+        if prefix in _RESERVED_PREFIXES:
+            continue
+        if prefix == "":
+            existing = declared.get("", "")
+            if existing != wanted:
+                raise _conflict("", existing, wanted)
+            continue
+        existing = declared.get(prefix)
+        if existing is None:
+            additions.append((prefix, wanted))
+            declared[prefix] = wanted
+        elif existing != wanted:
+            raise _conflict(prefix, existing, wanted)
+
+    tokens = sorted(prefix for prefix in ignorable if prefix)
+    for prefix in tokens:
+        if prefix not in declared:
+            raise ValueError(
+                f"cannot list prefix {prefix!r} as ignorable: the root does not declare it"
+            )
+
+    edited = tag
+    new_attributes = "".join(
+        f' xmlns:{prefix}="{_double_quoted(uri)}"' for prefix, uri in additions
+    )
+    if tokens:
+        attribute = _mce_ignorable_attribute(tag, declared)
+        if attribute is not None:
+            raw = attribute.group("value")
+            listed = _attribute_value(raw).split()
+            missing = [prefix for prefix in tokens if prefix not in listed]
+            if missing:
+                value = (raw.rstrip() + " " if raw.strip() else "") + " ".join(missing)
+                edited = (
+                    tag[: attribute.start("value")] + value + tag[attribute.end("value"):]
+                )
+        else:
+            mce_prefixes = [prefix for prefix, uri in declared.items() if prefix and uri == MCE_NS]
+            if "mc" in mce_prefixes or not mce_prefixes:
+                mce_prefix = "mc"
+            else:
+                mce_prefix = mce_prefixes[0]
+            if mce_prefix not in declared:
+                new_attributes += f' xmlns:mc="{MCE_NS}"'
+                declared["mc"] = MCE_NS
+            elif declared[mce_prefix] != MCE_NS:
+                raise _conflict(mce_prefix, declared[mce_prefix], MCE_NS)
+            new_attributes += f' {mce_prefix}:Ignorable="{" ".join(tokens)}"'
+
+    if new_attributes:
+        close = _TAG_CLOSE_RE.search(edited)
+        if close is None:  # pragma: no cover - _root_open_tag returns whole tags
+            raise ValueError("XML part root tag is not terminated")
+        edited = edited[: close.start()] + new_attributes + edited[close.start():]
+    if edited == tag:
+        return part_xml
+    return part_xml[:start] + edited + part_xml[end:]
+
+
+def root_namespace_additions(before_xml: str, after_xml: str) -> Tuple[str, ...]:
+    """Prefixes the root of ``after_xml`` declares or lists as ignorable anew.
+
+    For reporting what :func:`ensure_root_declarations` changed: each entry is
+    a prefix, ``mc:Ignorable=<prefix>`` for an ignorable token. Prefixes are
+    markup identifiers, never document text.
+    """
+
+    declared = sorted(
+        set(root_namespace_declarations(after_xml)) - set(root_namespace_declarations(before_xml))
+    )
+    ignorable = sorted(root_ignorable_prefixes(after_xml) - root_ignorable_prefixes(before_xml))
+    return tuple(declared) + tuple(f"mc:Ignorable={prefix}" for prefix in ignorable)
+
+
+def declare_fragment_namespaces(
+    part_xml: str,
+    fragments: Iterable[str],
+    source: RootNamespaces,
+) -> str:
+    """Declare in ``part_xml`` every prefix ``fragments`` use, meaning what it meant in ``source``.
+
+    ``source`` is the root the fragments were taken from. A prefix it does
+    not declare raises :class:`NamespaceReconciliationError` with reason
+    ``"undeclared"``: its meaning at the fragment's original position came
+    from a declaration somewhere below the source root, which a fragment
+    moved out of that position no longer has. Prefixes ``source`` lists as
+    ignorable stay ignorable in ``part_xml``.
+    """
+
+    used: Set[str] = set()
+    for fragment in fragments:
+        used |= prefixes_used(fragment, source.declarations)
+    needed: Dict[str, str] = {}
+    for prefix in sorted(used):
+        if prefix == "":
+            needed[""] = source.declarations.get("", "")
+        elif prefix in source.declarations:
+            needed[prefix] = source.declarations[prefix]
+        else:
+            raise NamespaceReconciliationError(
+                prefix,
+                "undeclared",
+                f"prefix {prefix!r} is used by the inserted markup but its "
+                "source root does not declare it",
+            )
+    return ensure_root_declarations(part_xml, needed, source.ignorable & used)
+

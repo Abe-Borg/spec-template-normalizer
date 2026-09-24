@@ -124,6 +124,13 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "The architect styles need numbering definitions but the numbering "
         "importer is not installed with this build. Reinstall the application."
     ),
+    "style_import_namespace_conflict": (
+        "An XML namespace used by the template's styles could not be declared "
+        "in the target's styles part: the target already uses its prefix for a "
+        "different namespace, or the template does not declare it on the root "
+        "of its own styles part. Open the target and the template in Word, save "
+        "each as a Word Document (.docx), and run again."
+    ),
     "template_section_shell_conflict": (
         "Architect template has conflicting section shells; use one canonical "
         "page layout and default/even/first header-footer mapping."

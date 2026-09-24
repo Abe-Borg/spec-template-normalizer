@@ -29,7 +29,8 @@ Usage:
     apply_environment_to_target(
         target_extract_dir=Path("mech_spec_extracted"),
         registry=loaded_registry_dict,
-        log=[]
+        log=[],
+        architect_namespaces=RootNamespaces.of(portable_styles_xml),
     )
 """
 
@@ -41,6 +42,7 @@ from typing import Any, Dict, List, Optional
 
 import xml.etree.ElementTree as ET
 
+from .core.errors import EngineError
 from .core.registry import _check_xml_fragment
 from .core.ooxml_namespaces import (
     CT_NS,
@@ -50,7 +52,13 @@ from .core.ooxml_namespaces import (
     serialize_package_relationships,
 )
 from .core.ooxml_text import prepare_xml_text_for_utf8, read_xml_text, write_xml_text
-from .core.untrusted_xml import parse_untrusted_xml
+from .core.untrusted_xml import UntrustedXmlError, parse_untrusted_xml
+from .core.xml_helpers import (
+    NamespaceReconciliationError,
+    RootNamespaces,
+    declare_fragment_namespaces,
+    root_namespace_additions,
+)
 from .core.section_mapping import choose_section_sources
 from .core.sectpr_tools import (
     CANONICAL_SECTPR_ORDER,
@@ -102,13 +110,24 @@ def _build_doc_defaults_block(
 def apply_doc_defaults(
     styles_xml: str,
     registry: Dict[str, Any],
-    log: List[str]
+    log: List[str],
+    *,
+    architect_namespaces: RootNamespaces,
 ) -> str:
     """
     Replace or insert docDefaults in styles.xml with values from registry.
     
     This is critical because styles inherit from docDefaults, and if the
     target document has different defaults, fonts/spacing will be wrong.
+
+    The registry's fragments were captured from the architect's styles part,
+    whose root declared their prefixes -- ``w14`` for the ligatures current
+    Word writes into every document's defaults. ``architect_namespaces`` is
+    that root. Each prefix the new block uses is declared on the target root
+    with the architect's meaning and keeps its ``mc:Ignorable`` status; a
+    prefix the target binds differently fails with
+    ``style_import_namespace_conflict``. The result is parsed before it is
+    returned, so an ill-formed stylesheet never reaches the next step.
     """
     doc_defaults = registry.get("doc_defaults", {})
     
@@ -122,6 +141,30 @@ def apply_doc_defaults(
     new_defaults = _build_doc_defaults_block(arch_rpr, arch_ppr)
     
     existing = _extract_doc_defaults_block(styles_xml)
+    if not existing and not re.search(r'(<w:styles\b[^>]*>)', styles_xml):
+        log.append("WARNING: Could not find <w:styles> tag to insert docDefaults")
+        return styles_xml
+
+    try:
+        declared_xml = declare_fragment_namespaces(
+            styles_xml,
+            [new_defaults],
+            architect_namespaces,
+        )
+    except NamespaceReconciliationError as exc:
+        raise EngineError(
+            "style_import_namespace_conflict",
+            f"Architect document defaults cannot be written into the target styles.xml: {exc}",
+        ) from exc
+    declared = root_namespace_additions(styles_xml, declared_xml)
+    if declared:
+        log.append(
+            "Added XML namespace declarations to the target styles.xml root "
+            "for the architect docDefaults: "
+            + ", ".join(declared)
+        )
+    styles_xml = declared_xml
+
     if existing:
         # Replace existing docDefaults
         styles_xml = styles_xml.replace(existing, new_defaults, 1)
@@ -129,17 +172,21 @@ def apply_doc_defaults(
     else:
         # Insert after <w:styles ...> opening tag
         m = re.search(r'(<w:styles\b[^>]*>)', styles_xml)
-        if m:
-            insert_point = m.end()
-            styles_xml = (
-                styles_xml[:insert_point] + 
-                "\n" + new_defaults + "\n" + 
-                styles_xml[insert_point:]
-            )
-            log.append("Inserted docDefaults from architect (none existed)")
-        else:
-            log.append("WARNING: Could not find <w:styles> tag to insert docDefaults")
-    
+        insert_point = m.end()
+        styles_xml = (
+            styles_xml[:insert_point] + 
+            "\n" + new_defaults + "\n" + 
+            styles_xml[insert_point:]
+        )
+        log.append("Inserted docDefaults from architect (none existed)")
+
+    try:
+        parse_untrusted_xml(styles_xml, "word/styles.xml")
+    except UntrustedXmlError as exc:
+        raise ValueError(
+            "The target styles.xml is not well-formed after the architect's "
+            "document defaults were applied"
+        ) from exc
     return styles_xml
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -610,6 +657,8 @@ def apply_environment_to_target(
     apply_fonts_flag: bool = True,
     apply_headers_footers_flag: bool = True,
     registry_dir: Optional[Path] = None,
+    *,
+    architect_namespaces: RootNamespaces,
 ) -> Dict[str, Any]:
     """
     Apply the formatting environment from arch_template_registry to target.
@@ -627,6 +676,11 @@ def apply_environment_to_target(
         registry: Loaded arch_template_registry.json
         log: List to append log messages
         apply_*: Flags to selectively disable parts of application
+        architect_namespaces: the declarations on the root of the architect's
+            styles part (the bundle's ``portable_styles.xml``), which say what
+            the prefixes in the registry's docDefaults fragments mean.
+            Required rather than defaulted: without it the target root cannot
+            be checked for a prefix it binds differently.
     """
     target_extract_dir = Path(target_extract_dir)
     
@@ -656,12 +710,21 @@ def apply_environment_to_target(
         log.append("\n[3/6] Font table application skipped")
     
     # 4. docDefaults in styles.xml
+    styles_namespace_additions: tuple = ()
     if apply_doc_defaults_flag:
         log.append("\n[4/6] Applying docDefaults...")
         styles_path = target_extract_dir / "word" / "styles.xml"
         if styles_path.exists():
-            styles_xml = read_xml_text(styles_path)
-            styles_xml = apply_doc_defaults(styles_xml, registry, log)
+            original_styles_xml = read_xml_text(styles_path)
+            styles_xml = apply_doc_defaults(
+                original_styles_xml,
+                registry,
+                log,
+                architect_namespaces=architect_namespaces,
+            )
+            styles_namespace_additions = root_namespace_additions(
+                original_styles_xml, styles_xml
+            )
             write_xml_text(styles_path, styles_xml)
         else:
             log.append("WARNING: No styles.xml in target; cannot apply docDefaults")
@@ -699,4 +762,7 @@ def apply_environment_to_target(
     log.append("\n" + "=" * 60)
     log.append("END ENVIRONMENT APPLICATION")
     log.append("=" * 60)
-    return {"header_footer_import": hf_result}
+    return {
+        "header_footer_import": hf_result,
+        "styles_namespace_additions": styles_namespace_additions,
+    }

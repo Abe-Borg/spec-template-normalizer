@@ -17,6 +17,8 @@ R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+W14_NS = "http://schemas.microsoft.com/office/word/2010/wordml"
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 
 PNG_1X1 = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -591,9 +593,9 @@ def test_format_only_preserves_target_automatic_numbering_for_typed_architect_ro
     assert '<w:num w:numId="17">' in output_numbering
 
 
-def test_unified_canadian_mode_converts_typed_csi_markers_end_to_end(
-    tmp_path: Path,
-) -> None:
+def _write_canadian_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """An architect with a two-level Canadian list and a typed-CSI target."""
+
     architect = tmp_path / "canadian-architect.docx"
     target = tmp_path / "csi-target.docx"
     _write_docx(architect, architect=True)
@@ -650,6 +652,13 @@ def test_unified_canadian_mode_converts_typed_csi_markers_end_to_end(
         1,
     )
     _rewrite_docx_parts(target, {"word/document.xml": target_document})
+    return architect, target
+
+
+def test_unified_canadian_mode_converts_typed_csi_markers_end_to_end(
+    tmp_path: Path,
+) -> None:
+    architect, target = _write_canadian_pair(tmp_path)
     target_sha = _sha256(target)
 
     run = format_specifications(
@@ -680,3 +689,161 @@ def test_unified_canadian_mode_converts_typed_csi_markers_end_to_end(
     assert '<w:lvlText w:val=".%1"/>' in output_numbering
     assert '<w:lvlText w:val=".%2"/>' in output_numbering
     assert b'<w:numId w:val="17"/>' not in output_document
+
+
+def _extension_namespace_architect_styles() -> str:
+    """An architect stylesheet shaped the way current Word writes one.
+
+    ``w14`` is declared on the root and marked ignorable, the document
+    defaults carry ligatures, and ``Normal`` overrides them, so a clone that
+    resolves its inheritance correctly carries Normal's value, not the
+    defaults'.
+    """
+
+    return (
+        f'<w:styles xmlns:w="{W_NS}" xmlns:w14="{W14_NS}" xmlns:mc="{MC_NS}" '
+        'mc:Ignorable="w14">'
+        "<w:docDefaults><w:rPrDefault><w:rPr>"
+        '<w:rFonts w:ascii="Aptos" w:hAnsi="Aptos"/><w:sz w:val="24"/>'
+        '<w14:ligatures w14:val="standardContextual"/>'
+        "</w:rPr></w:rPrDefault>"
+        "<w:pPrDefault><w:pPr/></w:pPrDefault></w:docDefaults>"
+        '<w:style w:type="paragraph" w:default="1" w:styleId="Normal">'
+        '<w:name w:val="Normal"/><w:qFormat/>'
+        '<w:rPr><w14:ligatures w14:val="standard"/></w:rPr></w:style>'
+        "</w:styles>"
+    )
+
+
+def _styles_root_tag(styles_xml: str) -> str:
+    match = re.search(r"<w:styles\b[^>]*>", styles_xml)
+    assert match is not None, "output stylesheet has no w:styles root"
+    return match.group(0)
+
+
+def _assert_declares_ignorable_w14(styles_xml: str) -> ET.Element:
+    root_tag = _styles_root_tag(styles_xml)
+    assert f'xmlns:w14="{W14_NS}"' in root_tag
+    assert f'xmlns:mc="{MC_NS}"' in root_tag
+    assert 'mc:Ignorable="w14"' in root_tag
+    root = ET.fromstring(styles_xml.encode("utf-8"))
+    defaults = root.find(
+        f"{{{W_NS}}}docDefaults/{{{W_NS}}}rPrDefault/{{{W_NS}}}rPr/{{{W14_NS}}}ligatures"
+    )
+    assert defaults is not None
+    assert defaults.get(f"{{{W14_NS}}}val") == "standardContextual"
+    return root
+
+
+def _assert_ligatures_last(style: ET.Element, value: str) -> None:
+    rpr = style.find(f"{{{W_NS}}}rPr")
+    assert rpr is not None
+    tags = [child.tag for child in rpr]
+    assert tags[-1] == f"{{{W14_NS}}}ligatures", tags
+    assert all(tag.startswith(f"{{{W_NS}}}") for tag in tags[:-1]), tags
+    assert rpr[-1].get(f"{{{W14_NS}}}val") == value
+
+
+def test_format_only_carries_extension_namespace_styles_into_a_bare_target_stylesheet(
+    tmp_path: Path,
+) -> None:
+    # Every template current Word saves has w14:ligatures in its document
+    # defaults. Format-only used to fail on it at style import ("unbound
+    # prefix"), because materialization parsed each run-property block with
+    # only the w namespace declared.
+    architect = tmp_path / "w14-architect.docx"
+    target = tmp_path / "bare-target.docx"
+    _write_docx(architect, architect=True)
+    _write_docx(target, architect=False)
+    _rewrite_docx_parts(architect, {"word/styles.xml": _extension_namespace_architect_styles()})
+    with zipfile.ZipFile(target) as package:
+        target_styles = package.read("word/styles.xml").decode("utf-8")
+        target_document_before = package.read("word/document.xml")
+    assert _styles_root_tag(target_styles) == f'<w:styles xmlns:w="{W_NS}">'
+
+    run = format_specifications(
+        architect_template=architect,
+        target_specs=[target],
+        output_dir=tmp_path / "formatted",
+        cache_dir=tmp_path / "template-cache",
+        api_key="",
+        max_workers=1,
+        template_model="w14-format-only-fixture",
+        template_classifier=_deterministic_classifier,
+    )
+
+    assert run.success, "\n".join(run.targets[0].log)
+    result = run.targets[0]
+    assert result.output_path is not None
+    validate_docx_package(result.output_path)
+    with zipfile.ZipFile(result.output_path) as package:
+        output_styles = package.read("word/styles.xml").decode("utf-8")
+        output_document = package.read("word/document.xml")
+
+    root = _assert_declares_ignorable_w14(output_styles)
+    # The defaults arrive first and declare w14; the imported styles then find
+    # it declared. Both steps say what they did, in the log and as counts.
+    run_log = (run.run_dir / "run.log").read_text(encoding="utf-8")
+    assert (
+        "Added XML namespace declarations to the target styles.xml root "
+        "for the architect docDefaults: mc, w14, mc:Ignorable=w14"
+    ) in run_log
+    events = {
+        event["event"]: event["fields"]
+        for event in (
+            json.loads(line)
+            for line in run.diagnostics_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if event.get("event") in {"apply_environment", "style_import"}
+    }
+    assert events["apply_environment"]["styles_namespace_additions"] == 3
+    assert events["style_import"]["styles_namespace_additions"] == 0
+    body_clones = [
+        style
+        for style in root.findall(f"{{{W_NS}}}style")
+        if "_BODY_CSI_" in (style.get(f"{{{W_NS}}}styleId") or "")
+    ]
+    assert len(body_clones) == 2
+    for clone in body_clones:
+        # Detached from Normal, so Normal's override is materialized into it.
+        _assert_ligatures_last(clone, "standard")
+    assert _xml_text_sequence(output_document) == _xml_text_sequence(target_document_before)
+
+
+def test_canadian_mode_carries_extension_namespace_styles_into_a_bare_target_stylesheet(
+    tmp_path: Path,
+) -> None:
+    # The Canadian path does not materialize run properties, so it never hit
+    # the parse error. It cloned Normal with its w14 child intact and wrote it
+    # into a stylesheet whose root did not declare w14.
+    architect, target = _write_canadian_pair(tmp_path)
+    _rewrite_docx_parts(architect, {"word/styles.xml": _extension_namespace_architect_styles()})
+
+    run = format_specifications(
+        architect_template=architect,
+        target_specs=[target],
+        output_dir=tmp_path / "formatted",
+        cache_dir=tmp_path / "template-cache",
+        api_key="",
+        max_workers=1,
+        conversion_mode=CSI_TO_CANADIAN,
+        template_model="w14-canadian-fixture",
+        template_classifier=_deterministic_classifier,
+    )
+
+    assert run.success, "\n".join(run.targets[0].log)
+    result = run.targets[0]
+    assert result.output_path is not None
+    validate_docx_package(result.output_path)
+    with zipfile.ZipFile(result.output_path) as package:
+        output_styles = package.read("word/styles.xml").decode("utf-8")
+
+    root = _assert_declares_ignorable_w14(output_styles)
+    normal_clones = [
+        style
+        for style in root.findall(f"{{{W_NS}}}style")
+        if "_SHELL_Normal_" in (style.get(f"{{{W_NS}}}styleId") or "")
+    ]
+    assert len(normal_clones) == 1
+    _assert_ligatures_last(normal_clones[0], "standard")

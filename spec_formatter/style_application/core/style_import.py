@@ -8,13 +8,24 @@ property materialization for cross-document portability.
 import hashlib
 import functools
 import re
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Set, Optional, Tuple
+from typing import Callable, Dict, FrozenSet, Iterator, List, Mapping, Set, Optional, Tuple
 
+from .errors import EngineError
 from .ooxml_text import read_xml_text, write_xml_text
-from .xml_helpers import edit_preserving_out_of_scope_subtrees
+from .untrusted_xml import UntrustedXmlError, parse_untrusted_xml
+from .xml_helpers import (
+    W_NS,
+    NamespaceReconciliationError,
+    RootNamespaces,
+    declare_fragment_namespaces,
+    edit_preserving_out_of_scope_subtrees,
+    iter_direct_child_xml_blocks,
+    root_namespace_additions,
+    root_namespace_declarations,
+    root_opening_tag,
+)
 
 # Word built-in styles that exist implicitly in every DOCX.
 # These never need to be imported — Word creates them internally
@@ -26,10 +37,6 @@ WORD_BUILTIN_STYLE_IDS = frozenset({
     "NoList",
 })
 
-_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-ET.register_namespace("w", _W_NS)
-
-
 @dataclass(frozen=True)
 class StyleImportResult:
     """Collision-safe style IDs selected for an imported architect graph."""
@@ -39,6 +46,9 @@ class StyleImportResult:
     # Format-only body roles use fully materialized, numbering-detached clones.
     body_style_id_map: Dict[str, str]
     imported_style_ids: Set[str]
+    # What the import added to the target stylesheet's root so the imported
+    # blocks keep their meaning: prefixes, and ``mc:Ignorable=<prefix>``.
+    declared_namespace_prefixes: Tuple[str, ...] = ()
 
 
 def _namespaced_style_id(
@@ -418,31 +428,124 @@ def _effective_rpr_inner_in_arch(arch_styles_xml_text: str, style_id: str) -> st
 
     return "".join(nodes)
 
-def _ppr_children_by_name(inner_xml: str) -> List[tuple[str, str]]:
-    """Parse direct pPr children without flattening nested borders/tabs."""
+
+# Children a style does not pass on through ``basedOn``: its own identity
+# (pStyle/rStyle), numbering (the mode policy owns it), section properties,
+# and tracked-change history. Matched by qualified name, like every child.
+_PPR_CHILDREN_NOT_INHERITED = frozenset({"w:pStyle", "w:numPr", "w:sectPr", "w:pPrChange"})
+_RPR_CHILDREN_NOT_INHERITED = frozenset({"w:rStyle", "w:rPrChange"})
+
+
+def _property_children(
+    inner_xml: str,
+    container: str,
+    excluded: FrozenSet[str],
+    owner: str,
+) -> List[Tuple[str, str]]:
+    """Direct children of a property container as ``(qualified name, source bytes)``.
+
+    Read lexically, never parsed. A property block is a fragment whose
+    prefixes are declared on the architect stylesheet's root, not on the
+    block, so a parser given only the ``w`` namespace fails on the first
+    extension child -- ``w14:ligatures`` in the document defaults of every
+    template current Word saves -- and re-serializing would reformat the
+    children besides. ``owner`` names the style in the error for a fragment
+    that cannot be read; the fragment itself is never quoted.
+    """
 
     if not inner_xml.strip():
         return []
     try:
-        root = ET.fromstring(f'<w:pPr xmlns:w="{_W_NS}">{inner_xml}</w:pPr>')
-    except ET.ParseError as exc:
-        raise ValueError(f"Architect style contains invalid pPr XML: {exc}") from exc
-    children: List[tuple[str, str]] = []
-    for child in list(root):
-        local_name = child.tag.rsplit("}", 1)[-1]
-        if local_name in {"pStyle", "numPr", "sectPr", "pPrChange"}:
-            continue
-        serialized = ET.tostring(child, encoding="unicode", short_empty_elements=True)
-        serialized = serialized.replace(f' xmlns:w="{_W_NS}"', "")
-        children.append((local_name, serialized))
-    return children
+        children = list(iter_direct_child_xml_blocks(f"<{container}>{inner_xml}</{container}>"))
+    except ValueError as exc:
+        raise ValueError(f"{owner} contains malformed {container} XML") from exc
+    return [(name, block) for _start, _end, name, block in children if name not in excluded]
 
 
-def _effective_ppr_inner_in_arch(arch_styles_xml_text: str, style_id: str) -> str:
-    """Resolve each formatting property independently through basedOn."""
+def _ppr_children_by_name(inner_xml: str, owner: str) -> List[Tuple[str, str]]:
+    """Direct pPr children, nested borders and tabs left whole."""
 
-    resolved: Dict[str, str] = {}
-    order: List[str] = []
+    return _property_children(inner_xml, "w:pPr", _PPR_CHILDREN_NOT_INHERITED, owner)
+
+
+def _rpr_children_by_name(inner_xml: str, owner: str) -> List[Tuple[str, str]]:
+    """Direct rPr children for property-wise inheritance."""
+
+    return _property_children(inner_xml, "w:rPr", _RPR_CHILDREN_NOT_INHERITED, owner)
+
+
+# A property child's identity: its namespace URI and local name. ``None`` in
+# place of the URI marks a prefix that resolves nowhere, and the name is then
+# the qualified name as written.
+_PropertyKey = Tuple[Optional[str], str]
+
+
+def _architect_root_bindings(arch_styles_xml_text: str) -> Dict[str, str]:
+    """The architect stylesheet root's declarations; none for a rootless fragment."""
+
+    try:
+        return root_namespace_declarations(arch_styles_xml_text)
+    except ValueError:
+        return {}
+
+
+def _property_key(
+    qualified_name: str,
+    child_block: str,
+    bindings: Mapping[str, str],
+) -> _PropertyKey:
+    """The expanded name of a property child, resolved through ``bindings``.
+
+    A declaration on the child itself wins over the architect root's, as it
+    does in XML. An unprefixed child is in the default namespace, or in none.
+    """
+
+    prefix, _, local = qualified_name.rpartition(":")
+    own = root_namespace_declarations(child_block)
+    if prefix in own:
+        return own[prefix], local
+    if prefix in bindings:
+        return bindings[prefix], local
+    if not prefix:
+        return "", local
+    return None, qualified_name
+
+
+def _effective_properties_in_arch(
+    arch_styles_xml_text: str,
+    style_id: str,
+    container: str,
+    read_children: Callable[[str, str], List[Tuple[str, str]]],
+    defaults_inner: str,
+) -> str:
+    """Resolve each property child independently through ``basedOn``, then the defaults.
+
+    Keyed by expanded name -- namespace URI and local name, each prefix
+    resolved through the architect root's declarations. ``w:shadow`` and
+    ``w14:shadow`` are different properties that share a local name, and
+    keying by local name let the nearer one hide the other; two prefixes bound
+    to one namespace name one property, and keying by the prefix as written
+    kept a parent's value beside the child's override. Extension children are
+    carried, not dropped: ``w14:textFill`` is visible, and dropping it would
+    silently change what the architect specified.
+
+    ``w:`` children -- those in the WordprocessingML namespace -- come first,
+    in first-seen order, then every extension child in first-seen order: Word
+    writes extension children last, and the strict schema does not know them.
+    """
+
+    bindings = _architect_root_bindings(arch_styles_xml_text)
+    main_namespace = bindings.get("w", W_NS)
+    resolved: Dict[_PropertyKey, str] = {}
+    order: List[_PropertyKey] = []
+
+    def take(children: List[Tuple[str, str]]) -> None:
+        for name, node in children:
+            key = _property_key(name, node, bindings)
+            if key not in resolved:
+                resolved[key] = node
+                order.append(key)
+
     seen: Set[str] = set()
     cur = style_id
     while cur and cur not in seen and len(seen) < 50:
@@ -450,38 +553,30 @@ def _effective_ppr_inner_in_arch(arch_styles_xml_text: str, style_id: str) -> st
         block = _extract_style_block(arch_styles_xml_text, cur)
         if not block:
             break
-        inner = _extract_tag_inner(block, "w:pPr") or ""
-        for name, node in _ppr_children_by_name(inner):
-            if name not in resolved:
-                resolved[name] = node
-                order.append(name)
+        inner = _extract_tag_inner(block, container) or ""
+        take(read_children(inner, f"Architect style {cur!r}"))
         cur = _extract_basedOn(block)
+    take(read_children(defaults_inner, "Architect document defaults"))
 
-    for name, node in _ppr_children_by_name(_docdefaults_ppr_inner(arch_styles_xml_text)):
-        if name not in resolved:
-            resolved[name] = node
-            order.append(name)
-    return "".join(resolved[name] for name in order)
+    def is_core(key: _PropertyKey) -> bool:
+        namespace, name = key
+        return namespace == main_namespace if namespace is not None else name.startswith("w:")
+
+    core = [key for key in order if is_core(key)]
+    extensions = [key for key in order if not is_core(key)]
+    return "".join(resolved[key] for key in core + extensions)
 
 
-def _rpr_children_by_name(inner_xml: str) -> List[tuple[str, str]]:
-    """Parse direct style rPr children for property-wise inheritance."""
+def _effective_ppr_inner_in_arch(arch_styles_xml_text: str, style_id: str) -> str:
+    """Resolve each formatting property independently through basedOn."""
 
-    if not inner_xml.strip():
-        return []
-    try:
-        root = ET.fromstring(f'<w:rPr xmlns:w="{_W_NS}">{inner_xml}</w:rPr>')
-    except ET.ParseError as exc:
-        raise ValueError(f"Architect style contains invalid rPr XML: {exc}") from exc
-    children: List[tuple[str, str]] = []
-    for child in list(root):
-        local_name = child.tag.rsplit("}", 1)[-1]
-        if local_name in {"rStyle", "rPrChange"}:
-            continue
-        serialized = ET.tostring(child, encoding="unicode", short_empty_elements=True)
-        serialized = serialized.replace(f' xmlns:w="{_W_NS}"', "")
-        children.append((local_name, serialized))
-    return children
+    return _effective_properties_in_arch(
+        arch_styles_xml_text,
+        style_id,
+        "w:pPr",
+        _ppr_children_by_name,
+        _docdefaults_ppr_inner(arch_styles_xml_text),
+    )
 
 
 def _effective_full_rpr_inner_in_arch(
@@ -490,27 +585,23 @@ def _effective_full_rpr_inner_in_arch(
 ) -> str:
     """Resolve every reusable run property independently through basedOn."""
 
-    resolved: Dict[str, str] = {}
-    order: List[str] = []
-    seen: Set[str] = set()
-    cur = style_id
-    while cur and cur not in seen and len(seen) < 50:
-        seen.add(cur)
-        block = _extract_style_block(arch_styles_xml_text, cur)
-        if not block:
-            break
-        inner = _extract_tag_inner(block, "w:rPr") or ""
-        for name, node in _rpr_children_by_name(inner):
-            if name not in resolved:
-                resolved[name] = node
-                order.append(name)
-        cur = _extract_basedOn(block)
+    return _effective_properties_in_arch(
+        arch_styles_xml_text,
+        style_id,
+        "w:rPr",
+        _rpr_children_by_name,
+        _docdefaults_rpr_inner(arch_styles_xml_text),
+    )
 
-    for name, node in _rpr_children_by_name(_docdefaults_rpr_inner(arch_styles_xml_text)):
-        if name not in resolved:
-            resolved[name] = node
-            order.append(name)
-    return "".join(resolved[name] for name in order)
+
+def _replace_first(pattern: str, replacement: str, text: str) -> str:
+    """Replace the first match of ``pattern`` with ``replacement``, literally.
+
+    Materialized fragments are source bytes. ``re.sub`` would read a
+    backslash in one as a group reference in the replacement template.
+    """
+
+    return re.sub(pattern, lambda _match: replacement, text, count=1)
 
 
 def _materialize_full_rpr_for_detached_body(
@@ -525,18 +616,16 @@ def _materialize_full_rpr_for_detached_body(
         style_id,
     )
     if re.search(r"<w:rPr\b[^>]*/>", style_block):
-        return re.sub(
+        return _replace_first(
             r"<w:rPr\b[^>]*/>",
             f"<w:rPr>{effective}</w:rPr>" if effective else "",
             style_block,
-            count=1,
         )
     if re.search(r"<w:rPr\b[^>]*>[\s\S]*?</w:rPr>", style_block):
-        return re.sub(
+        return _replace_first(
             r"<w:rPr\b[^>]*>[\s\S]*?</w:rPr>",
             f"<w:rPr>{effective}</w:rPr>" if effective else "",
             style_block,
-            count=1,
         )
     if not effective:
         return style_block
@@ -551,14 +640,48 @@ def _rpr_contains_tag(rpr_inner: str, tag: str) -> bool:
 def _extract_rpr_inner(style_block: str) -> Optional[str]:
     return _extract_tag_inner(style_block, "w:rPr")
 
+def _rpr_opening_before(style_block: str, close: int) -> Optional[int]:
+    """Where the ``w:rPr`` element that ``</w:rPr>`` at ``close`` ends begins."""
+
+    position = close
+    while True:
+        position = style_block.rfind("<w:rPr", 0, position)
+        if position < 0:
+            return None
+        # <w:rPrChange> shares the spelling; only <w:rPr> itself qualifies.
+        if style_block[position + len("<w:rPr"):position + len("<w:rPr") + 1] in (
+            " ", "\t", "\r", "\n", ">", "/",
+        ):
+            return position
+
+
 def _inject_missing_rpr_children(style_block: str, missing_children_xml: str) -> str:
-    """Insert missing rPr children (already as raw XML) just before </w:rPr>."""
+    """Insert missing ``w:`` rPr children (raw XML) into the first rPr.
+
+    They go ahead of the rPr's first extension-namespace child, where Word
+    keeps its own ``w:`` children, or just before ``</w:rPr>`` when it has
+    none. Only the first closing tag is used, as before.
+    """
     if not missing_children_xml.strip():
         return style_block
-    if "</w:rPr>" not in style_block:
+    close = style_block.find("</w:rPr>")
+    if close < 0:
         return style_block
-    # Replace only the first closing tag (avoid accidental insertion into nested rPr blocks)
-    return style_block.replace("</w:rPr>", f"{missing_children_xml}</w:rPr>", 1)
+    insert_at = close
+    opening = _rpr_opening_before(style_block, close)
+    if opening is not None:
+        rpr_block = style_block[opening:close + len("</w:rPr>")]
+        try:
+            for start, _end, name, _block in iter_direct_child_xml_blocks(rpr_block):
+                if not name.startswith("w:"):
+                    insert_at = opening + start
+                    break
+        except ValueError:
+            # A malformed rPr keeps the old insertion point. The imported
+            # stylesheet is parsed before it is written, and that names the
+            # style.
+            pass
+    return style_block[:insert_at] + missing_children_xml + style_block[insert_at:]
 
 def _materialize_minimal_typography(style_block: str, style_id: str, arch_styles_xml_text: str) -> str:
     """
@@ -638,18 +761,16 @@ def materialize_arch_style_block(style_block: str, style_id: str, arch_styles_xm
         combined_ppr = direct_numpr + effp
         if combined_ppr.strip():
             if re.search(r"<w:pPr\b[^>]*/>", style_block):
-                style_block = re.sub(
+                style_block = _replace_first(
                     r"<w:pPr\b[^>]*/>",
                     f"<w:pPr>{combined_ppr}</w:pPr>",
                     style_block,
-                    count=1,
                 )
             elif re.search(r"<w:pPr\b[^>]*>[\s\S]*?</w:pPr>", style_block):
-                style_block = re.sub(
+                style_block = _replace_first(
                     r"<w:pPr\b[^>]*>[\s\S]*?</w:pPr>",
                     f"<w:pPr>{combined_ppr}</w:pPr>",
                     style_block,
-                    count=1,
                 )
             else:
                 style_block = style_block.replace(
@@ -727,6 +848,7 @@ def import_arch_styles_into_target(
     format_only_body_style_ids: Optional[Set[str]] = None,
     shell_style_ids: Optional[Set[str]] = None,
     namespace_seed: Optional[str] = None,
+    architect_namespaces: Optional[RootNamespaces] = None,
 ) -> StyleImportResult:
     """
     Copy specific style blocks from architect styles.xml into target styles.xml (idempotent),
@@ -734,6 +856,19 @@ def import_arch_styles_into_target(
 
     arch_styles_xml: the architect styles as a string -- the bundle's
     ``portable_styles.xml``. The architect-free modes never import styles.
+
+    architect_namespaces: the declarations on ``arch_styles_xml``'s root. The
+    shared application path builds it once per target and passes the same
+    value to docDefaults application; when omitted it is read from
+    ``arch_styles_xml`` here, which gives the same answer.
+
+    Every prefix the imported blocks use is declared on the target
+    stylesheet's root with the meaning it had in the architect's, and keeps
+    its ``mc:Ignorable`` status. A prefix the target already binds to a
+    different namespace, or one the architect root does not declare, fails
+    with ``style_import_namespace_conflict`` before anything is written. The
+    stylesheet is parsed before it is written; a block that does not parse
+    fails naming its style ID.
     """
     tgt_styles_path = target_extract_dir / "word" / "styles.xml"
 
@@ -880,14 +1015,69 @@ def import_arch_styles_into_target(
             imported_style_ids=imported_ids,
         )
 
-    tgt_new = insert_styles_into_styles_xml(tgt_styles_text, blocks)
+    try:
+        tgt_new = declare_fragment_namespaces(
+            tgt_styles_text,
+            blocks,
+            architect_namespaces or RootNamespaces.of(arch_styles_text),
+        )
+    except NamespaceReconciliationError as exc:
+        raise EngineError(
+            "style_import_namespace_conflict",
+            f"Architect styles cannot be written into the target styles.xml: {exc}",
+        ) from exc
+    declared = root_namespace_additions(tgt_styles_text, tgt_new)
+    if declared:
+        log.append(
+            "Added XML namespace declarations to the target styles.xml root "
+            "for imported architect styles: "
+            + ", ".join(declared)
+        )
+    tgt_new = insert_styles_into_styles_xml(tgt_new, blocks)
+    _require_well_formed_styles(
+        tgt_new,
+        [(sid, blk) for sid, final_id, blk in prepared_blocks if final_id in imported_ids],
+    )
     if tgt_new != original_tgt_styles_text:
         write_xml_text(tgt_styles_path, tgt_new)
     return StyleImportResult(
         style_id_map=style_id_map,
         body_style_id_map=body_style_id_map,
         imported_style_ids=imported_ids,
+        declared_namespace_prefixes=declared,
     )
+
+def _require_well_formed_styles(
+    styles_xml_text: str,
+    imported_blocks: List[Tuple[str, str]],
+) -> None:
+    """Refuse to write a stylesheet that does not parse, naming the culprit.
+
+    Materialization reads fragments lexically and never parses them, so this
+    is where a malformed architect fragment is caught -- before the target is
+    touched, not at packaging. When the whole part fails, each imported block
+    is parsed on its own under the part's root declarations, and the first
+    that fails is named by its source style ID. The XML is never quoted.
+    """
+
+    try:
+        parse_untrusted_xml(styles_xml_text, "word/styles.xml")
+    except UntrustedXmlError as exc:
+        # The blocks were inserted before </w:styles>, so the root is w:styles.
+        opening = root_opening_tag(styles_xml_text)
+        for style_id, block in imported_blocks:
+            try:
+                parse_untrusted_xml(f"{opening}{block}</w:styles>", "word/styles.xml")
+            except UntrustedXmlError:
+                raise ValueError(
+                    f"Architect style {style_id!r} is not well-formed XML; "
+                    "it was not imported"
+                ) from None
+        raise ValueError(
+            "The target styles.xml is not well-formed after architect styles were "
+            "imported, and every imported style parses on its own"
+        ) from exc
+
 
 def insert_styles_into_styles_xml(styles_xml_text: str, style_blocks: List[str]) -> str:
     if not style_blocks:

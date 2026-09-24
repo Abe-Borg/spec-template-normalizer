@@ -967,14 +967,23 @@ def _ind_values(ind_element: Optional[ET.Element]) -> _Geometry:
 
 
 def _ind_from_ppr_xml(ppr_xml: str) -> _Geometry:
+    """The ``w:ind`` attributes of a pPr, read in either quoting.
+
+    An imported architect style carries its property children as the source
+    wrote them, so single quotes and spaces around ``=`` reach this reader.
+    Seeing only ``w:left="..."`` took such an indent for no indent at all.
+    """
+
     match = re.search(r"<w:ind\b[^>]*/?>", ppr_xml)
     if match is None:
         return None
-    values = {
-        name: value
-        for name in _IND_ATTRIBUTES
-        for value in re.findall(rf'w:{name}="([^"]*)"', match.group(0))
-    }
+    values: Dict[str, str] = {}
+    for name in _IND_ATTRIBUTES:
+        found = re.search(
+            rf"""\sw:{name}\s*=\s*(?:"([^"]*)"|'([^']*)')""", match.group(0)
+        )
+        if found is not None:
+            values[name] = found.group(1) if found.group(1) is not None else found.group(2)
     return values or None
 
 

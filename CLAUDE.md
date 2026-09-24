@@ -243,6 +243,34 @@ conflicting architect style and its dependencies under deterministic private
 IDs, rewrite `basedOn`/`next`/`link` and imported header/footer references, and
 reject a deterministic namespace collision with different content.
 
+Extension-namespace properties are **carried, not dropped**. Current Word
+writes `<w14:ligatures w14:val="standardContextual"/>` into the document
+defaults of every template, and a style can carry `w14:textFill`, `w14:glow`
+or `w14:shadow` of its own. Dropping one would silently change formatting the
+architect specified (`w14:textFill` is visible), and the Phase 1 side keeps
+them for the same reason (`build_portable_styles_xml` declares their
+namespaces on the portable stylesheet root). So materialization reads a
+style's property children lexically -- never through a parser given only the
+`w` namespace, which fails on the first extension child -- keys inheritance by
+**expanded** name, namespace URI plus local name resolved through the
+architect root's declarations (`w:shadow` and `w14:shadow` are different
+properties that share a local name; `w14:ligatures` and `x:ligatures` are one
+property when both prefixes name the Word 2010 namespace), carries each child
+exactly as the source wrote it, and places extension children after the `w:`
+children, where Word writes them.
+
+A fragment written into the target's styles part must keep the meaning its
+prefixes had in the architect's. Every prefix it uses -- in an element or
+attribute name, or named in a markup-compatibility value such as
+`mc:Choice Requires="w14"` or a nested `mc:Ignorable` -- is declared on the
+target root with the architect's namespace URI and keeps its `mc:Ignorable`
+status (markup compatibility is recognised by namespace, not by the literal
+`mc`; Word 2007 wrote `ve`). A prefix the target already binds to a different
+namespace, or one the architect's stylesheet does not declare on its root,
+fails closed with `style_import_namespace_conflict` before anything is
+written. The engine never rebinds a prefix, never adds or changes a default
+namespace, and never guesses a URI.
+
 ### 6. Profile bundle and cache are strict boundaries
 
 Target application consumes the complete `.phase1` directory after strict
@@ -620,6 +648,28 @@ formatting, detach Format-only body styles from architect numbering, namespace
 every target-ID collision deterministically, and rewrite dependency references.
 Return the source-to-final style-ID map to every body/header/footer consumer.
 
+Materialization (`_effective_ppr_inner_in_arch`,
+`_effective_full_rpr_inner_in_arch`, `_inject_missing_rpr_children`) reads
+property children with `iter_direct_child_xml_blocks`, keys them by expanded
+name (`_property_key`, through the architect root's declarations and any on
+the child itself), and splices them literally. There is no ElementTree round
+trip left in this module, so a materialized child is the architect's bytes
+(`<w:keepNext/>`, not `<w:keepNext />`) in the architect's quoting; a reader
+of the output that assumed double quotes (the geometry invariant's `w:ind`
+reader did) must accept either. Every block written into the target goes through
+`declare_fragment_namespaces`, and the stylesheet is parsed before it is
+written: a block that does not parse fails naming its source style ID, never
+quoting the XML. The namespace helpers live in `core/xml_helpers.py`
+(`RootNamespaces`, `root_namespace_declarations`, `root_ignorable_prefixes`,
+`prefixes_used`, `ensure_root_declarations`, `declare_fragment_namespaces`).
+`_apply_classified_target_impl` builds one `RootNamespaces` per target from the
+portable stylesheet root and passes the same value to style import and to
+`apply_environment_to_target`, where it is required rather than defaulted: a
+missing map could not detect a conflicting binding. What each step declared is
+logged, carried on `StyleImportResult.declared_namespace_prefixes`, and counted
+as `styles_namespace_additions` on the `apply_environment` and `style_import`
+diagnostics events.
+
 Style references (`pStyle`/`rStyle`/`tblStyle` in content, `basedOn`/`link`/
 `next` in a style) are read by `referenced_style_ids` and rewritten by
 `remap_style_references`, one grammar that accepts either quoting and spaces
@@ -649,7 +699,12 @@ and to point the header at them.
 ### Target shell, packaging, and invariants
 
 - `arch_env_applier.py` applies document defaults, theme/settings,
-  compatibility, and canonical section/page layout.
+  compatibility, and canonical section/page layout. `apply_doc_defaults`
+  declares the prefixes the architect's defaults use exactly as style import
+  does (the ligatures in every current template's defaults are usually what
+  first brings `w14` into a target), fails with
+  `style_import_namespace_conflict` on a conflicting binding, and parses the
+  stylesheet before returning it.
 - `core/section_mapping.py` resolves Word's per-type header/footer inheritance
   before comparing the architect's effective section shells. Raw profile
   registries stay immutable, and explicit shell conflicts fail in shared
@@ -677,7 +732,9 @@ and to point the header at them.
   readings and a paragraph fails only when it changed under both. A rendering
   stable under either precedence is stable whichever one Word implements, and
   a document that moved under only one is exactly where this module cannot
-  honestly claim a defect. Do not "fix" it by picking a precedence.
+  honestly claim a defect. Do not "fix" it by picking a precedence. Indent
+  attributes are read in either quoting, because imported clones carry the
+  architect's property children as written.
 
   It runs for every mode. The two forward Canadian modes retarget converted
   paragraphs onto a different list's level indents, so their geometry is meant
@@ -906,7 +963,7 @@ Current codes: `header_footer_target_section_id_required`,
 `conversion_prediction_mismatch`, `builtin_scheme_contract`, `classification_invalid_payload`,
 `classification_deterministic_override`,
 `classification_coverage_incomplete`, `paragraph_style_not_applied`,
-`numbering_importer_unavailable`,
+`numbering_importer_unavailable`, `style_import_namespace_conflict`,
 `template_section_shell_conflict`, `template_default_section_conflict`,
 `template_duplicate_section_index`.
 
@@ -1260,6 +1317,13 @@ Before considering a formatter change complete:
   `apply_pstyle_to_paragraph_block`, which escapes its argument.
 - Replacing a target style merely because an architect style uses the same ID.
 - Inspecting only a direct style's `pPr` and ignoring its `basedOn` chain.
+- Parsing an OOXML fragment with only the `w` namespace declared, or writing
+  one into another part without declaring the prefixes it uses on that part's
+  root -- including a prefix named only in a markup-compatibility value.
+- Dropping extension-namespace children (`w14:`, `w15:`) during
+  materialization, or keying inherited properties by local name (so
+  `w14:shadow` hides `w:shadow`) or by the prefix as written (so a second
+  prefix for one namespace keeps a parent's value beside the child's).
 - Collecting or remapping style references with a regex of one's own instead
   of `referenced_style_ids` / `remap_style_references`, or following
   `basedOn` without `_extract_basedOn`.
