@@ -25,7 +25,7 @@ test's assertion messages before editing here. Rules, in short:
 |----|-------|--------|---------|----|--------------|-------|
 | WI-00 | Program scaffolding | merged | 00 | https://github.com/Abe-Borg/spec-template-normalizer/pull/60 | f2da16a | |
 | WI-01 | Extension-namespace-safe style import and shell application | merged | 01 | https://github.com/Abe-Borg/spec-template-normalizer/pull/61 | 4082087 | Hard failure on current-Word templates; do first. Adjacent defects found and left for later are listed in handoff 02. |
-| WI-02 | Exact run-content signature at the Format-only gate | in_progress | 02 | | | |
+| WI-02 | Exact run-content signature at the Format-only gate | in_review | 02 | https://github.com/Abe-Borg/spec-template-normalizer/pull/62 | | Failures stay untrusted_error with no location (no code, per plan); adjacent findings are listed in handoff 03. |
 | WI-03 | Final-gate text identity for every mode | not_started | | | | Depends on WI-02. |
 | WI-04 | Even-page header parity follows the architect | not_started | | | | |
 | WI-05 | Package-level change whitelist invariant | not_started | | | | |
@@ -46,4 +46,4 @@ test's assertion messages before editing here. Rules, in short:
 |---------|------------|-----------|---------|----|-----------------|
 | 00 | 2026-09-24 | WI-00 | plan, tracker, template, probes and tracker test created; PR opened, baseline suite 1306 passed / 1 skipped | https://github.com/Abe-Borg/spec-template-normalizer/pull/60 | handoffs/handoff-for-session-01.md |
 | 01 | 2026-09-24 | WI-01 | extension-namespace style import and docDefaults fixed, new code style_import_namespace_conflict; PR opened, two review findings fixed; suite 1372 passed / 1 skipped (baseline 1306 / 1) | https://github.com/Abe-Borg/spec-template-normalizer/pull/61 | handoffs/handoff-for-session-02.md |
-| 02 | 2026-09-24 | WI-02 | started; baseline suite 1372 passed / 1 skipped | | handoffs/handoff-for-session-03.md |
+| 02 | 2026-09-24 | WI-02 | exact run-content signature at the Format-only gate; probe rejects all 7 mutations; PR opened; suite 1463 passed / 1 skipped (baseline 1372 / 1) | https://github.com/Abe-Borg/spec-template-normalizer/pull/62 | handoffs/handoff-for-session-03.md |
