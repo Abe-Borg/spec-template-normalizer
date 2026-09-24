@@ -616,6 +616,26 @@ def test_format_only_invariant_accepts_the_edits_format_only_makes(tmp_path):
     assert verification["body_signature_paragraphs_compared"] == 1
 
 
+def test_format_only_invariant_accepts_a_paragraph_whose_only_change_is_a_contracted_rpr_child(
+    tmp_path,
+):
+    runs = (
+        '<w:t xml:space="preserve">Trailing </w:t><w:tab/><w:br/>'
+        "<w:t>Double  space kept</w:t><w:softHyphen/>"
+    )
+    verification = {}
+
+    _verify_format_only_paragraph_edit(
+        tmp_path,
+        f'<w:p><w:r><w:rPr><w:rFonts w:ascii="Arial"/><w:i/></w:rPr>{runs}</w:r></w:p>',
+        f"<w:p><w:r><w:rPr><w:i/></w:rPr>{runs}</w:r></w:p>",
+        allowed_rpr_properties_by_paragraph={1: {"rFonts"}},
+        verification_out=verification,
+    )
+
+    assert verification["body_signature_paragraphs_compared"] == 1
+
+
 def test_run_content_check_reports_that_it_ran_when_a_later_check_fails(tmp_path):
     source = tmp_path / "source-numbering-after-signature.docx"
     output = tmp_path / "output-numbering-after-signature.docx"

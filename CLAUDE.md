@@ -149,16 +149,17 @@ application's own `_CANADIAN.docx` and `_CANADIAN_FORMATTED.docx` output, so
 those must not be refused as "already formatted".
 
 What Format-only preserves is **semantic, not byte-level**, and the guarantee
-is scoped to the **body**. `_verify_format_only_body_invariants` compares
-paragraph blocks from `word/document.xml` before and after; that is where
-"unchanged text and numbering" is proven and where the claim stops. The DOCX
-package is not byte-identical and is not meant to be -- styles are imported,
-the shell is applied, and parts are re-serialized. Header and footer wording
-is deliberately outside the promise: `import_headers_footers` removes the
-target's parts and writes the architect's, so target-authored header/footer
-text is expected to change in both modes. Do not describe or test Format-only
-as package byte identity, and do not describe it as preserving every word in
-the file.
+is scoped to the **body**. `_verify_format_only_body_invariants` proves it on
+the paragraph blocks of `word/document.xml`, before and after -- their visible
+text, their exact run content and their effective numbering -- and that is
+where "unchanged text and numbering" is proven and where the claim stops. The
+DOCX package is not byte-identical and is not meant to be -- styles are
+imported, the shell is applied, and parts are re-serialized. Header and footer
+wording is deliberately outside the promise: `import_headers_footers` removes
+the target's parts and writes the architect's, so target-authored
+header/footer text is expected to change in both modes. Do not describe or
+test Format-only as package byte identity, and do not describe it as
+preserving every word in the file.
 
 The same distinction applies to ignored paragraphs. Leaving a paragraph's XML
 unedited proves the engine did not touch it; it does not prove the paragraph
@@ -168,6 +169,39 @@ expected behaviour, not a preservation failure -- and it is why the change
 checklist asks for visual inspection of representative output when shell or
 formatting behaviour changes, rather than treating XML invariants as
 sufficient on their own.
+
+Text is proven twice for every paragraph whose XML changed. The normalized
+visible text is compared first and keeps its message (`target body text
+changed at paragraph index N`, which callers match on). It cannot be the
+proof on its own: it is one whitespace-collapsing function run on both sides,
+so it cannot see a tab or break dropped beside a space, a lost
+`xml:space="preserve"`, a non-breaking space made plain, a collapsed double
+space, a dropped soft hyphen, or tracked-deleted text emptied. The exact
+**run-content signature** is compared next. `paragraph_run_content_signature`
+(`core/xml_helpers.py`; appendix A of the hardening plan is its specification)
+walks every `w:r` at any depth -- inside revisions, hyperlinks, smart tags,
+content controls, custom XML, simple fields, `w:dir`/`w:bdo`, and a run's own
+`w:ruby` -- outside the out-of-scope subtrees, and records each run's content
+children in order: text and tracked-deleted text with their `xml:space`
+flag, field instructions, tabs, positional tabs, breaks, carriage returns,
+soft and non-breaking hyphens, symbols, field characters, note and comment
+references, and the special characters (separators, note marks, date parts,
+page numbers). Text is decoded as a parser reports it (`xml_unescape`, never
+`html.unescape`, which accepts HTML's entities and remaps XML's `&#x80;`) and
+is never trimmed, collapsed or mapped. `w:rPr` and `w:lastRenderedPageBreak`
+are not content; a `w:tab` counts only as a run child, because the tab stops
+in `w:pPr/w:tabs` share its name and Format-only may strip them; any other
+child counts as `("other", name)` rather than being ignored. A difference
+fails with `target run content changed (<kind>) at paragraph index N`, the
+kind drawn from the closed set `RUN_CONTENT_DIFFERENCE_KINDS` and never the
+text. That message is developer detail: like every Format-only body failure it
+is a plain `RuntimeError` with no error code, so `run.json`, `audit.json` and
+the GUI report `untrusted_error` with the detail withheld and no location. The
+check records `body_signature_paragraphs_compared` in `verification_out` on
+success and on the failure path, so the `build_output` diagnostics event shows
+it ran. It records run content, not the container a run sits in: unwrapping a
+hyperlink or accepting a tracked insertion leaves every run's content as it
+was, so this check does not see it.
 
 ### 3. Explicit disposition coverage
 
@@ -1306,6 +1340,10 @@ Before considering a formatter change complete:
   numbering level was supplying.
 - Reusing a `w:pPr` order table abbreviated for one element to insert another.
 - Deriving a conversion's "expected diff" from what the conversion did.
+- Proving content unchanged with whitespace-normalized text alone. The same
+  collapsing function on both sides cannot see a lost tab, break, soft
+  hyphen, non-breaking space, doubled space, `xml:space="preserve"`, or
+  tracked-deleted text; compare `paragraph_run_content_signature`.
 - Writing `w:numPr` before `w:pStyle` inside `w:pPr`.
 - Swapping a paragraph's own style for a generated one in a mode that promises
   to change only numbering.

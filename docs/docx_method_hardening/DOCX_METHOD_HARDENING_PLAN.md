@@ -514,12 +514,12 @@ breaks and space preservation are proven unchanged.
 
 **Definition of done**
 
-- [ ] `probe_format_only_gate.py` prints REJECTED for every row and exits 0.
-- [ ] `paragraph_run_content_signature` implemented per appendix A with unit tests for each item kind and for the `w:pPr/w:tabs` exclusion.
-- [ ] The Format-only gate compares signatures and reports the kind, never text; `body_signature_paragraphs_compared` recorded on success.
-- [ ] Existing message contract kept; probe rows are permanent tests.
-- [ ] `CLAUDE.md` invariant 2 and README updated.
-- [ ] Full suite and corpus regression green on the PR.
+- [x] `probe_format_only_gate.py` prints REJECTED for every row and exits 0.
+- [x] `paragraph_run_content_signature` implemented per appendix A with unit tests for each item kind and for the `w:pPr/w:tabs` exclusion.
+- [x] The Format-only gate compares signatures and reports the kind, never text; `body_signature_paragraphs_compared` recorded on success.
+- [x] Existing message contract kept; probe rows are permanent tests.
+- [x] `CLAUDE.md` invariant 2 and README updated.
+- [x] Full suite and corpus regression green on the PR.
 
 ### WI-03: Final-gate text identity for every mode (identity except the enumerated diff)
 
@@ -963,6 +963,19 @@ content children in order:
 
 Decoded text uses an XML-only unescape. Nothing is trimmed, collapsed or
 mapped. Two paragraphs are identical when their tuples are equal.
+
+*As implemented (session 02):* `kind` in `("ref", kind, id)` is the element's
+local name (`footnoteReference`, `endnoteReference`, `commentReference`), and
+`type` in `("fldChar", type)` is `w:fldCharType`. Decoded text is exactly what
+an XML parser reports: line ends are normalized first (XML 1.0 section 2.11; a
+literal CR survives no parser, so Word never sees one, while `&#13;` is
+content), then references are expanded with `xml_unescape`; a CDATA section
+is literal, and comments and processing instructions are not content. A run
+nested in a run's own child (`w:ruby`) follows the run that holds it. The
+companion `run_content_difference` names the first differing item from the
+closed set `RUN_CONTENT_DIFFERENCE_KINDS`, which adds `preserve_space` (only a
+text node's `xml:space` changed) and `run_boundary` (the same items regrouped
+into runs, or an empty run added or removed) to one kind per item tag.
 
 ## Appendix B: `CT_Settings` child order (WI-04)
 

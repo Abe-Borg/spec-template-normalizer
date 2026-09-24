@@ -25,7 +25,9 @@ from .core.xml_helpers import (
     iter_direct_child_xml_blocks,
     iter_element_xml_blocks,
     iter_paragraph_xml_blocks,
+    paragraph_run_content_signature,
     paragraph_text_from_block,
+    run_content_difference,
     strip_direct_run_properties,
     strip_out_of_scope_subtrees,
 )
@@ -97,11 +99,58 @@ def _numbering_definition_signatures(numbering_xml: str) -> Counter:
     return Counter(_element_semantic_signature(child) for child in root)
 
 
+def _verify_format_only_run_content(
+    source_blocks: List[str],
+    output_blocks: List[str],
+    verification_out: Optional[Dict[str, Any]],
+) -> None:
+    """Fail closed unless every changed paragraph kept its exact run content.
+
+    The normalized-text comparison that runs first reads both sides through
+    one whitespace-collapsing function, so it cannot see a tab or break
+    dropped beside a space, emptied tracked-deleted text, a lost
+    ``xml:space="preserve"``, a non-breaking space made plain, a collapsed
+    double space or a dropped soft hyphen. Format-only edits properties and
+    never a text node -- the ``pStyle`` swap, the direct paragraph and run
+    properties the architect style supplies, materialized numbering, the
+    shell's section properties -- so any difference in
+    :func:`paragraph_run_content_signature` is damage. The failure names the
+    kind of item that changed, never its text.
+    """
+
+    compared = 0
+    try:
+        for index, (source_block, output_block) in enumerate(
+            zip(source_blocks, output_blocks)
+        ):
+            if source_block == output_block:
+                # Identical XML has identical run content.
+                continue
+            compared += 1
+            kind = run_content_difference(
+                paragraph_run_content_signature(source_block),
+                paragraph_run_content_signature(output_block),
+            )
+            if kind is not None:
+                raise RuntimeError(
+                    "FORMAT_ONLY INVARIANT FAIL: target run content changed "
+                    f"({kind}) at paragraph index {index}"
+                )
+    finally:
+        if verification_out is not None:
+            # Recorded on the failure path too, as the geometry counters are:
+            # the build_output event is assembled from whatever was recorded
+            # before unwinding, and a check that only reports success is
+            # indistinguishable, on a failed run, from one that never ran.
+            verification_out["body_signature_paragraphs_compared"] = compared
+
+
 def _verify_format_only_body_invariants(
     src_docx: Path,
     before_document_xml: str,
     after_document_xml: str,
     new_docx: Path | None,
+    verification_out: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Fail closed if Format-only changes target content or numbering semantics."""
 
@@ -135,6 +184,7 @@ def _verify_format_only_body_invariants(
             "FORMAT_ONLY INVARIANT FAIL: target body text changed at paragraph "
             f"index {changed}"
         )
+    _verify_format_only_run_content(source_blocks, output_blocks, verification_out)
 
     source_styles_bytes = _read_optional_docx_part(src_docx, "word/styles.xml")
     source_numbering_bytes = _read_optional_docx_part(src_docx, "word/numbering.xml")
@@ -1257,6 +1307,7 @@ def verify_phase2_invariants(
             before_doc,
             after_doc,
             new_docx,
+            verification_out=verification_out,
         )
 
     # Unconditional, unlike the check above: every mode can move a paragraph's

@@ -427,6 +427,300 @@ def paragraph_text_from_block(p_xml: str) -> str:
     joined = re.sub(r"\s+", " ", joined).strip()
     return joined
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exact run content
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# paragraph_text_from_block is the classifier's reading of a paragraph: it
+# drops deleted text, maps tabs and breaks to spaces and collapses whitespace.
+# Run on both sides of a transform, it is blind to exactly the losses an engine
+# can cause without changing a word -- a tab or break beside a space, a lost
+# xml:space="preserve", a non-breaking space made plain, a doubled space, a
+# soft hyphen, tracked-deleted text. The signature below is a gate's reading:
+# every run's content children in order, exactly, as appendix A of
+# docs/docx_method_hardening/DOCX_METHOD_HARDENING_PLAN.md specifies.
+
+#: One run content child: a tag naming its kind, then the fields that identify it.
+RunContentItem = Tuple[Any, ...]
+#: A paragraph's runs in document order, each the tuple of its content items.
+RunContentSignature = Tuple[Tuple[RunContentItem, ...], ...]
+
+# Children whose character content is the item: tag, and whether the item
+# also records xml:space="preserve".
+_RUN_TEXT_CHILDREN: Mapping[str, Tuple[str, bool]] = MappingProxyType({
+    "w:t": ("t", True),
+    "w:delText": ("delText", True),
+    "w:instrText": ("instr", False),
+    "w:delInstrText": ("delInstr", False),
+})
+# Children that carry nothing but their name, recorded as ``(local_name,)``.
+_RUN_MARK_CHILDREN = frozenset({
+    "w:tab",
+    "w:cr",
+    "w:noBreakHyphen",
+    "w:softHyphen",
+    "w:separator",
+    "w:continuationSeparator",
+    "w:footnoteRef",
+    "w:endnoteRef",
+    "w:annotationRef",
+    "w:dayShort",
+    "w:dayLong",
+    "w:monthShort",
+    "w:monthLong",
+    "w:yearShort",
+    "w:yearLong",
+    "w:pgNum",
+})
+# Children identified by the listed attributes, an absent one read as "".
+_RUN_ATTRIBUTE_CHILDREN: Mapping[str, Tuple[str, Tuple[str, ...]]] = MappingProxyType({
+    "w:ptab": ("ptab", ("w:alignment", "w:relativeTo", "w:leader")),
+    "w:br": ("br", ("w:type", "w:clear")),
+    "w:sym": ("sym", ("w:font", "w:char")),
+    "w:fldChar": ("fldChar", ("w:fldCharType",)),
+})
+_RUN_REFERENCE_CHILDREN = frozenset({
+    "w:footnoteReference",
+    "w:endnoteReference",
+    "w:commentReference",
+})
+# Run properties are the run-property invariant's to compare, and a rendered
+# page break is Word's note of where a page last ended, not content.
+_RUN_NON_CONTENT_CHILDREN = frozenset({"w:rPr", "w:lastRenderedPageBreak"})
+
+# What run_content_difference calls a changed item of each tag. A closed set of
+# identifiers, because the kind goes into failure messages about a customer's
+# document and must never carry its text.
+_ITEM_DIFFERENCE_KINDS: Mapping[str, str] = MappingProxyType({
+    "t": "text",
+    "delText": "deleted_text",
+    "instr": "field_instruction",
+    "delInstr": "deleted_field_instruction",
+    "tab": "tab",
+    "ptab": "positional_tab",
+    "br": "break",
+    "cr": "carriage_return",
+    "noBreakHyphen": "non_breaking_hyphen",
+    "softHyphen": "soft_hyphen",
+    "sym": "symbol",
+    "fldChar": "field_character",
+    "separator": "separator",
+    "continuationSeparator": "continuation_separator",
+    "footnoteRef": "footnote_ref",
+    "endnoteRef": "endnote_ref",
+    "annotationRef": "annotation_ref",
+    "dayShort": "day_short",
+    "dayLong": "day_long",
+    "monthShort": "month_short",
+    "monthLong": "month_long",
+    "yearShort": "year_short",
+    "yearLong": "year_long",
+    "pgNum": "page_number",
+    "other": "other_run_content",
+})
+_REFERENCE_DIFFERENCE_KINDS: Mapping[str, str] = MappingProxyType({
+    "footnoteReference": "footnote_reference",
+    "endnoteReference": "endnote_reference",
+    "commentReference": "comment_reference",
+})
+#: Every kind :func:`run_content_difference` can report.
+RUN_CONTENT_DIFFERENCE_KINDS: FrozenSet[str] = frozenset(
+    set(_ITEM_DIFFERENCE_KINDS.values())
+    | set(_REFERENCE_DIFFERENCE_KINDS.values())
+    | {"preserve_space", "run_boundary"}
+)
+
+
+def paragraph_run_content_signature(p_xml: str) -> RunContentSignature:
+    """Every run's content children, exactly, in document order.
+
+    Where :func:`paragraph_text_from_block` is the classifier's reading of a
+    paragraph, this is a gate's. Runs are every ``w:r`` at any depth -- inside
+    ``w:ins``, ``w:del``, ``w:moveTo``, ``w:moveFrom``, ``w:hyperlink``,
+    ``w:smartTag``, ``w:sdt``, ``w:customXml``, ``w:fldSimple``, ``w:dir`` and
+    ``w:bdo``, and inside a run's own ``w:ruby``, where the nested runs follow
+    the run that holds them -- except in the subtrees
+    :func:`strip_out_of_scope_subtrees` removes: drawings, text boxes and
+    objects are compared byte-for-byte elsewhere, and tracked property changes
+    are properties.
+
+    Each run is the tuple of its content items, per appendix A of the DOCX
+    Method Hardening plan:
+
+    - ``("t", text, preserve)`` and ``("delText", text, preserve)``, where
+      ``preserve`` is whether ``xml:space="preserve"`` is present;
+    - ``("instr", text)`` and ``("delInstr", text)`` for field instructions;
+    - ``("ptab", alignment, relativeTo, leader)``, ``("br", type, clear)``,
+      ``("sym", font, char)`` and ``("fldChar", fldCharType)``, an absent
+      attribute as ``""``;
+    - ``("ref", local_name, id)`` for a footnote, endnote or comment reference;
+    - ``(local_name,)`` for a tab, carriage return, hyphen, separator, note or
+      annotation mark, date part or page number;
+    - ``("other", qualified_name)`` for anything else, so an unknown child is a
+      difference rather than silence.
+
+    ``w:rPr`` and ``w:lastRenderedPageBreak`` are not content. A ``w:tab``
+    counts only as a run child: the tab stops in ``w:pPr/w:tabs`` share its
+    name and are paragraph properties, which Format-only may legitimately
+    strip. Text is decoded the way an XML parser reports it, with
+    :func:`xml_unescape` rather than :func:`html.unescape`, and is otherwise
+    never trimmed, collapsed or mapped.
+    """
+
+    runs: List[Tuple[RunContentItem, ...]] = []
+    _collect_run_content(strip_out_of_scope_subtrees(p_xml), runs)
+    return tuple(runs)
+
+
+def _collect_run_content(
+    xml_text: str,
+    runs: List[Tuple[RunContentItem, ...]],
+) -> None:
+    for _start, _end, run_xml in iter_element_xml_blocks(xml_text, "w:r"):
+        items: List[RunContentItem] = []
+        holders: List[str] = []
+        for _child_start, _child_end, name, block in iter_direct_child_xml_blocks(run_xml):
+            item = _run_content_item(name, block)
+            if item is None:
+                continue
+            items.append(item)
+            if item[0] == "other" and element_is_mentioned(block, "w:r"):
+                holders.append(block)
+        runs.append(tuple(items))
+        for block in holders:
+            _collect_run_content(block, runs)
+
+
+def _run_content_item(qualified_name: str, block: str) -> Optional[RunContentItem]:
+    if qualified_name in _RUN_NON_CONTENT_CHILDREN:
+        return None
+    if qualified_name in _RUN_MARK_CHILDREN:
+        return (qualified_name[len("w:"):],)
+    text_child = _RUN_TEXT_CHILDREN.get(qualified_name)
+    attribute_child = _RUN_ATTRIBUTE_CHILDREN.get(qualified_name)
+    is_reference = qualified_name in _RUN_REFERENCE_CHILDREN
+    if text_child is None and attribute_child is None and not is_reference:
+        return ("other", qualified_name)
+
+    start_tag, content = _split_element(block)
+    attributes = _tag_attribute_values(start_tag)
+    if text_child is not None:
+        tag, records_preserve = text_child
+        text = _character_data(content)
+        if not records_preserve:
+            return (tag, text)
+        return (tag, text, attributes.get("xml:space") == "preserve")
+    if attribute_child is not None:
+        tag, names = attribute_child
+        return (tag,) + tuple(attributes.get(name, "") for name in names)
+    return ("ref", qualified_name[len("w:"):], attributes.get("w:id", ""))
+
+
+def _split_element(element_xml: str) -> Tuple[str, str]:
+    """An element block's start tag and its content (``""`` when self-closing)."""
+
+    end, _kind, _name, _is_close, is_self_closing = _scan_markup(element_xml, 0)
+    if is_self_closing:
+        return element_xml[:end], ""
+    # The block ends with its own close tag, which holds the last "<".
+    return element_xml[:end], element_xml[end:element_xml.rfind("<")]
+
+
+def _tag_attribute_values(tag: str) -> Dict[str, str]:
+    """Attribute name -> value, as a parser reports it, on one isolated tag."""
+
+    return {
+        attribute.group("name"): _attribute_value(attribute.group("value"))
+        for attribute in _tag_attributes(tag)
+    }
+
+
+def _normalized_line_ends(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _character_data(content: str) -> str:
+    """An element's character content, exactly as an XML parser reports it.
+
+    Line ends are normalized first (XML 1.0 section 2.11: a literal CR survives
+    no parser, so Word never sees one, while ``&#13;`` is content) and
+    references are then expanded with :func:`xml_unescape`. A CDATA section is
+    taken literally; comments and processing instructions are not content.
+    Element markup has no place in a text node, but any that is there is kept
+    verbatim, so it still counts.
+    """
+
+    pieces: List[str] = []
+    cursor = 0
+    while True:
+        start = content.find("<", cursor)
+        if start < 0:
+            pieces.append(xml_unescape(_normalized_line_ends(content[cursor:])))
+            return "".join(pieces)
+        pieces.append(xml_unescape(_normalized_line_ends(content[cursor:start])))
+        if content.startswith("<![CDATA[", start):
+            end = content.find("]]>", start + len("<![CDATA["))
+            if end < 0:
+                raise ValueError("Malformed XML: unterminated CDATA")
+            pieces.append(_normalized_line_ends(content[start + len("<![CDATA["):end]))
+            cursor = end + len("]]>")
+            continue
+        end, kind, _name, _is_close, _is_self_closing = _scan_markup(content, start)
+        if kind == "tag":
+            pieces.append(content[start:end])
+        cursor = end
+
+
+def run_content_difference(
+    before: RunContentSignature,
+    after: RunContentSignature,
+) -> Optional[str]:
+    """The kind of the first difference between two signatures, or ``None``.
+
+    Always one of :data:`RUN_CONTENT_DIFFERENCE_KINDS` -- a name for what
+    changed, never the content -- so it can go into a failure message about a
+    customer's document.
+
+    Items are compared across run boundaries first: the same content split or
+    merged into runs differently, or an empty run added or removed, is
+    ``"run_boundary"``. Otherwise the first differing item is named: the item
+    removed or added when everything after it still lines up, and
+    ``"preserve_space"`` when only a text node's ``xml:space`` changed.
+    """
+
+    if before == after:
+        return None
+    flat_before = [item for run in before for item in run]
+    flat_after = [item for run in after for item in run]
+    if flat_before == flat_after:
+        return "run_boundary"
+    index = 0
+    shared = min(len(flat_before), len(flat_after))
+    while index < shared and flat_before[index] == flat_after[index]:
+        index += 1
+    if index == len(flat_before):
+        return _item_difference_kind(flat_after[index])
+    if index == len(flat_after):
+        return _item_difference_kind(flat_before[index])
+    lost, gained = flat_before[index], flat_after[index]
+    if lost[0] == gained[0]:
+        if lost[0] in ("t", "delText") and lost[1] == gained[1]:
+            return "preserve_space"
+        return _item_difference_kind(lost)
+    if flat_before[index + 1:] == flat_after[index:]:
+        return _item_difference_kind(lost)
+    if flat_before[index:] == flat_after[index + 1:]:
+        return _item_difference_kind(gained)
+    return _item_difference_kind(lost)
+
+
+def _item_difference_kind(item: RunContentItem) -> str:
+    if item[0] == "ref":
+        return _REFERENCE_DIFFERENCE_KINDS.get(item[1], "other_run_content")
+    return _ITEM_DIFFERENCE_KINDS.get(item[0], "other_run_content")
+
+
 def paragraph_contains_sectpr(p_xml: str) -> bool:
     live_xml = strip_out_of_scope_subtrees(p_xml)
     return next(iter_element_xml_blocks(live_xml, "w:sectPr"), None) is not None
