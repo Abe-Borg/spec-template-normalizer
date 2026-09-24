@@ -98,6 +98,13 @@ tests/test_canadian_to_csi.py, tests/test_architect_free_modes.py
 tests/test_error_location.py
     proves a fail-closed failure reports the paragraph it is about, and that
     the published location cannot be made to carry document text
+docs/docx_method_hardening/
+    the multi-session hardening program derived from the spec-formatting
+    method documents: the implementation plan, the machine-checked progress
+    tracker, the handoff prompts, and the probes that reproduce each defect
+tests/test_docx_method_hardening_tracker.py
+    enforces that program's bookkeeping: statuses, ticked definitions of
+    done, and a handoff prompt for every session
 ```
 
 `phase1_pipeline.run_phase1()` remains a compatibility and internal profile
@@ -1127,7 +1134,16 @@ python -m pytest tests/test_builtin_scheme.py tests/test_canadian_to_csi.py \
 python -m pytest tests/test_geometry_invariant.py \
     tests/test_conversion_verification.py -q
 python -m pytest tests/test_error_location.py -q
+python -m pytest tests/test_docx_method_hardening_tracker.py -q
+python docs/docx_method_hardening/probes/probe_style_import_w14.py
+python docs/docx_method_hardening/probes/probe_format_only_gate.py
 ```
+
+The last three belong to the DOCX Method Hardening program in
+`docs/docx_method_hardening/`. Its plan is the specification for a sequence
+of single-PR sessions; its tracker is the only record of where the program
+stands and the test keeps it honest; each probe exits non-zero while the
+defect it reproduces still exists.
 
 `tests/test_conversion_verification.py` is deliberately written against the
 standard library alone and shares no helper code with the engine. Keep it that
