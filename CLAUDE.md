@@ -252,19 +252,24 @@ them for the same reason (`build_portable_styles_xml` declares their
 namespaces on the portable stylesheet root). So materialization reads a
 style's property children lexically -- never through a parser given only the
 `w` namespace, which fails on the first extension child -- keys inheritance by
-**qualified** name (`w:shadow` and `w14:shadow` are different properties that
-share a local name), carries each child exactly as the source wrote it, and
-places extension children after the `w:` children, where Word writes them.
+**expanded** name, namespace URI plus local name resolved through the
+architect root's declarations (`w:shadow` and `w14:shadow` are different
+properties that share a local name; `w14:ligatures` and `x:ligatures` are one
+property when both prefixes name the Word 2010 namespace), carries each child
+exactly as the source wrote it, and places extension children after the `w:`
+children, where Word writes them.
 
 A fragment written into the target's styles part must keep the meaning its
-prefixes had in the architect's. Every prefix it uses is declared on the
+prefixes had in the architect's. Every prefix it uses -- in an element or
+attribute name, or named in a markup-compatibility value such as
+`mc:Choice Requires="w14"` or a nested `mc:Ignorable` -- is declared on the
 target root with the architect's namespace URI and keeps its `mc:Ignorable`
-status (the markup-compatibility attribute is found by namespace, not by the
-literal `mc`). A prefix the target already binds to a different namespace, or
-one the architect's stylesheet does not declare on its root, fails closed with
-`style_import_namespace_conflict` before anything is written. The engine never
-rebinds a prefix, never adds or changes a default namespace, and never guesses
-a URI.
+status (markup compatibility is recognised by namespace, not by the literal
+`mc`; Word 2007 wrote `ve`). A prefix the target already binds to a different
+namespace, or one the architect's stylesheet does not declare on its root,
+fails closed with `style_import_namespace_conflict` before anything is
+written. The engine never rebinds a prefix, never adds or changes a default
+namespace, and never guesses a URI.
 
 ### 6. Profile bundle and cache are strict boundaries
 
@@ -645,12 +650,13 @@ Return the source-to-final style-ID map to every body/header/footer consumer.
 
 Materialization (`_effective_ppr_inner_in_arch`,
 `_effective_full_rpr_inner_in_arch`, `_inject_missing_rpr_children`) reads
-property children with `iter_direct_child_xml_blocks` and splices them
-literally. There is no ElementTree round trip left in this module, so a
-materialized child is the architect's bytes (`<w:keepNext/>`, not
-`<w:keepNext />`) in the architect's quoting; a reader of the output that
-assumed double quotes (the geometry invariant's `w:ind` reader did) must accept
-either. Every block written into the target goes through
+property children with `iter_direct_child_xml_blocks`, keys them by expanded
+name (`_property_key`, through the architect root's declarations and any on
+the child itself), and splices them literally. There is no ElementTree round
+trip left in this module, so a materialized child is the architect's bytes
+(`<w:keepNext/>`, not `<w:keepNext />`) in the architect's quoting; a reader
+of the output that assumed double quotes (the geometry invariant's `w:ind`
+reader did) must accept either. Every block written into the target goes through
 `declare_fragment_namespaces`, and the stylesheet is parsed before it is
 written: a block that does not parse fails naming its source style ID, never
 quoting the XML. The namespace helpers live in `core/xml_helpers.py`
@@ -1313,10 +1319,11 @@ Before considering a formatter change complete:
 - Inspecting only a direct style's `pPr` and ignoring its `basedOn` chain.
 - Parsing an OOXML fragment with only the `w` namespace declared, or writing
   one into another part without declaring the prefixes it uses on that part's
-  root.
+  root -- including a prefix named only in a markup-compatibility value.
 - Dropping extension-namespace children (`w14:`, `w15:`) during
-  materialization, or keying inherited properties by local name so that
-  `w14:shadow` hides `w:shadow`.
+  materialization, or keying inherited properties by local name (so
+  `w14:shadow` hides `w:shadow`) or by the prefix as written (so a second
+  prefix for one namespace keeps a parent's value beside the child's).
 - Collecting or remapping style references with a regex of one's own instead
   of `referenced_style_ids` / `remap_style_references`, or following
   `basedOn` without `_extract_basedOn`.

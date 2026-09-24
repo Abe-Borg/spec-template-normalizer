@@ -355,6 +355,11 @@ repository runs a stylesheet with `w14:` content through Format-only.
    name (`w:rFonts`, `w14:ligatures`). Keep the existing exclusions
    (`pStyle`, `numPr`, `sectPr`, `pPrChange` for pPr; `rStyle`, `rPrChange`
    for rPr) by qualified name under the `w:` prefix.
+   *As implemented (session 01, after review of PR 61):* keyed by the
+   **expanded** name instead -- namespace URI and local name, each prefix
+   resolved through the architect root's declarations -- because two
+   prefixes bound to one namespace name one property, and keying by the
+   prefix as written kept a parent's value beside the child's override.
 2. Ordering of materialized children: keep the current first-seen order
    for `w:` children; place every extension-namespace child after all `w:`
    children, in first-seen order. Word writes extension children last in
@@ -368,7 +373,9 @@ repository runs a stylesheet with `w14:` content through Format-only.
 4. Add one namespace helper module or a section of `xml_helpers.py` with:
    `root_namespace_declarations(xml_text) -> dict[prefix, uri]` (from the
    root element's open tag), `prefixes_used(fragment) -> set[str]` (element
-   and attribute prefixes; ignore `xml` and `xmlns`), and
+   and attribute prefixes; ignore `xml` and `xmlns`; *as implemented, also
+   the prefixes named in markup-compatibility values such as
+   `mc:Choice Requires="w14"`*), and
    `ensure_root_declarations(part_xml, needed: dict[prefix, uri], ignorable: set[str]) -> str`
    which adds missing `xmlns:` declarations to the root open tag, merges
    `mc:Ignorable` tokens for prefixes the architect root lists as ignorable
@@ -433,7 +440,7 @@ passing.
 
 - [x] Both rows of `probe_style_import_w14.py` (`format_only` and `csi_to_canadian`) print OK, and the probe exits 0.
 - [x] Failing tests were added first and are now passing, including the end-to-end Format-only run.
-- [x] Materialization keys by qualified name and carries extension children after `w:` children.
+- [x] Materialization keys by expanded name (namespace and local name, so neither a shared local name nor a second prefix for one namespace confuses it) and carries extension children after `w:` children.
 - [x] Target stylesheet roots gain the declarations (and `mc:Ignorable` tokens) the inserted fragments need; a prefix bound to a different URI fails closed with `style_import_namespace_conflict`.
 - [x] `apply_doc_defaults` is covered by the same guarantee.
 - [x] `CLAUDE.md` invariant 5, module notes, error-code list and README updated; `test_engine_errors.py` bound raised.

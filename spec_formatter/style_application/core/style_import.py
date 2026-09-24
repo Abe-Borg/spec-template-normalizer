@@ -10,18 +10,20 @@ import functools
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, FrozenSet, Iterator, List, Set, Optional, Tuple
+from typing import Callable, Dict, FrozenSet, Iterator, List, Mapping, Set, Optional, Tuple
 
 from .errors import EngineError
 from .ooxml_text import read_xml_text, write_xml_text
 from .untrusted_xml import UntrustedXmlError, parse_untrusted_xml
 from .xml_helpers import (
+    W_NS,
     NamespaceReconciliationError,
     RootNamespaces,
     declare_fragment_namespaces,
     edit_preserving_out_of_scope_subtrees,
     iter_direct_child_xml_blocks,
     root_namespace_additions,
+    root_namespace_declarations,
     root_opening_tag,
 )
 
@@ -472,16 +474,41 @@ def _rpr_children_by_name(inner_xml: str, owner: str) -> List[Tuple[str, str]]:
     return _property_children(inner_xml, "w:rPr", _RPR_CHILDREN_NOT_INHERITED, owner)
 
 
-def _core_children_first(order: List[str]) -> List[str]:
-    """``w:`` children in first-seen order, then every extension child.
+# A property child's identity: its namespace URI and local name. ``None`` in
+# place of the URI marks a prefix that resolves nowhere, and the name is then
+# the qualified name as written.
+_PropertyKey = Tuple[Optional[str], str]
 
-    Word writes extension-namespace children (``w14:``, ``w15:``) after the
-    ``w:`` ones, and the strict schema does not know them at all.
+
+def _architect_root_bindings(arch_styles_xml_text: str) -> Dict[str, str]:
+    """The architect stylesheet root's declarations; none for a rootless fragment."""
+
+    try:
+        return root_namespace_declarations(arch_styles_xml_text)
+    except ValueError:
+        return {}
+
+
+def _property_key(
+    qualified_name: str,
+    child_block: str,
+    bindings: Mapping[str, str],
+) -> _PropertyKey:
+    """The expanded name of a property child, resolved through ``bindings``.
+
+    A declaration on the child itself wins over the architect root's, as it
+    does in XML. An unprefixed child is in the default namespace, or in none.
     """
 
-    return [name for name in order if name.startswith("w:")] + [
-        name for name in order if not name.startswith("w:")
-    ]
+    prefix, _, local = qualified_name.rpartition(":")
+    own = root_namespace_declarations(child_block)
+    if prefix in own:
+        return own[prefix], local
+    if prefix in bindings:
+        return bindings[prefix], local
+    if not prefix:
+        return "", local
+    return None, qualified_name
 
 
 def _effective_properties_in_arch(
@@ -493,15 +520,32 @@ def _effective_properties_in_arch(
 ) -> str:
     """Resolve each property child independently through ``basedOn``, then the defaults.
 
-    Keyed by qualified name: ``w:shadow`` and ``w14:shadow`` are different
-    properties that share a local name, and keying by local name let the
-    nearer one hide the other. Extension children are carried, not dropped:
-    ``w14:textFill`` is visible, and dropping it would silently change what
-    the architect specified.
+    Keyed by expanded name -- namespace URI and local name, each prefix
+    resolved through the architect root's declarations. ``w:shadow`` and
+    ``w14:shadow`` are different properties that share a local name, and
+    keying by local name let the nearer one hide the other; two prefixes bound
+    to one namespace name one property, and keying by the prefix as written
+    kept a parent's value beside the child's override. Extension children are
+    carried, not dropped: ``w14:textFill`` is visible, and dropping it would
+    silently change what the architect specified.
+
+    ``w:`` children -- those in the WordprocessingML namespace -- come first,
+    in first-seen order, then every extension child in first-seen order: Word
+    writes extension children last, and the strict schema does not know them.
     """
 
-    resolved: Dict[str, str] = {}
-    order: List[str] = []
+    bindings = _architect_root_bindings(arch_styles_xml_text)
+    main_namespace = bindings.get("w", W_NS)
+    resolved: Dict[_PropertyKey, str] = {}
+    order: List[_PropertyKey] = []
+
+    def take(children: List[Tuple[str, str]]) -> None:
+        for name, node in children:
+            key = _property_key(name, node, bindings)
+            if key not in resolved:
+                resolved[key] = node
+                order.append(key)
+
     seen: Set[str] = set()
     cur = style_id
     while cur and cur not in seen and len(seen) < 50:
@@ -510,17 +554,17 @@ def _effective_properties_in_arch(
         if not block:
             break
         inner = _extract_tag_inner(block, container) or ""
-        for name, node in read_children(inner, f"Architect style {cur!r}"):
-            if name not in resolved:
-                resolved[name] = node
-                order.append(name)
+        take(read_children(inner, f"Architect style {cur!r}"))
         cur = _extract_basedOn(block)
+    take(read_children(defaults_inner, "Architect document defaults"))
 
-    for name, node in read_children(defaults_inner, "Architect document defaults"):
-        if name not in resolved:
-            resolved[name] = node
-            order.append(name)
-    return "".join(resolved[name] for name in _core_children_first(order))
+    def is_core(key: _PropertyKey) -> bool:
+        namespace, name = key
+        return namespace == main_namespace if namespace is not None else name.startswith("w:")
+
+    core = [key for key in order if is_core(key)]
+    extensions = [key for key in order if not is_core(key)]
+    return "".join(resolved[key] for key in core + extensions)
 
 
 def _effective_ppr_inner_in_arch(arch_styles_xml_text: str, style_id: str) -> str:

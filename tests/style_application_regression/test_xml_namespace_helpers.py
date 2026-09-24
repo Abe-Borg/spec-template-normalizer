@@ -126,6 +126,57 @@ def test_unprefixed_elements_need_the_default_namespace():
     assert prefixes_used('<w:b val="1"/>') == {"w"}
 
 
+# Markup compatibility names prefixes inside attribute values. A fragment that
+# names w14 only there still needs w14 declared, or an MCE consumer cannot
+# resolve it and silently takes the fallback or drops the feature.
+MCE_CONTEXT = {"mc": MCE_NS, "w": W_NS, "w14": W14_NS}
+
+
+@pytest.mark.parametrize(
+    ("fragment", "expected"),
+    [
+        (
+            '<mc:AlternateContent><mc:Choice Requires="w14"><w:b/></mc:Choice>'
+            "<mc:Fallback><w:i/></mc:Fallback></mc:AlternateContent>",
+            {"mc", "w", "w14"},
+        ),
+        ('<w:rPr mc:Ignorable="w14 w15"><w:b/></w:rPr>', {"mc", "w", "w14", "w15"}),
+        ('<w:rPr mc:MustUnderstand="w14"/>', {"mc", "w", "w14"}),
+        ('<w:rPr mc:ProcessContent="w14:shadow w15:*"/>', {"mc", "w", "w14", "w15"}),
+        ('<w:rPr mc:PreserveElements="w14:glow" mc:PreserveAttributes="w15:x"/>', {"mc", "w", "w14", "w15"}),
+    ],
+    ids=["requires", "ignorable", "must_understand", "process_content", "preserve"],
+)
+def test_prefixes_named_by_markup_compatibility_values_are_needed(fragment, expected):
+    assert prefixes_used(fragment, MCE_CONTEXT) == expected
+
+
+def test_markup_compatibility_is_recognised_by_namespace():
+    word_2007 = '<w:rPr ve:Ignorable="w14"/>'
+    impostor = '<w:rPr mc:Ignorable="w14"/><x:Choice Requires="w15"/>'
+
+    assert prefixes_used(word_2007, {"ve": MCE_NS}) == {"ve", "w", "w14"}
+    # "mc" and "x" mean something else here, so their values are only text.
+    assert prefixes_used(impostor, {"mc": FOREIGN_NS, "x": FOREIGN_NS}) == {"mc", "w", "x"}
+    # An unprefixed Requires means something only on a markup-compatibility Choice.
+    assert prefixes_used('<w:b Requires="w14"/>', MCE_CONTEXT) == {"w"}
+
+
+def test_markup_compatibility_declared_inside_the_fragment_needs_no_context():
+    fragment = f'<w:rPr xmlns:mc="{MCE_NS}" mc:Ignorable="w14"><w:b/></w:rPr>'
+
+    assert prefixes_used(fragment) == {"w", "w14"}
+
+
+def test_a_value_prefix_declared_in_scope_inside_the_fragment_is_not_needed():
+    fragment = (
+        f'<mc:AlternateContent xmlns:w14="{W14_NS}"><mc:Choice Requires="w14"/>'
+        "</mc:AlternateContent>"
+    )
+
+    assert prefixes_used(fragment, MCE_CONTEXT) == {"mc"}
+
+
 def test_text_that_only_looks_like_markup_is_not_read():
     fragment = (
         "<w:r><!-- <x:y/> --><?pi <p:q/> ?>"
@@ -245,6 +296,22 @@ def test_fragments_take_their_prefixes_meaning_from_the_source_root():
     result = declare_fragment_namespaces(TARGET, fragments, source)
 
     # w15 is ignorable in the source but no fragment uses it.
+    assert root_namespace_declarations(result) == {"w": W_NS, "w14": W14_NS, "mc": MCE_NS}
+    assert root_ignorable_prefixes(result) == frozenset({"w14"})
+
+
+def test_a_prefix_named_only_by_requires_is_declared_from_the_source_root():
+    source = RootNamespaces.of(
+        f'<w:styles xmlns:w="{W_NS}" xmlns:w14="{W14_NS}" xmlns:mc="{MCE_NS}" '
+        'mc:Ignorable="w14"/>'
+    )
+    fragment = (
+        '<mc:AlternateContent><mc:Choice Requires="w14"><w:b/></mc:Choice>'
+        "<mc:Fallback><w:b/></mc:Fallback></mc:AlternateContent>"
+    )
+
+    result = declare_fragment_namespaces(TARGET, [fragment], source)
+
     assert root_namespace_declarations(result) == {"w": W_NS, "w14": W14_NS, "mc": MCE_NS}
     assert root_ignorable_prefixes(result) == frozenset({"w14"})
 

@@ -32,8 +32,9 @@ first tool call, in this order:
     `classification_application` because the stylesheet was already
     ill-formed, and silently accepted a target that bound `w14` to a foreign
     URI.
-  - After the fix: 85 new and affected tests passed.
-  - `python -m pytest -q`: 1360 passed, 1 skipped. The skip is the GUI test,
+  - After the fix, including the two review follow-ups below: 97 new and
+    affected tests passed.
+  - `python -m pytest -q`: 1372 passed, 1 skipped. The skip is the GUI test,
     which needs `tkinter`.
   - `python -m pytest tests/test_sanitized_format_only_corpus.py -q`: 2
     passed.
@@ -56,6 +57,18 @@ first tool call, in this order:
     - A default namespace is never added or changed.
     - A Strict Open XML target or template binds `w` to a different URI, so
       it now fails closed instead of mixing namespaces.
+  - **Changed after review.** The Codex reviewer raised two P2 findings on
+    PR 61, both fixed in the PR, and the plan's WI-01 text and third box were
+    amended to match:
+    - Materialized properties are keyed by **expanded** name (namespace URI
+      and local name, resolved through the architect root's declarations),
+      not by the prefix as written. Two prefixes bound to one namespace name
+      one property.
+    - `prefixes_used` also counts prefixes named in markup-compatibility
+      values: `Requires` on `mc:Choice`, `Ignorable`, `MustUnderstand`,
+      `ProcessContent`, `PreserveElements` and `PreserveAttributes`. These
+      are recognised by namespace, with the source root's declarations
+      passed as `context`.
   - **Unexpected, fixed in the same PR.** ElementTree used to normalize
     quoting inside materialized style children. Raw fragments keep the
     architect's quoting, and the geometry invariant's `_ind_from_ppr_xml`

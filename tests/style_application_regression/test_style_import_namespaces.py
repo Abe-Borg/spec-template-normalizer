@@ -337,6 +337,56 @@ def test_w_and_w14_children_with_one_local_name_are_both_materialized(
     ET.fromstring(out.encode("utf-8"))
 
 
+@pytest.mark.parametrize(
+    ("root_x", "child_x"),
+    [(f' xmlns:x="{W14_NS}"', ""), ("", f' xmlns:x="{W14_NS}"')],
+    ids=["declared_on_root", "declared_on_child"],
+)
+def test_one_namespace_under_two_prefixes_is_one_property(tmp_path, root_x, child_x):
+    # Keyed by qualified name, x:ligatures and w14:ligatures were two
+    # properties, so the parent's value survived beside the child's override.
+    styles_path = _target(tmp_path, BARE_TARGET_STYLES)
+    architect = (
+        f'<w:styles xmlns:w="{W_NS}" xmlns:w14="{W14_NS}"{root_x}>'
+        f'<w:style w:type="paragraph" w:styleId="Base"><w:rPr>{LIGATURES}</w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Role"><w:basedOn w:val="Base"/>'
+        f'<w:rPr><x:ligatures{child_x} x:val="none"/></w:rPr></w:style>'
+        "</w:styles>"
+    )
+
+    result = import_arch_styles_into_target(
+        tmp_path, architect, ["Role"], [], format_only_body_style_ids={"Role"}
+    )
+
+    out = styles_path.read_text(encoding="utf-8")
+    block = extract_style_block_raw(out, result.body_style_id_map["Role"])
+    assert block is not None
+    assert _rpr_inner(block) == f'<x:ligatures{child_x} x:val="none"/>'
+    root = ET.fromstring(out.encode("utf-8"))
+    rpr = root.find(
+        f"{{{W_NS}}}style[@{{{W_NS}}}styleId='{result.body_style_id_map['Role']}']/{{{W_NS}}}rPr"
+    )
+    assert [child.tag for child in rpr] == [f"{{{W14_NS}}}ligatures"]
+
+
+def test_a_prefix_named_only_by_a_markup_compatibility_value_is_declared(tmp_path):
+    styles_path = _target(tmp_path, BARE_TARGET_STYLES)
+    architect = (
+        f'<w:styles xmlns:w="{W_NS}" xmlns:w14="{W14_NS}" xmlns:mc="{MC_NS}" '
+        'mc:Ignorable="w14">'
+        '<w:style w:type="paragraph" w:styleId="Role"><w:rPr>'
+        '<mc:AlternateContent><mc:Choice Requires="w14"><w:b/></mc:Choice>'
+        "<mc:Fallback><w:i/></mc:Fallback></mc:AlternateContent>"
+        "</w:rPr></w:style></w:styles>"
+    )
+
+    import_arch_styles_into_target(tmp_path, architect, ["Role"], [])
+
+    root_tag = _root_tag(styles_path.read_text(encoding="utf-8"))
+    assert f'xmlns:w14="{W14_NS}"' in root_tag
+    assert 'mc:Ignorable="w14"' in root_tag
+
+
 # ── malformed fragments name the style, never the XML ──────────────────────
 
 

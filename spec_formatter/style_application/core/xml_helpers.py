@@ -660,16 +660,26 @@ def strip_conflicting_direct_ppr(
 #
 # These helpers stay lexical like the rest of this module: the destination is
 # edited only in its root opening tag, and fragments are never re-serialized.
-# They consider element and attribute *names*. Prefixes named inside an
-# attribute value (markup compatibility's ``Requires``, or an ``Ignorable`` on
-# a nested element) are not read; Word writes neither inside the fragments the
-# engine moves.
+# A prefix counts wherever the markup gives it meaning: in an element or
+# attribute name, and in the values of the markup-compatibility attributes that
+# list prefixes or qualified names (``Requires`` on ``Choice``, ``Ignorable``,
+# ``MustUnderstand``, ``ProcessContent``, ``PreserveElements``,
+# ``PreserveAttributes``). A prefix named only in such a value is still one an
+# MCE consumer must resolve; left undeclared, it silently takes the fallback or
+# drops the feature.
 
 #: Markup Compatibility and Extensibility (ECMA-376 Part 3).
 MCE_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 
 # ``xml`` is bound by definition and ``xmlns`` is not a prefix at all.
 _RESERVED_PREFIXES = frozenset({"xml", "xmlns"})
+
+# Markup-compatibility attributes (ECMA-376 Part 3) whose values name
+# prefixes: lists of prefixes, and lists of qualified names whose prefixes
+# count. ``Requires`` is the unqualified attribute of ``mc:Choice``.
+_MCE_PREFIX_LIST_ATTRIBUTES = frozenset({"Ignorable", "MustUnderstand"})
+_MCE_QNAME_LIST_ATTRIBUTES = frozenset({"ProcessContent", "PreserveElements", "PreserveAttributes"})
+_NO_BINDINGS: Mapping[str, str] = MappingProxyType({})
 
 # One attribute of a start tag: its name and its quoted value. Values are
 # matched whole, so a quote or ">" inside another value cannot end one early.
@@ -844,8 +854,8 @@ class RootNamespaces:
         return cls(root_namespace_declarations(xml_text), root_ignorable_prefixes(xml_text))
 
 
-def prefixes_used(fragment: str) -> Set[str]:
-    """The prefixes a fragment's names need from whatever encloses it.
+def prefixes_used(fragment: str, context: Mapping[str, str] = _NO_BINDINGS) -> Set[str]:
+    """The prefixes a fragment needs from whatever encloses it.
 
     Element and attribute names are read; ``xml`` and ``xmlns`` never need a
     declaration. A prefix the fragment declares itself is not reported
@@ -853,10 +863,32 @@ def prefixes_used(fragment: str) -> Set[str]:
     outside it. An unprefixed element needs the default namespace, reported
     as ``""``; an unprefixed attribute is in no namespace and needs nothing.
     Comments, CDATA sections and processing instructions are text.
+
+    Prefixes named in markup-compatibility values count as well (see the
+    section comment above). Those attributes are recognised by namespace, not
+    by the literal ``mc`` -- Word 2007 used ``ve`` -- so ``context``, the
+    declarations in scope around the fragment, is how one is recognised when
+    the fragment does not declare the markup-compatibility prefix itself.
+    ``context`` only identifies them: whatever the fragment does not declare
+    is reported, whether or not ``context`` declares it.
     """
 
     needed: Set[str] = set()
-    scopes: List[FrozenSet[str]] = []
+    scopes: List[Dict[str, str]] = []
+
+    def in_scope(prefix: str) -> bool:
+        return any(prefix in scope for scope in scopes)
+
+    def resolve(prefix: str) -> Optional[str]:
+        for scope in reversed(scopes):
+            if prefix in scope:
+                return scope[prefix]
+        return context.get(prefix)
+
+    def need(prefix: str) -> None:
+        if prefix not in _RESERVED_PREFIXES and not in_scope(prefix):
+            needed.add(prefix)
+
     cursor = 0
     while True:
         start = fragment.find("<", cursor)
@@ -870,27 +902,43 @@ def prefixes_used(fragment: str) -> Set[str]:
             if scopes:
                 scopes.pop()
             continue
-        attributes = [match.group("name") for match in _tag_attributes(fragment[start:end])]
-        declared_here = frozenset(
-            prefix
-            for prefix in (_declared_prefix(attribute) for attribute in attributes)
-            if prefix is not None
-        )
+        attributes = [
+            (match.group("name"), match.group("value"))
+            for match in _tag_attributes(fragment[start:end])
+        ]
+        declared_here: Dict[str, str] = {}
+        for attribute, value in attributes:
+            prefix = _declared_prefix(attribute)
+            if prefix is not None:
+                declared_here[prefix] = _attribute_value(value)
+        scopes.append(declared_here)
 
-        def in_scope(prefix: str) -> bool:
-            return prefix in declared_here or any(prefix in scope for scope in scopes)
-
-        element_prefix = name.partition(":")[0] if ":" in name else ""
-        if element_prefix not in _RESERVED_PREFIXES and not in_scope(element_prefix):
-            needed.add(element_prefix)
-        for attribute in attributes:
-            if _declared_prefix(attribute) is not None or ":" not in attribute:
+        element_prefix, _, element_local = name.rpartition(":")
+        need(element_prefix)
+        is_mce_choice = element_local == "Choice" and resolve(element_prefix) == MCE_NS
+        for attribute, value in attributes:
+            if _declared_prefix(attribute) is not None:
                 continue
-            prefix = attribute.partition(":")[0]
-            if prefix not in _RESERVED_PREFIXES and not in_scope(prefix):
-                needed.add(prefix)
-        if not is_self_closing:
-            scopes.append(declared_here)
+            prefix, _, local = attribute.rpartition(":")
+            if prefix:
+                need(prefix)
+            named: List[str] = []
+            if prefix and resolve(prefix) == MCE_NS:
+                if local in _MCE_PREFIX_LIST_ATTRIBUTES:
+                    named = _attribute_value(value).split()
+                elif local in _MCE_QNAME_LIST_ATTRIBUTES:
+                    named = [
+                        token.partition(":")[0]
+                        for token in _attribute_value(value).split()
+                        if ":" in token
+                    ]
+            elif not prefix and local == "Requires" and is_mce_choice:
+                named = _attribute_value(value).split()
+            for named_prefix in named:
+                if named_prefix:
+                    need(named_prefix)
+        if is_self_closing:
+            scopes.pop()
 
 
 def _conflict(prefix: str, existing: str, wanted: str) -> NamespaceReconciliationError:
@@ -1025,7 +1073,7 @@ def declare_fragment_namespaces(
 
     used: Set[str] = set()
     for fragment in fragments:
-        used |= prefixes_used(fragment)
+        used |= prefixes_used(fragment, source.declarations)
     needed: Dict[str, str] = {}
     for prefix in sorted(used):
         if prefix == "":

@@ -45,4 +45,4 @@ test's assertion messages before editing here. Rules, in short:
 | Session | Date (UTC) | Work item | Outcome | PR | Handoff written |
 |---------|------------|-----------|---------|----|-----------------|
 | 00 | 2026-09-24 | WI-00 | plan, tracker, template, probes and tracker test created; PR opened, baseline suite 1306 passed / 1 skipped | https://github.com/Abe-Borg/spec-template-normalizer/pull/60 | handoffs/handoff-for-session-01.md |
-| 01 | 2026-09-24 | WI-01 | extension-namespace style import and docDefaults fixed, new code style_import_namespace_conflict; PR opened; suite 1360 passed / 1 skipped (baseline 1306 / 1) | https://github.com/Abe-Borg/spec-template-normalizer/pull/61 | handoffs/handoff-for-session-02.md |
+| 01 | 2026-09-24 | WI-01 | extension-namespace style import and docDefaults fixed, new code style_import_namespace_conflict; PR opened, two review findings fixed; suite 1372 passed / 1 skipped (baseline 1306 / 1) | https://github.com/Abe-Borg/spec-template-normalizer/pull/61 | handoffs/handoff-for-session-02.md |
