@@ -23,7 +23,7 @@ test's assertion messages before editing here. Rules, in short:
 
 | ID | Title | Status | Session | PR | Merge commit | Notes |
 |----|-------|--------|---------|----|--------------|-------|
-| WI-00 | Program scaffolding | in_progress | 00 | | | |
+| WI-00 | Program scaffolding | in_review | 00 | https://github.com/Abe-Borg/spec-template-normalizer/pull/60 | | |
 | WI-01 | Extension-namespace-safe style import and shell application | not_started | | | | Hard failure on current-Word templates; do first. |
 | WI-02 | Exact run-content signature at the Format-only gate | not_started | | | | |
 | WI-03 | Final-gate text identity for every mode | not_started | | | | Depends on WI-02. |
@@ -44,4 +44,4 @@ test's assertion messages before editing here. Rules, in short:
 
 | Session | Date (UTC) | Work item | Outcome | PR | Handoff written |
 |---------|------------|-----------|---------|----|-----------------|
-| 00 | 2026-09-24 | WI-00 | started: plan, tracker, template, probes and tracker test created | pending | handoffs/handoff-for-session-01.md |
+| 00 | 2026-09-24 | WI-00 | plan, tracker, template, probes and tracker test created; PR opened, baseline suite 1306 passed / 1 skipped | https://github.com/Abe-Borg/spec-template-normalizer/pull/60 | handoffs/handoff-for-session-01.md |

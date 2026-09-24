@@ -19,7 +19,7 @@ first tool call, in this order:
 - Previous session: `00`, work item `WI-00: Program scaffolding`. Session 00
   wrote no engine code; it created the plan, the tracker, the handoff
   template, the two probes and the tracker test.
-- Pull request: `PR_URL_PLACEHOLDER`. Merge status when this prompt was
+- Pull request: `https://github.com/Abe-Borg/spec-template-normalizer/pull/60`. Merge status when this prompt was
   written: `open`.
 - Tracker rows changed by the previous session: `WI-00` created as
   `in_review`; session log row `00` added.
@@ -29,7 +29,7 @@ first tool call, in this order:
   (`probe_style_import_w14.py`: `format_only` row FAIL with `unbound prefix`,
   `csi_to_canadian` row OK; `probe_format_only_gate.py`: 7 mutations
   ACCEPTED, control REJECTED). The full suite was run once on the unchanged
-  tree; its result is in the PR description.
+  tree; 1306 passed, 1 skipped (the GUI test skips without `tkinter`).
 - Anything left unfinished, unexpected, or decided along the way: nothing
   unfinished. Two facts you should not have to rediscover: `master` is the
   default branch, and `tests/style_application_regression/test_engine_errors.py`
