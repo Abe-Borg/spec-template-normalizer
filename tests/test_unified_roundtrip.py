@@ -8,7 +8,11 @@ import zipfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+import pytest
+
 from spec_formatter.pipeline import CSI_TO_CANADIAN, format_specifications
+from spec_formatter.style_application import batch_runner
+from spec_formatter.style_application.core.xml_helpers import iter_paragraph_xml_blocks
 from spec_formatter.style_application.phase2_invariants import validate_docx_package
 
 
@@ -847,3 +851,170 @@ def test_canadian_mode_carries_extension_namespace_styles_into_a_bare_target_sty
     ]
     assert len(normal_clones) == 1
     _assert_ligatures_last(normal_clones[0], "standard")
+
+
+# The run content a whitespace-normalized text check cannot see: a doubled
+# space, edge spaces kept by xml:space="preserve", a tab and a break beside a
+# space, non-breaking spaces, soft and non-breaking hyphens, tracked-deleted
+# text, a field and a symbol -- under direct fonts and sizes that Format-only's
+# style swap strips, because the architect's document defaults supply both.
+_RICH_RUNS_ONE = (
+    '<w:r><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="20"/></w:rPr>'
+    '<w:t xml:space="preserve">Provide  sprinklers </w:t><w:tab/>'
+    '<w:t xml:space="preserve">throughout </w:t><w:br/>'
+    "<w:t>Type\u00a0K\u00a0copper</w:t><w:softHyphen/><w:t>listed</w:t>"
+    "<w:noBreakHyphen/><w:t>type</w:t></w:r>"
+    '<w:del w:id="91" w:author="Reviewer" w:date="2026-01-01T00:00:00Z">'
+    '<w:r><w:rPr><w:sz w:val="20"/></w:rPr>'
+    '<w:delText xml:space="preserve"> where required</w:delText></w:r></w:del>'
+)
+_RICH_RUNS_TWO = (
+    '<w:r><w:rPr><w:rFonts w:ascii="Arial"/></w:rPr>'
+    '<w:t xml:space="preserve">See page </w:t></w:r>'
+    '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+    '<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>'
+    '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+    "<w:r><w:t>4</w:t></w:r>"
+    '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+    '<w:r><w:sym w:font="Symbol" w:char="F0B0"/></w:r>'
+)
+_XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+
+
+def _write_run_content_pair(tmp_path: Path) -> tuple[Path, Path]:
+    architect = tmp_path / "run-content-architect.docx"
+    target = tmp_path / "run-content-target.docx"
+    _write_docx(architect, architect=True)
+    _write_docx(target, architect=False)
+    _rewrite_docx_parts(architect, {"word/styles.xml": _extension_namespace_architect_styles()})
+    with zipfile.ZipFile(target) as package:
+        document = package.read("word/document.xml").decode("utf-8")
+    for plain, rich in (
+        ("<w:r><w:t>Architect paragraph one</w:t></w:r>", _RICH_RUNS_ONE),
+        ("<w:r><w:t>Architect paragraph two</w:t></w:r>", _RICH_RUNS_TWO),
+    ):
+        assert document.count(plain) == 1
+        document = document.replace(plain, rich)
+    _rewrite_docx_parts(target, {"word/document.xml": document})
+    return architect, target
+
+
+def _format_run_content_pair(tmp_path: Path, architect: Path, target: Path):
+    return format_specifications(
+        architect_template=architect,
+        target_specs=[target],
+        output_dir=tmp_path / "formatted",
+        cache_dir=tmp_path / "template-cache",
+        api_key="",
+        max_workers=1,
+        template_model="run-content-format-only-fixture",
+        template_classifier=_deterministic_classifier,
+    )
+
+
+def _run_children_by_element_tree(document_xml: bytes) -> list[tuple]:
+    """Every run's content children, read with ElementTree.
+
+    Not the engine's lexical scanner, so this assertion can disagree with the
+    gate it backs up.
+    """
+
+    root = ET.fromstring(document_xml)
+    skipped = {f"{{{W_NS}}}rPr", f"{{{W_NS}}}lastRenderedPageBreak"}
+    return [
+        tuple(
+            (child.tag, child.text or "", tuple(sorted(child.attrib.items())))
+            for child in run
+            if child.tag not in skipped
+        )
+        for run in root.iter(f"{{{W_NS}}}r")
+    ]
+
+
+def _diagnostics_event(run, name: str) -> dict:
+    events = [
+        json.loads(line)
+        for line in run.diagnostics_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return next(event for event in events if event.get("event") == name)
+
+
+def test_format_only_proves_exact_run_content_through_a_real_run(tmp_path: Path) -> None:
+    architect, target = _write_run_content_pair(tmp_path)
+    with zipfile.ZipFile(target) as package:
+        target_document_before = package.read("word/document.xml")
+
+    run = _format_run_content_pair(tmp_path, architect, target)
+
+    assert run.success, "\n".join(run.targets[0].log)
+    result = run.targets[0]
+    assert result.output_path is not None
+    validate_docx_package(result.output_path)
+    with zipfile.ZipFile(result.output_path) as package:
+        output_document = package.read("word/document.xml")
+
+    # The style swap really did edit these runs: the direct fonts and sizes
+    # the architect's defaults now supply are gone...
+    assert target_document_before.count(b"<w:rFonts") == 2
+    assert output_document.count(b"<w:rFonts") == 0
+    assert output_document.count(b"<w:sz ") == 0
+    # ...and every run's content came through exactly, preserve flags included.
+    assert _run_children_by_element_tree(output_document) == _run_children_by_element_tree(
+        target_document_before
+    )
+    assert any(
+        child.get(_XML_SPACE) == "preserve"
+        for child in ET.fromstring(output_document).iter(f"{{{W_NS}}}delText")
+    )
+
+    source_paragraphs = [
+        block for _s, _e, block in iter_paragraph_xml_blocks(target_document_before.decode("utf-8"))
+    ]
+    output_paragraphs = [
+        block for _s, _e, block in iter_paragraph_xml_blocks(output_document.decode("utf-8"))
+    ]
+    changed = sum(
+        before != after for before, after in zip(source_paragraphs, output_paragraphs)
+    )
+    assert changed >= 2
+    # The gate says it ran, and compared exactly the paragraphs that changed.
+    build_output = _diagnostics_event(run, "build_output")
+    assert build_output["fields"]["body_signature_paragraphs_compared"] == changed
+
+
+def test_format_only_withholds_output_when_run_content_changes_after_application(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    architect, target = _write_run_content_pair(tmp_path)
+    real_build = batch_runner._build_and_patch_output
+
+    def build_after_a_late_corruption(docx_path, extract_dir, *args, **kwargs):
+        # Stands in for any step after classification application that
+        # damages run content -- numbering import, style import, the shell,
+        # repackaging -- which the final gate is the only check to cover. The
+        # dropped tab sits beside a space, so the visible words are unchanged.
+        document = Path(extract_dir) / "word" / "document.xml"
+        payload = document.read_bytes()
+        assert b'throughout </w:t>' in payload and b"<w:tab/>" in payload
+        document.write_bytes(payload.replace(b"<w:tab/>", b"", 1))
+        return real_build(docx_path, extract_dir, *args, **kwargs)
+
+    monkeypatch.setattr(batch_runner, "_build_and_patch_output", build_after_a_late_corruption)
+
+    run = _format_run_content_pair(tmp_path, architect, target)
+
+    assert not run.success
+    result = run.targets[0]
+    assert result.output_path is None
+    assert result.stage == "output_publication"
+    assert result.error == (
+        "FORMAT_ONLY INVARIANT FAIL: target run content changed (tab) at paragraph index 0"
+    )
+    assert not list(run.run_dir.glob("*.docx"))
+    build_output = _diagnostics_event(run, "build_output")
+    assert build_output["fields"]["failed"] is True
+    assert build_output["fields"]["body_signature_paragraphs_compared"] >= 1
+    manifest = run.manifest_path.read_text(encoding="utf-8")
+    assert "sprinklers" not in manifest
