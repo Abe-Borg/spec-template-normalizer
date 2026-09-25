@@ -20,6 +20,11 @@ from .core.classification import (
     _effective_numpr,
 )
 from .core.errors import EngineError, ErrorLocation
+from .core.header_parity import (
+    architect_even_and_odd_headers,
+    even_and_odd_headers,
+    even_and_odd_headers_as_written,
+)
 from .core.expected_changes import (
     NO_EXPECTED_PARAGRAPH_CHANGES,
     PREDICTION_MISMATCH,
@@ -1003,6 +1008,107 @@ def _validate_rpr_property_contract(
     return normalized
 
 
+def _document_settings_part(docx: Path, label: str) -> Optional[bytes]:
+    """The settings part the main document relates, or ``None`` when it has none.
+
+    Resolved through ``word/_rels/document.xml.rels`` rather than read from
+    ``word/settings.xml`` by name, because the relationship is what Word
+    follows: a settings part nothing relates is not the document's settings.
+    """
+
+    with zipfile.ZipFile(docx, "r") as package:
+        names = {name.casefold(): name for name in package.namelist()}
+        rels_name = names.get("word/_rels/document.xml.rels")
+        if rels_name is None:
+            return None
+        root = parse_untrusted_xml(
+            package.read(rels_name),
+            f"word/_rels/document.xml.rels ({label})",
+        )
+        relationships = [
+            rel
+            for rel in root.findall(f"{{{PKG_REL_NS}}}Relationship")
+            if rel.attrib.get("Type", "") == f"{R_NS}/settings"
+            and rel.attrib.get("TargetMode", "").casefold() != "external"
+        ]
+        if not relationships:
+            return None
+        if len(relationships) > 1:
+            raise RuntimeError(
+                f"INVARIANT FAIL: the {label} document relates more than one settings part"
+            )
+        part_name = _resolve_relationship_target(
+            "word/document.xml",
+            relationships[0].attrib.get("Target", ""),
+        )
+        member = names.get(part_name.casefold()) if part_name else None
+        if member is None:
+            raise RuntimeError(
+                f"INVARIANT FAIL: the {label} settings relationship names no part in the package"
+            )
+        return package.read(member)
+
+
+def _verify_header_parity(
+    src_docx: Path,
+    new_docx: Path,
+    *,
+    architect_registry: Optional[Dict[str, Any]],
+    verification_out: Optional[Dict[str, Any]],
+) -> None:
+    """The output's even/odd header switch belongs to the header set it carries.
+
+    ``w:evenAndOddHeaders`` decides whether a section's ``even`` header and
+    footer render at all, so it has to travel with the header set. When the
+    architect's set replaced the target's (``architect_registry`` given), the
+    output's switch must read exactly as the architect's does. When the target
+    kept its own set, the target's switch must be exactly as it was written,
+    compared uninterpreted so that even a switch the strict reader would refuse
+    is proven untouched.
+
+    Recorded as it starts, so a failure still shows the check ran.
+    """
+
+    follows_architect = architect_registry is not None
+    if verification_out is not None:
+        verification_out["header_parity_checked"] = True
+        verification_out["header_parity_follows_architect"] = follows_architect
+    after_settings = _document_settings_part(new_docx, "output")
+    try:
+        output_parity: Optional[bool] = even_and_odd_headers(
+            after_settings, "settings part (output)"
+        )
+    except ValueError:
+        output_parity = None
+    if verification_out is not None:
+        verification_out["even_and_odd_headers"] = output_parity
+
+    try:
+        if follows_architect:
+            wanted = architect_even_and_odd_headers(architect_registry)
+            # Strict here: an output switch that cannot be read is a failure.
+            output_parity = even_and_odd_headers(after_settings, "settings part (output)")
+            if output_parity is not wanted:
+                raise RuntimeError(
+                    "INVARIANT FAIL: output even/odd header setting "
+                    f"({'on' if output_parity else 'off'}) does not match the "
+                    f"architect's ({'on' if wanted else 'off'}), so the imported "
+                    "even-page headers and footers would not render as the "
+                    "template renders them"
+                )
+            return
+        before_settings = _document_settings_part(src_docx, "source")
+        if even_and_odd_headers_as_written(
+            before_settings, "settings part (source)"
+        ) != even_and_odd_headers_as_written(after_settings, "settings part (output)"):
+            raise RuntimeError(
+                "INVARIANT FAIL: the target kept its own headers and footers, but "
+                "its even/odd header setting changed"
+            )
+    except ValueError as exc:
+        raise RuntimeError(f"INVARIANT FAIL: {exc}") from exc
+
+
 def _verify_target_header_footer_preserved(src_docx: Path, new_docx: Path) -> None:
     before_rels = decode_xml_bytes(
         _read_docx_part(src_docx, "word/_rels/document.xml.rels"),
@@ -1365,7 +1471,10 @@ def verify_phase2_invariants(
        Format-only predicts nothing; an omitted prediction allows no change.
     1. sectPr non-layout semantics unchanged (managed layout tags may change)
     2. If architect header/footer data is present, output header/footer parts match architect set
-       and sectPr references resolve to valid document rels IDs
+       and sectPr references resolve to valid document rels IDs. The even/odd
+       header switch in the output's settings follows whichever header set the
+       output carries: the architect's when it was imported, the target's
+       own (unchanged) otherwise.
     3. Direct run properties may be removed only when the effective replacement
        style supplies that property. An omitted contract authorizes no removal.
     """
@@ -1473,6 +1582,12 @@ def verify_phase2_invariants(
 
     if new_docx is not None and not (arch_headers or arch_footers):
         _verify_target_header_footer_preserved(src_docx, new_docx)
+        _verify_header_parity(
+            src_docx,
+            new_docx,
+            architect_registry=None,
+            verification_out=verification_out,
+        )
 
     if new_docx is not None and (arch_headers or arch_footers):
         if not after_sectprs:
@@ -1521,8 +1636,20 @@ def verify_phase2_invariants(
             # section references, the importer deliberately performs no
             # replacement and the target package must remain intact.
             _verify_target_header_footer_preserved(src_docx, new_docx)
+            _verify_header_parity(
+                src_docx,
+                new_docx,
+                architect_registry=None,
+                verification_out=verification_out,
+            )
 
         if expected_parts:
+            _verify_header_parity(
+                src_docx,
+                new_docx,
+                architect_registry=arch_template_registry,
+                verification_out=verification_out,
+            )
             with zipfile.ZipFile(new_docx, "r") as z_after:
                 rels_xml = z_after.read("word/_rels/document.xml.rels")
                 rels_root = parse_untrusted_xml(

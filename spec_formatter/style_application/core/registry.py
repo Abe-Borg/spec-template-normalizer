@@ -26,6 +26,7 @@ from .opc_paths import (
     relationship_part_name_for_owner,
     resolve_internal_relationship_target as _resolve_safe_internal_relationship_target,
 )
+from .header_parity import architect_even_and_odd_headers
 from .section_mapping import choose_section_sources
 
 
@@ -878,6 +879,30 @@ def _validate_compat_xml(
         errors.append(f"settings.compat.compat_xml: {err}")
 
 
+def _validate_header_parity(
+    template_registry: Dict[str, Any], errors: List[str]
+) -> None:
+    """The architect's even/odd header switch must be readable.
+
+    It is applied to a target whenever the architect's header/footer set
+    replaces the target's, so a template with header or footer parts whose
+    switch cannot be read (the element repeated, a ``w:val`` that is neither
+    on nor off, or no captured settings field at all) fails here, once,
+    before any target work -- not on every target.
+
+    An ``even`` reference with the switch off is deliberately *not* an error:
+    Word keeps that part dormant and renders the default header on even
+    pages, and application reproduces exactly that by clearing the switch.
+    """
+    hf = template_registry.get("headers_footers")
+    if not isinstance(hf, dict) or not (hf.get("headers") or hf.get("footers")):
+        return
+    try:
+        architect_even_and_odd_headers(template_registry)
+    except ValueError as exc:
+        errors.append(f"settings.settings_xml: {exc}")
+
+
 def _validate_top_level_xml_fragments(
     template_registry: Dict[str, Any], errors: List[str]
 ) -> None:
@@ -1500,6 +1525,7 @@ def preflight_validate_registries(
     _validate_numbering_consistency(template_registry, errors)
     if applies_shell:
         _validate_header_footer_contract(template_registry, errors)
+        _validate_header_parity(template_registry, errors)
         _validate_page_layout(template_registry, errors)
 
     return errors

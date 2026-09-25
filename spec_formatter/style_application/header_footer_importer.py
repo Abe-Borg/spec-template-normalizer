@@ -77,6 +77,11 @@ class HeaderFooterImportResult:
     removed_rels_names: set[str] = field(default_factory=set)
     style_ids: set[str] = field(default_factory=set)
     direct_num_ids: set[int] = field(default_factory=set)
+    #: True once the architect's header/footer set has replaced the target's.
+    #: The global even/odd header switch follows the header set, so this is
+    #: what decides whether the target's ``w:evenAndOddHeaders`` is kept or
+    #: made to match the architect's.
+    replaced_target_parts: bool = False
 
 
 def _iter_hf_entries(registry: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
@@ -823,6 +828,7 @@ def import_headers_footers(target_extract_dir: Path, registry: Dict[str, Any], l
         return result
 
     removed_parts, removed_rels = _remove_existing_hf_files(target_extract_dir, log)
+    result.replaced_target_parts = True
     result.removed_part_names.update(removed_parts)
     result.removed_rels_names.update(removed_rels)
     write_entries = _unique_part_entries(entries)

@@ -900,10 +900,14 @@ def _apply_classified_target_impl(
             _ns_additions = (
                 env_result.get("styles_namespace_additions", ()) if isinstance(env_result, dict) else ()
             )
+            _parity = env_result.get("header_parity", {}) if isinstance(env_result, dict) else {}
             phase.set(
                 header_footer_parts=len(_hf_import.get("part_names", set()) or set()),
                 header_footer_media=len(_hf_import.get("media_names", set()) or set()),
                 styles_namespace_additions=len(_ns_additions or ()),
+                header_parity_follows_architect=bool(_parity.get("follows_architect")),
+                even_and_odd_headers=_parity.get("even_and_odd_headers"),
+                header_parity_changed=bool(_parity.get("changed")),
             )
         log.append("Applied environment")
         checkpoint.stage = "header_footer_token_patch"
