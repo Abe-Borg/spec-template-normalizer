@@ -124,6 +124,8 @@ def test_invariants_allow_created_body_sectpr_and_require_expected_reference(tmp
             },
             "section_chain": [],
         },
+        # No settings part in the template: its even/odd header switch is off.
+        "settings": {"settings_xml": None},
     }
 
     verify_phase2_invariants(

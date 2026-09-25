@@ -336,6 +336,16 @@ def _relationship_map(payload: bytes) -> dict[str, ET.Element]:
     }
 
 
+def _settings_child_names(settings: bytes) -> list[str]:
+    return [child.tag.rsplit("}", 1)[-1] for child in ET.fromstring(settings)]
+
+
+def _assert_even_and_odd_headers_on(settings: bytes) -> None:
+    switches = ET.fromstring(settings).findall(f"{{{W_NS}}}evenAndOddHeaders")
+    assert len(switches) == 1
+    assert switches[0].get(f"{{{W_NS}}}val") in (None, "1", "true", "on")
+
+
 def test_unified_formatter_round_trips_without_api(tmp_path: Path) -> None:
     architect = tmp_path / "architect.docx"
     target = tmp_path / "target.docx"
@@ -433,6 +443,23 @@ def test_unified_formatter_round_trips_without_api(tmp_path: Path) -> None:
     assert output_settings.decode("utf-8").startswith('<?xml version="1.0" encoding="UTF-8"?>')
     assert 'w:percent="110"' in output_settings.decode("utf-8")
     assert 'w:name="compatibilityMode"' in output_settings.decode("utf-8")
+    # The architect renders its even-page header only because its settings
+    # switch it on, and the output imports that header: the switch has to
+    # come with it, at its schema position (after w:zoom, before w:compat).
+    _assert_even_and_odd_headers_on(output_settings)
+    assert _settings_child_names(output_settings) == [
+        "zoom",
+        "evenAndOddHeaders",
+        "compat",
+    ]
+    build_output = _diagnostics_event(run, "build_output")["fields"]
+    assert build_output["header_parity_checked"] is True
+    assert build_output["header_parity_follows_architect"] is True
+    assert build_output["even_and_odd_headers"] is True
+    apply_environment = _diagnostics_event(run, "apply_environment")["fields"]
+    assert apply_environment["header_parity_follows_architect"] is True
+    assert apply_environment["even_and_odd_headers"] is True
+    assert apply_environment["header_parity_changed"] is True
     assert '<w:numFmt w:val="upperLetter"/>' in output_numbering
     assert '<w:lvlText w:val="%1."/>' in output_numbering
     assert '<w:numFmt w:val="decimal"/>' in output_numbering
@@ -689,10 +716,16 @@ def test_unified_canadian_mode_converts_typed_csi_markers_end_to_end(
     with zipfile.ZipFile(result.output_path) as package:
         output_document = package.read("word/document.xml")
         output_numbering = package.read("word/numbering.xml").decode("utf-8")
+        output_settings = package.read("word/settings.xml")
     assert _xml_text_sequence(output_document)[:2] == ["Work Included", "Pumps"]
     assert '<w:lvlText w:val=".%1"/>' in output_numbering
     assert '<w:lvlText w:val=".%2"/>' in output_numbering
     assert b'<w:numId w:val="17"/>' not in output_document
+    # Canadian conversion applies the architect's whole shell too, so its
+    # even-page header renders in the output as it does in the template.
+    assert b'w:type="even"' in output_document
+    _assert_even_and_odd_headers_on(output_settings)
+    assert _diagnostics_event(run, "build_output")["fields"]["header_parity_checked"] is True
 
 
 def _extension_namespace_architect_styles() -> str:
