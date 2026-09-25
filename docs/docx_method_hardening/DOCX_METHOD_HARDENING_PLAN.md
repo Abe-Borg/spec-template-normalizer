@@ -821,13 +821,64 @@ wiring may change and `word/styles.xml` may not.
 bullet; README safety guarantees: "every part outside the mode's remit is
 proven byte-identical to the source".
 
+*As implemented (session 05):*
+
+- **Census and remit.** `_package_member_census` (`phase2_invariants.py`)
+  hashes every member of both packages from its bytes and classifies it;
+  `_package_remit` derives the allowed sets from the four policy fields named
+  in step 2, and `_enforce_package_remit` fails on the first out-of-remit
+  member in name order, with a count of the rest. `verify_phase2_invariants`
+  gained `header_footer_manifest` and `log`; `_build_and_patch_output` passes
+  the manifest that chose its replacements, and the target log. No new error
+  code, stage or policy field: a violation is an `INVARIANT FAIL`, like every
+  other invariant, and `APPLICATION_POLICY_VERSION` is unchanged.
+- **Shell parts, as Word finds them.** Step 2 lists `word/settings.xml`,
+  `word/theme/theme1.xml` and `word/fontTable.xml` by name. Header parity
+  (WI-04) writes the settings part the document *relates*, under any name, so
+  the remit also admits whichever settings, theme and font table parts the
+  output's document relates. The conventional names stay admitted as well,
+  because `apply_settings` and `apply_font_table` edit them by name even when
+  the document relates another part (handoff 05, finding 1): refusing that
+  stray write would change what such a run publishes, which is the user's
+  call, not this item's. Narrowing the shell to related parts belongs with
+  that fix.
+- **The header set is cross-checked against the packages too**, not only the
+  manifest. A header or footer part or its `.rels` may be changed or added
+  only where the manifest names it and the output's document relates it;
+  media only added (the importer allocates fresh names, so an existing media
+  part never changes), only where the manifest names it and an output header
+  relates it; and a removal only where the manifest names it and the
+  source's document related it as a header or footer (or it is that part's
+  relationships). An omitted manifest authorizes no header change; a mode
+  with no shell handed a manifest that names anything is a `ValueError`.
+- **Recorded first, enforced last.** The census is taken and its counters
+  recorded before the body check, so they reach the `build_output` event on
+  every failure path; the remit is enforced after every other check, so the
+  header/footer, parity and section checks keep their own, more specific
+  messages. Four existing tests that assert the exact `verification_out` of
+  an early failure now expect the census counters too, and one direct
+  header/footer gate test passes the manifest the importer would.
+- **Names in the run log only.** Each changed, added or removed member is
+  logged as `Package member <verb>: <name>`; `pipeline.py` whitelists that
+  prefix into `run.log`. Diagnostics carry the four counts.
+- **Tests** are in `tests/test_package_change_whitelist.py`: the per-mode
+  happy paths assert the counters against an independent census and the
+  exact set of members each mode changes; `word/footnotes.xml`,
+  `word/comments.xml` and `[trash]/0000.dat` are altered (and a member
+  removed and another added) in the packaged output of all four modes;
+  `canadian_to_csi` is refused a changed styles, settings (UTF-16) or
+  numbering part and an added theme or font table; the standalone mode adds
+  and wires its numbering and is refused a styles change; and direct tests
+  cover the census, the policy-field derivation, the related settings part,
+  and the manifest cross-check.
+
 **Definition of done**
 
-- [ ] Whitelist derived from `ApplicationPolicy` fields and the header/footer manifest, not from a hard-coded mode name.
-- [ ] Any out-of-remit change, addition or removal fails the target; counters recorded on success.
-- [ ] Tests listed above added and passing for all four modes.
-- [ ] `CLAUDE.md` and README updated.
-- [ ] Full suite and corpus regression green on the PR.
+- [x] Whitelist derived from `ApplicationPolicy` fields and the header/footer manifest, not from a hard-coded mode name.
+- [x] Any out-of-remit change, addition or removal fails the target; counters recorded on success.
+- [x] Tests listed above added and passing for all four modes.
+- [x] `CLAUDE.md` and README updated.
+- [x] Full suite and corpus regression green on the PR.
 
 ### WI-06: Revision accounting, discarded-revision warnings, collision-proof revision ids
 

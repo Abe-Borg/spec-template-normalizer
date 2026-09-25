@@ -674,6 +674,7 @@ def _build_and_patch_output(
     allowed_rpr_properties_by_paragraph: Optional[Dict[int, set[str]]] = None,
     verification_out: Optional[Dict[str, Any]] = None,
     expected_paragraph_changes: Optional[ExpectedParagraphChanges] = None,
+    log: Optional[List[str]] = None,
 ) -> Path:
     conversion_mode = validate_conversion_mode(conversion_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -752,6 +753,11 @@ def _build_and_patch_output(
             ),
             verification_out=verification_out,
             expected_paragraph_changes=expected_paragraph_changes,
+            # The same manifest that chose the header/footer replacements
+            # above: the gate holds every other member of the package to
+            # byte identity with the source.
+            header_footer_manifest=hf_manifest,
+            log=log,
         )
         os.replace(temp_output_path, output_path)
     except Exception:
@@ -1112,6 +1118,7 @@ def _apply_classified_target_impl(
                 ),
                 verification_out=verification,
                 expected_paragraph_changes=expected_paragraph_changes,
+                log=log,
             )
         finally:
             # Published on the failure path too. The body-text and geometry

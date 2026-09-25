@@ -1191,6 +1191,7 @@ _SAFE_OPERATIONAL_PREFIXES = (
     "No theme ",
     "No token matches ",
     "Output:",
+    "Package member",
     "Patched sectPr[",
     "Patched tokens ",
     "Processing target ",
