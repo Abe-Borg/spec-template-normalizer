@@ -73,6 +73,10 @@ spec_formatter/style_application/core/application_policy.py
     immutable mode-dependent mutation contract
 spec_formatter/style_application/core/marker_tools.py
     leading-marker machinery shared by both hierarchy converters
+spec_formatter/style_application/core/expected_changes.py
+    what a conversion predicts about every paragraph it changes, the one
+    comparison the converters and the final gate hold it to, and the
+    projection of this application's own tracked revisions
 spec_formatter/style_application/core/canadian_to_csi.py
     Canadian -> typed CSI marker conversion
 spec_formatter/style_application/core/classification.py
@@ -98,6 +102,10 @@ tests/test_canadian_to_csi.py, tests/test_architect_free_modes.py
 tests/test_error_location.py
     proves a fail-closed failure reports the paragraph it is about, and that
     the published location cannot be made to carry document text
+tests/test_final_gate_text_identity.py, tests/test_conversion_prediction.py
+    every mode's output held to identity except the predicted diff, end to
+    end with damage injected before packaging, and each converter's exact
+    prediction
 docs/docx_method_hardening/
     the multi-session hardening program derived from the spec-formatting
     method documents: the implementation plan, the machine-checked progress
@@ -197,11 +205,15 @@ kind drawn from the closed set `RUN_CONTENT_DIFFERENCE_KINDS` and never the
 text. That message is developer detail: like every Format-only body failure it
 is a plain `RuntimeError` with no error code, so `run.json`, `audit.json` and
 the GUI report `untrusted_error` with the detail withheld and no location. The
-check records `body_signature_paragraphs_compared` in `verification_out` on
+check records `body_signature_paragraphs_compared` (and
+`body_paragraphs_expected_changed`, always 0 here) in `verification_out` on
 success and on the failure path, so the `build_output` diagnostics event shows
 it ran. It records run content, not the container a run sits in: unwrapping a
 hyperlink or accepting a tracked insertion leaves every run's content as it
-was, so this check does not see it.
+was, so this check does not see it. The conversion modes are held to the same
+signature everywhere except the paragraphs their converter predicted it would
+change: see "Identity except the enumerated diff" under "Target shell,
+packaging, and invariants".
 
 ### 3. Explicit disposition coverage
 
@@ -520,7 +532,12 @@ produced it. It tests what each paragraph *leads with* rather than whether it
 changed, because a typed Canadian `PART 1` converts to a CSI `PART 1` and
 correctly changes nothing; and it separately proves no unpredicted paragraph
 changed text, which the per-paragraph check inside the edit loop structurally
-cannot see. Fails closed with `conversion_prediction_mismatch`.
+cannot see. Fails closed with `conversion_prediction_mismatch`. The prediction
+is exact as well: `_predict_marked_paragraph` works out each marked
+paragraph's run content from the source's signature before either edit runs,
+the converter asserts its assembled document against it, and the final gate
+asserts it again on the packaged output (see "Identity except the enumerated
+diff").
 
 Markers are `PART 1`, `1.1`, `A.`, `1.`, `a.`, `1)`, `a)`, `(1)`, `(a)`. An
 alphabetic level that runs past `z` fails closed rather than writing `aa.`,
@@ -800,6 +817,48 @@ and to point the header at them.
   imports nothing and compares every paragraph. `docDefaults` is part of the
   comparison rather than a tiebreak consulted only after the per-paragraph
   sources already differ, which would hide exactly this case.
+- **Identity except the enumerated diff** is the body-text rule for every
+  mode, and `core/expected_changes.py` owns it. The converters used to verify
+  their edits only in memory, at the conversion stage, so anything
+  environment application, numbering or style import, classification
+  application or repackaging did to a paragraph's text published. Now each
+  converter predicts, before it edits, what every paragraph it changes will
+  read afterwards: an `ExpectedParagraphChange` per paragraph index, holding
+  the visible text, the exact run-content signature, and the signature with
+  this application's own tracked insertions projected out.
+
+  The prediction is **worked out, never read back**: from the *source*
+  paragraph's signature and the planned edit (`_predict_marker_removal` in
+  `marker_tools`, `_predict_marker_insertion` and `_predict_marked_paragraph`
+  in `canadian_to_csi`), on the signature rather than on the XML the edit
+  writes, so it can disagree with the edit. Each converter asserts its
+  assembled document against it exactly; a prediction that cannot be formed is
+  reported only after the edit had its chance to refuse the paragraph in its
+  own, actionable terms. `apply_csi_to_canadian` and `apply_canadian_to_csi`
+  return a `ConversionResult` -- the text-free report beside the prediction --
+  and `ConversionPlan` carries the prediction beside its document.
+
+  `verify_phase2_invariants(expected_paragraph_changes=...)` then runs on the
+  packaged output, after every later stage. Every unpredicted paragraph keeps
+  its exact run content -- compared with *no* projection, which would hide a
+  marker inserted where none was predicted. Every predicted paragraph must read
+  as predicted, match the predicted run content, and match it again with the
+  application's own revisions projected out, which is what tells a tracked
+  marker still inside its `w:ins` from one made permanent text (the wrapper is
+  not run content). A failure is `conversion_prediction_mismatch`, placed by
+  SECTION and heading from the roles the converter recorded, and names the
+  kind of difference, never the text. Format-only passes the empty prediction
+  -- the WI-02 check is this comparison with nothing predicted -- keeps its
+  `FORMAT_ONLY INVARIANT FAIL` messages, and refuses a non-empty one. An
+  omitted prediction allows no change, as an omitted run-property contract
+  authorizes no removal. `body_signature_paragraphs_compared` and
+  `body_paragraphs_expected_changed` reach the `build_output` event on success
+  and failure alike.
+
+  A prediction holds document text, because it has to. It travels as a value
+  from the converter to the gate and nowhere else, and it renders without its
+  contents. Never attach it to the conversion report, a `BatchResult` or
+  `TargetFormatResult`, an audit, or a diagnostics field.
 - `docx_decomposer.py` extracts targets safely; `docx_patch.py` assembles and
   validates replacements before publication.
 
@@ -1230,6 +1289,8 @@ python -m pytest tests/test_builtin_scheme.py tests/test_canadian_to_csi.py \
     tests/test_architect_free_modes.py -q
 python -m pytest tests/test_geometry_invariant.py \
     tests/test_conversion_verification.py -q
+python -m pytest tests/test_final_gate_text_identity.py \
+    tests/test_conversion_prediction.py -q
 python -m pytest tests/test_error_location.py -q
 python -m pytest tests/test_docx_method_hardening_tracker.py -q
 python docs/docx_method_hardening/probes/probe_style_import_w14.py
@@ -1349,6 +1410,12 @@ Before considering a formatter change complete:
   numbering level was supplying.
 - Reusing a `w:pPr` order table abbreviated for one element to insert another.
 - Deriving a conversion's "expected diff" from what the conversion did.
+- Proving a conversion's text only where the converter runs. Every later stage
+  can still change it; the final gate holds every paragraph to its exact run
+  content except the ones the converter predicted, and those to the
+  prediction.
+- Comparing an unpredicted paragraph with this application's revisions
+  projected out, which hides a marker inserted where none was predicted.
 - Proving content unchanged with whitespace-normalized text alone. The same
   collapsing function on both sides cannot see a lost tab, break, soft
   hyphen, non-breaking space, doubled space, `xml:space="preserve"`, or

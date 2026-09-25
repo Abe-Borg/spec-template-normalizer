@@ -269,6 +269,16 @@ levels of one coherent automatic multilevel Word list. That is an application
 safety limitation, not a claim that CSC PageFormat requires one particular
 Word/OOXML implementation.
 
+Before it edits anything, the conversion records what every paragraph it
+changes must read afterwards, and the finished file is checked against that
+record after the architect's styles, numbering, and shell have been applied:
+each paragraph whose typed marker was removed must read exactly as its original
+text without that marker, and every other paragraph — including one whose
+automatic numbering was retargeted — must come through with its text
+unchanged, run by run, down to a tab, a line break, or a doubled space.
+Anything else withholds the output with `conversion_prediction_mismatch` and
+the paragraph's location.
+
 Conversion counts and diagnostics are included in the application's saved
 activity log, including when a later validation or publication step fails.
 
@@ -333,7 +343,9 @@ markup like any other proposed edit and you can accept or reject them as a
 group. Rejecting them all restores the file exactly. Your own pending edits are
 carried through untouched either way. With tracking off, the markers are
 written as ordinary text as before. Either way `run.json` records which
-happened, so it is never left to inference.
+happened, so it is never left to inference. A tracked marker is a run of its
+own, placed just before the run that holds the paragraph's text and carrying
+that run's character formatting, so a bold heading still gets a bold number.
 
 Typed markers are the deliberate output. A spec whose numbering is literal text
 renders identically everywhere, survives being pasted into another editor, and
@@ -361,7 +373,11 @@ reject the tracked changes on that paragraph first.
 Finally, the conversion decides every number before it edits anything, then
 checks the finished document against that list — including that no paragraph it
 did not plan to touch changed at all. A report written as the work happened
-could only tell you the tool agreed with itself.
+could only tell you the tool agreed with itself. The same prediction is checked
+once more on the finished file, run by run: each marked paragraph must be
+exactly its original text — less any typed Canadian marker it replaced — with
+the CSI marker and a tab in front, a tracked marker must still be a tracked
+insertion, and every other paragraph must be exactly as it was.
 
 A round trip returns your markers, with one documented exception: converting
 *to* Canadian treats the dash in `PART 1 - GENERAL` as part of the typed marker
@@ -617,6 +633,15 @@ fails instead of publishing a header that still names the architect's section.
   hyphenation marks, symbols and space preservation are compared run by run,
   so a lost tab or a non-breaking space made plain withholds the output
   instead of publishing it.
+- Every mode proves that only the paragraphs the conversion predicted have
+  changed. Each conversion records, before it edits anything, what every
+  paragraph it changes must read afterwards; after every later step, the
+  finished file is checked against that record run by run, and every other
+  paragraph must keep its exact text, tabs, breaks and spacing. A converted
+  paragraph that departs from its prediction, or any other paragraph that
+  changed at all, withholds the output with `conversion_prediction_mismatch`
+  and the paragraph's location. Format-only predicts no change, so every
+  paragraph is held to the exact comparison above.
 - Every mode verifies that no paragraph's effective indentation moved. This
   catches the one class of damage a text comparison cannot: identical words,
   identical numbering, identical formatting runs, and a visibly different page.
@@ -687,6 +712,14 @@ exact run-content comparison behind Format-only's body-text check, and
 `tests/style_application_regression/test_final_package_validation.py` keeps
 every mutation that a word-for-word comparison used to accept as a permanent
 failing case.
+
+`tests/test_final_gate_text_identity.py` runs every conversion mode end to end
+with the document damaged after the conversion and before packaging — a
+doubled space, a non-breaking space, a dropped tab or soft hyphen, a marker
+taken out of its tracked insertion — and requires each run to be withheld,
+with the damaged paragraph's location. `tests/test_conversion_prediction.py`
+checks each converter's prediction against hand-written expected values, and
+shows that a converter edit a word-for-word check would pass is refused.
 
 `tests/test_sanitized_format_only_corpus.py` builds a tracked, non-proprietary
 154-paragraph reproduction of the supplied acceptance case and runs it through
