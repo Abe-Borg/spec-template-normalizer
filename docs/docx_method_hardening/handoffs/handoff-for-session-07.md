@@ -46,9 +46,10 @@ first tool call, in this order:
     - `tests/test_conversion_verification.py` gained three id checks; two
       failed on the old engine.
   - After the implementation:
-    - `tests/test_revision_accounting.py`: 18 passed;
+    - `tests/test_revision_accounting.py`: 20 passed (the 18 above plus two
+      added for the review finding below);
       `tests/test_conversion_verification.py`: 15 passed;
-    - `python -m pytest -q`: 1638 passed, 1 skipped;
+    - `python -m pytest -q`: 1640 passed, 1 skipped;
     - `python -m pytest tests/test_sanitized_format_only_corpus.py -q`:
       2 passed;
     - `tests/test_engine_identity.py`: passes (no fingerprinted file
@@ -110,8 +111,11 @@ first tool call, in this order:
         schema version bump.
       - A malformed target header/footer part now fails rather than being
         discarded uncounted.
-    - **Ids.** `apply_canadian_to_csi` scans every `.xml` part below `word/`
-      of a *tracked* target. `plan_canadian_to_csi` gained
+    - **Ids.** `apply_canadian_to_csi` scans every XML part below `word/`
+      of a *tracked* target: `.xml` in any case, or any part
+      `[Content_Types].xml` declares as XML. This was fixed after Codex's
+      review of PR 66, because a case-sensitive glob missed
+      `word/comments.XML` on Linux. `plan_canadian_to_csi` gained
       `highest_annotation_id` and allocates from max + 1 in document order:
       a paragraph's `w:pPrChange` first, then its `w:ins`. An id above
       2**31 - 1 fails closed (plain `ValueError`).

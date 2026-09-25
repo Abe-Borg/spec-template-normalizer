@@ -997,9 +997,11 @@ safety guarantees: revisions are counted and discarded ones are reported.
   every engine event of the target whatever the diagnostics level; no new
   top-level audit key, so the artifact schema version is unchanged. A target
   part that cannot be parsed fails rather than being discarded uncounted.
-- **Ids.** `apply_canadian_to_csi` reads every `.xml` part below `word/` of a
+- **Ids.** `apply_canadian_to_csi` reads every XML part below `word/` of a
   tracked target (`highest_annotation_id_in_package`), a superset of the parts
-  step 3 lists, and `plan_canadian_to_csi(highest_annotation_id=...)`
+  step 3 lists: `.xml` in any case, or any part `[Content_Types].xml` declares
+  as XML (after review of PR 66: a case-sensitive glob missed
+  `word/comments.XML` on Linux). `plan_canadian_to_csi(highest_annotation_id=...)`
   allocates from one above the highest of those and the body's own, in
   document order. An id beyond 2**31 - 1 (Word's signed 32-bit reading) fails
   closed. `tests/test_conversion_verification.py` asserts, with no engine

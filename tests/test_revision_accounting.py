@@ -756,3 +756,48 @@ def test_a_prediction_holds_the_revisions_a_paragraph_gains() -> None:
             run_content_outside_own_revisions=(),
             own_revisions=("bookmarkStart",),
         )
+
+
+@pytest.mark.parametrize(
+    "part_name, content_type_override",
+    [
+        # OPC part names are case-insensitive: an upper-case extension is
+        # still an XML part, and a case-sensitive "*.xml" glob misses it.
+        ("word/footnotes.XML", None),
+        # A part may take any extension when [Content_Types].xml declares
+        # its content type by an Override.
+        (
+            "word/notes.part",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+        ),
+    ],
+)
+def test_marker_ids_are_allocated_above_ids_in_parts_named_any_way(
+    tmp_path: Path, part_name: str, content_type_override: Optional[str]
+) -> None:
+    target = _extracted_high_id_target(tmp_path / "target", note_id=900003)
+    notes = target / "word" / "footnotes.xml"
+    renamed = target / part_name
+    notes.rename(renamed)
+    overrides = (
+        f'<Override PartName="/{part_name}" ContentType="{content_type_override}"/>'
+        if content_type_override
+        else ""
+    )
+    (target / "[Content_Types].xml").write_text(
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        f"{overrides}</Types>",
+        encoding="utf-8",
+    )
+
+    apply_canadian_to_csi(
+        target,
+        reverse._classifications([role for role, _text in _HIGH_ID_ROWS]),
+        [],
+    )
+
+    document = (target / "word" / "document.xml").read_text(encoding="utf-8")
+    allocated = _own_revision_ids(document)
+    assert len(allocated) == 2 * len(_HIGH_ID_ROWS)
+    assert min(allocated) > 900003

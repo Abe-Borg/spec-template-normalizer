@@ -31,6 +31,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Mapping, Optional, Tuple, Union
 
+from .ooxml_namespaces import CT_NS
 from .untrusted_xml import parse_untrusted_xml
 from .xml_helpers import W_NS, iter_start_tags
 
@@ -139,25 +140,62 @@ def max_annotation_id(xml: Union[bytes, str], part_name: str) -> Optional[int]:
 def highest_annotation_id_in_package(extract_dir: Path) -> Optional[int]:
     """The highest annotation id in any WordprocessingML part of a package.
 
-    Every ``.xml`` part below ``word/`` is read -- the body, headers, footers,
+    Every XML part below ``word/`` is read -- the body, headers, footers,
     footnotes, endnotes and comments, and the styles, numbering and glossary
     parts, which can carry property revisions of their own -- rather than the
     parts a relationship happens to name, because an id is taken wherever it
-    is written. Relationship parts carry no annotations and are skipped.
+    is written. A part is XML when its extension is ``.xml`` in any case (OPC
+    part names are case-insensitive) or when ``[Content_Types].xml`` declares
+    an XML content type for it, by an ``Override`` or by its extension's
+    ``Default``. Relationship parts carry no annotations and are skipped.
     """
 
-    word = Path(extract_dir) / "word"
+    root = Path(extract_dir)
+    word = root / "word"
     if not word.is_dir():
         return None
+    overrides, defaults = _declared_content_types(root)
     highest: Optional[int] = None
-    for path in sorted(word.rglob("*.xml")):
-        relative = path.relative_to(extract_dir)
+    for path in sorted(word.rglob("*")):
+        relative = path.relative_to(root)
         if "_rels" in relative.parts or not path.is_file():
             continue
-        value = max_annotation_id(path.read_bytes(), relative.as_posix())
+        name = relative.as_posix()
+        extension = path.suffix[1:].casefold()
+        content_type = overrides.get(name.casefold(), defaults.get(extension, ""))
+        if extension != "xml" and not _is_xml_content_type(content_type):
+            continue
+        value = max_annotation_id(path.read_bytes(), name)
         if value is not None and (highest is None or value > highest):
             highest = value
     return highest
+
+
+def _declared_content_types(root: Path) -> Tuple[dict, dict]:
+    """``[Content_Types].xml`` as (override by part name, default by extension).
+
+    Both keyed casefolded, as OPC compares them. An absent part declares
+    nothing, which leaves the ``.xml`` extension rule on its own.
+    """
+
+    path = root / "[Content_Types].xml"
+    if not path.is_file():
+        return {}, {}
+    types = parse_untrusted_xml(path.read_bytes(), "[Content_Types].xml")
+    overrides = {
+        node.get("PartName", "").lstrip("/").casefold(): node.get("ContentType", "")
+        for node in types.findall(f"{{{CT_NS}}}Override")
+    }
+    defaults = {
+        node.get("Extension", "").casefold(): node.get("ContentType", "")
+        for node in types.findall(f"{{{CT_NS}}}Default")
+    }
+    return overrides, defaults
+
+
+def _is_xml_content_type(content_type: str) -> bool:
+    value = content_type.strip().casefold()
+    return value.endswith("+xml") or value in ("application/xml", "text/xml")
 
 
 def revision_kinds_by_author(xml_fragment: str, author: str) -> Counter:

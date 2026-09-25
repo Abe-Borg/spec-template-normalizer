@@ -564,10 +564,14 @@ revision shares one space with every annotation -- bookmarks, comment ranges,
 references and the comments themselves, permission ranges, other revisions --
 and a reviewer's ids reach any size. The converter used to start at a fixed
 900000 "without needing to scan", which only moved the collision somewhere
-less likely. `apply_canadian_to_csi` now reads every `.xml` part below `word/`
+less likely. `apply_canadian_to_csi` now reads every XML part below `word/`
 of a tracked target (`highest_annotation_id_in_package` in `core/revisions.py`:
 footnotes, endnotes, comments, headers and footers, and the styles and
-numbering parts, which can carry property revisions too) and
+numbering parts, which can carry property revisions too). A part is XML when
+its extension is `.xml` in any case -- OPC part names are case-insensitive, so
+a case-sensitive `*.xml` glob misses `word/comments.XML` on Linux -- or when
+`[Content_Types].xml` declares an XML content type for it, by `Override` or
+by its extension's `Default`. Then
 `plan_canadian_to_csi(highest_annotation_id=...)` allocates from one above the
 highest of those and of the body's own, monotonically, in document order (a
 paragraph's `w:pPrChange` before its `w:ins`). An id past 2**31 - 1, which Word
