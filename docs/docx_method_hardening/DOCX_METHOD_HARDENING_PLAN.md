@@ -944,14 +944,84 @@ whose existing ids already exceed the old base gets non-colliding markers.
 bullet, and the "Run artifacts" section for the new audit fields. README
 safety guarantees: revisions are counted and discarded ones are reported.
 
+*As implemented (session 06):*
+
+- **One module, `core/revisions.py`.** `revision_census` counts revision
+  elements by `(author, kind)` from a parsed part (namespace-aware, so a
+  comment or CDATA section that looks like a revision is not one, and a UTF-16
+  part reads as any other). `REVISION_KINDS` is the complete ECMA-376 17.13.5
+  family rather than the eleven kinds step 1 lists: it adds the move and
+  custom-XML range markers, `w:cellIns`/`w:cellDel`/`w:cellMerge`,
+  `w:tblPrExChange` and `w:tblGridChange`. Counting more can only refuse more
+  real damage; no engine step legitimately adds or removes any of them.
+- **The expected delta is the prediction.** `ExpectedParagraphChange` gained
+  `own_revisions`, the kinds an edit adds in this application's name, worked
+  out by `_predict_marked_paragraph` from the edit it plans (`("ins",
+  "pPrChange")` for a tracked automatic source; the typed-source path under
+  tracking already fails closed). The census requires every other author to
+  keep each kind they had -- per author, so a revision moved from one reviewer
+  to another is a difference too -- and `MARKER_REVISION_AUTHOR` to carry
+  exactly its source revisions plus `own_revisions_added()`. Failure:
+  `INVARIANT FAIL: tracked revisions in word/document.xml changed (<kind> by
+  this application|another author: expected <n>, found <m>; ...)`, a plain
+  `RuntimeError` like every invariant failure, naming kinds and counts and
+  never an author (personal data). No new error code, stage or policy field.
+- **Per paragraph as well.** `prediction_mismatch` gained a last check,
+  `own_revision_kinds`: a predicted paragraph must carry the revisions in this
+  application's name it carried before plus exactly `own_revisions`. The
+  converter and the gate both run it, so a `w:pPrChange` lost, doubled or
+  placed on the wrong paragraph fails as `conversion_prediction_mismatch` with
+  the paragraph's location, before the document-wide census would.
+- **`without_own_revisions` is unchanged.** Its consumers compare runs and a
+  `w:pPrChange` holds none; projecting one out by deleting it would not be the
+  rejection it stands for (that restores the old properties). The
+  `w:pPrChange` is accounted for by the two checks above instead.
+- **Recorded first, enforced after the specific checks.** `revisions_before`,
+  `revisions_after` and `revisions_added_by_application` are recorded as the
+  gate starts, beside the package census, so they reach the `build_output`
+  event on success and on every failure. The census is enforced after the
+  body, section and run-property checks and before the package remit. Four
+  tests that assert an early failure's exact `verification_out` expect the
+  three counters, with exact values.
+- **Header and footer revisions.** Counted per part before a target part is
+  deleted and before an architect part is written
+  (`HeaderFooterImportResult.revisions_discarded` / `revisions_imported`),
+  logged as `WARNING: Discarded tracked revisions in replaced target part
+  <name>: <n>` / `WARNING: Imported tracked revisions in architect part
+  <name>: <n>` (whitelisted into `run.log` by exactly those prefixes, not a bare
+  `WARNING`), and returned as totals through the manifest. The
+  `apply_environment` event records `header_footer_revisions_discarded` and
+  `header_footer_revisions_imported` on every shell run, zero included, and a
+  warning-level `header_footer_revisions` event follows when either is
+  non-zero. "The audit" is `audit.json`'s `diagnostics` array, which carries
+  every engine event of the target whatever the diagnostics level; no new
+  top-level audit key, so the artifact schema version is unchanged. A target
+  part that cannot be parsed fails rather than being discarded uncounted.
+- **Ids.** `apply_canadian_to_csi` reads every XML part below `word/` of a
+  tracked target (`highest_annotation_id_in_package`), a superset of the parts
+  step 3 lists: `.xml` in any case, or any part `[Content_Types].xml` declares
+  as XML (after review of PR 66: a case-sensitive glob missed
+  `word/comments.XML` on Linux). `plan_canadian_to_csi(highest_annotation_id=...)`
+  allocates from one above the highest of those and the body's own, in
+  document order. An id beyond 2**31 - 1 (Word's signed 32-bit reading) fails
+  closed. `tests/test_conversion_verification.py` asserts, with no engine
+  code, that the allocated ids collide with no source annotation id in any
+  part, are distinct, and that revision ids are unique across every output
+  part while paired annotations keep their shared ids.
+- **Found by the census, not fixed here.** Format-only rewrites a paragraph's
+  direct `w:numPr` and drops a `w:numberingChange` inside it. The unchanged
+  engine published that as a success; the census now withholds such a target
+  (`untrusted_error`). Preserving the revision belongs with the numbering
+  materialization in `core/classification.py`; recorded in handoff 07.
+
 **Definition of done**
 
-- [ ] Revision census invariant with exact expected delta per mode; counters recorded on success.
-- [ ] Discarded and imported header/footer revisions counted, logged and recorded as counts.
-- [ ] Revision ids allocated above every existing annotation id; the independent verifier asserts the allocated ids collide with nothing and revision-element ids are unique, without requiring paired annotation ids to differ.
-- [ ] Tests listed above added and passing.
-- [ ] `CLAUDE.md` and README updated.
-- [ ] Full suite and corpus regression green on the PR.
+- [x] Revision census invariant with exact expected delta per mode; counters recorded on success.
+- [x] Discarded and imported header/footer revisions counted, logged and recorded as counts.
+- [x] Revision ids allocated above every existing annotation id; the independent verifier asserts the allocated ids collide with nothing and revision-element ids are unique, without requiring paired annotation ids to differ.
+- [x] Tests listed above added and passing.
+- [x] `CLAUDE.md` and README updated.
+- [x] Full suite and corpus regression green on the PR.
 
 ### WI-07: Marker placement before leading structural run content
 

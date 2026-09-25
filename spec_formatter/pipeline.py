@@ -1212,6 +1212,11 @@ _SAFE_OPERATIONAL_PREFIXES = (
     "Updated ",
     "Validating the architect formatting profile",
     "Validating the template profile",
+    # Counts and part names only, as "Package member" lines are: the header
+    # and footer revisions a replaced set discarded or an imported one
+    # brought. A bare "WARNING" prefix would let any warning's text through.
+    "WARNING: Discarded tracked revisions in ",
+    "WARNING: Imported tracked revisions in ",
     "Wrote ",
 )
 

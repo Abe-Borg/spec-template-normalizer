@@ -13,8 +13,8 @@ by its index in ``word/document.xml``. The gate then holds
 * every paragraph *not* in the prediction to its exact run content
   (:func:`~.xml_helpers.paragraph_run_content_signature`), and
 * every paragraph *in* it to that prediction: its visible text, its exact run
-  content, and its run content outside this application's own tracked
-  revisions.
+  content, its run content outside this application's own tracked
+  revisions, and the tracked revisions this application's name adds to it.
 
 Format-only predicts nothing, so the same comparison holds every paragraph to
 identity, which is the check WI-02 added.
@@ -34,11 +34,13 @@ renders without its contents.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 from .errors import EngineError
+from .revisions import REVISION_KINDS, revision_kinds_by_author
 from .xml_helpers import (
     RunContentSignature,
     paragraph_run_content_signature,
@@ -89,11 +91,25 @@ class ExpectedParagraphChange:
     application's own tracked insertions are projected out: for an untracked
     edit that is ``run_content`` itself, and for a tracked marker it is the
     source paragraph, untouched.
+
+    ``own_revisions`` lists the revision kinds (members of
+    :data:`~.revisions.REVISION_KINDS`) the edit adds to the paragraph under
+    :data:`MARKER_REVISION_AUTHOR`: ``("ins", "pPrChange")`` for a tracked
+    marker that also cancels automatic numbering, nothing for an untracked
+    edit. Stored sorted, because what is compared is the multiset.
     """
 
     visible_text: str
     run_content: RunContentSignature
     run_content_outside_own_revisions: RunContentSignature
+    own_revisions: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        kinds = tuple(self.own_revisions)
+        unknown = sorted({kind for kind in kinds if kind not in REVISION_KINDS})
+        if unknown:
+            raise ValueError(f"not revision kinds: {unknown}")
+        object.__setattr__(self, "own_revisions", tuple(sorted(kinds)))
 
     def __repr__(self) -> str:
         return (
@@ -131,6 +147,19 @@ class ExpectedParagraphChanges:
         object.__setattr__(self, "changes", MappingProxyType(changes))
         object.__setattr__(self, "roles", MappingProxyType(roles))
 
+    def own_revisions_added(self) -> Counter:
+        """Every revision kind the conversion adds in this application's name.
+
+        The document-wide half of the prediction: the final gate's revision
+        census holds ``word/document.xml`` to exactly the source's revisions
+        plus these.
+        """
+
+        added: Counter = Counter()
+        for change in self.changes.values():
+            added.update(change.own_revisions)
+        return added
+
     def __repr__(self) -> str:
         return (
             f"ExpectedParagraphChanges(<{len(self.changes)} predicted "
@@ -162,7 +191,7 @@ class PredictionMismatch:
 
 
 #: Every ``PredictionMismatch.check``: an unpredicted paragraph is tested for
-#: its visible text and then its run content, a predicted one for the three
+#: its visible text and then its run content, a predicted one for the four
 #: after it, in this order.
 PREDICTION_CHECKS = (
     "unpredicted_visible_text",
@@ -170,6 +199,7 @@ PREDICTION_CHECKS = (
     "visible_text",
     "run_content",
     "own_revisions",
+    "own_revision_kinds",
 )
 
 
@@ -190,7 +220,10 @@ def prediction_mismatch(
     predicted run content exactly, and then match it again once this
     application's own tracked revisions are projected out -- which is what
     tells a marker still inside its revision from one that became permanent
-    text, since the ``w:ins`` wrapper is not run content.
+    text, since the ``w:ins`` wrapper is not run content. Last, the revisions
+    in this application's name must be the source's plus exactly those the
+    edit was predicted to add: a ``w:pPrChange`` holds no run content, so
+    nothing before this sees one lost, doubled or put on the wrong paragraph.
     """
 
     if change is None:
@@ -217,6 +250,10 @@ def prediction_mismatch(
     kind = run_content_difference(change.run_content_outside_own_revisions, outside)
     if kind is not None:
         return PredictionMismatch("own_revisions", kind)
+    expected_own = revision_kinds_by_author(before_block, MARKER_REVISION_AUTHOR)
+    expected_own.update(change.own_revisions)
+    if revision_kinds_by_author(after_block, MARKER_REVISION_AUTHOR) != expected_own:
+        return PredictionMismatch("own_revision_kinds")
     return None
 
 
@@ -294,6 +331,12 @@ def describe_prediction_mismatch(
         return (
             f"Paragraph {index}{where} changed beyond its predicted conversion "
             f"({mismatch.kind})."
+        )
+    if mismatch.check == "own_revision_kinds":
+        return (
+            f"Paragraph {index}{where} does not carry exactly the tracked "
+            "revisions the conversion predicted it would add in this "
+            "application's name."
         )
     return (
         f"Paragraph {index}{where} is not its predicted conversion outside this "

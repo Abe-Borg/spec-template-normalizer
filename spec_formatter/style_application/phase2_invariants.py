@@ -27,6 +27,7 @@ from .core.header_parity import (
     even_and_odd_headers_as_written,
 )
 from .core.expected_changes import (
+    MARKER_REVISION_AUTHOR,
     NO_EXPECTED_PARAGRAPH_CHANGES,
     PREDICTION_MISMATCH,
     ExpectedParagraphChanges,
@@ -37,6 +38,7 @@ from .core.expected_changes import (
     without_own_revisions as _without_own_revisions,
 )
 from .core.marker_tools import _paragraph_locator
+from .core.revisions import revision_census, revision_census_differences
 from .core.xml_helpers import (
     iter_direct_child_xml_blocks,
     iter_element_xml_blocks,
@@ -1792,6 +1794,82 @@ def _verify_package_member_remit(
     return census
 
 
+_REVISION_CENSUS_FAIL = "INVARIANT FAIL: tracked revisions in word/document.xml changed"
+
+
+@dataclass(frozen=True)
+class RevisionCensus:
+    """Every revision element in the source and output body, by author and kind.
+
+    Keys are ``(author, kind)``; an author is compared, never reported.
+    """
+
+    before: Counter
+    after: Counter
+
+    def total_before(self) -> int:
+        return sum(self.before.values())
+
+    def total_after(self) -> int:
+        return sum(self.after.values())
+
+    def added_by_application(self) -> int:
+        """This application's revisions in the output, less those in the source."""
+
+        def own(counts: Counter) -> int:
+            return sum(
+                count for (author, _kind), count in counts.items()
+                if author == MARKER_REVISION_AUTHOR
+            )
+
+        return own(self.after) - own(self.before)
+
+
+def _take_revision_census(
+    before_document_xml: str,
+    after_document_xml: str,
+    verification_out: Optional[Dict[str, Any]],
+) -> RevisionCensus:
+    """Count every revision in both bodies and record the totals at once.
+
+    Recorded before any check can fail, as the package census is, so a failed
+    run still shows the census ran and what it counted.
+    """
+
+    census = RevisionCensus(
+        before=revision_census(before_document_xml, "word/document.xml (source)"),
+        after=revision_census(after_document_xml, "word/document.xml (output)"),
+    )
+    if verification_out is not None:
+        verification_out["revisions_before"] = census.total_before()
+        verification_out["revisions_after"] = census.total_after()
+        verification_out["revisions_added_by_application"] = census.added_by_application()
+    return census
+
+
+def _enforce_revision_census(
+    census: RevisionCensus,
+    own_revisions_added: Mapping[str, int],
+) -> None:
+    """Hold the body's revisions to the source's plus the predicted additions.
+
+    Every author but this application keeps exactly the revisions they had,
+    kind by kind. This application's name carries exactly what the conversion
+    predicted it would add: nothing in every mode, except the ``w:ins`` and
+    ``w:pPrChange`` of each paragraph a tracked ``canadian_to_csi`` run
+    converts. The failure names kinds and counts, never an author or text.
+    """
+
+    differences = revision_census_differences(
+        census.before,
+        census.after,
+        MARKER_REVISION_AUTHOR,
+        own_revisions_added,
+    )
+    if differences:
+        raise RuntimeError(f"{_REVISION_CENSUS_FAIL} ({'; '.join(differences)})")
+
+
 # ``_without_own_revisions`` -- this application's own tracked insertions
 # projected out by author, everyone else's kept -- is imported from
 # core/expected_changes.py, which the enumerated-diff gate above shares with
@@ -1836,11 +1914,15 @@ def verify_phase2_invariants(
        own (unchanged) otherwise.
     3. Direct run properties may be removed only when the effective replacement
        style supplies that property. An omitted contract authorizes no removal.
-    4. Every package member outside the policy's remit is byte-identical to the
+    4. Every tracked revision in the body is accounted for: each author other
+       than this application keeps exactly the revisions they had, by kind,
+       and this application's name carries exactly the revisions the
+       prediction adds (none unless a tracked conversion predicted them).
+    5. Every package member outside the policy's remit is byte-identical to the
        source, and none is added or removed. Header and footer parts count as
        within the remit only where ``header_footer_manifest`` (the importer's
        manifest) names them; an omitted manifest authorizes no header change.
-       The census is recorded as the checks start and enforced after them;
+       Both censuses are recorded as the checks start and enforced after them;
        member names go to ``log`` only.
     """
     # 1) sectPr non-layout semantics unchanged
@@ -1861,6 +1943,11 @@ def verify_phase2_invariants(
         # census ran and what it counted; enforced last, after the checks that
         # explain a change in their own terms.
         package_census = _take_package_census(src_docx, new_docx, verification_out, log)
+    # The same for the body's tracked revisions: counted and recorded now,
+    # held to the prediction once the checks that explain a change in their
+    # own terms -- the body, the sections, the run properties -- have run.
+    revisions = _take_revision_census(before_doc, after_doc, verification_out)
+    own_revisions_added = expected.own_revisions_added()
     if application_policy.preserve_target_numbering:
         if expected.changes:
             raise ValueError(
@@ -2175,7 +2262,10 @@ def verify_phase2_invariants(
             f"removed, or moved between runs in paragraph {paragraph_index}"
         )
 
-    # 4) Nothing outside the mode's remit changed, arrived or went.
+    # 4) Every tracked revision in the body accounted for.
+    _enforce_revision_census(revisions, own_revisions_added)
+
+    # 5) Nothing outside the mode's remit changed, arrived or went.
     if package_census is not None:
         _enforce_package_remit(
             package_census,

@@ -282,6 +282,26 @@ def iter_direct_child_xml_blocks(
     raise ValueError(f"Malformed XML: unclosed <{root_name}> element")
 
 
+def iter_start_tags(xml_text: str) -> Iterator[Tuple[str, Dict[str, str]]]:
+    """Every element start tag in document order, as ``(name, attributes)``.
+
+    Self-closing tags count as start tags. Comments, CDATA sections and
+    processing instructions are stepped over whole, so markup-shaped text
+    inside them is never reported; attribute values are decoded as a parser
+    reports them. Works on a fragment, with no namespace declarations needed.
+    """
+
+    cursor = 0
+    while True:
+        start = xml_text.find("<", cursor)
+        if start < 0:
+            return
+        end, kind, name, is_close, _is_self_closing = _scan_markup(xml_text, start)
+        cursor = end
+        if kind == "tag" and not is_close and name is not None:
+            yield name, _tag_attribute_values(xml_text[start:end])
+
+
 def iter_paragraph_xml_blocks(document_xml_text: str) -> Generator[Tuple[int, int, str], None, None]:
     """Yield stable, non-overlapping top-level ``w:p`` blocks."""
     yield from iter_element_xml_blocks(document_xml_text, "w:p")

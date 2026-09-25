@@ -222,7 +222,11 @@ it is a guarantee about the **body**: your body text and its list numbering
 come through unchanged, and the file itself is legitimately a different file.
 Headers and footers are not covered by that promise -- applying the
 architect's shell replaces them, which is the point of step 5 above, so
-target-authored header and footer wording is expected to change. An untouched
+target-authored header and footer wording is expected to change. Any tracked
+changes still pending in the target's headers and footers go with them, and
+any pending in the template's arrive in the output; neither happens silently —
+each part is named with its count on a `WARNING:` line in `run.log`, and the
+counts are recorded in the diagnostics and the target's audit. An untouched
 body paragraph can also still look different on the page once the architect's
 defaults apply to it.
 
@@ -361,6 +365,10 @@ written as ordinary text as before. Either way `run.json` records which
 happened, so it is never left to inference. A tracked marker is a run of its
 own, placed just before the run that holds the paragraph's text and carrying
 that run's character formatting, so a bold heading still gets a bold number.
+Every revision the conversion writes is numbered above the highest id the file
+already uses — its bookmarks, comments, and your own pending revisions,
+wherever in the file they are — so none can collide with an id Word already
+knows.
 
 Typed markers are the deliberate output. A spec whose numbering is literal text
 renders identically everywhere, survives being pasted into another editor, and
@@ -657,6 +665,18 @@ fails instead of publishing a header that still names the architect's section.
   changed at all, withholds the output with `conversion_prediction_mismatch`
   and the paragraph's location. Format-only predicts no change, so every
   paragraph is held to the exact comparison above.
+- Tracked changes are counted. Every tracked revision in the body is counted
+  by author and kind before and after, and the finished file must carry
+  exactly the source's revisions plus the ones the conversion said it would
+  add: none in every mode, except a Canadian-to-CSI run under Track Changes,
+  which adds one insertion and one property change per marker, in its own
+  name. A reviewer's revision that was lost, turned into another kind, or
+  re-signed in the application's name withholds the output. When the
+  template's headers and footers replace the target's, pending tracked changes
+  in the target's discarded parts and in the template's imported parts are
+  counted and reported: a `WARNING:` line in `run.log` names each part and its
+  count, and the diagnostics, the target's audit and the warning count in
+  `run.json` carry the totals.
 - Even-page headers render as they do in the template. Whenever the
   template's headers and footers are imported, the output's even/odd-page
   header setting is proven to match the template's, so an even-page header is
