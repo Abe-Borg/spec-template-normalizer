@@ -73,6 +73,7 @@ from .sectpr_tools import extract_all_sectpr_blocks
 from .untrusted_xml import parse_untrusted_xml
 from .xml_helpers import (
     edit_preserving_out_of_scope_subtrees,
+    iter_element_xml_blocks,
     iter_paragraph_xml_blocks,
     paragraph_text_from_block,
     strip_out_of_scope_subtrees,
@@ -486,18 +487,28 @@ def _insert_marker(
             )
         if tracked:
             # The revision wraps its own run, so it is placed before the run
-            # holding the first text rather than inside it.
-            run_start = unprotected.rfind("<w:r", 0, match.start())
-            if run_start < 0:
+            # holding the first text, as that run's sibling, never inside it.
+            # The run is found as an element: searching back for the nearest
+            # "<w:r" also matches "<w:rPr", which spliced the revision into a
+            # formatted run ahead of its own properties -- invalid OOXML that
+            # no well-formedness check notices.
+            holder = next(
+                (
+                    (start, block)
+                    for start, end, block in iter_element_xml_blocks(unprotected, "w:r")
+                    if start < match.start() < end
+                ),
+                None,
+            )
+            if holder is None:
                 raise EngineError(
                     _HIERARCHY,
                     f"A paragraph classified for CSI marker {marker!r} has no run "
                     "to place a tracked marker before.",
                 )
+            run_start, source_run = holder
             # The run this marker is placed before is the run it should look
             # like, so its properties come along.
-            run_end = unprotected.find("</w:r>", run_start)
-            source_run = unprotected[run_start : run_end if run_end >= 0 else None]
             insertion = _tracked_marker_run(
                 marker, revision_id, revision_date, _run_properties(source_run)
             )

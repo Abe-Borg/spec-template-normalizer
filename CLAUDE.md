@@ -543,6 +543,12 @@ structure is identical to the source again. The projection is scoped by author,
 so a reviewer's pending edits stay in the comparison -- losing run formatting
 inside one of those is as damaging as losing it anywhere else.
 
+That `w:ins` is the *sibling* of the run holding the first text, placed before
+it, and the run is found as an element. Searching back for the nearest `<w:r`
+also matches `<w:rPr`, which put the revision inside every formatted run ahead
+of the run's own properties: a `w:r` holding a `w:ins`, invalid OOXML that the
+package validator, checking well-formedness rather than the schema, published.
+
 Note that a round trip is not byte-exact through `PART`: the forward converter
 treats a dash or colon after `PART n` as part of the typed marker and removes
 it with the marker, so `PART 1 - GENERAL` returns as `PART 1 GENERAL`. That is
@@ -1333,6 +1339,9 @@ Before considering a formatter change complete:
 - Writing a marker from the classified role without proving it matches the
   list level the document actually renders.
 - Placing a generated marker inside a field result or tracked insertion.
+- Finding a run by searching back for `<w:r`, which also matches `<w:rPr`.
+  Locate the run as an element (`iter_element_xml_blocks`), or a tracked
+  marker's `w:ins` lands inside a formatted run.
 - Numbering a paragraph whose own mark is an unresolved tracked revision.
 - Writing numbers into a document with `w:trackRevisions` on as plain,
   untracked text.
