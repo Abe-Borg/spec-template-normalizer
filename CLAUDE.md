@@ -79,6 +79,10 @@ spec_formatter/style_application/core/expected_changes.py
     projection of this application's own tracked revisions
 spec_formatter/style_application/core/canadian_to_csi.py
     Canadian -> typed CSI marker conversion
+spec_formatter/style_application/core/header_parity.py
+    the global even/odd header switch (w:evenAndOddHeaders): the strict
+    reader, the architect's setting from the registry, and the one writer,
+    which places the element by the complete CT_Settings sequence
 spec_formatter/style_application/core/classification.py
     numbering-aware target dispositions and paragraph application
 spec_formatter/style_application/core/style_import.py
@@ -106,6 +110,9 @@ tests/test_final_gate_text_identity.py, tests/test_conversion_prediction.py
     every mode's output held to identity except the predicted diff, end to
     end with damage injected before packaging, and each converter's exact
     prediction
+tests/test_header_parity.py
+    even/odd header parity: the reader, the CT_Settings insertion, preflight,
+    and every architect and architect-free mode end to end, gate included
 docs/docx_method_hardening/
     the multi-session hardening program derived from the spec-formatting
     method documents: the implementation plan, the machine-checked progress
@@ -145,6 +152,10 @@ validation. Do not recreate mode checks independently in downstream modules.
   Canadian number and writes it into the text as a literal CSI marker.
 - The two architect modes apply the architect's complete shell. The two
   architect-free modes apply **no** shell at all.
+- The even/odd header switch (`w:evenAndOddHeaders` in `word/settings.xml`)
+  is part of the shell but belongs to the header set it governs: it follows
+  the architect exactly when the architect's header/footer set replaces the
+  target's, and is otherwise the target's own, left as written.
 
 `requires_architect_template` and `numbering_scheme` on the policy are the one
 place that says which of those a mode is. The pipeline must not accept an
@@ -165,7 +176,8 @@ DOCX package is not byte-identical and is not meant to be -- styles are
 imported, the shell is applied, and parts are re-serialized. Header and footer
 wording is deliberately outside the promise: `import_headers_footers` removes
 the target's parts and writes the architect's, so target-authored
-header/footer text is expected to change in both modes. Do not describe or
+header/footer text is expected to change in both modes, and the target's
+even/odd header switch is replaced by the architect's with them. Do not describe or
 test Format-only as package byte identity, and do not describe it as
 preserving every word in the file.
 
@@ -757,7 +769,35 @@ and to point the header at them.
 ### Target shell, packaging, and invariants
 
 - `arch_env_applier.py` applies document defaults, theme/settings,
-  compatibility, and canonical section/page layout. `apply_doc_defaults`
+  compatibility, canonical section/page layout, and even/odd header parity.
+  `apply_settings` still carries only the architect's `w:compat` block --
+  protection, tracking and mail-merge state stay target-owned -- and the one
+  other setting the shell carries is `w:evenAndOddHeaders`, because it decides
+  whether the `even` header and footer the importer wires in render at all.
+  `apply_header_parity` sets or clears it after the header/footer import, and
+  only when `HeaderFooterImportResult.replaced_target_parts` says the
+  architect's set replaced the target's; a target that keeps its own headers
+  keeps its own switch. The architect's setting is read from the registry's
+  captured `settings.settings_xml` (`architect_even_and_odd_headers`), so the
+  profile contract and the engine fingerprint are unchanged; an absent field
+  is unknown, not off. An architect whose sections reference an `even` part
+  with the switch off is valid and common -- Word keeps the part dormant --
+  and is reproduced as it is: the reference imported, the switch cleared.
+  Shared-profile preflight rejects, once, a template with headers or footers
+  whose switch cannot be read (the element repeated, or a `w:val` outside
+  `ST_OnOff`). The switch is written into the settings part the target's
+  document *relates*, under whatever name (`_related_settings_part`), and
+  `_build_and_patch_output` packages that part when it is not
+  `word/settings.xml`; a stray `word/settings.xml` the document does not
+  relate is never related to carry the switch, because every other setting in
+  it would then take effect. Only when the document relates no settings part
+  is `word/settings.xml` created, through `_ensure_target_settings_part`, the
+  creation path compat uses too, so parity never depends on the architect
+  having a compat block. `core/header_parity.py` writes the element lexically,
+  at its position in `CT_SETTINGS_CHILD_ORDER` (the complete 98-element
+  `CT_Settings` sequence, checked against the transitional `wml.xsd` of
+  ISO/IEC 29500-4:2012), and proves every edit changed the switch and nothing
+  else. `apply_doc_defaults`
   declares the prefixes the architect's defaults use exactly as style import
   does (the ligatures in every current template's defaults are usually what
   first brings `w14` into a target), fails with
@@ -773,8 +813,8 @@ and to point the header at them.
   slots in just-imported parts, including mirrored DrawingML/VML text boxes;
   ambiguous shells or incomplete target tokens fail closed.
 - `phase2_invariants.py` verifies body, numbering, protected structure,
-  section, header/footer, relationship, and package contracts, plus
-  **effective paragraph geometry**. That last one covers the class every
+  section, header/footer, even/odd header parity, relationship, and package
+  contracts, plus **effective paragraph geometry**. That last one covers the class every
   other check is blind to: identical text, identical numbering semantics,
   identical run structure and valid XSD, with every paragraph rendering
   somewhere else. It is reachable because a numbering level's `w:pPr` applies
@@ -818,6 +858,19 @@ and to point the header at them.
   imports nothing and compares every paragraph. `docDefaults` is part of the
   comparison rather than a tiebreak consulted only after the per-paragraph
   sources already differ, which would hide exactly this case.
+- **Even/odd header parity** is checked in the header/footer step of
+  `verify_phase2_invariants`, in every mode. Each package's settings part is
+  found through its document relationship, as Word finds it, not by name.
+  Where the architect's header set was imported the output's switch must read
+  as the architect's does; where the target kept its own set (every
+  architect-free run, and a template with no mapped header parts) the target's
+  switch must be exactly as written, compared uninterpreted so that even a
+  value the strict reader refuses is proven untouched.
+  `header_parity_checked`, `header_parity_follows_architect` and
+  `even_and_odd_headers` reach the `build_output` event from the moment the
+  check starts; the `apply_environment` event records what was applied
+  (`header_parity_follows_architect`, `even_and_odd_headers`,
+  `header_parity_changed`). No error code: a mismatch is an `INVARIANT FAIL`.
 - **Identity except the enumerated diff** is the body-text rule for every
   mode, and `core/expected_changes.py` owns it. The converters used to verify
   their edits only in memory, at the conversion stage, so anything
@@ -1299,6 +1352,7 @@ python -m pytest tests/test_geometry_invariant.py \
 python -m pytest tests/test_final_gate_text_identity.py \
     tests/test_conversion_prediction.py -q
 python -m pytest tests/test_error_location.py -q
+python -m pytest tests/test_header_parity.py -q
 python -m pytest tests/test_docx_method_hardening_tracker.py -q
 python docs/docx_method_hardening/probes/probe_style_import_w14.py
 python docs/docx_method_hardening/probes/probe_format_only_gate.py
@@ -1416,6 +1470,12 @@ Before considering a formatter change complete:
 - Cancelling automatic numbering without materializing the geometry the
   numbering level was supplying.
 - Reusing a `w:pPr` order table abbreviated for one element to insert another.
+- Placing a `w:settings` child by anything but the complete `CT_Settings`
+  sequence (`CT_SETTINGS_CHILD_ORDER`), or appending it before `</w:settings>`.
+- Importing an architect's header set without its `w:evenAndOddHeaders`
+  switch, or changing the switch of a target that keeps its own headers.
+- Rejecting an architect whose `even` header reference is dormant (switch
+  off). That is how Word renders the template; reproduce it.
 - Deriving a conversion's "expected diff" from what the conversion did.
 - Proving a conversion's text only where the converter runs. Every later stage
   can still change it; the final gate holds every paragraph to its exact run

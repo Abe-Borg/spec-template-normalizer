@@ -704,15 +704,68 @@ the `arch_env_applier.py` bullet. README: Format-only and
 Canadian mode sections mention that even/odd header parity follows the
 template.
 
+*As implemented (session 04):*
+
+- **The switch follows the header set, not the shell alone.** Approach step 2
+  sets or clears the switch under the full shell, and step 4 checks it only
+  when architect header/footer data is present. The two disagree where the
+  importer keeps the target's own headers (the architect has no header parts,
+  or none a mapped section references): changing the switch there would do to
+  the target's headers exactly what this item fixes for the architect's. So
+  the switch follows the architect exactly when the architect's set replaced
+  the target's (`HeaderFooterImportResult.replaced_target_parts`, set by
+  `import_headers_footers`), and is otherwise the target's own and left as
+  written. `apply_header_parity` (`arch_env_applier.py`) runs after the
+  header/footer import, still under `apply_full_architect_shell` only.
+- **One module, `core/header_parity.py`.** `even_and_odd_headers` reads the
+  switch namespace-aware and fails closed (`HeaderParityError`, a
+  `ValueError`) on a repeated element or a `w:val` outside the six `ST_OnOff`
+  spellings (trimmed), rather than mirroring `_TRACK_REVISIONS_RX`'s "anything
+  else is on". `architect_even_and_odd_headers` reads the registry's
+  `settings.settings_xml`: `None` is a template with no settings part (off); a
+  registry that does not record the field is unknown, not off.
+  `set_even_and_odd_headers` edits lexically and proves afterwards that the
+  part reads as intended, is byte-identical to the original once every switch
+  is taken out of both, and has the switch at its schema position.
+- **Insertion point.** After the last child the sequence places before the
+  switch (or just inside the root), rather than before the first child it
+  places after it. The two agree on any part whose children are all known and
+  ordered; this reading also keeps an extension element such as `w14:docId`
+  from moving it. A part with no valid position (a child that must follow the
+  switch sitting before one that must precede it) fails closed.
+- **The table was checked against the schema text**, element by element, in
+  two copies that agree: ISO/IEC 29500-4:2012 as printed (transitional
+  `wml.xsd`, `CT_Settings` from schema line 2896, page 922) and the
+  transitional `wml.xsd` in python-docx's `ref/xsd` (commit `e454546`). Both
+  match appendix B exactly, and `tests/test_header_parity.py` holds the
+  constant equal to appendix B.
+- **Preflight.** No rejection for a dormant `even` reference. One check was
+  added, under `applies_shell`: a template with headers or footers whose
+  switch cannot be read fails once, before any target work. Two hand-built
+  test registries gained `settings.settings_xml`, which Phase 1 always writes.
+- **The gate** resolves each package's settings part through its document
+  relationship. When the architect's set was imported the output's switch must
+  read as the architect's; when the target kept its own it must be exactly as
+  written, compared uninterpreted. It records `header_parity_checked`,
+  `header_parity_follows_architect` and `even_and_odd_headers` as it starts;
+  `apply_environment` records `header_parity_follows_architect`,
+  `even_and_odd_headers` and `header_parity_changed`.
+- **After review of PR 64.** The writer edited `word/settings.xml` by name
+  while the gate reads the part the document relates, so a target relating
+  its settings under another name failed the gate. `apply_header_parity` now
+  writes into the related part (packaged by `_build_and_patch_output` when it
+  is not `word/settings.xml`), creates `word/settings.xml` only when nothing
+  is related, and refuses to relate a stray unrelated `word/settings.xml`.
+
 **Definition of done**
 
-- [ ] Parity derived from the registry's settings XML; set or cleared under the full shell only.
-- [ ] Insertion uses the complete `CT_Settings` order table, verified against the schema.
-- [ ] A dormant even reference with the switch off is imported unchanged and the target switch is cleared; no preflight rejection was added.
-- [ ] Final gate verifies parity and records `header_parity_checked`.
-- [ ] Tests listed above added and passing; architect-free modes proven untouched.
-- [ ] `CLAUDE.md` and README updated.
-- [ ] Full suite and corpus regression green on the PR.
+- [x] Parity derived from the registry's settings XML; set or cleared under the full shell only.
+- [x] Insertion uses the complete `CT_Settings` order table, verified against the schema.
+- [x] A dormant even reference with the switch off is imported unchanged and the target switch is cleared; no preflight rejection was added.
+- [x] Final gate verifies parity and records `header_parity_checked`.
+- [x] Tests listed above added and passing; architect-free modes proven untouched.
+- [x] `CLAUDE.md` and README updated.
+- [x] Full suite and corpus regression green on the PR.
 
 ### WI-05: Package-level change whitelist invariant
 
@@ -1076,6 +1129,12 @@ shapeDefaults, doNotEmbedSmartTags, decimalSymbol, listSeparator
 `w:bookFoldRevPrinting`; `w:compat` comes much later. Insert by walking the
 target's existing children and placing the new element before the first
 child whose position in this table is greater.
+
+*Verified (session 04):* the list above matches, element for element, the
+`CT_Settings` sequence of the transitional `wml.xsd` in ISO/IEC 29500-4:2012
+and in python-docx's `ref/xsd/wml.xsd`. It is committed as
+`CT_SETTINGS_CHILD_ORDER` in `core/header_parity.py`, which places the element
+after the last child that precedes it (see WI-04's *as implemented* note).
 
 ## Appendix C: method-document lessons already covered by the engine
 

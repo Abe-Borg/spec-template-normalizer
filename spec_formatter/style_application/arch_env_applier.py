@@ -15,7 +15,11 @@ Application order (deterministic):
 NOTE: This module does NOT touch:
 - numbering.xml (handled separately with explicit numPr materialization)
 
-It now imports architect headers/footers after page layout sync.
+It now imports architect headers/footers after page layout sync, and when
+the architect's header/footer set replaces the target's it makes the target's
+even/odd header switch (``w:evenAndOddHeaders`` in settings.xml) match the
+architect's, because that global switch decides whether the imported ``even``
+parts render at all.
 
 It DOES sync page layout in document.xml sectPr blocks for managed tags:
 - w:pgSz
@@ -43,6 +47,12 @@ from typing import Any, Dict, List, Optional
 import xml.etree.ElementTree as ET
 
 from .core.errors import EngineError
+from .core.header_parity import (
+    HeaderParityError,
+    architect_even_and_odd_headers,
+    set_even_and_odd_headers,
+)
+from .core.opc_paths import resolve_internal_relationship_target
 from .core.registry import _check_xml_fragment
 from .core.ooxml_namespaces import (
     CT_NS,
@@ -395,6 +405,22 @@ def _ensure_settings_in_rels(extract_dir: Path, log: List[str]) -> None:
     _ensure_relationship_in_document_rels(extract_dir, "settings.xml", log, "settings")
 
 
+def _ensure_target_settings_part(target_extract_dir: Path, log: List[str]) -> Path:
+    """Return the target's ``word/settings.xml``, creating a minimal one if absent.
+
+    A created part is wired into [Content_Types].xml and document.xml.rels
+    idempotently. The one creation path, shared by compat and header parity.
+    """
+    settings_path = target_extract_dir / "word" / "settings.xml"
+    if not settings_path.exists():
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        write_xml_text(settings_path, _MINIMAL_SETTINGS_XML)
+        _ensure_settings_in_content_types(target_extract_dir, log)
+        _ensure_settings_in_rels(target_extract_dir, log)
+        log.append("Created minimal settings.xml (none existed in target)")
+    return settings_path
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Font table plumbing helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -433,9 +459,13 @@ def apply_settings(
     If the target lacks settings.xml, a minimal valid part is created and
     wired into [Content_Types].xml and document.xml.rels idempotently.
     Malformed compat_xml is rejected before any mutation.
+
+    The even/odd header switch is not applied here: it belongs to the header
+    set it governs, so :func:`apply_header_parity` applies it after the
+    header/footer import, and only when that import replaced the target's set.
+    It therefore never depends on the architect having a compat block.
     """
     settings_data = registry.get("settings", {})
-    settings_path = target_extract_dir / "word" / "settings.xml"
 
     compat_xml = settings_data.get("compat", {}).get("compat_xml")
     if not compat_xml:
@@ -448,14 +478,7 @@ def apply_settings(
         log.append(f"WARNING: Skipping compat application — {err}")
         return
 
-    if not settings_path.exists():
-        # Create minimal settings.xml and wire package plumbing
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        write_xml_text(settings_path, _MINIMAL_SETTINGS_XML)
-        _ensure_settings_in_content_types(target_extract_dir, log)
-        _ensure_settings_in_rels(target_extract_dir, log)
-        log.append("Created minimal settings.xml (none existed in target)")
-
+    settings_path = _ensure_target_settings_part(target_extract_dir, log)
     settings_xml = read_xml_text(settings_path)
 
     # Find and replace existing <w:compat> block
@@ -480,6 +503,105 @@ def apply_settings(
     post_err = _check_xml_fragment(final_xml, "w:settings")
     if post_err:
         log.append(f"WARNING: settings.xml may be malformed after mutation — {post_err}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Even/odd header parity
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _related_settings_part(target_extract_dir: Path) -> Optional[str]:
+    """The settings part the target's document relates, as a package part name.
+
+    Word reads the part the relationship names, whatever it is called, so the
+    switch is written there. ``None`` when document.xml.rels relates no
+    settings part; a second settings relationship is ambiguous and fails.
+    """
+    rels_path = target_extract_dir / "word" / "_rels" / "document.xml.rels"
+    if not rels_path.is_file():
+        return None
+    rels_xml = read_xml_text(rels_path)
+    if not rels_xml.strip():
+        return None
+    root = parse_untrusted_xml(
+        prepare_xml_text_for_utf8(rels_xml),
+        "word/_rels/document.xml.rels",
+    )
+    targets = [
+        node.attrib.get("Target", "")
+        for node in root.findall(f"{{{PKG_REL_NS}}}Relationship")
+        if node.attrib.get("Type", "") == _DOCUMENT_REL_TYPES["settings.xml"]
+        and node.attrib.get("TargetMode", "").casefold() != "external"
+    ]
+    if not targets:
+        return None
+    if len(targets) > 1:
+        raise HeaderParityError(
+            "The target document relates more than one settings part, so the "
+            "one Word reads w:evenAndOddHeaders from is ambiguous"
+        )
+    return resolve_internal_relationship_target("word/document.xml", targets[0])
+
+
+def apply_header_parity(
+    target_extract_dir: Path,
+    registry: Dict[str, Any],
+    log: List[str],
+) -> Dict[str, Any]:
+    """Set or clear the target's ``w:evenAndOddHeaders`` to match the architect.
+
+    Call only once the architect's header/footer set has replaced the
+    target's. The switch is global and decides whether a section's ``even``
+    header and footer render at all, so it follows the header set it governs:
+    an architect with distinct even-page headers keeps them, and one without
+    them leaves no target switch behind to blank the even pages. An architect
+    whose sections reference an ``even`` part while its switch is off is
+    reproduced as it is -- the reference imported and dormant, the switch
+    cleared -- because that is how Word renders the template itself.
+
+    The architect's setting comes from the registry's captured settings part
+    (see :func:`architect_even_and_odd_headers`). The switch is written into
+    the settings part the target's document relates, under whatever name;
+    ``word/settings.xml`` is created and wired only when there is none.
+    Returns ``{"even_and_odd_headers": bool, "changed": bool,
+    "settings_part": str | None}``, the last naming the part written.
+    """
+    wanted = architect_even_and_odd_headers(registry)
+    part_name = _related_settings_part(target_extract_dir)
+    if part_name is not None and (target_extract_dir / part_name).is_file():
+        settings_path = target_extract_dir / part_name
+    else:
+        if not wanted:
+            # Word reads a document with no settings part as the switch off.
+            log.append(
+                "Even/odd headers: off in the template and the target document "
+                "relates no settings part; nothing to clear"
+            )
+            return {"even_and_odd_headers": False, "changed": False, "settings_part": None}
+        if part_name is None and (target_extract_dir / "word" / "settings.xml").exists():
+            raise HeaderParityError(
+                "The target has a word/settings.xml its document does not relate; "
+                "relating it to carry w:evenAndOddHeaders would make every other "
+                "setting in it take effect"
+            )
+        settings_path = _ensure_target_settings_part(target_extract_dir, log)
+        part_name = "word/settings.xml"
+    before = read_xml_text(settings_path)
+    after = set_even_and_odd_headers(before, wanted, part_name=part_name)
+    changed = after != before
+    if changed:
+        write_xml_text(settings_path, after)
+        log.append(
+            "Even/odd headers: "
+            + ("set w:evenAndOddHeaders" if wanted else "cleared w:evenAndOddHeaders")
+            + f" in {part_name} to match the template"
+        )
+    else:
+        log.append(
+            f"Even/odd headers: {part_name} already "
+            + ("sets" if wanted else "omits")
+            + " w:evenAndOddHeaders, as the template does"
+        )
+    return {"even_and_odd_headers": wanted, "changed": changed, "settings_part": part_name}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Font table application
@@ -669,7 +791,8 @@ def apply_environment_to_target(
     3. Font table (font declarations)
     4. docDefaults in styles.xml (baseline formatting)
     5. page layout managed tags in document.xml sectPr (pgSz/pgMar/cols/docGrid)
-    6. headers/footers
+    6. headers/footers, then the even/odd header switch when the architect's
+       header/footer set replaced the target's
     
     Args:
         target_extract_dir: Extracted target document folder
@@ -742,6 +865,15 @@ def apply_environment_to_target(
         "removed_rels_names": set(),
         "style_ids": set(),
         "direct_num_ids": set(),
+        "replaced_target_parts": False,
+    }
+    # The target keeps its own switch unless its header set is replaced: the
+    # switch governs how those headers render, so it belongs with them.
+    header_parity: Dict[str, Any] = {
+        "follows_architect": False,
+        "even_and_odd_headers": None,
+        "changed": False,
+        "settings_part": None,
     }
     if apply_headers_footers_flag:
         log.append("\n[6/6] Applying headers/footers...")
@@ -755,7 +887,16 @@ def apply_environment_to_target(
             "removed_rels_names": set(imported.removed_rels_names),
             "style_ids": set(imported.style_ids),
             "direct_num_ids": set(imported.direct_num_ids),
+            "replaced_target_parts": imported.replaced_target_parts,
         }
+        if imported.replaced_target_parts:
+            applied = apply_header_parity(target_extract_dir, registry, log)
+            header_parity = {"follows_architect": True, **applied}
+        else:
+            log.append(
+                "Even/odd headers: the target keeps its own header set, so its "
+                "own w:evenAndOddHeaders setting is left unchanged"
+            )
     else:
         log.append("\n[6/6] Headers/footers application skipped")
     
@@ -764,5 +905,6 @@ def apply_environment_to_target(
     log.append("=" * 60)
     return {
         "header_footer_import": hf_result,
+        "header_parity": header_parity,
         "styles_namespace_additions": styles_namespace_additions,
     }

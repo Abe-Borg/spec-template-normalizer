@@ -47,7 +47,9 @@ would be the worst possible answer.
      marker.
 5. Applies the architect's complete document shell: source-derived CSI
    formatting, theme/defaults, compatibility settings, page layout, and
-   default/even/first headers and footers. *(The two template-free modes apply
+   default/even/first headers and footers, together with the template's
+   even/odd-page header setting that decides whether the even-page ones show.
+   *(The two template-free modes apply
    no shell: your fonts, page size, margins, headers, and footers stay exactly
    as you wrote them.)*
 6. Validates content, numbering, protected structure, and the complete DOCX
@@ -224,6 +226,15 @@ target-authored header and footer wording is expected to change. An untouched
 body paragraph can also still look different on the page once the architect's
 defaults apply to it.
 
+Whether even pages get their own header is a single document-wide Word
+setting ("Different Odd & Even Pages"), and it follows the template's headers
+into the output: if the template gives even pages their own header or footer,
+so does the output; if it does not, a target setting that would leave even
+pages with no header at all is cleared. A template whose even-page header
+exists but is switched off keeps it switched off, exactly as Word shows the
+template. When the template has no headers or footers to give, the target
+keeps its own, and its own setting with them.
+
 Architect styles are always imported into deterministic private `SF_*`
 namespaces. Existing target style IDs, including built-ins such as `Normal`,
 are never overwritten, and every imported dependency reference is rewritten to
@@ -278,6 +289,10 @@ automatic numbering was retargeted — must come through with its text
 unchanged, run by run, down to a tab, a line break, or a doubled space.
 Anything else withholds the output with `conversion_prediction_mismatch` and
 the paragraph's location.
+
+Like Format-only, this mode applies the template's complete shell, including
+its headers and footers and its even/odd-page header setting, so even pages
+show the header they show in the template.
 
 Conversion counts and diagnostics are included in the application's saved
 activity log, including when a later validation or publication step fails.
@@ -642,6 +657,12 @@ fails instead of publishing a header that still names the architect's section.
   changed at all, withholds the output with `conversion_prediction_mismatch`
   and the paragraph's location. Format-only predicts no change, so every
   paragraph is held to the exact comparison above.
+- Even-page headers render as they do in the template. Whenever the
+  template's headers and footers are imported, the output's even/odd-page
+  header setting is proven to match the template's, so an even-page header is
+  neither lost nor left blank; when the target keeps its own headers, its own
+  setting is proven untouched. A template whose even/odd setting cannot be
+  read is refused before any target is processed.
 - Every mode verifies that no paragraph's effective indentation moved. This
   catches the one class of damage a text comparison cannot: identical words,
   identical numbering, identical formatting runs, and a visibly different page.

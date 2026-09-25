@@ -689,6 +689,15 @@ def _build_and_patch_output(
         if local_path.exists():
             replacements[rel_path] = local_path.read_bytes()
 
+    # The even/odd header switch is written into the settings part the target's
+    # document relates. Under its conventional name that part is already in the
+    # optional set above; under any other name it is packaged here, or the
+    # edit would stay in the working copy while the gate reads the source's.
+    header_parity = env_result.get("header_parity", {}) if isinstance(env_result, dict) else {}
+    parity_part = header_parity.get("settings_part") if header_parity.get("changed") else None
+    if parity_part and parity_part not in replacements:
+        replacements[parity_part] = (extract_dir / parity_part).read_bytes()
+
     hf_manifest = env_result.get("header_footer_import", {}) if isinstance(env_result, dict) else {}
     # Only explicitly imported architect parts are eligible for replacement.
     # When the bundle supplies no mapped header/footer, the source package
@@ -713,6 +722,8 @@ def _build_and_patch_output(
             "removed_rels_names",
         ))
     )
+    if parity_part and parity_part != "word/settings.xml":
+        dynamic_parts.add(parity_part)
     with tempfile.NamedTemporaryFile(
         prefix=".sf-",
         suffix=".tmp.docx",
@@ -900,10 +911,14 @@ def _apply_classified_target_impl(
             _ns_additions = (
                 env_result.get("styles_namespace_additions", ()) if isinstance(env_result, dict) else ()
             )
+            _parity = env_result.get("header_parity", {}) if isinstance(env_result, dict) else {}
             phase.set(
                 header_footer_parts=len(_hf_import.get("part_names", set()) or set()),
                 header_footer_media=len(_hf_import.get("media_names", set()) or set()),
                 styles_namespace_additions=len(_ns_additions or ()),
+                header_parity_follows_architect=bool(_parity.get("follows_architect")),
+                even_and_odd_headers=_parity.get("even_and_odd_headers"),
+                header_parity_changed=bool(_parity.get("changed")),
             )
         log.append("Applied environment")
         checkpoint.stage = "header_footer_token_patch"

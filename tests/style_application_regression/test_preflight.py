@@ -37,6 +37,13 @@ def _minimal_template_registry():
             },
             "section_chain": [],
         },
+        # What Phase 1 records for a template with no settings part. A
+        # template's even/odd header switch is read from here whenever it
+        # has headers or footers to import.
+        "settings": {
+            "settings_xml": None,
+            "compat": {"compat_xml": None, "important_flags": []},
+        },
     }
 
 
