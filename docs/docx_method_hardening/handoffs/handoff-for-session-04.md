@@ -42,9 +42,9 @@ first tool call, in this order:
     - `tests/test_conversion_prediction.py` and the new section of
       `test_final_package_validation.py`: `ImportError`.
     - The new `test_batch_runner.py` plumbing test: `ModuleNotFoundError`.
-  - After the implementation:
-    - new and affected tests: 150 passed;
-    - `python -m pytest -q`: 1500 passed, 1 skipped;
+  - After the implementation and one review round (see below):
+    - new and affected tests: 150 passed before the review round;
+    - `python -m pytest -q`: 1506 passed, 1 skipped;
     - `python -m pytest tests/test_sanitized_format_only_corpus.py -q`:
       2 passed;
     - `tests/test_engine_identity.py`: 4 passed (no fingerprinted file
@@ -86,7 +86,17 @@ first tool call, in this order:
       - an omitted prediction allows no change; Format-only refuses a
         non-empty one.
     - Counters: `body_signature_paragraphs_compared` and
-      `body_paragraphs_expected_changed`, recorded in a `finally`.
+      `body_paragraphs_expected_changed`. `record_body_check` writes them as
+      the body check starts, and the comparison writes them again in a
+      `finally`.
+  - **Review (Codex, two P2s, both reproduced, fixed in 3a6de43, threads
+    resolved).**
+    - An unpredicted paragraph is now compared by visible text too. The
+      signature records runs, not their containers, so a run wrapped in
+      `w:del` / `w:moveFrom` kept its signature while its text vanished.
+    - The counters are recorded from the start of the body check, in both
+      branches, so a paragraph-count or Format-only text failure still shows
+      the check ran.
   - **Owner decision.** The user was asked in chat and chose to fix the
     tracked-marker placement bug in WI-03's PR, in its own commit.
     `_insert_marker` searched back for `<w:r`, which matched `<w:rPr` and put
