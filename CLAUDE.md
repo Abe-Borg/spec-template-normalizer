@@ -113,6 +113,10 @@ tests/test_final_gate_text_identity.py, tests/test_conversion_prediction.py
 tests/test_header_parity.py
     even/odd header parity: the reader, the CT_Settings insertion, preflight,
     and every architect and architect-free mode end to end, gate included
+tests/test_package_change_whitelist.py
+    every package member outside a mode's remit held to byte identity: the
+    census, the policy-derived remit, the header/footer manifest cross-check,
+    and out-of-remit damage injected into each mode's packaged output
 docs/docx_method_hardening/
     the multi-session hardening program derived from the spec-formatting
     method documents: the implementation plan, the machine-checked progress
@@ -179,7 +183,11 @@ the target's parts and writes the architect's, so target-authored
 header/footer text is expected to change in both modes, and the target's
 even/odd header switch is replaced by the architect's with them. Do not describe or
 test Format-only as package byte identity, and do not describe it as
-preserving every word in the file.
+preserving every word in the file. What *is* byte-identical, in every mode, is
+each package member outside the mode's remit -- footnotes, comments, embedded
+objects, `[trash]` items, and every part the policy does not let the mode
+touch: see "Package members outside the remit" under "Target shell,
+packaging, and invariants".
 
 The same distinction applies to ignored paragraphs. Leaving a paragraph's XML
 unedited proves the engine did not touch it; it does not prove the paragraph
@@ -814,7 +822,8 @@ and to point the header at them.
   ambiguous shells or incomplete target tokens fail closed.
 - `phase2_invariants.py` verifies body, numbering, protected structure,
   section, header/footer, even/odd header parity, relationship, and package
-  contracts, plus **effective paragraph geometry**. That last one covers the class every
+  contracts, every package member outside the mode's remit, plus **effective
+  paragraph geometry**. That last one covers the class every
   other check is blind to: identical text, identical numbering semantics,
   identical run structure and valid XSD, with every paragraph rendering
   somewhere else. It is reachable because a numbering level's `w:pPr` applies
@@ -919,6 +928,50 @@ and to point the header at them.
   from the converter to the gate and nowhere else, and it renders without its
   contents. Never attach it to the conversion report, a `BatchResult` or
   `TargetFormatResult`, an audit, or a diagnostics field.
+- **Package members outside the remit** are proven byte-identical, in every
+  mode. `patch_docx` copies every member it is not handed, but the packaging
+  step hands styles, settings, theme, font table, numbering, content types and
+  document relationships over as replacements in every mode, read back from
+  the working copy, so the transform alone stood behind "the architect-free
+  modes apply no shell". `verify_phase2_invariants` takes a census of both
+  packages (`_package_member_census`: every member name and the SHA-256 of its
+  bytes, never decoded text -- fixture parts are often UTF-16) and holds each
+  change, addition and removal to the remit `_package_remit` derives from
+  `ApplicationPolicy` fields, never from a mode name:
+  - every mode: `word/document.xml`;
+  - `applies_role_styles` or `apply_full_architect_shell`: `word/styles.xml`;
+  - `import_body_numbering` or the shell: `word/numbering.xml` (changed or
+    added), `[Content_Types].xml` and `word/_rels/document.xml.rels`;
+  - the shell: the settings, theme and font table parts the *output's*
+    document relates (the even/odd switch is written into the related
+    settings part under any name), plus the names the shell's writers use
+    (`word/settings.xml`, `word/theme/theme1.xml`, `word/fontTable.xml`); and
+    the header set, cross-checked against both the importer's manifest and
+    the packages themselves. A header or footer part or its `.rels` may be
+    written only where `header_footer_manifest` (the
+    `env_result["header_footer_import"]` that chose the replacements) names
+    it *and* the output's document relates it; media may only be added, only
+    where the manifest names it and an output header relates it; and a
+    removal must be named in the manifest and have been a header or footer
+    part, or its relationships, that the source's document related.
+
+  Anything else fails with `INVARIANT FAIL: package member outside the mode's
+  remit <changed|added|removed>: <name>` -- the first in name order, with a
+  count of the rest -- a plain `RuntimeError` with no error code, like every
+  invariant failure. An omitted manifest authorizes no header change, as an
+  omitted prediction authorizes no text change; a mode with no shell handed a
+  manifest that names anything is a caller error (`ValueError`). The census is
+  taken and recorded before any other check, so `package_members_compared`,
+  `package_members_changed`, `package_members_added` and
+  `package_members_removed` reach the `build_output` event on success and on
+  every failure, and it is enforced after all of them, so the checks that
+  explain a change in their own terms keep their messages. Member names go to
+  the target log only (`Package member <verb>: <name>`, whitelisted into
+  `run.log`), never to diagnostics. The shell writers' names are admitted
+  because `apply_settings` and `apply_font_table` edit them by name even when
+  the document relates another part -- a known defect of those steps that this
+  check records rather than refuses; narrowing the shell to related parts
+  belongs with that fix.
 - `docx_decomposer.py` extracts targets safely; `docx_patch.py` assembles and
   validates replacements before publication.
 
@@ -1353,6 +1406,7 @@ python -m pytest tests/test_final_gate_text_identity.py \
     tests/test_conversion_prediction.py -q
 python -m pytest tests/test_error_location.py -q
 python -m pytest tests/test_header_parity.py -q
+python -m pytest tests/test_package_change_whitelist.py -q
 python -m pytest tests/test_docx_method_hardening_tracker.py -q
 python docs/docx_method_hardening/probes/probe_style_import_w14.py
 python docs/docx_method_hardening/probes/probe_format_only_gate.py
@@ -1477,6 +1531,10 @@ Before considering a formatter change complete:
 - Rejecting an architect whose `even` header reference is dormant (switch
   off). That is how Word renders the template; reproduce it.
 - Deriving a conversion's "expected diff" from what the conversion did.
+- Taking `patch_docx`'s copy as proof that a part the mode never edits came
+  through unchanged, or handing the packaging step a part outside the mode's
+  remit. The final gate censuses every member; identify a shell part as Word
+  does, through the document's relationship, not by its usual name alone.
 - Proving a conversion's text only where the converter runs. Every later stage
   can still change it; the final gate holds every paragraph to its exact run
   content except the ones the converter predicted, and those to the

@@ -676,6 +676,19 @@ fails instead of publishing a header that still names the architect's section.
 - A mode that uses no architect template refuses one that is supplied rather
   than ignoring it, and applies no document shell of any kind, so the target's
   fonts, page geometry, headers, and footers are left exactly as authored.
+- Every part outside the mode's remit is proven byte-identical to the source.
+  The finished file is compared with the original part by part, by the bytes
+  of each part rather than its decoded text. Format-only and Convert CSI to
+  Canadian with a template may change the body, the styles, the numbering, the
+  template's shell (settings, theme, font table, content types and
+  relationships) and the header and footer set the template import reports
+  bringing in. Convert CSI to Canadian without a template may change the body
+  and add and wire in its numbering, and leaves the styles alone.
+  Canadian-to-CSI may change the body and nothing else. A change, addition or
+  removal anywhere else — footnotes, comments, embedded objects, even a
+  discarded `[trash]` item Word keeps — withholds the output. The run log
+  lists every part that changed, was added or was removed; the diagnostics
+  carry only the counts.
 - Canadian-to-CSI writes a marker only where the source counter can be proven:
   one Word list, starting at 1, without restarts or level overrides, and with
   every paragraph on that list converted. An unnumbered paragraph is preserved
