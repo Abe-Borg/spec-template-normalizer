@@ -297,6 +297,27 @@ def test_standalone_canadian_gate_rejects_a_change_outside_the_prediction(
     assert result.error_location["section_number"] == "21 13 13"
 
 
+def test_standalone_canadian_gate_rejects_text_moved_out_of_sight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Wrapping the title's run in a move-from keeps every run's content -- the
+    # run-content signature does not record containers -- while Word stops
+    # showing the words. The visible-text reading catches it.
+    _damage_before_publication(
+        monkeypatch,
+        _replace_once(
+            b'<w:r><w:t xml:space="preserve">WET-PIPE SPRINKLER SYSTEMS</w:t></w:r>',
+            b'<w:moveFrom w:id="7" w:author="Someone" w:date="2026-01-01T00:00:00Z">'
+            b'<w:r><w:t xml:space="preserve">WET-PIPE SPRINKLER SYSTEMS</w:t></w:r>'
+            b"</w:moveFrom>",
+        ),
+    )
+
+    run = _standalone_run(tmp_path)
+
+    _assert_withheld_by_the_gate(run, 1, never_published="WET-PIPE")
+
+
 def test_standalone_canadian_gate_rejects_a_non_breaking_space_in_a_converted_paragraph(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

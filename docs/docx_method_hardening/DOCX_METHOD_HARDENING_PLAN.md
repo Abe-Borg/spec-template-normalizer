@@ -619,6 +619,12 @@ predicted have changed".
   `core/expected_changes.py`, so the converters and the gate share one
   definition without an import cycle; `canadian_to_csi` re-exports the
   constant.
+- **After review of PR 63.** An unpredicted paragraph is compared by visible
+  text as well as by signature, because the signature does not record a run's
+  container: a run wrapped in `w:del` or `w:moveFrom` kept its signature while
+  its text vanished. The counters are recorded as the body check starts, in
+  both branches, so a failure before any comparison (a paragraph added or
+  removed, a Format-only word changed) still shows the check ran.
 - **Owner-approved extra fix, in its own commit.** With Track Changes on,
   `_insert_marker` found the run to precede by searching back for `<w:r`,
   which also matches `<w:rPr`. For every formatted run it put the `w:ins`

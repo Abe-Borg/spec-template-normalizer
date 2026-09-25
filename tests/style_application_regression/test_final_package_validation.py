@@ -1258,3 +1258,89 @@ def test_format_only_gate_refuses_a_prediction(tmp_path):
             conversion_mode="format_only",
             expected_paragraph_changes=plan.expected_paragraph_changes,
         )
+
+
+@pytest.mark.parametrize("wrapper", ["w:del", "w:moveFrom"])
+def test_conversion_gate_rejects_text_hidden_in_a_revision_it_did_not_predict(
+    tmp_path, wrapper
+):
+    # The run-content signature records runs, not the container they sit in,
+    # so a run wrapped in a deletion or a move-from keeps its signature while
+    # Word stops showing its text. The visible-text reading sees it.
+    document, plan = _reverse_conversion()
+    damaged = plan.document_xml.replace(
+        "<w:r><w:t>Front matter.</w:t></w:r>",
+        f'<{wrapper} w:id="7" w:author="Someone" w:date="2026-01-01T00:00:00Z">'
+        f"<w:r><w:t>Front matter.</w:t></w:r></{wrapper}>",
+    )
+    assert damaged != plan.document_xml
+
+    with pytest.raises(EngineError) as raised:
+        _verify_conversion(
+            tmp_path,
+            document,
+            damaged,
+            expected_paragraph_changes=plan.expected_paragraph_changes,
+        )
+
+    assert raised.value.code == "conversion_prediction_mismatch"
+    assert raised.value.location is not None
+    assert raised.value.location.paragraph_index == 0
+    assert "Front" not in str(raised.value)
+
+
+def test_conversion_gate_reports_its_counters_when_the_paragraph_count_changes(
+    tmp_path,
+):
+    # A paragraph added after the conversion fails before any paragraph is
+    # compared; the build_output event must still show the check ran.
+    document, plan = _reverse_conversion()
+    extra = plan.document_xml.replace(
+        "<w:sectPr/>", "<w:p><w:r><w:t>Added.</w:t></w:r></w:p><w:sectPr/>"
+    )
+    verification = {}
+
+    with pytest.raises(EngineError) as raised:
+        _verify_conversion(
+            tmp_path,
+            document,
+            extra,
+            expected_paragraph_changes=plan.expected_paragraph_changes,
+            verification_out=verification,
+        )
+
+    assert raised.value.code == "conversion_prediction_mismatch"
+    assert verification == {
+        "body_signature_paragraphs_compared": 0,
+        "body_paragraphs_expected_changed": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    "output_paragraph",
+    [
+        pytest.param("<w:p><w:r><w:t>Changed</w:t></w:r></w:p>", id="body-text"),
+        pytest.param(
+            "<w:p><w:r><w:t>Text</w:t></w:r></w:p><w:p/>", id="paragraph-count"
+        ),
+    ],
+)
+def test_format_only_gate_reports_its_counters_when_an_earlier_body_check_fails(
+    tmp_path, output_paragraph
+):
+    # The body-text and paragraph-count checks run before any run content is
+    # compared. Failing there is still the body check running.
+    verification = {}
+
+    with pytest.raises(RuntimeError, match="FORMAT_ONLY INVARIANT FAIL"):
+        _verify_format_only_paragraph_edit(
+            tmp_path,
+            "<w:p><w:r><w:t>Text</w:t></w:r></w:p>",
+            output_paragraph,
+            verification_out=verification,
+        )
+
+    assert verification == {
+        "body_signature_paragraphs_compared": 0,
+        "body_paragraphs_expected_changed": 0,
+    }

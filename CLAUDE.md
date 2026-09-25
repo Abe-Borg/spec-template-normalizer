@@ -206,11 +206,12 @@ text. That message is developer detail: like every Format-only body failure it
 is a plain `RuntimeError` with no error code, so `run.json`, `audit.json` and
 the GUI report `untrusted_error` with the detail withheld and no location. The
 check records `body_signature_paragraphs_compared` (and
-`body_paragraphs_expected_changed`, always 0 here) in `verification_out` on
-success and on the failure path, so the `build_output` diagnostics event shows
-it ran. It records run content, not the container a run sits in: unwrapping a
-hyperlink or accepting a tracked insertion leaves every run's content as it
-was, so this check does not see it. The conversion modes are held to the same
+`body_paragraphs_expected_changed`, always 0 here) in `verification_out` from
+the moment the body check starts -- on success, on its own failure, and on an
+earlier normalized-text or paragraph-count failure -- so the `build_output`
+diagnostics event shows it ran. It records run content, not the container a
+run sits in: unwrapping a hyperlink or accepting a tracked insertion leaves
+every run's content as it was, so this check does not see it. The conversion modes are held to the same
 signature everywhere except the paragraphs their converter predicted it would
 change: see "Identity except the enumerated diff" under "Target shell,
 packaging, and invariants".
@@ -839,9 +840,13 @@ and to point the header at them.
   and `ConversionPlan` carries the prediction beside its document.
 
   `verify_phase2_invariants(expected_paragraph_changes=...)` then runs on the
-  packaged output, after every later stage. Every unpredicted paragraph keeps
-  its exact run content -- compared with *no* projection, which would hide a
-  marker inserted where none was predicted. Every predicted paragraph must read
+  packaged output, after every later stage. Every unpredicted paragraph must
+  still read as it did and keep its exact run content -- compared with *no*
+  projection, which would hide a marker inserted where none was predicted.
+  Both readings are needed: the signature records runs, not their containers,
+  so a run wrapped in `w:del` or `w:moveFrom` keeps its signature while its
+  text disappears, which the visible-text reading sees. Every predicted
+  paragraph must read
   as predicted, match the predicted run content, and match it again with the
   application's own revisions projected out, which is what tells a tracked
   marker still inside its `w:ins` from one made permanent text (the wrapper is
@@ -852,8 +857,10 @@ and to point the header at them.
   `FORMAT_ONLY INVARIANT FAIL` messages, and refuses a non-empty one. An
   omitted prediction allows no change, as an omitted run-property contract
   authorizes no removal. `body_signature_paragraphs_compared` and
-  `body_paragraphs_expected_changed` reach the `build_output` event on success
-  and failure alike.
+  `body_paragraphs_expected_changed` are recorded as the body check starts
+  (`record_body_check`) and again when the comparison ends, so they reach the
+  `build_output` event on success and on every failure, including a paragraph
+  count that changed before anything was compared.
 
   A prediction holds document text, because it has to. It travels as a value
   from the converter to the gate and nowhere else, and it renders without its

@@ -26,6 +26,7 @@ from .core.expected_changes import (
     ExpectedParagraphChanges,
     describe_prediction_mismatch,
     first_prediction_mismatch,
+    record_body_check,
     require_predicted_paragraphs_exist,
     without_own_revisions as _without_own_revisions,
 )
@@ -140,6 +141,14 @@ def _verify_format_only_run_content(
     )
     if found is not None:
         index, mismatch = found
+        if mismatch.kind is None:
+            # The comparison reads visible text too. The normalized-text check
+            # that runs first has already proven it, so this is unreachable;
+            # it keeps that check's message if it ever is not.
+            raise RuntimeError(
+                "FORMAT_ONLY INVARIANT FAIL: target body text changed at "
+                f"paragraph index {index}"
+            )
         raise RuntimeError(
             "FORMAT_ONLY INVARIANT FAIL: target run content changed "
             f"({mismatch.kind}) at paragraph index {index}"
@@ -167,6 +176,10 @@ def _verify_conversion_body_invariants(
     difference, never the text.
     """
 
+    # Reported from here on, so a failure before any paragraph is compared --
+    # a paragraph added or removed, a prediction about one that is missing --
+    # still shows the check ran.
+    record_body_check(verification_out, expected)
     source = list(iter_paragraph_xml_blocks(before_document_xml))
     output_blocks = [block for _s, _e, block in iter_paragraph_xml_blocks(after_document_xml)]
     if len(source) != len(output_blocks):
@@ -221,6 +234,10 @@ def _verify_format_only_body_invariants(
 ) -> None:
     """Fail closed if Format-only changes target content or numbering semantics."""
 
+    # Reported from here on, so a failure before any run content is compared --
+    # a paragraph added or removed, a word changed -- still shows the body
+    # check ran. The run-content comparison overwrites the count it reaches.
+    record_body_check(verification_out, NO_EXPECTED_PARAGRAPH_CHANGES)
     source_blocks = [block for _s, _e, block in iter_paragraph_xml_blocks(before_document_xml)]
     output_blocks = [block for _s, _e, block in iter_paragraph_xml_blocks(after_document_xml)]
     if len(source_blocks) != len(output_blocks):

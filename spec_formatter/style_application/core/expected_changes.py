@@ -161,8 +161,16 @@ class PredictionMismatch:
     kind: Optional[str] = None
 
 
-#: Every ``PredictionMismatch.check``, in the order a paragraph is tested.
-PREDICTION_CHECKS = ("unpredicted_change", "visible_text", "run_content", "own_revisions")
+#: Every ``PredictionMismatch.check``: an unpredicted paragraph is tested for
+#: its visible text and then its run content, a predicted one for the three
+#: after it, in this order.
+PREDICTION_CHECKS = (
+    "unpredicted_visible_text",
+    "unpredicted_change",
+    "visible_text",
+    "run_content",
+    "own_revisions",
+)
 
 
 def prediction_mismatch(
@@ -172,17 +180,26 @@ def prediction_mismatch(
 ) -> Optional[PredictionMismatch]:
     """How ``after_block`` departs from what was predicted for it, or ``None``.
 
-    With no prediction the paragraph must keep its exact run content. With
-    one, it must read as predicted, then match the predicted run content
-    exactly, and then match it again once this application's own tracked
-    revisions are projected out -- which is what tells a marker still inside
-    its revision from one that became permanent text, since the ``w:ins``
-    wrapper is not run content.
+    With no prediction the paragraph must still read as it did and keep its
+    exact run content. Both are needed: the signature records runs, not the
+    container a run sits in, so a run wrapped in ``w:del`` or ``w:moveFrom``
+    keeps its signature while Word stops showing its text -- which the
+    visible-text reading, dropping exactly those containers, does see.
+
+    With a prediction the paragraph must read as predicted, then match the
+    predicted run content exactly, and then match it again once this
+    application's own tracked revisions are projected out -- which is what
+    tells a marker still inside its revision from one that became permanent
+    text, since the ``w:ins`` wrapper is not run content.
     """
 
     if change is None:
         if before_block == after_block:
             return None
+        if paragraph_text_from_block(before_block) != paragraph_text_from_block(
+            after_block
+        ):
+            return PredictionMismatch("unpredicted_visible_text")
         kind = run_content_difference(
             paragraph_run_content_signature(before_block),
             paragraph_run_content_signature(after_block),
@@ -233,9 +250,25 @@ def first_prediction_mismatch(
                 return index, mismatch
         return None
     finally:
-        if progress is not None:
-            progress["body_signature_paragraphs_compared"] = compared
-            progress["body_paragraphs_expected_changed"] = len(expected.changes)
+        record_body_check(progress, expected, compared)
+
+
+def record_body_check(
+    progress: Optional[Dict[str, int]],
+    expected: ExpectedParagraphChanges,
+    compared: int = 0,
+) -> None:
+    """Write the body check's counters into ``progress``, when there is one.
+
+    Called as the body check starts, with nothing compared yet, and again by
+    :func:`first_prediction_mismatch` with the real count. A check that fails
+    before comparing anything -- a paragraph added or removed, a Format-only
+    word changed -- has still run, and a failed run must be able to show it.
+    """
+
+    if progress is not None:
+        progress["body_signature_paragraphs_compared"] = compared
+        progress["body_paragraphs_expected_changed"] = len(expected.changes)
 
 
 def describe_prediction_mismatch(
@@ -245,6 +278,11 @@ def describe_prediction_mismatch(
 ) -> str:
     """The developer detail for a mismatch: index, placement and kind only."""
 
+    if mismatch.check == "unpredicted_visible_text":
+        return (
+            f"Paragraph {index}{where} no longer reads as it did, but the "
+            "conversion predicted no change to it."
+        )
     if mismatch.check == "unpredicted_change":
         return (
             f"Paragraph {index}{where} changed its run content ({mismatch.kind}), "
@@ -293,6 +331,7 @@ __all__ = [
     "describe_prediction_mismatch",
     "first_prediction_mismatch",
     "prediction_mismatch",
+    "record_body_check",
     "require_predicted_paragraphs_exist",
     "without_own_revisions",
 ]
