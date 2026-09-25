@@ -689,6 +689,15 @@ def _build_and_patch_output(
         if local_path.exists():
             replacements[rel_path] = local_path.read_bytes()
 
+    # The even/odd header switch is written into the settings part the target's
+    # document relates. Under its conventional name that part is already in the
+    # optional set above; under any other name it is packaged here, or the
+    # edit would stay in the working copy while the gate reads the source's.
+    header_parity = env_result.get("header_parity", {}) if isinstance(env_result, dict) else {}
+    parity_part = header_parity.get("settings_part") if header_parity.get("changed") else None
+    if parity_part and parity_part not in replacements:
+        replacements[parity_part] = (extract_dir / parity_part).read_bytes()
+
     hf_manifest = env_result.get("header_footer_import", {}) if isinstance(env_result, dict) else {}
     # Only explicitly imported architect parts are eligible for replacement.
     # When the bundle supplies no mapped header/footer, the source package
@@ -713,6 +722,8 @@ def _build_and_patch_output(
             "removed_rels_names",
         ))
     )
+    if parity_part and parity_part != "word/settings.xml":
+        dynamic_parts.add(parity_part)
     with tempfile.NamedTemporaryFile(
         prefix=".sf-",
         suffix=".tmp.docx",

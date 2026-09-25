@@ -48,9 +48,11 @@ import xml.etree.ElementTree as ET
 
 from .core.errors import EngineError
 from .core.header_parity import (
+    HeaderParityError,
     architect_even_and_odd_headers,
     set_even_and_odd_headers,
 )
+from .core.opc_paths import resolve_internal_relationship_target
 from .core.registry import _check_xml_fragment
 from .core.ooxml_namespaces import (
     CT_NS,
@@ -506,6 +508,39 @@ def apply_settings(
 # Even/odd header parity
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _related_settings_part(target_extract_dir: Path) -> Optional[str]:
+    """The settings part the target's document relates, as a package part name.
+
+    Word reads the part the relationship names, whatever it is called, so the
+    switch is written there. ``None`` when document.xml.rels relates no
+    settings part; a second settings relationship is ambiguous and fails.
+    """
+    rels_path = target_extract_dir / "word" / "_rels" / "document.xml.rels"
+    if not rels_path.is_file():
+        return None
+    rels_xml = read_xml_text(rels_path)
+    if not rels_xml.strip():
+        return None
+    root = parse_untrusted_xml(
+        prepare_xml_text_for_utf8(rels_xml),
+        "word/_rels/document.xml.rels",
+    )
+    targets = [
+        node.attrib.get("Target", "")
+        for node in root.findall(f"{{{PKG_REL_NS}}}Relationship")
+        if node.attrib.get("Type", "") == _DOCUMENT_REL_TYPES["settings.xml"]
+        and node.attrib.get("TargetMode", "").casefold() != "external"
+    ]
+    if not targets:
+        return None
+    if len(targets) > 1:
+        raise HeaderParityError(
+            "The target document relates more than one settings part, so the "
+            "one Word reads w:evenAndOddHeaders from is ambiguous"
+        )
+    return resolve_internal_relationship_target("word/document.xml", targets[0])
+
+
 def apply_header_parity(
     target_extract_dir: Path,
     registry: Dict[str, Any],
@@ -523,36 +558,49 @@ def apply_header_parity(
     cleared -- because that is how Word renders the template itself.
 
     The architect's setting comes from the registry's captured settings part
-    (see :func:`architect_even_and_odd_headers`). Returns
-    ``{"even_and_odd_headers": bool, "changed": bool}``.
+    (see :func:`architect_even_and_odd_headers`). The switch is written into
+    the settings part the target's document relates, under whatever name;
+    ``word/settings.xml`` is created and wired only when there is none.
+    Returns ``{"even_and_odd_headers": bool, "changed": bool,
+    "settings_part": str | None}``, the last naming the part written.
     """
     wanted = architect_even_and_odd_headers(registry)
-    settings_path = target_extract_dir / "word" / "settings.xml"
-    if not settings_path.exists() and not wanted:
-        # Word reads a missing settings part as the switch off already.
-        log.append(
-            "Even/odd headers: off in the template and the target has no "
-            "settings.xml; nothing to clear"
-        )
-        return {"even_and_odd_headers": False, "changed": False}
-    settings_path = _ensure_target_settings_part(target_extract_dir, log)
+    part_name = _related_settings_part(target_extract_dir)
+    if part_name is not None and (target_extract_dir / part_name).is_file():
+        settings_path = target_extract_dir / part_name
+    else:
+        if not wanted:
+            # Word reads a document with no settings part as the switch off.
+            log.append(
+                "Even/odd headers: off in the template and the target document "
+                "relates no settings part; nothing to clear"
+            )
+            return {"even_and_odd_headers": False, "changed": False, "settings_part": None}
+        if part_name is None and (target_extract_dir / "word" / "settings.xml").exists():
+            raise HeaderParityError(
+                "The target has a word/settings.xml its document does not relate; "
+                "relating it to carry w:evenAndOddHeaders would make every other "
+                "setting in it take effect"
+            )
+        settings_path = _ensure_target_settings_part(target_extract_dir, log)
+        part_name = "word/settings.xml"
     before = read_xml_text(settings_path)
-    after = set_even_and_odd_headers(before, wanted, part_name="word/settings.xml")
+    after = set_even_and_odd_headers(before, wanted, part_name=part_name)
     changed = after != before
     if changed:
         write_xml_text(settings_path, after)
         log.append(
             "Even/odd headers: "
             + ("set w:evenAndOddHeaders" if wanted else "cleared w:evenAndOddHeaders")
-            + " in settings.xml to match the template"
+            + f" in {part_name} to match the template"
         )
     else:
         log.append(
-            "Even/odd headers: settings.xml already "
+            f"Even/odd headers: {part_name} already "
             + ("sets" if wanted else "omits")
             + " w:evenAndOddHeaders, as the template does"
         )
-    return {"even_and_odd_headers": wanted, "changed": changed}
+    return {"even_and_odd_headers": wanted, "changed": changed, "settings_part": part_name}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -825,6 +873,7 @@ def apply_environment_to_target(
         "follows_architect": False,
         "even_and_odd_headers": None,
         "changed": False,
+        "settings_part": None,
     }
     if apply_headers_footers_flag:
         log.append("\n[6/6] Applying headers/footers...")

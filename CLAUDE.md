@@ -785,8 +785,14 @@ and to point the header at them.
   and is reproduced as it is: the reference imported, the switch cleared.
   Shared-profile preflight rejects, once, a template with headers or footers
   whose switch cannot be read (the element repeated, or a `w:val` outside
-  `ST_OnOff`). Both settings paths create a missing settings part through
-  `_ensure_target_settings_part`, so parity never depends on the architect
+  `ST_OnOff`). The switch is written into the settings part the target's
+  document *relates*, under whatever name (`_related_settings_part`), and
+  `_build_and_patch_output` packages that part when it is not
+  `word/settings.xml`; a stray `word/settings.xml` the document does not
+  relate is never related to carry the switch, because every other setting in
+  it would then take effect. Only when the document relates no settings part
+  is `word/settings.xml` created, through `_ensure_target_settings_part`, the
+  creation path compat uses too, so parity never depends on the architect
   having a compat block. `core/header_parity.py` writes the element lexically,
   at its position in `CT_SETTINGS_CHILD_ORDER` (the complete 98-element
   `CT_Settings` sequence, checked against the transitional `wml.xsd` of

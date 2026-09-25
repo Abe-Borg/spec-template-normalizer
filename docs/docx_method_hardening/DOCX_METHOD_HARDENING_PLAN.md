@@ -750,6 +750,12 @@ template.
   `header_parity_follows_architect` and `even_and_odd_headers` as it starts;
   `apply_environment` records `header_parity_follows_architect`,
   `even_and_odd_headers` and `header_parity_changed`.
+- **After review of PR 64.** The writer edited `word/settings.xml` by name
+  while the gate reads the part the document relates, so a target relating
+  its settings under another name failed the gate. `apply_header_parity` now
+  writes into the related part (packaged by `_build_and_patch_output` when it
+  is not `word/settings.xml`), creates `word/settings.xml` only when nothing
+  is related, and refuses to relate a stray unrelated `word/settings.xml`.
 
 **Definition of done**
 

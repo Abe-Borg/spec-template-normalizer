@@ -373,7 +373,9 @@ def test_a_settings_root_in_another_namespace_is_refused() -> None:
 # --- Applying it to an extracted target -------------------------------------
 
 
-def _extract_dir(tmp_path: Path, settings: bytes | None) -> Path:
+def _extract_dir(tmp_path: Path, settings: bytes | None, *, related: bool = True) -> Path:
+    """An extracted target; ``settings``, when given, is related unless told not."""
+
     extract = tmp_path / "extract"
     (extract / "word" / "_rels").mkdir(parents=True)
     (extract / "[Content_Types].xml").write_bytes(
@@ -383,9 +385,17 @@ def _extract_dir(tmp_path: Path, settings: bytes | None) -> Path:
         b'vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
         b"</Types>"
     )
+    relationship = (
+        b'<Relationship Id="rIdSettings" Type="http://schemas.openxmlformats.org/'
+        b'officeDocument/2006/relationships/settings" Target="settings.xml"/>'
+        if settings is not None and related
+        else b""
+    )
     (extract / "word" / "_rels" / "document.xml.rels").write_bytes(
         b'<?xml version="1.0" encoding="UTF-8"?>'
-        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + relationship
+        + b"</Relationships>"
     )
     if settings is not None:
         (extract / "word" / "settings.xml").write_bytes(settings)
@@ -402,7 +412,11 @@ def test_apply_header_parity_sets_the_switch_in_a_utf16_settings_part(tmp_path: 
     result = apply_header_parity(
         extract, {"settings": {"settings_xml": _settings(SWITCH)}}, log
     )
-    assert result == {"even_and_odd_headers": True, "changed": True}
+    assert result == {
+        "even_and_odd_headers": True,
+        "changed": True,
+        "settings_part": "word/settings.xml",
+    }
     written = (extract / "word" / "settings.xml").read_bytes()
     assert written.startswith(b'<?xml version="1.0" encoding="UTF-8"?>')
     assert _child_names(written) == ["zoom", "evenAndOddHeaders", "compat"]
@@ -413,12 +427,16 @@ def test_apply_header_parity_creates_a_settings_part_only_when_the_switch_is_on(
 ) -> None:
     off = _extract_dir(tmp_path / "off", None)
     result = apply_header_parity(off, {"settings": {"settings_xml": None}}, [])
-    assert result == {"even_and_odd_headers": False, "changed": False}
+    assert result == {"even_and_odd_headers": False, "changed": False, "settings_part": None}
     assert not (off / "word" / "settings.xml").exists()
 
     on = _extract_dir(tmp_path / "on", None)
     result = apply_header_parity(on, {"settings": {"settings_xml": _settings(SWITCH)}}, [])
-    assert result == {"even_and_odd_headers": True, "changed": True}
+    assert result == {
+        "even_and_odd_headers": True,
+        "changed": True,
+        "settings_part": "word/settings.xml",
+    }
     assert even_and_odd_headers((on / "word" / "settings.xml").read_bytes(), "s")
     # The created part is wired in, as the compat path wires it.
     assert b"/word/settings.xml" in (on / "[Content_Types].xml").read_bytes()
@@ -435,7 +453,11 @@ def test_apply_header_parity_does_not_rewrite_a_part_that_already_matches(
     result = apply_header_parity(
         extract, {"settings": {"settings_xml": _settings(SWITCH)}}, []
     )
-    assert result == {"even_and_odd_headers": True, "changed": False}
+    assert result == {
+        "even_and_odd_headers": True,
+        "changed": False,
+        "settings_part": "word/settings.xml",
+    }
     assert (extract / "word" / "settings.xml").read_bytes() == original
 
 
@@ -506,6 +528,7 @@ def test_environment_clears_the_target_switch_when_the_architect_headers_replace
         "follows_architect": True,
         "even_and_odd_headers": False,
         "changed": True,
+        "settings_part": "word/settings.xml",
     }
     assert not even_and_odd_headers((extract / "word" / "settings.xml").read_bytes(), "s")
 
@@ -770,6 +793,75 @@ def test_switch_reaches_a_target_with_no_settings_part(tmp_path: Path) -> None:
     settings, _document = _output_parts(run)
     assert _child_names(settings) == ["evenAndOddHeaders"]
     assert even_and_odd_headers(settings, "output") is True
+
+
+def _relate_settings_under_another_name(target: Path, custom_settings: str) -> None:
+    """Point the target's settings relationship at ``word/custom/prefs.xml``.
+
+    The conventional ``word/settings.xml`` stays in the package, unrelated, as
+    a leftover a tool might write. Word reads only the related part.
+    """
+
+    with zipfile.ZipFile(target) as package:
+        parts = {name: package.read(name) for name in package.namelist()}
+    parts["word/custom/prefs.xml"] = custom_settings.encode("utf-8")
+    rels = parts["word/_rels/document.xml.rels"]
+    assert rels.count(b'Target="settings.xml"') == 1
+    parts["word/_rels/document.xml.rels"] = rels.replace(
+        b'Target="settings.xml"', b'Target="custom/prefs.xml"'
+    )
+    parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+        b"</Types>",
+        b'<Override PartName="/word/custom/prefs.xml" ContentType="application/'
+        b'vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/></Types>',
+    )
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as package:
+        for name, payload in parts.items():
+            package.writestr(name, payload)
+
+
+def test_switch_is_applied_to_the_settings_part_the_document_relates(
+    tmp_path: Path,
+) -> None:
+    """The part Word reads is the one the relationship names, not the usual name."""
+
+    architect, target = _pair(
+        tmp_path,
+        FORMAT_ONLY,
+        architect_switch=False,
+        target_switch=False,
+        architect_even_reference=False,
+    )
+    _relate_settings_under_another_name(
+        target, _settings(f'<w:zoom w:percent="80"/>{SWITCH}')
+    )
+    run = _format(tmp_path, architect, target, FORMAT_ONLY)
+    result = run.targets[0]
+    assert result.success, "\n".join(result.log)
+    validate_docx_package(result.output_path)
+    with zipfile.ZipFile(result.output_path) as package:
+        related = package.read("word/custom/prefs.xml")
+        rels = package.read("word/_rels/document.xml.rels")
+    assert b'Target="custom/prefs.xml"' in rels
+    assert even_and_odd_headers(related, "output") is False
+    assert _child_names(related) == ["zoom"]
+    assert _build_output_fields(run)["even_and_odd_headers"] is False
+
+
+def test_a_stray_unrelated_settings_part_is_not_activated_to_carry_the_switch(
+    tmp_path: Path,
+) -> None:
+    """Relating a leftover part would make every other setting in it live."""
+
+    extract = _extract_dir(tmp_path, _settings("").encode("utf-8"), related=False)
+    before = (extract / "word" / "settings.xml").read_bytes()
+    with pytest.raises(HeaderParityError, match="does not relate"):
+        apply_header_parity(extract, {"settings": {"settings_xml": _settings(SWITCH)}}, [])
+    assert (extract / "word" / "settings.xml").read_bytes() == before
+    # With the switch off there is nothing to write, so nothing to refuse:
+    # a document that relates no settings part already reads as off.
+    result = apply_header_parity(extract, {"settings": {"settings_xml": None}}, [])
+    assert result == {"even_and_odd_headers": False, "changed": False, "settings_part": None}
 
 
 # --- The final gate ---------------------------------------------------------

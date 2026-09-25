@@ -41,9 +41,9 @@ first tool call, in this order:
       switch is on: the output switch stayed on (even pages blank), and is
       now off;
     - architect has no headers: the target keeps its switch, before and after.
-  - After the implementation:
-    - `tests/test_header_parity.py`: 62 passed;
-    - `python -m pytest -q`: 1568 passed, 1 skipped;
+  - After the implementation and one review round (see below):
+    - `tests/test_header_parity.py`: 64 passed;
+    - `python -m pytest -q`: 1570 passed, 1 skipped;
     - `python -m pytest tests/test_sanitized_format_only_corpus.py -q`:
       2 passed;
     - `tests/test_engine_identity.py`: passes (no fingerprinted file
@@ -96,19 +96,30 @@ first tool call, in this order:
       constant equal to the plan's appendix B.
     - No new error code, stage or policy field. `APPLICATION_POLICY_VERSION`
       is unchanged: no policy field was added, as with WI-01 to WI-03.
+  - **Review (Codex, one P2, reproduced and fixed).** The writer edited
+    `word/settings.xml` by name while the gate reads the part the document
+    relates, so a target relating its settings under another name (with a
+    stray `word/settings.xml` beside it) failed the gate.
+    - `apply_header_parity` now writes into the related part
+      (`_related_settings_part`);
+    - `_build_and_patch_output` packages that part when it is not
+      `word/settings.xml` (added to the replacements and the dynamic parts);
+    - `word/settings.xml` is created only when nothing is related;
+    - a stray unrelated `word/settings.xml` is refused rather than related
+      to carry the switch.
   - **Found, not fixed.** Raise these with the user; do not fold them into
     WI-05 unasked.
-    1. **Non-standard settings part name.** `apply_settings` and
-       `apply_header_parity` work on `word/settings.xml` by name. If a
-       target relates its settings under another name and has no
-       `word/settings.xml`, creating one retargets the relationship
-       (`_ensure_relationship_in_document_rels`). That orphans the target's
-       real settings, silently dropping its tracking and protection state.
-       - This predates WI-04 on the compat path; WI-04 made it reachable when
-         the architect's switch is on.
-       - The gate would still catch a parity mismatch, but not the orphaned
-         settings.
-       - Word always writes `word/settings.xml`, so this is rare.
+    1. **Non-standard settings part name, compat path.** `apply_settings`
+       still works on `word/settings.xml` by name (parity no longer does).
+       - If a target relates its settings under another name and has no
+         `word/settings.xml`, the compat step creates one and retargets the
+         relationship (`_ensure_relationship_in_document_rels`). That orphans
+         the target's real settings, silently dropping its tracking and
+         protection state.
+       - If a stray `word/settings.xml` exists beside the related part,
+         compat is written into the stray part and never takes effect.
+       - This predates WI-04. Word always writes `word/settings.xml`, so it
+         is rare.
     2. **Settings order (handoff 04 finding 5), still open.** `apply_settings`
        inserts a missing `w:compat` just before `</w:settings>`.
        `CT_SETTINGS_CHILD_ORDER` now exists, so the fix is small, but it was
@@ -150,6 +161,10 @@ first tool call, in this order:
   - `spec_formatter/style_application/core/application_policy.py`: derive
     the allowed set from policy fields, never from a mode name.
 - Pitfalls already discovered that bear on this item:
+  - **The settings part may have another name.** Parity writes into the
+    part the document relates, and `_build_and_patch_output` packages it as
+    a dynamic part when it is not `word/settings.xml`; the whitelist must
+    treat that related part, not the conventional name, as the settings part.
   - **Parts can be added, not only changed.** Under the full shell,
     `word/settings.xml` may be **added**: `_ensure_target_settings_part`
     creates it when the target has none and the architect has compat or its
