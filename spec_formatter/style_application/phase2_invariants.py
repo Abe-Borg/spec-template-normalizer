@@ -19,15 +19,23 @@ from .core.classification import (
     _effective_numbering_semantics,
     _effective_numpr,
 )
-from .core.canadian_to_csi import MARKER_REVISION_AUTHOR
 from .core.errors import EngineError, ErrorLocation
+from .core.expected_changes import (
+    NO_EXPECTED_PARAGRAPH_CHANGES,
+    PREDICTION_MISMATCH,
+    ExpectedParagraphChanges,
+    describe_prediction_mismatch,
+    first_prediction_mismatch,
+    record_body_check,
+    require_predicted_paragraphs_exist,
+    without_own_revisions as _without_own_revisions,
+)
+from .core.marker_tools import _paragraph_locator
 from .core.xml_helpers import (
     iter_direct_child_xml_blocks,
     iter_element_xml_blocks,
     iter_paragraph_xml_blocks,
-    paragraph_run_content_signature,
     paragraph_text_from_block,
-    run_content_difference,
     strip_direct_run_properties,
     strip_out_of_scope_subtrees,
 )
@@ -116,33 +124,105 @@ def _verify_format_only_run_content(
     shell's section properties -- so any difference in
     :func:`paragraph_run_content_signature` is damage. The failure names the
     kind of item that changed, never its text.
+
+    This is the conversion modes' gate with an empty prediction: Format-only
+    changes no paragraph, so every paragraph is held to identity. The
+    counters are recorded on the failure path too, as the geometry counters
+    are: the build_output event is assembled from whatever was recorded
+    before unwinding, and a check that only reports success is
+    indistinguishable, on a failed run, from one that never ran.
     """
 
-    compared = 0
-    try:
-        for index, (source_block, output_block) in enumerate(
-            zip(source_blocks, output_blocks)
-        ):
-            if source_block == output_block:
-                # Identical XML has identical run content.
-                continue
-            compared += 1
-            kind = run_content_difference(
-                paragraph_run_content_signature(source_block),
-                paragraph_run_content_signature(output_block),
+    found = first_prediction_mismatch(
+        source_blocks,
+        output_blocks,
+        NO_EXPECTED_PARAGRAPH_CHANGES,
+        progress=verification_out,
+    )
+    if found is not None:
+        index, mismatch = found
+        if mismatch.kind is None:
+            # The comparison reads visible text too. The normalized-text check
+            # that runs first has already proven it, so this is unreachable;
+            # it keeps that check's message if it ever is not.
+            raise RuntimeError(
+                "FORMAT_ONLY INVARIANT FAIL: target body text changed at "
+                f"paragraph index {index}"
             )
-            if kind is not None:
-                raise RuntimeError(
-                    "FORMAT_ONLY INVARIANT FAIL: target run content changed "
-                    f"({kind}) at paragraph index {index}"
-                )
-    finally:
-        if verification_out is not None:
-            # Recorded on the failure path too, as the geometry counters are:
-            # the build_output event is assembled from whatever was recorded
-            # before unwinding, and a check that only reports success is
-            # indistinguishable, on a failed run, from one that never ran.
-            verification_out["body_signature_paragraphs_compared"] = compared
+        raise RuntimeError(
+            "FORMAT_ONLY INVARIANT FAIL: target run content changed "
+            f"({mismatch.kind}) at paragraph index {index}"
+        )
+
+
+def _verify_conversion_body_invariants(
+    before_document_xml: str,
+    after_document_xml: str,
+    expected: ExpectedParagraphChanges,
+    verification_out: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Identity except the enumerated diff, for the three conversion modes.
+
+    The converters check their own edits in memory, at the conversion stage,
+    before environment application, numbering and style import,
+    classification application and packaging. This runs on the packaged
+    output after all of them: every paragraph the conversion did not predict
+    must keep its exact run content, and every paragraph it did predict must
+    read, run by run, exactly as predicted -- including, for a tracked marker,
+    that the marker is still inside this application's own revision.
+
+    A failure is ``conversion_prediction_mismatch``, placed by SECTION and
+    heading from the roles the converter recorded, and names the kind of
+    difference, never the text.
+    """
+
+    # Reported from here on, so a failure before any paragraph is compared --
+    # a paragraph added or removed, a prediction about one that is missing --
+    # still shows the check ran.
+    record_body_check(verification_out, expected)
+    source = list(iter_paragraph_xml_blocks(before_document_xml))
+    output_blocks = [block for _s, _e, block in iter_paragraph_xml_blocks(after_document_xml)]
+    if len(source) != len(output_blocks):
+        raise EngineError(
+            PREDICTION_MISMATCH,
+            f"The converted document has {len(output_blocks)} body paragraphs; "
+            f"the source had {len(source)}.",
+        )
+    require_predicted_paragraphs_exist(expected, len(source))
+    found = first_prediction_mismatch(
+        [block for _s, _e, block in source],
+        output_blocks,
+        expected,
+        progress=verification_out,
+    )
+    if found is not None:
+        index, mismatch = found
+        locate = _paragraph_locator(source, dict(expected.roles))
+        raise EngineError(
+            PREDICTION_MISMATCH,
+            describe_prediction_mismatch(index, locate(index), mismatch),
+            locate.at(index),
+        )
+
+
+def _resolve_expected_paragraph_changes(
+    value: Optional[ExpectedParagraphChanges],
+) -> ExpectedParagraphChanges:
+    """No prediction means no paragraph may change, never "do not check".
+
+    Missing plumbing fails closed here, as an omitted run-property contract
+    does below: a caller that forgets to pass a conversion's prediction gets
+    every converted paragraph refused, not an unverified output.
+    """
+
+    if value is None:
+        return NO_EXPECTED_PARAGRAPH_CHANGES
+    if not isinstance(value, ExpectedParagraphChanges):
+        raise TypeError(
+            "expected_paragraph_changes must be an ExpectedParagraphChanges, "
+            f"not {type(value).__name__}"
+        )
+    return value
 
 
 def _verify_format_only_body_invariants(
@@ -154,6 +234,10 @@ def _verify_format_only_body_invariants(
 ) -> None:
     """Fail closed if Format-only changes target content or numbering semantics."""
 
+    # Reported from here on, so a failure before any run content is compared --
+    # a paragraph added or removed, a word changed -- still shows the body
+    # check ran. The run-content comparison overwrites the count it reaches.
+    record_body_check(verification_out, NO_EXPECTED_PARAGRAPH_CHANGES)
     source_blocks = [block for _s, _e, block in iter_paragraph_xml_blocks(before_document_xml)]
     output_blocks = [block for _s, _e, block in iter_paragraph_xml_blocks(after_document_xml)]
     if len(source_blocks) != len(output_blocks):
@@ -1245,22 +1329,10 @@ def _verify_effective_paragraph_geometry(
 
 
 
-_OWN_REVISION_RX = re.compile(
-    rf'<w:ins\b[^>]*w:author="{re.escape(MARKER_REVISION_AUTHOR)}"[^>]*'
-    r"(?:/>|>.*?</w:ins>)",
-    re.S,
-)
-
-
-def _without_own_revisions(paragraph_xml: str) -> str:
-    """Drop insertions this application authored, keeping everyone else's.
-
-    Scoped by author on purpose: a reviewer's pending edits must stay in the
-    comparison, because losing run formatting inside one of those is exactly
-    as damaging as losing it anywhere else.
-    """
-
-    return _OWN_REVISION_RX.sub("", paragraph_xml)
+# ``_without_own_revisions`` -- this application's own tracked insertions
+# projected out by author, everyone else's kept -- is imported from
+# core/expected_changes.py, which the enumerated-diff gate above shares with
+# the converters.
 
 
 def _styles_and_numbering(docx: Path) -> tuple:
@@ -1284,9 +1356,13 @@ def verify_phase2_invariants(
     conversion_mode: Optional[str] = None,
     allowed_rpr_properties_by_paragraph: Optional[Dict[int, Set[str]]] = None,
     verification_out: Optional[Dict[str, Any]] = None,
+    expected_paragraph_changes: Optional[ExpectedParagraphChanges] = None,
 ) -> None:
     """
     Verify Phase 2 invariants:
+    0. Body text: every paragraph keeps its exact run content except those in
+       ``expected_paragraph_changes``, which must match their prediction.
+       Format-only predicts nothing; an omitted prediction allows no change.
     1. sectPr non-layout semantics unchanged (managed layout tags may change)
     2. If architect header/footer data is present, output header/footer parts match architect set
        and sectPr references resolve to valid document rels IDs
@@ -1301,7 +1377,13 @@ def verify_phase2_invariants(
     after_doc = decode_xml_bytes(new_document_xml, part_name="word/document.xml (output)")
 
     application_policy = _resolve_application_policy(policy, conversion_mode)
+    expected = _resolve_expected_paragraph_changes(expected_paragraph_changes)
     if application_policy.preserve_target_numbering:
+        if expected.changes:
+            raise ValueError(
+                "Format-only changes no paragraph's text, so it cannot be given "
+                "a prediction of changed paragraphs"
+            )
         _verify_format_only_body_invariants(
             src_docx,
             before_doc,
@@ -1309,10 +1391,19 @@ def verify_phase2_invariants(
             new_docx,
             verification_out=verification_out,
         )
+    else:
+        # Every conversion mode, identity except the enumerated diff. Before
+        # WI-03 these modes proved no text property at the final gate at all.
+        _verify_conversion_body_invariants(
+            before_doc,
+            after_doc,
+            expected,
+            verification_out=verification_out,
+        )
 
-    # Unconditional, unlike the check above: every mode can move a paragraph's
-    # indentation, and the modes that do so deliberately say so on the policy
-    # rather than by being exempt from the check.
+    # Every mode, as the body check above now is: every mode can move a
+    # paragraph's indentation, and the modes that do so deliberately say so on
+    # the policy rather than by being exempt from the check.
     if not application_policy.reindents_converted_paragraphs:
         before_styles, before_numbering = _styles_and_numbering(src_docx)
         after_styles, after_numbering = (

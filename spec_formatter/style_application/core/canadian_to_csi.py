@@ -49,10 +49,19 @@ from .csi_to_canadian import (
     CanadianConversionReport,
     ConversionIssue,
     ConversionPlan,
+    ConversionResult,
     MarkerEdit,
     PRESERVED_UNNUMBERED_ROLE,
 )
 from .errors import EngineError, ErrorLocation
+from .expected_changes import (
+    MARKER_REVISION_AUTHOR,
+    ExpectedParagraphChange,
+    ExpectedParagraphChanges,
+    describe_prediction_mismatch,
+    first_prediction_mismatch,
+    without_own_revisions,
+)
 from .marker_tools import (
     Locator,
     _TRACKED_OR_FIELD_RX,
@@ -61,6 +70,7 @@ from .marker_tools import (
     _find_numbering_level,
     _no_locator,
     _paragraph_locator,
+    _predict_marker_removal,
     _remove_literal_marker,
     _SourceEvidence,
     _validate_automatic_source,
@@ -72,8 +82,11 @@ from .ooxml_text import prepare_xml_text_for_utf8, read_xml_text, write_xml_text
 from .sectpr_tools import extract_all_sectpr_blocks
 from .untrusted_xml import parse_untrusted_xml
 from .xml_helpers import (
+    RunContentSignature,
     edit_preserving_out_of_scope_subtrees,
+    iter_element_xml_blocks,
     iter_paragraph_xml_blocks,
+    paragraph_run_content_signature,
     paragraph_text_from_block,
     strip_out_of_scope_subtrees,
 )
@@ -340,15 +353,10 @@ def _suppress_automatic_numbering(
     return paragraph_xml[: match.start()] + rebuilt + paragraph_xml[match.end():]
 
 
-#: Author recorded on marker insertions when the source is under review.
-#:
-#: Deliberately *not* the document author. Three things depend on it being
-#: distinguishable: Word's markup pane should show a machine conversion apart
-#: from a person's own edits; the run-structure invariant projects the app's
-#: revisions back out by author; and a reviewer validating that nothing changed
-#: the author's content outside a revision must not have that check pass
-#: trivially because the app signed the author's name to its own work.
-MARKER_REVISION_AUTHOR = "Specification Formatter"
+# ``MARKER_REVISION_AUTHOR`` -- the author on marker insertions when the
+# source is under review, deliberately not the document author -- is defined
+# in core/expected_changes.py beside the projection that recognises this
+# application's own revisions by it, and re-exported from here.
 
 _TRACK_REVISIONS_RX = re.compile(
     r"<w:trackRevisions\b(?![^>]*\bw:val=\"(?:0|false|off)\")"
@@ -486,18 +494,28 @@ def _insert_marker(
             )
         if tracked:
             # The revision wraps its own run, so it is placed before the run
-            # holding the first text rather than inside it.
-            run_start = unprotected.rfind("<w:r", 0, match.start())
-            if run_start < 0:
+            # holding the first text, as that run's sibling, never inside it.
+            # The run is found as an element: searching back for the nearest
+            # "<w:r" also matches "<w:rPr", which spliced the revision into a
+            # formatted run ahead of its own properties -- invalid OOXML that
+            # no well-formedness check notices.
+            holder = next(
+                (
+                    (start, block)
+                    for start, end, block in iter_element_xml_blocks(unprotected, "w:r")
+                    if start < match.start() < end
+                ),
+                None,
+            )
+            if holder is None:
                 raise EngineError(
                     _HIERARCHY,
                     f"A paragraph classified for CSI marker {marker!r} has no run "
                     "to place a tracked marker before.",
                 )
+            run_start, source_run = holder
             # The run this marker is placed before is the run it should look
             # like, so its properties come along.
-            run_end = unprotected.find("</w:r>", run_start)
-            source_run = unprotected[run_start : run_end if run_end >= 0 else None]
             insertion = _tracked_marker_run(
                 marker, revision_id, revision_date, _run_properties(source_run)
             )
@@ -506,6 +524,99 @@ def _insert_marker(
         return unprotected[: match.start()] + prefix + unprotected[match.start():]
 
     return edit_preserving_out_of_scope_subtrees(paragraph_xml, _edit)
+
+
+def _predict_marker_insertion(
+    signature: RunContentSignature,
+    marker: str,
+    *,
+    tracked: bool,
+) -> Optional[RunContentSignature]:
+    """The run content :func:`_insert_marker` must produce, from the source's.
+
+    Worked out on the source paragraph's run-content signature rather than
+    read back off the edit, so it can disagree with the edit. The marker is a
+    text node with ``xml:space="preserve"`` followed by a tab, placed before
+    the paragraph's first ``w:t``: untracked, at the front of the run holding
+    it; tracked, as a run of its own immediately before that run. ``None``
+    when the paragraph has no text node to place it before.
+    """
+
+    runs = [list(run) for run in signature]
+    first = next(
+        (
+            (run, position)
+            for run, content in enumerate(runs)
+            for position, item in enumerate(content)
+            if item[0] == "t"
+        ),
+        None,
+    )
+    if first is None:
+        return None
+    run, position = first
+    marker_items = [("t", marker, True), ("tab",)]
+    if tracked:
+        runs.insert(run, marker_items)
+    else:
+        runs[run][position:position] = marker_items
+    return tuple(tuple(content) for content in runs)
+
+
+def _predict_marked_paragraph(
+    paragraph_xml: str,
+    role: str,
+    marker: str,
+    body: str,
+    *,
+    literal: bool,
+    tracked: bool,
+) -> Optional[ExpectedParagraphChange]:
+    """What a paragraph must read once *marker* is written into it.
+
+    Worked out from the source paragraph before either edit runs: a typed
+    Canadian marker, when there is one, comes off as
+    :func:`_predict_marker_removal` says, and the CSI marker goes on as
+    :func:`_predict_marker_insertion` says. Tracked, the paragraph outside this
+    application's own revisions is the source, untouched. ``None`` when the
+    source gives no place to form the prediction.
+    """
+
+    source = paragraph_run_content_signature(paragraph_xml)
+    projected = without_own_revisions(paragraph_xml)
+    source_outside = (
+        source if projected == paragraph_xml else paragraph_run_content_signature(projected)
+    )
+    unmarked: Optional[RunContentSignature] = source
+    unmarked_outside: Optional[RunContentSignature] = source_outside
+    if literal:
+        unmarked = _predict_marker_removal(source, role)
+        unmarked_outside = _predict_marker_removal(source_outside, role)
+    if unmarked is None or unmarked_outside is None:
+        return None
+    run_content = _predict_marker_insertion(unmarked, marker, tracked=tracked)
+    outside = (
+        source_outside
+        if tracked
+        else _predict_marker_insertion(unmarked_outside, marker, tracked=False)
+    )
+    if run_content is None or outside is None:
+        return None
+    return ExpectedParagraphChange(
+        visible_text=_marked_text(marker, body),
+        run_content=run_content,
+        run_content_outside_own_revisions=outside,
+    )
+
+
+def _marked_text(marker: str, body: str) -> str:
+    """The visible text of a paragraph once *marker* leads *body*.
+
+    The marker's tab reads as one space, which the visible-text reading
+    collapses into any space the body began with.
+    """
+
+    return f"{marker} {body}" if body else marker
 
 
 def _verify_marked_paragraph(
@@ -1020,6 +1131,7 @@ def plan_canadian_to_csi(
     literal_removed = 0
     automatic_converted = 0
 
+    expected_changes: Dict[int, ExpectedParagraphChange] = {}
     for index, role, marker in predicted:
         paragraph = blocks[index][2]
 
@@ -1043,8 +1155,22 @@ def plan_canadian_to_csi(
                     "conversion, or accept the existing markers first.",
                     locate.at(index),
                 )
-            stripped, _tab_removed = _remove_literal_marker(paragraph, role)
             body = literal.body_text
+        else:
+            body = paragraph_text_from_block(paragraph)
+        # Predicted from the source before either edit runs, and never read
+        # back off them: see core/expected_changes.py.
+        expectation = _predict_marked_paragraph(
+            paragraph,
+            role,
+            marker,
+            body,
+            literal=literal is not None,
+            tracked=tracked,
+        )
+
+        if literal is not None:
+            stripped, _tab_removed = _remove_literal_marker(paragraph, role)
             source_kind = "literal"
             literal_removed += 1
         else:
@@ -1062,7 +1188,6 @@ def plan_canadian_to_csi(
                 revision_id=_MARKER_REVISION_ID_BASE + 2 * len(edits) + 1,
                 revision_date=date,
             )
-            body = paragraph_text_from_block(paragraph)
             source_kind = "automatic"
             automatic_converted += 1
 
@@ -1074,6 +1199,18 @@ def plan_canadian_to_csi(
             revision_date=date,
         )
         _verify_marked_paragraph(index, converted, marker, body, describe=locate)
+        if expectation is None:
+            # Checked only now, so a paragraph the edit itself refuses is
+            # reported in the edit's own, actionable terms. Reaching here means
+            # the edit succeeded on a paragraph no prediction could be formed
+            # for: the two disagree, which is this application's defect.
+            raise EngineError(
+                _PREDICTION,
+                f"Paragraph {index}{locate(index)}: the edit for CSI marker "
+                f"{marker!r} could not be predicted from its run content.",
+                locate.at(index),
+            )
+        expected_changes[index] = expectation
         replacements[index] = converted
         edits.append(
             MarkerEdit(
@@ -1111,6 +1248,24 @@ def plan_canadian_to_csi(
         "word/document.xml (converted)",
     )
     _verify_prediction(blocks, after_blocks, predicted, describe=locate)
+    expected = ExpectedParagraphChanges(
+        changes=expected_changes,
+        roles=effective_role_by_index,
+    )
+    # _verify_prediction reads normalized text; this reads every run exactly,
+    # against values worked out before any paragraph was touched.
+    mismatch = first_prediction_mismatch(
+        [block for _start, _end, block in blocks],
+        [block for _start, _end, block in after_blocks],
+        expected,
+    )
+    if mismatch is not None:
+        mismatch_index, found = mismatch
+        raise EngineError(
+            _PREDICTION,
+            describe_prediction_mismatch(mismatch_index, locate(mismatch_index), found),
+            locate.at(mismatch_index),
+        )
 
     report = CanadianConversionReport(
         paragraphs_examined=sum(
@@ -1126,14 +1281,14 @@ def plan_canadian_to_csi(
         markers_tracked=tracked and automatic_converted + literal_removed > 0,
         marker_author=MARKER_REVISION_AUTHOR if tracked else None,
     )
-    return ConversionPlan(converted_document, report)
+    return ConversionPlan(converted_document, report, expected)
 
 
 def apply_canadian_to_csi(
     extract_dir: Path,
     classifications: Dict[str, Any],
     log: List[str],
-) -> CanadianConversionReport:
+) -> ConversionResult:
     """Apply a validated Canadian-to-CSI conversion to one extracted DOCX."""
 
     document_path = Path(extract_dir) / "word" / "document.xml"
@@ -1162,7 +1317,7 @@ def apply_canadian_to_csi(
     )
     for issue in report.warnings:
         log.append(f"CSI conversion warning p[{issue.paragraph_index}]: {issue.message}")
-    return report
+    return ConversionResult(report, plan.expected_paragraph_changes)
 
 
 __all__ = [

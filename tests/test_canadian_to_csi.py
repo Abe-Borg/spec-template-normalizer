@@ -8,6 +8,7 @@ tests the refusals rather than the conversions.
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -994,6 +995,64 @@ def test_tracked_marker_run_is_bare_when_the_source_run_is() -> None:
     marker_run = re.search(r"<w:ins\b[^>]*>(.*?)</w:ins>", plan.document_xml, re.S)
     assert marker_run is not None
     assert "<w:rPr" not in marker_run.group(1)
+
+
+def _w(local_name: str) -> str:
+    return f"{{{W_NS}}}{local_name}"
+
+
+def test_tracked_marker_is_placed_before_a_formatted_run_never_inside_it() -> None:
+    """Regression: a revision inside a run is invalid OOXML.
+
+    The tracked marker used to be spliced in at the last ``<w:r`` before the
+    paragraph's first text. For any run that carries properties, that is the
+    run's own ``<w:rPr``, so the ``w:ins`` landed *inside* the run, ahead of
+    its properties. ``CT_R`` allows neither a revision child nor anything
+    before ``w:rPr``. Nothing downstream noticed, because the package
+    validator checks well-formedness rather than the schema, so every bold or
+    sized heading converted under Track Changes published this way.
+    """
+
+    paragraphs = [
+        '<w:p><w:pPr><w:pStyle w:val="Geo0"/></w:pPr>'
+        '<w:r><w:rPr><w:b/><w:sz w:val="28"/></w:rPr>'
+        '<w:t xml:space="preserve">GENERAL</w:t></w:r></w:p>',
+        '<w:p><w:pPr><w:pStyle w:val="Geo1"/></w:pPr>'
+        '<w:hyperlink w:anchor="summary"><w:r><w:rPr><w:i/></w:rPr>'
+        '<w:t xml:space="preserve">SUMMARY</w:t></w:r></w:hyperlink></w:p>',
+    ]
+    plan = plan_canadian_to_csi(
+        _document(paragraphs),
+        _geometry_styles_xml(),
+        _classifications(["PART", "ARTICLE"]),
+        numbering_xml=_geometry_numbering_xml(),
+        settings_xml=_TRACKING_ON,
+        revision_date="2026-01-01T00:00:00Z",
+    )
+
+    root = ET.fromstring(plan.document_xml)
+    for run in root.iter(_w("r")):
+        # A run holds run content, never a revision...
+        assert run.find(_w("ins")) is None
+        # ...and its own properties, when it has any, come first.
+        properties = run.find(_w("rPr"))
+        if properties is not None:
+            assert list(run)[0] is properties
+
+    heading, article = root.iter(_w("p"))
+    # The marker's revision is the paragraph's first content, immediately
+    # before the heading run, which is itself untouched.
+    content = [child for child in heading if child.tag != _w("pPr")]
+    assert [child.tag for child in content] == [_w("ins"), _w("r")]
+    assert content[0].get(_w("author")) == "Specification Formatter"
+    assert "".join(node.text for node in content[0].iter(_w("t"))) == "PART 1"
+    assert [child.tag for child in content[1]] == [_w("rPr"), _w("t")]
+    assert content[1].find(_w("t")).text == "GENERAL"
+    # Inside a hyperlink the revision stays inside it, as the run's sibling,
+    # which is where an untracked marker joins the text too.
+    link = article.find(_w("hyperlink"))
+    assert [child.tag for child in link] == [_w("ins"), _w("r")]
+    assert "".join(node.text for node in link.find(_w("ins")).iter(_w("t"))) == "1.1"
 
 
 def test_reject_simulation_does_not_swallow_neighbouring_paragraphs() -> None:

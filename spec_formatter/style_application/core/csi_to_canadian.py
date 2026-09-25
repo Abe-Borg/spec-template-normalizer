@@ -25,6 +25,14 @@ from .conversion_modes import (  # re-exported: long-standing import site
     VALID_CONVERSION_MODES,
     validate_conversion_mode,
 )
+from .expected_changes import (
+    NO_EXPECTED_PARAGRAPH_CHANGES,
+    PREDICTION_MISMATCH,
+    ExpectedParagraphChange,
+    ExpectedParagraphChanges,
+    describe_prediction_mismatch,
+    first_prediction_mismatch,
+)
 from .marker_tools import (
     NUMBERED_ROLES,
     _detect_any_literal_marker,
@@ -33,6 +41,7 @@ from .marker_tools import (
     _has_heading_like_article_body,
     _marker_markup_delimiter,
     _paragraph_locator,
+    _predict_marker_removal,
     _remove_literal_marker,
     _SourceEvidence,
     _validate_automatic_source,
@@ -51,6 +60,7 @@ from .ooxml_text import prepare_xml_text_for_utf8, read_xml_text, write_xml_text
 from .sectpr_tools import extract_all_sectpr_blocks
 from .xml_helpers import (
     iter_paragraph_xml_blocks,
+    paragraph_run_content_signature,
     paragraph_text_from_block,
     strip_out_of_scope_subtrees,
 )
@@ -132,6 +142,22 @@ class CanadianConversionReport:
 class ConversionPlan:
     document_xml: str
     report: CanadianConversionReport
+    #: Every paragraph whose text the conversion changes, with what it must
+    #: read afterwards. Held to it here and again by the final gate; it holds
+    #: document text, so it never leaves the engine.
+    expected_paragraph_changes: ExpectedParagraphChanges = NO_EXPECTED_PARAGRAPH_CHANGES
+
+
+@dataclass(frozen=True)
+class ConversionResult:
+    """What applying a conversion hands to the rest of the target's run.
+
+    The report is text-free and is published; the prediction is not, and
+    goes only to the final gate.
+    """
+
+    report: CanadianConversionReport
+    expected_paragraph_changes: ExpectedParagraphChanges
 
 
 def classifications_for_canadian_application(
@@ -445,6 +471,7 @@ def plan_csi_to_canadian(
     )
 
     replacements: Dict[int, str] = {}
+    expected_changes: Dict[int, ExpectedParagraphChange] = {}
     evidence: list[_SourceEvidence] = []
     edits: list[MarkerEdit] = []
     literal_removed = 0
@@ -515,12 +542,38 @@ def plan_csi_to_canadian(
             evidence.append(
                 _SourceEvidence(index, role, "literal", literal, None, None)
             )
+            # Predicted from the source before the edit, and never read back
+            # off it: see core/expected_changes.py.
+            predicted_run_content = _predict_marker_removal(
+                paragraph_run_content_signature(paragraph), role
+            )
             converted, tab_removed = _remove_literal_marker(paragraph, role)
             _verify_changed_paragraph(
                 paragraph,
                 converted,
                 literal.body_text,
                 tab_removed=tab_removed,
+            )
+            if predicted_run_content is None:
+                # Checked only now, so a paragraph the edit itself refuses is
+                # reported in the edit's own, actionable terms. Reaching here
+                # means the edit found a marker the prediction could not: the
+                # two disagree, which is this application's defect.
+                raise EngineError(
+                    PREDICTION_MISMATCH,
+                    f"Paragraph {index}{locate(index)}: its typed marker could not "
+                    "be found in its run content, so the edit could not be "
+                    "predicted.",
+                    locate.at(index),
+                )
+            expected_changes[index] = ExpectedParagraphChange(
+                visible_text=literal.body_text,
+                run_content=predicted_run_content,
+                # Nothing in the forward direction is tracked: the edit above
+                # refuses a paragraph holding any tracked insertion, deletion
+                # or move, so there is no revision of this application's to
+                # project out.
+                run_content_outside_own_revisions=predicted_run_content,
             )
             replacements[index] = converted
             literal_removed += 1
@@ -624,6 +677,24 @@ def plan_csi_to_canadian(
         prepare_xml_text_for_utf8(converted_document),
         "word/document.xml (converted)",
     )
+    expected = ExpectedParagraphChanges(
+        changes=expected_changes,
+        roles=effective_role_by_index,
+    )
+    # The converter's own per-paragraph check reads normalized text and the
+    # text-free skeleton; this one reads every run exactly.
+    mismatch = first_prediction_mismatch(
+        [block for _start, _end, block in blocks],
+        [block for _start, _end, block in after_blocks],
+        expected,
+    )
+    if mismatch is not None:
+        mismatch_index, found = mismatch
+        raise EngineError(
+            PREDICTION_MISMATCH,
+            describe_prediction_mismatch(mismatch_index, locate(mismatch_index), found),
+            locate.at(mismatch_index),
+        )
 
     report = CanadianConversionReport(
         paragraphs_examined=sum(
@@ -636,7 +707,7 @@ def plan_csi_to_canadian(
         edits=tuple(edits),
         warnings=tuple(warnings),
     )
-    return ConversionPlan(converted_document, report)
+    return ConversionPlan(converted_document, report, expected)
 
 
 def apply_csi_to_canadian(
@@ -646,7 +717,7 @@ def apply_csi_to_canadian(
     log: list[str],
     *,
     architect_numbering_xml: Optional[str] = None,
-) -> CanadianConversionReport:
+) -> ConversionResult:
     """Apply a validated Canadian conversion to one extracted target DOCX."""
 
     document_path = Path(extract_dir) / "word" / "document.xml"
@@ -674,7 +745,7 @@ def apply_csi_to_canadian(
         log.append(
             f"Canadian conversion warning p[{issue.paragraph_index}]: {issue.message}"
         )
-    return report
+    return ConversionResult(report, plan.expected_paragraph_changes)
 
 
 __all__ = [
@@ -683,6 +754,8 @@ __all__ = [
     "VALID_CONVERSION_MODES",
     "CanadianConversionReport",
     "ConversionIssue",
+    "ConversionPlan",
+    "ConversionResult",
     "MarkerEdit",
     "apply_csi_to_canadian",
     "classifications_for_canadian_application",

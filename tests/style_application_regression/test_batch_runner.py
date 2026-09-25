@@ -79,6 +79,53 @@ def test_direct_canadian_output_name_does_not_collide(monkeypatch, tmp_path):
     assert output.name == "source_CANADIAN_FORMATTED.docx"
 
 
+def test_output_build_hands_the_conversion_prediction_to_the_final_gate(
+    monkeypatch, tmp_path
+):
+    # The gate can only hold unpredicted paragraphs to identity if it is told
+    # which paragraphs were predicted to change; the builder is the one hop
+    # between the converter and the gate.
+    from spec_formatter.style_application.core.expected_changes import (
+        ExpectedParagraphChanges,
+    )
+
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source")
+    extract = tmp_path / "extract"
+    (extract / "word").mkdir(parents=True)
+    (extract / "word" / "document.xml").write_bytes(b"document")
+    (extract / "word" / "styles.xml").write_bytes(b"styles")
+    captured = {}
+
+    def fake_patch_docx(**kwargs):
+        Path(kwargs["out_docx"]).write_bytes(b"output")
+
+    monkeypatch.setattr(
+        "spec_formatter.style_application.batch_runner.patch_docx",
+        fake_patch_docx,
+    )
+    monkeypatch.setattr(
+        "spec_formatter.style_application.batch_runner.validate_docx_package",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "spec_formatter.style_application.batch_runner.verify_phase2_invariants",
+        lambda *_args, **kwargs: captured.update(kwargs),
+    )
+    prediction = ExpectedParagraphChanges()
+
+    _build_and_patch_output(
+        source,
+        extract,
+        {},
+        tmp_path / "out",
+        conversion_mode=CSI_TO_CANADIAN,
+        expected_paragraph_changes=prediction,
+    )
+
+    assert captured["expected_paragraph_changes"] is prediction
+
+
 def test_direct_format_only_output_name_matches_the_pipeline_suffix(monkeypatch, tmp_path):
     # The engine used to stage format_only output as _PHASE2_FORMATTED.docx
     # while the pipeline planned _FORMATTED.docx; both now read the suffix

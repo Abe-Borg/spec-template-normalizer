@@ -42,6 +42,7 @@ from .errors import EngineError, ErrorLocation
 from .section_numbers import section_number_display_form
 from .xml_helpers import (
     OUT_OF_SCOPE_SUBTREE_NAMES,
+    RunContentSignature,
     edit_preserving_out_of_scope_subtrees,
     iter_element_xml_blocks,
     paragraph_text_from_block,
@@ -149,6 +150,18 @@ def _marker_family(role: str, marker: str) -> str:
     return "decimal"
 
 
+def _marker_separator_chars(role: str) -> str:
+    """Characters that separate a typed marker from the text it numbers.
+
+    A dash or colon counts only after ``PART n``, where ``PART 1 - GENERAL``
+    is the usual shape; anywhere else it would belong to the text.
+    """
+
+    if role == "PART":
+        return " \t\u00a0-\u2010\u2011\u2012\u2013\u2014\u2015:"
+    return " \t\u00a0"
+
+
 def _detect_literal_marker(
     text: str,
     role: str,
@@ -162,12 +175,7 @@ def _detect_literal_marker(
     if match is None:
         return None
     marker = match.group("marker")
-    separator_chars = (
-        " \t\u00a0-\u2010\u2011\u2012\u2013\u2014\u2015:"
-        if role == "PART"
-        else " \t\u00a0"
-    )
-    body = text[match.end():].lstrip(separator_chars)
+    body = text[match.end():].lstrip(_marker_separator_chars(role))
     return _LiteralMarker(marker, _marker_family(role, marker), body)
 
 
@@ -526,11 +534,7 @@ def _remove_marker_from_unprotected_xml(
     marker_match = _RAW_ROLE_MARKERS[role].match(joined)
     assert marker_match is not None
     remove_end = marker_match.end()
-    separator_chars = (
-        " \t\u00a0-\u2010\u2011\u2012\u2013\u2014\u2015:"
-        if role == "PART"
-        else " \t\u00a0"
-    )
+    separator_chars = _marker_separator_chars(role)
     while remove_end < len(joined) and joined[remove_end] in separator_chars:
         remove_end += 1
 
@@ -590,6 +594,76 @@ def _remove_literal_marker(paragraph_xml: str, role: str) -> Tuple[str, bool]:
 
     edited = edit_preserving_out_of_scope_subtrees(paragraph_xml, _edit)
     return edited, return_result[1]
+
+
+def _predict_marker_removal(
+    signature: RunContentSignature,
+    role: str,
+) -> Optional[RunContentSignature]:
+    """The run content :func:`_remove_literal_marker` must leave behind.
+
+    Worked out from the *source* paragraph's run-content signature, never
+    from the edited XML, so it can disagree with the edit it predicts. The
+    rules are the edit's, restated on the signature:
+
+    * the marker and the separators after it come off the front of the
+      paragraph's joined ``w:t`` text, each text node keeping whatever
+      follows the cut (a node wholly inside the marker stays, empty);
+    * a node the cut leaves with an edge space gains ``xml:space="preserve"``;
+    * when the cut ends exactly at the end of a node, the first run-level tab
+      between that node and the next is the marker's delimiter, and goes too.
+
+    Text here is decoded as an XML parser reports it; the edit decodes with
+    ``html.unescape``, and where the two disagree this is the one that is
+    right. ``None`` when the marker cannot be found in the text at all.
+    """
+
+    runs = [list(run) for run in signature]
+    items = [(run, position) for run, content in enumerate(runs) for position in range(len(content))]
+    texts = [(run, position) for run, position in items if runs[run][position][0] == "t"]
+    joined = "".join(runs[run][position][1] for run, position in texts)
+    match = _RAW_ROLE_MARKERS[role].match(joined)
+    if match is None:
+        return None
+    remove_end = match.end()
+    separators = _marker_separator_chars(role)
+    while remove_end < len(joined) and joined[remove_end] in separators:
+        remove_end += 1
+
+    delimiter_after: Optional[int] = None
+    start = 0
+    for ordinal, (run, position) in enumerate(texts):
+        _tag, text, preserve = runs[run][position]
+        end = start + len(text)
+        if start < remove_end:
+            kept = text[remove_end - start:] if end > remove_end else ""
+            if kept and (kept[0].isspace() or kept[-1].isspace()):
+                preserve = True
+            runs[run][position] = ("t", kept, preserve)
+            if end == remove_end:
+                delimiter_after = ordinal
+        start = end
+
+    dropped: set[Tuple[int, int]] = set()
+    if delimiter_after is not None:
+        first = items.index(texts[delimiter_after]) + 1
+        last = (
+            items.index(texts[delimiter_after + 1])
+            if delimiter_after + 1 < len(texts)
+            else len(items)
+        )
+        for run, position in items[first:last]:
+            if runs[run][position] == ("tab",):
+                dropped.add((run, position))
+                break
+    return tuple(
+        tuple(
+            item
+            for position, item in enumerate(content)
+            if (run, position) not in dropped
+        )
+        for run, content in enumerate(runs)
+    )
 
 
 def _text_skeleton(paragraph_xml: str) -> str:
@@ -812,9 +886,11 @@ __all__ = [
     "_literal_counter",
     "_marker_family",
     "_marker_markup_delimiter",
+    "_marker_separator_chars",
     "_no_locator",
     "Locator",
     "_paragraph_locator",
+    "_predict_marker_removal",
     "_remove_first_tab",
     "_remove_literal_marker",
     "_remove_marker_from_unprotected_xml",

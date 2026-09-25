@@ -582,14 +582,64 @@ gains a bullet describing the enumerated-diff gate; README safety
 guarantees: "every mode proves that only the paragraphs the conversion
 predicted have changed".
 
+*As implemented (session 03):*
+
+- **The expectation is exact run content, not a text skeleton.** A skeleton
+  (the paragraph XML with `w:t` contents blanked) cannot be compared at the
+  final gate: classification application legitimately rewrites `pPr` and
+  `rPr` in the Canadian modes, so every skeleton would differ. Each
+  `ExpectedParagraphChange` (`core/expected_changes.py`) instead holds the
+  visible text, the exact run-content signature, and the signature with this
+  application's own tracked insertions projected out.
+- **Worked out from the source, on the signature.**
+  `_predict_marker_removal` (`marker_tools`) and `_predict_marker_insertion` /
+  `_predict_marked_paragraph` (`canadian_to_csi`) restate each edit on the
+  source paragraph's signature, never on the XML the edit writes.
+  - Each converter asserts its assembled document against the prediction
+    exactly, beside its existing normalized checks, so every existing
+    converter test also exercises the model.
+  - A prediction that cannot be formed is reported only after the edit had
+    its chance to refuse the paragraph in its own, actionable terms.
+  - The exact prediction also catches a real converter defect: the forward
+    edit decodes with `html.unescape`, which turns `&#x80;` into a euro sign.
+    Such a paragraph now fails closed.
+- **No projection for unpredicted paragraphs.** Approach step 3 projects this
+  application's insertions out before the identity check. For a paragraph
+  outside the prediction that would *hide* a marker inserted where none was
+  predicted, so unpredicted paragraphs are compared exactly, which is
+  stricter. The projection is used only for predicted paragraphs, where it
+  proves a tracked marker is still inside its own revision.
+- **Interfaces.** `apply_csi_to_canadian` / `apply_canadian_to_csi` return a
+  `ConversionResult` (the text-free report beside the prediction), so the
+  prediction never rides on a published report; `ConversionPlan` carries it
+  too. The prediction also records the classified roles, so a gate failure is
+  placed by SECTION and heading. An omitted prediction allows no change, and
+  Format-only refuses a non-empty one.
+- `MARKER_REVISION_AUTHOR` and the own-revision projection moved to
+  `core/expected_changes.py`, so the converters and the gate share one
+  definition without an import cycle; `canadian_to_csi` re-exports the
+  constant.
+- **After review of PR 63.** An unpredicted paragraph is compared by visible
+  text as well as by signature, because the signature does not record a run's
+  container: a run wrapped in `w:del` or `w:moveFrom` kept its signature while
+  its text vanished. The counters are recorded as the body check starts, in
+  both branches, so a failure before any comparison (a paragraph added or
+  removed, a Format-only word changed) still shows the check ran.
+- **Owner-approved extra fix, in its own commit.** With Track Changes on,
+  `_insert_marker` found the run to precede by searching back for `<w:r`,
+  which also matches `<w:rPr`. For every formatted run it put the `w:ins`
+  inside the run, ahead of its properties: invalid OOXML that published as a
+  success. The prediction asserts the documented placement, so the
+  placement was fixed in this item's PR at the owner's request.
+
 **Definition of done**
 
-- [ ] Both converters return an `ExpectedParagraphChanges` value consumed by the final gate.
-- [ ] Non-predicted paragraphs are proven identical by run-content signature in every mode; predicted ones are re-asserted at the gate.
-- [ ] Mutation tests fail the gate for all three conversion modes; happy paths pass.
-- [ ] Counters recorded on success; no document text in any new field.
-- [ ] `CLAUDE.md` and README updated.
-- [ ] Full suite and corpus regression green on the PR.
+- [x] Both converters return an `ExpectedParagraphChanges` value consumed by the final gate.
+- [x] Non-predicted paragraphs are proven identical by run-content signature in every mode; predicted ones are re-asserted at the gate.
+- [x] Mutation tests fail the gate for all three conversion modes; happy paths pass.
+- [x] Counters recorded on success; no document text in any new field.
+- [x] `CLAUDE.md` and README updated.
+- [x] Full suite and corpus regression green on the PR.
 
 ### WI-04: Even-page header parity follows the architect
 
@@ -734,9 +784,10 @@ proven byte-identical to the source".
 `w:ins`/`w:del` before and after every transform and assert the exact
 delta; the engine's run-property invariant catches lost revision *subtrees*
 indirectly (through run paths) but there is no explicit census, and
-`_without_own_revisions` in `phase2_invariants.py` projects out only
-`w:ins` by `MARKER_REVISION_AUTHOR`, not the `w:pPrChange` the tracked
-reverse conversion also writes. (2) `_remove_existing_hf_files` in
+`_without_own_revisions` (`without_own_revisions` in
+`core/expected_changes.py` since WI-03) projects out only `w:ins` by
+`MARKER_REVISION_AUTHOR`, not the `w:pPrChange` the tracked reverse
+conversion also writes. (2) `_remove_existing_hf_files` in
 `header_footer_importer.py` deletes the target's header and footer parts
 with a log line; any pending tracked change inside them is discarded
 silently, and pending changes inside the architect's parts are imported as
@@ -811,8 +862,17 @@ paragraph tab, text" and the output reads "paragraph tab, 1.1, tab, text".
 `_verify_marked_paragraph` and `_verify_prediction` compare whitespace-
 normalized text with leading whitespace stripped, so they cannot see it, and
 `test_structural_children_change_only_by_the_marker_tabs` counts tabs
-without positions. The tracked path is already correct because its `w:ins`
-run is placed before the whole run.
+without positions. The tracked path places its `w:ins` run before the whole
+run that holds the first `w:t`, which covers a leading tab in that same run
+but not one in an *earlier*, text-less run; verify the tracked variants too.
+
+*Session 03 notes.* The tracked placement was not even that for any run
+carrying properties: a search back for `<w:r` matched `<w:rPr` and put the
+revision inside the run. WI-03's PR fixed that. WI-03 also added
+`_predict_marker_insertion`, which restates today's placement (before the
+first `w:t`) on the run-content signature. This item must move that
+prediction with the edit, or the converter's own prediction check refuses
+every paragraph it changes.
 
 **Approach.** Insert the untracked marker text node and its tab as the
 first content children (after `w:rPr`, and after an inert
