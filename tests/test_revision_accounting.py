@@ -368,7 +368,7 @@ def test_a_deletion_turned_into_an_insertion_is_refused(
     run, _target = _format_only_run(tmp_path)
 
     fields = _assert_withheld(run, CENSUS_FAIL)
-    assert "del by other authors" in str(run.targets[0].error)
+    assert "del by another author" in str(run.targets[0].error)
     assert fields["revisions_before"] == 2
     assert fields["revisions_after"] == 2
 
@@ -384,7 +384,7 @@ def test_a_dropped_property_revision_is_refused(
     run, _target = _format_only_run(tmp_path)
 
     _assert_withheld(run, CENSUS_FAIL)
-    assert "pPrChange by other authors" in str(run.targets[0].error)
+    assert "pPrChange by another author" in str(run.targets[0].error)
 
 
 def test_a_reviewers_revision_signed_with_the_applications_name_is_refused(

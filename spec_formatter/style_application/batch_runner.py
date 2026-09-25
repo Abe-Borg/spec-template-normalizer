@@ -918,13 +918,29 @@ def _apply_classified_target_impl(
                 env_result.get("styles_namespace_additions", ()) if isinstance(env_result, dict) else ()
             )
             _parity = env_result.get("header_parity", {}) if isinstance(env_result, dict) else {}
+            _revisions_discarded = int(_hf_import.get("revisions_discarded", 0) or 0)
+            _revisions_imported = int(_hf_import.get("revisions_imported", 0) or 0)
             phase.set(
                 header_footer_parts=len(_hf_import.get("part_names", set()) or set()),
                 header_footer_media=len(_hf_import.get("media_names", set()) or set()),
+                header_footer_revisions_discarded=_revisions_discarded,
+                header_footer_revisions_imported=_revisions_imported,
                 styles_namespace_additions=len(_ns_additions or ()),
                 header_parity_follows_architect=bool(_parity.get("follows_architect")),
                 even_and_odd_headers=_parity.get("even_and_odd_headers"),
                 header_parity_changed=bool(_parity.get("changed")),
+            )
+        if _revisions_discarded or _revisions_imported:
+            # A warning-level event as well as the counts above, so the fact
+            # survives a diagnostics level that drops the INFO phase event
+            # and is counted among the run's warnings in run.json.
+            diag.emit(
+                diag_events,
+                "WARNING",
+                "target",
+                "header_footer_revisions",
+                discarded=_revisions_discarded,
+                imported=_revisions_imported,
             )
         log.append("Applied environment")
         checkpoint.stage = "header_footer_token_patch"
