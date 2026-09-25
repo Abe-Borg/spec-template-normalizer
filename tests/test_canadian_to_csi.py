@@ -751,7 +751,11 @@ def test_markers_are_tracked_when_the_source_tracks_revisions() -> None:
     )
     assert len(changes) == 2
     assert plan.document_xml.count('w:date="2026-01-01T00:00:00Z"') == 4
-    ids = re.findall(r'w:id="(9\d+)"', plan.document_xml)
+    ids = re.findall(
+        r'<w:(?:ins|pPrChange)\b[^>]*w:id="(-?\d+)"[^>]*w:author="Specification Formatter"',
+        plan.document_xml,
+    )
+    assert len(ids) == 4
     assert len(ids) == len(set(ids)), "revision ids must be unique"
 
 
