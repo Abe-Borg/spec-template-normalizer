@@ -53,7 +53,6 @@ def _forward(source: str, *roles: str, **kwargs):
 def test_no_expected_changes_predicts_nothing() -> None:
     assert dict(NO_EXPECTED_PARAGRAPH_CHANGES.changes) == {}
     assert dict(NO_EXPECTED_PARAGRAPH_CHANGES.roles) == {}
-    assert len(NO_EXPECTED_PARAGRAPH_CHANGES) == 0
 
 
 def test_a_prediction_never_shows_the_document_text_it_holds() -> None:

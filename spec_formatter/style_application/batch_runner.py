@@ -34,6 +34,10 @@ from .core.csi_to_canadian import (
 )
 from .core.classification import validate_phase2_final_payload
 from .core.errors import EngineError, attach_engine_error, safe_error_location
+from .core.expected_changes import (
+    NO_EXPECTED_PARAGRAPH_CHANGES,
+    ExpectedParagraphChanges,
+)
 from .core.token_utils import extract_target_tokens
 from .core.llm_classifier import classify_target_document
 from .core.ooxml_text import read_xml_text, write_xml_text
@@ -669,6 +673,7 @@ def _build_and_patch_output(
     conversion_mode: str = FORMAT_ONLY,
     allowed_rpr_properties_by_paragraph: Optional[Dict[int, set[str]]] = None,
     verification_out: Optional[Dict[str, Any]] = None,
+    expected_paragraph_changes: Optional[ExpectedParagraphChanges] = None,
 ) -> Path:
     conversion_mode = validate_conversion_mode(conversion_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -735,6 +740,7 @@ def _build_and_patch_output(
                 allowed_rpr_properties_by_paragraph
             ),
             verification_out=verification_out,
+            expected_paragraph_changes=expected_paragraph_changes,
         )
         os.replace(temp_output_path, output_path)
     except Exception:
@@ -815,12 +821,16 @@ def _apply_classified_target_impl(
     target_tokens = extract_target_tokens(extract_dir, classifications)
     application_classifications = classifications
     conversion_report: Optional[CanadianConversionReport] = None
+    # What the conversion predicts about every paragraph it changes, handed to
+    # the final gate and nowhere else: it holds document text. Format-only
+    # changes no paragraph, so it passes the empty prediction.
+    expected_paragraph_changes: ExpectedParagraphChanges = NO_EXPECTED_PARAGRAPH_CHANGES
 
     if policy.convert_to_canadian:
         checkpoint.stage = "csi_conversion"
         log.append("Converting CSI hierarchy to Canadian CSC PageFormat...")
         with diag.timed(diag_events, "target", "csi_to_canadian") as phase:
-            conversion_report = apply_csi_to_canadian(
+            conversion = apply_csi_to_canadian(
                 extract_dir,
                 classifications,
                 role_specs,
@@ -829,6 +839,8 @@ def _apply_classified_target_impl(
                     env_registry.get("numbering", {}).get("numbering_xml") or ""
                 ),
             )
+            conversion_report = conversion.report
+            expected_paragraph_changes = conversion.expected_paragraph_changes
             phase.set(
                 paragraphs_examined=conversion_report.paragraphs_examined,
                 paragraphs_converted=conversion_report.paragraphs_converted,
@@ -851,7 +863,9 @@ def _apply_classified_target_impl(
         checkpoint.stage = "canadian_to_csi_conversion"
         log.append("Converting Canadian CSC PageFormat hierarchy to typed CSI markers...")
         with diag.timed(diag_events, "target", "canadian_to_csi") as phase:
-            conversion_report = apply_canadian_to_csi(extract_dir, classifications, log)
+            conversion = apply_canadian_to_csi(extract_dir, classifications, log)
+            conversion_report = conversion.report
+            expected_paragraph_changes = conversion.expected_paragraph_changes
             phase.set(
                 paragraphs_examined=conversion_report.paragraphs_examined,
                 paragraphs_converted=conversion_report.paragraphs_converted,
@@ -1082,12 +1096,14 @@ def _apply_classified_target_impl(
                     apply_report.allowed_rpr_properties_by_paragraph
                 ),
                 verification_out=verification,
+                expected_paragraph_changes=expected_paragraph_changes,
             )
         finally:
-            # Published on the failure path too. The geometry check runs early
-            # inside verify_phase2_invariants, so a later invariant can raise
-            # after it has already done its work -- and ``diag.timed`` builds
-            # its failure event from the fields attached *before* unwinding.
+            # Published on the failure path too. The body-text and geometry
+            # checks run early inside verify_phase2_invariants, so a later
+            # invariant can raise after they have already done their work --
+            # and ``diag.timed`` builds its failure event from the fields
+            # attached *before* unwinding.
             # Setting these only on success would leave a failed run looking
             # exactly like one where the check never ran, which is the state
             # this reporting exists to make impossible.

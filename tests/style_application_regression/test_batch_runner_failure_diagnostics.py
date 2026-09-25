@@ -13,7 +13,11 @@ from spec_formatter.style_application.core.csi_to_canadian import (
     CSI_TO_CANADIAN,
     CanadianConversionReport,
     ConversionIssue,
+    ConversionResult,
     MarkerEdit,
+)
+from spec_formatter.style_application.core.expected_changes import (
+    NO_EXPECTED_PARAGRAPH_CHANGES,
 )
 
 
@@ -119,7 +123,7 @@ def _stub_successful_conversion(monkeypatch: pytest.MonkeyPatch, report) -> None
     monkeypatch.setattr(
         batch_runner,
         "apply_csi_to_canadian",
-        lambda *_args, **_kwargs: report,
+        lambda *_args, **_kwargs: ConversionResult(report, NO_EXPECTED_PARAGRAPH_CHANGES),
     )
     monkeypatch.setattr(
         batch_runner,
