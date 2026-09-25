@@ -63,7 +63,6 @@ from tests import test_architect_free_modes as free
 from tests import test_canadian_to_csi as reverse
 from tests import test_unified_roundtrip as roundtrip
 from tests.test_final_gate_text_identity import (
-    _canadian_source,
     _damage_before_publication,
     _replace_once,
     _reverse_run,
