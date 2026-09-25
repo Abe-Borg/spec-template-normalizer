@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
+from spec_formatter import builtin_scheme
 from spec_formatter.style_application.batch_runner import _build_and_patch_output
+from spec_formatter.style_application.core.canadian_to_csi import plan_canadian_to_csi
+from spec_formatter.style_application.core.errors import EngineError
+from spec_formatter.style_application.core.expected_changes import ExpectedParagraphChanges
 from spec_formatter.style_application.phase2_invariants import validate_docx_package, verify_phase2_invariants
 
 
@@ -664,7 +668,11 @@ def test_run_content_check_reports_that_it_ran_when_a_later_check_fails(tmp_path
 
     # The paragraph's run content was compared, and matched, before the
     # numbering check refused it; the diagnostics event must be able to say so.
-    assert verification == {"body_signature_paragraphs_compared": 1}
+    # Format-only predicts no change, and says that too.
+    assert verification == {
+        "body_signature_paragraphs_compared": 1,
+        "body_paragraphs_expected_changed": 0,
+    }
 
 
 def test_format_only_gate_probe_rejects_every_row():
@@ -1075,3 +1083,178 @@ def test_run_property_verification_skips_byte_identical_paragraphs(tmp_path, mon
     assert calls["count"] == 0
     inv.verify_phase2_invariants(docx, changed.encode("utf-8"))
     assert calls["count"] == 1
+
+
+# ── Every mode: identity except the predicted diff (WI-03) ─────────────────
+#
+# The gate used to prove no text property at all for the three conversion
+# modes. Each converter now predicts every paragraph it changes, and the gate
+# holds every other paragraph to its exact run content and every predicted
+# one to its prediction, on the packaged output.
+
+_FRONT_MATTER = "<w:p><w:r><w:t>Front matter.</w:t></w:r></w:p>"
+
+
+def _reverse_conversion():
+    """A reverse conversion of a short section, planned by the real converter.
+
+    Paragraph 0 is front matter the converter leaves alone; 1-3 are PART,
+    ARTICLE and PARAGRAPH on the built-in list, which it marks. The last
+    carries a doubled space that only an exact comparison can see.
+    """
+
+    from tests.test_canadian_to_csi import _styled
+
+    rows = [
+        ("PART", "GENERAL"),
+        ("ARTICLE", "SUMMARY"),
+        ("PARAGRAPH", "Provide  listed sprinklers."),
+    ]
+    document = _document_with(
+        _FRONT_MATTER, *(_styled(role, text) for role, text in rows)
+    )
+    classifications = {
+        "classifications": [
+            {"paragraph_index": index, "csi_role": role}
+            for index, (role, _text) in enumerate(rows, start=1)
+        ]
+    }
+    plan = plan_canadian_to_csi(
+        document,
+        builtin_scheme.build_styles_xml(),
+        classifications,
+        numbering_xml=builtin_scheme.build_numbering_xml(),
+    )
+    return document, plan
+
+
+def _verify_conversion(tmp_path, source_document, output_document, **kwargs):
+    source = tmp_path / "source-conversion.docx"
+    output = tmp_path / "output-conversion.docx"
+    source_parts = _parts()
+    source_parts["word/document.xml"] = source_document
+    source_parts["word/styles.xml"] = builtin_scheme.build_styles_xml()
+    source_parts["word/numbering.xml"] = builtin_scheme.build_numbering_xml()
+    output_parts = dict(source_parts)
+    output_parts["word/document.xml"] = output_document
+    _write_docx(source, source_parts)
+    _write_docx(output, output_parts)
+
+    verify_phase2_invariants(
+        source,
+        output_document.encode("utf-8"),
+        new_docx=output,
+        conversion_mode="canadian_to_csi",
+        **kwargs,
+    )
+
+
+def test_conversion_gate_accepts_the_predicted_conversion_and_says_so(tmp_path):
+    document, plan = _reverse_conversion()
+    verification = {}
+
+    _verify_conversion(
+        tmp_path,
+        document,
+        plan.document_xml,
+        expected_paragraph_changes=plan.expected_paragraph_changes,
+        verification_out=verification,
+    )
+
+    assert verification["body_paragraphs_expected_changed"] == 3
+    # The three marked paragraphs are compared against their prediction; the
+    # front matter needs no comparison, because its XML is identical.
+    assert verification["body_signature_paragraphs_compared"] == 3
+
+
+def test_conversion_gate_rejects_a_change_the_conversion_did_not_predict(tmp_path):
+    document, plan = _reverse_conversion()
+    damaged = plan.document_xml.replace("Front matter.", "Front  matter.")
+    verification = {}
+
+    with pytest.raises(EngineError) as raised:
+        _verify_conversion(
+            tmp_path,
+            document,
+            damaged,
+            expected_paragraph_changes=plan.expected_paragraph_changes,
+            verification_out=verification,
+        )
+
+    assert raised.value.code == "conversion_prediction_mismatch"
+    assert raised.value.location is not None
+    assert raised.value.location.paragraph_index == 0
+    # The kind of difference, never the text.
+    assert "(text)" in str(raised.value)
+    assert "Front" not in str(raised.value)
+    # Reported on the failure path too.
+    assert verification["body_signature_paragraphs_compared"] == 1
+    assert verification["body_paragraphs_expected_changed"] == 3
+
+
+def test_conversion_gate_re_asserts_each_predicted_paragraph_exactly(tmp_path):
+    # The marker is right and the visible words are right; the doubled space
+    # the source carried is gone.
+    document, plan = _reverse_conversion()
+    damaged = plan.document_xml.replace("Provide  listed", "Provide listed")
+
+    with pytest.raises(EngineError) as raised:
+        _verify_conversion(
+            tmp_path,
+            document,
+            damaged,
+            expected_paragraph_changes=plan.expected_paragraph_changes,
+        )
+
+    assert raised.value.code == "conversion_prediction_mismatch"
+    assert raised.value.location is not None
+    assert raised.value.location.paragraph_index == 3
+    assert "(text)" in str(raised.value)
+    assert "Provide" not in str(raised.value)
+
+
+def test_conversion_gate_without_a_prediction_allows_no_change(tmp_path):
+    # Missing plumbing fails closed, as an omitted run-property contract does:
+    # no prediction means no paragraph may change.
+    document, plan = _reverse_conversion()
+
+    with pytest.raises(EngineError) as raised:
+        _verify_conversion(tmp_path, document, plan.document_xml)
+
+    assert raised.value.code == "conversion_prediction_mismatch"
+    assert raised.value.location is not None
+    assert raised.value.location.paragraph_index == 1
+
+
+def test_conversion_gate_refuses_a_prediction_for_a_paragraph_the_document_lacks(tmp_path):
+    document, plan = _reverse_conversion()
+    predicted = plan.expected_paragraph_changes
+    beyond = ExpectedParagraphChanges(
+        changes={**predicted.changes, 9: predicted.changes[1]},
+        roles=predicted.roles,
+    )
+
+    with pytest.raises(EngineError) as raised:
+        _verify_conversion(
+            tmp_path, document, plan.document_xml, expected_paragraph_changes=beyond
+        )
+
+    assert raised.value.code == "conversion_prediction_mismatch"
+
+
+def test_format_only_gate_refuses_a_prediction(tmp_path):
+    # Format-only changes no paragraph's text, so a prediction handed to it is
+    # a caller error, not something to verify.
+    document, plan = _reverse_conversion()
+    source = tmp_path / "source-format-only.docx"
+    parts = _parts()
+    parts["word/document.xml"] = document
+    _write_docx(source, parts)
+
+    with pytest.raises(ValueError, match="Format-only"):
+        verify_phase2_invariants(
+            source,
+            document.encode("utf-8"),
+            conversion_mode="format_only",
+            expected_paragraph_changes=plan.expected_paragraph_changes,
+        )
