@@ -3,8 +3,9 @@ import hashlib
 import posixpath
 import zipfile
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Dict, Any, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Mapping, Optional, Set
 from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
@@ -1434,6 +1435,362 @@ def _verify_effective_paragraph_geometry(
     return compared
 
 
+# --- Package members outside the mode's remit ------------------------------
+#
+# ``patch_docx`` copies every source member it is not handed as a
+# replacement, so a part nothing edits comes through intact -- by construction
+# of the transform, which is exactly what a verification must not rely on.
+# The packaging step hands styles, settings, theme, font table, numbering,
+# content types and document relationships over as replacements in *every*
+# mode, read back from the working copy, so a stray write to any of them
+# published even in a mode that promises to apply no shell at all. Nothing
+# else at the final gate compares the package with its source member by
+# member: ``validate_docx_package`` checks structure, and the header/footer
+# check covers header and footer parts only.
+#
+# So the gate takes a census of every member, by name and by the SHA-256 of
+# its bytes -- never decoded text, because Word reads bytes and fixture parts
+# are often UTF-16 -- and every change, addition and removal must fall inside
+# the remit the mode's ``ApplicationPolicy`` fields allow. The remit is
+# derived from those fields, never from a mode name, so a mode is held to what
+# its policy says it does.
+
+_CONTENT_TYPES_PART = "[Content_Types].xml"
+_MAIN_DOCUMENT_PART = "word/document.xml"
+_DOCUMENT_RELS_PART = "word/_rels/document.xml.rels"
+_STYLES_PART = "word/styles.xml"
+_NUMBERING_PART = "word/numbering.xml"
+#: The shell's global parts, identified as Word identifies them: through the
+#: main document's relationship of that type, whatever the part is called.
+#: The even/odd header switch is written into the settings part the document
+#: relates, under any name, so the conventional name alone would miss it.
+_SHELL_RELATIONSHIP_TYPES = frozenset(
+    {f"{R_NS}/settings", f"{R_NS}/theme", f"{R_NS}/fontTable"}
+)
+#: The names the shell's writers use whatever the document relates:
+#: ``apply_theme`` writes ``theme1.xml`` (and relates it), while
+#: ``apply_settings`` and ``apply_font_table`` edit ``settings.xml`` and
+#: ``fontTable.xml`` by name and relate them only when they create them. A
+#: target that relates its settings under another name therefore keeps a
+#: stray ``word/settings.xml`` the compat step writes into to no effect -- a
+#: known defect of that step, reported rather than refused here, so this
+#: check does not change what such a run publishes.
+_SHELL_WRITER_PARTS = frozenset(
+    {"word/settings.xml", "word/theme/theme1.xml", "word/fontTable.xml"}
+)
+_MEDIA_PREFIX = "word/media/"
+_HEADER_FOOTER_MANIFEST_KEYS = (
+    "part_names",
+    "rels_names",
+    "media_names",
+    "removed_part_names",
+    "removed_rels_names",
+)
+_OUT_OF_REMIT = "INVARIANT FAIL: package member outside the mode's remit"
+
+
+@dataclass(frozen=True)
+class PackageMemberCensus:
+    """Every member of a source and an output package, classified by its bytes.
+
+    ``compared`` counts the union of both packages' member names; the three
+    tuples are sorted member names. Names are package part names, never
+    document text, but they still belong in the run log only: diagnostics
+    carry the counts.
+    """
+
+    compared: int
+    changed: tuple[str, ...]
+    added: tuple[str, ...]
+    removed: tuple[str, ...]
+
+
+def _member_digests(docx: Path, label: str) -> Dict[str, str]:
+    digests: Dict[str, str] = {}
+    with zipfile.ZipFile(docx, "r") as package:
+        for info in package.infolist():
+            if info.filename in digests:
+                raise RuntimeError(
+                    f"INVARIANT FAIL: the {label} package names a member more than "
+                    f"once: {info.filename}"
+                )
+            digest = hashlib.sha256()
+            with package.open(info) as stream:
+                for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(chunk)
+            digests[info.filename] = digest.hexdigest()
+    return digests
+
+
+def _package_member_census(src_docx: Path, new_docx: Path) -> PackageMemberCensus:
+    """Classify every member of both packages as changed, added or removed."""
+
+    before = _member_digests(src_docx, "source")
+    after = _member_digests(new_docx, "output")
+    common = before.keys() & after.keys()
+    return PackageMemberCensus(
+        compared=len(before.keys() | after.keys()),
+        changed=tuple(sorted(name for name in common if before[name] != after[name])),
+        added=tuple(sorted(after.keys() - before.keys())),
+        removed=tuple(sorted(before.keys() - after.keys())),
+    )
+
+
+def _record_package_census(
+    census: PackageMemberCensus,
+    verification_out: Optional[Dict[str, Any]],
+    log: Optional[List[str]],
+) -> None:
+    """Counts to the verification record, member names to the run log only."""
+
+    if verification_out is not None:
+        verification_out["package_members_compared"] = census.compared
+        verification_out["package_members_changed"] = len(census.changed)
+        verification_out["package_members_added"] = len(census.added)
+        verification_out["package_members_removed"] = len(census.removed)
+    if log is not None:
+        log.append(
+            f"Package members: {census.compared} compared, "
+            f"{len(census.changed)} changed, {len(census.added)} added, "
+            f"{len(census.removed)} removed"
+        )
+        for verb, names in (
+            ("changed", census.changed),
+            ("added", census.added),
+            ("removed", census.removed),
+        ):
+            log.extend(f"Package member {verb}: {name}" for name in names)
+
+
+def _take_package_census(
+    src_docx: Path,
+    new_docx: Path,
+    verification_out: Optional[Dict[str, Any]],
+    log: Optional[List[str]],
+) -> PackageMemberCensus:
+    census = _package_member_census(src_docx, new_docx)
+    _record_package_census(census, verification_out, log)
+    return census
+
+
+def _header_footer_manifest_names(
+    manifest: Optional[Mapping[str, Any]],
+    policy: "ApplicationPolicy",
+) -> Dict[str, FrozenSet[str]]:
+    """The importer's manifest, as the sets of member names it reports.
+
+    An omitted manifest names nothing, so it authorizes no header or footer
+    change, as an omitted prediction authorizes no text change. A mode that
+    applies no architect shell imports no header set, so a manifest that names
+    anything is a caller error rather than something to honour.
+    """
+
+    if manifest is None:
+        manifest = {}
+    if not isinstance(manifest, Mapping):
+        raise TypeError("header/footer import manifest must be a mapping")
+    names: Dict[str, FrozenSet[str]] = {}
+    for key in _HEADER_FOOTER_MANIFEST_KEYS:
+        raw = manifest.get(key) or ()
+        if isinstance(raw, (str, bytes)):
+            raise TypeError(f"header/footer import manifest {key!r} must be a collection of names")
+        names[key] = frozenset(name for name in raw if isinstance(name, str))
+    if not policy.apply_full_architect_shell and any(names.values()):
+        raise ValueError(
+            "A mode that applies no architect shell imports no headers or footers, "
+            "so it cannot be given a header/footer import manifest that names parts"
+        )
+    return names
+
+
+def _relationship_targets_by_type(
+    package: zipfile.ZipFile,
+    members: Mapping[str, str],
+    owner_part: str,
+    label: str,
+) -> Dict[str, Set[str]]:
+    """Member names ``owner_part`` relates internally, grouped by relationship type.
+
+    ``members`` maps each casefolded member name to its spelling in the
+    package, because OPC resolves part names case-insensitively. A target
+    that names no member is left out: whether it resolves is
+    ``validate_docx_package``'s question, not this one's.
+    """
+
+    rels_member = members.get(_relationship_part_for_owner(owner_part).casefold())
+    if rels_member is None:
+        return {}
+    root = parse_untrusted_xml(package.read(rels_member), f"{rels_member} ({label})")
+    targets: Dict[str, Set[str]] = {}
+    for rel in root.findall(f"{{{PKG_REL_NS}}}Relationship"):
+        if rel.attrib.get("TargetMode", "").casefold() == "external":
+            continue
+        resolved = _resolve_relationship_target(owner_part, rel.attrib.get("Target", ""))
+        member = members.get(resolved.casefold()) if resolved else None
+        if member is not None:
+            targets.setdefault(rel.attrib.get("Type", ""), set()).add(member)
+    return targets
+
+
+@dataclass(frozen=True)
+class _RelatedParts:
+    """What a package's own relationships say its shell and header set are."""
+
+    shell_parts: FrozenSet[str]
+    header_footer_parts: FrozenSet[str]
+    header_footer_rels: FrozenSet[str]
+    header_footer_media: FrozenSet[str]
+
+
+def _related_parts(docx: Path, label: str) -> _RelatedParts:
+    """The document's shell parts, header set, their relationships and media.
+
+    Header and footer relationships are recognised by type suffix and
+    internal targets only, exactly as the importer recognises the target's
+    set when it removes it.
+    """
+
+    with zipfile.ZipFile(docx, "r") as package:
+        members = {name.casefold(): name for name in package.namelist()}
+        document = _relationship_targets_by_type(
+            package, members, _MAIN_DOCUMENT_PART, label
+        )
+        shell_parts = {
+            member
+            for rel_type, targets in document.items()
+            if rel_type in _SHELL_RELATIONSHIP_TYPES
+            for member in targets
+        }
+        header_footer_parts = {
+            member
+            for rel_type, targets in document.items()
+            if rel_type.endswith(("/header", "/footer"))
+            for member in targets
+        }
+        header_footer_rels: Set[str] = set()
+        header_footer_media: Set[str] = set()
+        for part in header_footer_parts:
+            rels_member = members.get(_relationship_part_for_owner(part).casefold())
+            if rels_member is None:
+                continue
+            header_footer_rels.add(rels_member)
+            for targets in _relationship_targets_by_type(
+                package, members, part, label
+            ).values():
+                header_footer_media.update(
+                    member for member in targets if member.startswith(_MEDIA_PREFIX)
+                )
+    return _RelatedParts(
+        shell_parts=frozenset(shell_parts),
+        header_footer_parts=frozenset(header_footer_parts),
+        header_footer_rels=frozenset(header_footer_rels),
+        header_footer_media=frozenset(header_footer_media),
+    )
+
+
+@dataclass(frozen=True)
+class _PackageRemit:
+    may_change: FrozenSet[str]
+    may_add: FrozenSet[str]
+    may_remove: FrozenSet[str]
+
+
+def _package_remit(
+    policy: "ApplicationPolicy",
+    src_docx: Path,
+    new_docx: Path,
+    manifest: Mapping[str, FrozenSet[str]],
+) -> _PackageRemit:
+    """The members the policy lets this run change, add and remove.
+
+    - Every mode may change the body, ``word/document.xml``.
+    - Restyling (``applies_role_styles``) or the shell may change
+      ``word/styles.xml``.
+    - Importing numbering (``import_body_numbering``) or the shell may change
+      or add ``word/numbering.xml`` and change the content types and the
+      document relationships that wire it in.
+    - The shell (``apply_full_architect_shell``) may change or add the
+      settings, theme and font table parts the output's document relates or
+      the shell's writers name, and the header set the importer's manifest
+      names -- each part and its
+      relationships only where the output's document relates them, media only
+      added and only where an imported part relates it, and a removal only of
+      a part the source's document related as a header or footer, or its
+      relationships.
+
+    The main document, styles and numbering parts are fixed by name
+    throughout the engine and ``validate_docx_package``; the shell's parts are
+    whatever the document relates, plus the names the shell's writers use.
+    Nothing else may change, be added or be removed.
+    """
+
+    may_change: Set[str] = {_MAIN_DOCUMENT_PART}
+    may_add: Set[str] = set()
+    may_remove: Set[str] = set()
+    if policy.applies_role_styles or policy.apply_full_architect_shell:
+        may_change.add(_STYLES_PART)
+    if policy.import_body_numbering or policy.apply_full_architect_shell:
+        may_change |= {_NUMBERING_PART, _CONTENT_TYPES_PART, _DOCUMENT_RELS_PART}
+        may_add.add(_NUMBERING_PART)
+    if policy.apply_full_architect_shell:
+        source = _related_parts(src_docx, "source")
+        output = _related_parts(new_docx, "output")
+        shell_parts = output.shell_parts | _SHELL_WRITER_PARTS
+        may_change |= shell_parts
+        may_add |= shell_parts
+        written = (manifest["part_names"] & output.header_footer_parts) | (
+            manifest["rels_names"] & output.header_footer_rels
+        )
+        may_change |= written
+        may_add |= written | (manifest["media_names"] & output.header_footer_media)
+        may_remove |= (
+            manifest["removed_part_names"] | manifest["removed_rels_names"]
+        ) & (source.header_footer_parts | source.header_footer_rels)
+    return _PackageRemit(frozenset(may_change), frozenset(may_add), frozenset(may_remove))
+
+
+def _enforce_package_remit(
+    census: PackageMemberCensus,
+    src_docx: Path,
+    new_docx: Path,
+    *,
+    policy: "ApplicationPolicy",
+    manifest: Mapping[str, FrozenSet[str]],
+) -> None:
+    remit = _package_remit(policy, src_docx, new_docx, manifest)
+    violations = sorted(
+        [(name, "changed") for name in census.changed if name not in remit.may_change]
+        + [(name, "added") for name in census.added if name not in remit.may_add]
+        + [(name, "removed") for name in census.removed if name not in remit.may_remove]
+    )
+    if violations:
+        name, verb = violations[0]
+        more = f" (and {len(violations) - 1} more)" if len(violations) > 1 else ""
+        raise RuntimeError(f"{_OUT_OF_REMIT} {verb}: {name}{more}")
+
+
+def _verify_package_member_remit(
+    src_docx: Path,
+    new_docx: Path,
+    *,
+    policy: "ApplicationPolicy",
+    header_footer_manifest: Optional[Mapping[str, Any]],
+    verification_out: Optional[Dict[str, Any]] = None,
+    log: Optional[List[str]] = None,
+) -> PackageMemberCensus:
+    """Census every member, record it, then hold it to the policy's remit.
+
+    Recorded before it is enforced, so a failure still shows what was
+    counted. ``verify_phase2_invariants`` runs the two halves apart -- the
+    census first, the enforcement last -- so the checks that explain a change
+    in their own terms keep their messages.
+    """
+
+    manifest = _header_footer_manifest_names(header_footer_manifest, policy)
+    census = _take_package_census(src_docx, new_docx, verification_out, log)
+    _enforce_package_remit(census, src_docx, new_docx, policy=policy, manifest=manifest)
+    return census
+
 
 # ``_without_own_revisions`` -- this application's own tracked insertions
 # projected out by author, everyone else's kept -- is imported from
@@ -1463,6 +1820,8 @@ def verify_phase2_invariants(
     allowed_rpr_properties_by_paragraph: Optional[Dict[int, Set[str]]] = None,
     verification_out: Optional[Dict[str, Any]] = None,
     expected_paragraph_changes: Optional[ExpectedParagraphChanges] = None,
+    header_footer_manifest: Optional[Mapping[str, Any]] = None,
+    log: Optional[List[str]] = None,
 ) -> None:
     """
     Verify Phase 2 invariants:
@@ -1477,6 +1836,12 @@ def verify_phase2_invariants(
        own (unchanged) otherwise.
     3. Direct run properties may be removed only when the effective replacement
        style supplies that property. An omitted contract authorizes no removal.
+    4. Every package member outside the policy's remit is byte-identical to the
+       source, and none is added or removed. Header and footer parts count as
+       within the remit only where ``header_footer_manifest`` (the importer's
+       manifest) names them; an omitted manifest authorizes no header change.
+       The census is recorded as the checks start and enforced after them;
+       member names go to ``log`` only.
     """
     # 1) sectPr non-layout semantics unchanged
     before_doc = decode_xml_bytes(
@@ -1487,6 +1852,15 @@ def verify_phase2_invariants(
 
     application_policy = _resolve_application_policy(policy, conversion_mode)
     expected = _resolve_expected_paragraph_changes(expected_paragraph_changes)
+    package_census: Optional[PackageMemberCensus] = None
+    if new_docx is not None:
+        header_footer_names = _header_footer_manifest_names(
+            header_footer_manifest, application_policy
+        )
+        # Taken and recorded first, so every later failure still shows the
+        # census ran and what it counted; enforced last, after the checks that
+        # explain a change in their own terms.
+        package_census = _take_package_census(src_docx, new_docx, verification_out, log)
     if application_policy.preserve_target_numbering:
         if expected.changes:
             raise ValueError(
@@ -1799,4 +2173,14 @@ def verify_phase2_invariants(
         raise RuntimeError(
             "INVARIANT FAIL: uncontracted run formatting was added, changed, "
             f"removed, or moved between runs in paragraph {paragraph_index}"
+        )
+
+    # 4) Nothing outside the mode's remit changed, arrived or went.
+    if package_census is not None:
+        _enforce_package_remit(
+            package_census,
+            src_docx,
+            new_docx,
+            policy=application_policy,
+            manifest=header_footer_names,
         )

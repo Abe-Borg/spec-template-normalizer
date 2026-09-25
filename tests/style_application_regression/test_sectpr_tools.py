@@ -128,12 +128,24 @@ def test_invariants_allow_created_body_sectpr_and_require_expected_reference(tmp
         "settings": {"settings_xml": None},
     }
 
+    # What the importer reports writing. Without it the header part is a
+    # member added outside the remit, as an omitted manifest authorizes no
+    # header change.
+    manifest = {"part_names": {"word/header1.xml"}}
     verify_phase2_invariants(
         src_docx=source,
         new_document_xml=output_document.encode("utf-8"),
         new_docx=output,
         arch_template_registry=registry,
+        header_footer_manifest=manifest,
     )
+    with pytest.raises(RuntimeError, match="remit added: word/header1.xml"):
+        verify_phase2_invariants(
+            src_docx=source,
+            new_document_xml=output_document.encode("utf-8"),
+            new_docx=output,
+            arch_template_registry=registry,
+        )
 
     missing_ref_document = output_document.replace(
         '<w:headerReference w:type="default" r:id="rId9"/>',
@@ -147,6 +159,7 @@ def test_invariants_allow_created_body_sectpr_and_require_expected_reference(tmp
             new_document_xml=missing_ref_document.encode("utf-8"),
             new_docx=broken,
             arch_template_registry=registry,
+            header_footer_manifest=manifest,
         )
 
 

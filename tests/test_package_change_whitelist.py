@@ -707,7 +707,7 @@ def test_the_remit_is_derived_from_policy_fields_not_the_mode_name(tmp_path: Pat
         _remit(source, output, policy=replace(format_only, apply_full_architect_shell=False))
 
 
-def test_the_settings_part_is_the_one_the_document_relates(tmp_path: Path) -> None:
+def test_the_settings_part_is_the_related_one_or_the_writers_name(tmp_path: Path) -> None:
     custom = _relationship("rIdSet", "settings", "custom/prefs.xml")
     source_members = _base_members(
         **{
@@ -715,50 +715,76 @@ def test_the_settings_part_is_the_one_the_document_relates(tmp_path: Path) -> No
             "word/custom/prefs.xml": f'<w:settings xmlns:w="{W_NS}"/>',
             # A stray part under the conventional name, which nothing relates.
             "word/settings.xml": f'<w:settings xmlns:w="{W_NS}"/>',
+            # And a leftover under another name, which nothing relates either.
+            "word/custom/old-prefs.xml": f'<w:settings xmlns:w="{W_NS}"/>',
         }
     )
     switched = f'<w:settings xmlns:w="{W_NS}"><w:evenAndOddHeaders/></w:settings>'
 
+    # The part Word reads, whatever it is called: header parity writes here.
     related_output = dict(source_members)
     related_output["word/custom/prefs.xml"] = switched
     source, output = _pair(tmp_path / "related", source_members, related_output)
     _remit(source, output)
 
+    # The name the compat step edits whether or not it is related. That write
+    # goes nowhere (a known defect of the compat step, reported in the
+    # program's handoffs); the census records it, and it stays publishable.
     stray_output = dict(source_members)
     stray_output["word/settings.xml"] = switched
     source, output = _pair(tmp_path / "stray", source_members, stray_output)
-    with pytest.raises(RuntimeError, match=f"{OUT_OF_REMIT} changed: word/settings.xml"):
+    _remit(source, output)
+
+    # Anything else is outside every remit, even a settings-shaped part.
+    leftover_output = dict(source_members)
+    leftover_output["word/custom/old-prefs.xml"] = switched
+    source, output = _pair(tmp_path / "leftover", source_members, leftover_output)
+    with pytest.raises(
+        RuntimeError, match=f"{OUT_OF_REMIT} changed: word/custom/old-prefs.xml"
+    ):
         _remit(source, output)
+    # And none of it for a mode that applies no shell.
+    source, output = _pair(tmp_path / "no-shell", source_members, related_output)
+    with pytest.raises(RuntimeError, match=f"{OUT_OF_REMIT} changed: word/custom/prefs.xml"):
+        _remit(source, output, CANADIAN_TO_CSI)
+
+
+_SETTINGS_PART = f'<w:settings xmlns:w="{W_NS}"/>'
 
 
 @pytest.mark.parametrize(
-    ("name", "kind", "target", "payload"),
+    ("kind", "writers_name", "other_name", "payload"),
     [
-        ("word/settings.xml", "settings", "settings.xml", f'<w:settings xmlns:w="{W_NS}"/>'),
-        ("word/theme/theme1.xml", "theme", "theme/theme1.xml", _THEME),
-        ("word/fontTable.xml", "fontTable", "fontTable.xml", _FONT_TABLE),
+        ("settings", "word/settings.xml", "word/custom/prefs.xml", _SETTINGS_PART),
+        ("theme", "word/theme/theme1.xml", "word/theme/theme2.xml", _THEME),
+        ("fontTable", "word/fontTable.xml", "word/fonts/table.xml", _FONT_TABLE),
     ],
 )
-def test_a_shell_part_may_be_added_only_where_the_document_relates_it(
-    tmp_path: Path, name: str, kind: str, target: str, payload
+def test_a_shell_part_may_be_added_where_the_document_relates_it_or_under_the_writers_name(
+    tmp_path: Path, kind: str, writers_name: str, other_name: str, payload
 ) -> None:
-    related = _base_members(
-        **{
-            name: payload,
-            "word/_rels/document.xml.rels": _rels(
+    def added(name: str, *, related: bool) -> dict:
+        target = name[len("word/"):]
+        extra: dict = {name: payload}
+        if related:
+            extra["word/_rels/document.xml.rels"] = _rels(
                 _STYLES_REL, _relationship("rIdNew", kind, target)
-            ),
-        }
-    )
-    source, output = _pair(tmp_path / "related", _base_members(), related)
-    _remit(source, output)
-    # Not for a mode that applies no shell.
-    with pytest.raises(RuntimeError, match=f"{OUT_OF_REMIT} added: {name}"):
-        _remit(source, output, CSI_TO_CANADIAN_STANDALONE)
+            )
+        return _base_members(**extra)
 
-    unrelated = _base_members(**{name: payload})
-    source, output = _pair(tmp_path / "unrelated", _base_members(), unrelated)
-    with pytest.raises(RuntimeError, match=f"{OUT_OF_REMIT} added: {name}"):
+    for name, related in ((writers_name, True), (writers_name, False), (other_name, True)):
+        case = tmp_path / f"{Path(name).stem}-{related}"
+        source, output = _pair(case, _base_members(), added(name, related=related))
+        _remit(source, output)
+        # Not for a mode that applies no shell.
+        with pytest.raises(RuntimeError, match=f"{OUT_OF_REMIT} added: {name}"):
+            _remit(source, output, CSI_TO_CANADIAN_STANDALONE)
+
+    # Under any other name, only where the output's document relates it.
+    source, output = _pair(
+        tmp_path / "unrelated", _base_members(), added(other_name, related=False)
+    )
+    with pytest.raises(RuntimeError, match=f"{OUT_OF_REMIT} added: {other_name}"):
         _remit(source, output)
 
 
