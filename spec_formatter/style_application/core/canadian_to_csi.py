@@ -32,7 +32,7 @@ import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import AbstractSet, Any, Callable, Dict, List, Optional, Set, Tuple
 
 from spec_formatter.role_contract import (
     BODY_HIERARCHY_ROLES,
@@ -86,6 +86,7 @@ from .untrusted_xml import parse_untrusted_xml
 from .xml_helpers import (
     RunContentSignature,
     edit_preserving_out_of_scope_subtrees,
+    iter_direct_child_xml_blocks,
     iter_element_xml_blocks,
     iter_paragraph_xml_blocks,
     paragraph_run_content_signature,
@@ -468,29 +469,69 @@ def _tracked_marker_run(
     )
 
 
+#: Run children that render nothing: the run's own properties, and Word's note
+#: of where a page ended when the document was last laid out. Everything else
+#: a run holds -- text, a tab, a break, a symbol, a field character -- is
+#: content, and Word renders an automatic number ahead of all of it.
+_INERT_RUN_CHILDREN = frozenset({"w:rPr", "w:lastRenderedPageBreak"})
+
+
+def _first_run_content(unprotected: str) -> Optional[Tuple[int, str, int]]:
+    """Where a paragraph's run content begins, as ``(run_start, run, offset)``.
+
+    The first run in document order holding any child but
+    :data:`_INERT_RUN_CHILDREN`, the run itself, and the offset in
+    *unprotected* of that first content child. ``None`` when no run holds any.
+    Out-of-scope subtrees are placeholders in *unprotected*, so a run holding
+    only a drawing holds no content here, as in the run-content signature.
+    """
+
+    for run_start, _run_end, run in iter_element_xml_blocks(unprotected, "w:r"):
+        for child_start, _child_end, name, _block in iter_direct_child_xml_blocks(run):
+            if name not in _INERT_RUN_CHILDREN:
+                return run_start, run, run_start + child_start
+    return None
+
+
 def _insert_marker(
     paragraph_xml: str,
     marker: str,
     *,
+    typed: bool = False,
     tracked: bool = False,
     revision_id: int = 0,
     revision_date: str = "",
 ) -> str:
-    """Prepend *marker* and a tab at the start of the paragraph's text.
+    """Write *marker* and a tab where the paragraph's number stood.
 
-    Untracked, the marker goes *into* the paragraph's existing first run rather
-    than into a run of its own, for two reasons. It inherits that run's
-    character formatting, so a bold heading gets a bold number instead of a
-    bare one in the document default; and the paragraph's run structure is
-    unchanged, which is what the run-property invariant in ``phase2_invariants``
-    checks. Adding runs would trip that check for a change that loses no
-    formatting at all.
+    For an automatically numbered paragraph that is ahead of all its run
+    content. Word renders the number, its suffix tab, and then the
+    paragraph's runs, so a tab, break or symbol before the first text follows
+    the number. The marker therefore goes before the first content child of
+    the first run that has any -- after that run's ``w:rPr`` and an inert
+    ``w:lastRenderedPageBreak`` -- which may be a text-less run ahead of the
+    one holding the text. Written before the first ``w:t`` instead, a line Word
+    showed as "1.1, tab, tab, SUMMARY" came out "tab, 1.1, tab, SUMMARY".
+
+    A *typed* marker being replaced stood where its author typed it: at the
+    front of the paragraph's text, behind whatever was typed before it. A
+    hand-numbered spec often indents its levels with tabs typed ahead of the
+    marker, so the replacement goes before the paragraph's first ``w:t``,
+    where the typed marker began, and stays inside that indentation.
+
+    Untracked, the marker goes *into* that run rather than into a run of its
+    own, for two reasons. It inherits the run's character formatting, so a
+    bold heading gets a bold number instead of a bare one in the document
+    default; and the paragraph's run structure is unchanged, which is what the
+    run-property invariant in ``phase2_invariants`` checks. Adding runs would
+    trip that check for a change that loses no formatting at all.
 
     Tracked, it cannot: a revision is a subtree, so the marker must be its own
-    run inside ``w:ins``. That does shift every following run index, and the
-    answer is still not to widen the invariant -- ``phase2_invariants`` runs the
-    unchanged check against the document with this application's own revisions
-    projected back out, where the run structure is identical again.
+    run inside ``w:ins``, placed immediately before that run. That does shift
+    every following run index, and the answer is still not to widen the
+    invariant -- ``phase2_invariants`` runs the unchanged check against the
+    document with this application's own revisions projected back out, where
+    the run structure is identical again.
 
     A run may hold several ``w:t`` and ``w:tab`` children, so both results are
     ordinary OOXML.
@@ -509,7 +550,9 @@ def _insert_marker(
         # or rejecting the insertion would delete the marker and leave the
         # paragraph with no number at all -- the automatic numbering that used
         # to supply it is gone by then. The forward converter refuses the same
-        # markup for the mirror-image reason.
+        # markup for the mirror-image reason. The marker is never written after
+        # the first text, so this slice covers everything that could enclose
+        # it, and a leading tab inside such markup is refused with it.
         if _TRACKED_OR_FIELD_RX.search(unprotected[: match.start()]):
             raise EngineError(
                 _HIERARCHY,
@@ -517,36 +560,49 @@ def _insert_marker(
                 f"result, so CSI marker {marker!r} could not be written where it "
                 "would survive. Accept the changes or unlink the field first.",
             )
-        if tracked:
-            # The revision wraps its own run, so it is placed before the run
-            # holding the first text, as that run's sibling, never inside it.
+        holder: Optional[Tuple[int, str]]
+        if typed:
+            position = match.start()
             # The run is found as an element: searching back for the nearest
-            # "<w:r" also matches "<w:rPr", which spliced the revision into a
-            # formatted run ahead of its own properties -- invalid OOXML that
-            # no well-formedness check notices.
+            # "<w:r" also matches "<w:rPr", which spliced a tracked revision
+            # into a formatted run ahead of its own properties -- invalid OOXML
+            # that no well-formedness check notices.
             holder = next(
                 (
                     (start, block)
                     for start, end, block in iter_element_xml_blocks(unprotected, "w:r")
-                    if start < match.start() < end
+                    if start < position < end
                 ),
                 None,
             )
+        else:
+            placement = _first_run_content(unprotected)
+            if placement is None:
+                raise EngineError(
+                    _HIERARCHY,
+                    f"A paragraph classified for CSI marker {marker!r} has no run "
+                    "to carry it.",
+                )
+            run_start, source_run, position = placement
+            holder = (run_start, source_run)
+        if tracked:
             if holder is None:
                 raise EngineError(
                     _HIERARCHY,
                     f"A paragraph classified for CSI marker {marker!r} has no run "
                     "to place a tracked marker before.",
                 )
+            # The revision wraps its own run, so it is placed before the run
+            # the marker would have joined, as that run's sibling, never inside
+            # it. That run is the one the marker should look like, so its
+            # properties come along.
             run_start, source_run = holder
-            # The run this marker is placed before is the run it should look
-            # like, so its properties come along.
             insertion = _tracked_marker_run(
                 marker, revision_id, revision_date, _run_properties(source_run)
             )
             return unprotected[:run_start] + insertion + unprotected[run_start:]
         prefix = f'<w:t xml:space="preserve">{_escape(marker)}</w:t><w:tab/>'
-        return unprotected[: match.start()] + prefix + unprotected[match.start():]
+        return unprotected[:position] + prefix + unprotected[position:]
 
     return edit_preserving_out_of_scope_subtrees(paragraph_xml, _edit)
 
@@ -556,19 +612,21 @@ def _predict_marker_insertion(
     marker: str,
     *,
     tracked: bool,
+    typed: bool = False,
 ) -> Optional[RunContentSignature]:
     """The run content :func:`_insert_marker` must produce, from the source's.
 
     Worked out on the source paragraph's run-content signature rather than
     read back off the edit, so it can disagree with the edit. The marker is a
-    text node with ``xml:space="preserve"`` followed by a tab, placed before
-    the paragraph's first ``w:t``: untracked, at the front of the run holding
-    it; tracked, as a run of its own immediately before that run. ``None``
-    when the paragraph has no text node to place it before.
+    text node with ``xml:space="preserve"`` followed by a tab. It leads the
+    first run with any content -- or, replacing a *typed* marker, it goes
+    before the paragraph's first ``w:t`` -- untracked, inside that run;
+    tracked, as a run of its own immediately before it. ``None`` when the
+    paragraph has no text node, which the edit refuses.
     """
 
     runs = [list(run) for run in signature]
-    first = next(
+    first_text = next(
         (
             (run, position)
             for run, content in enumerate(runs)
@@ -577,9 +635,13 @@ def _predict_marker_insertion(
         ),
         None,
     )
-    if first is None:
+    if first_text is None:
         return None
-    run, position = first
+    if typed:
+        run, position = first_text
+    else:
+        run = next(index for index, content in enumerate(runs) if content)
+        position = 0
     marker_items = [("t", marker, True), ("tab",)]
     if tracked:
         runs.insert(run, marker_items)
@@ -622,11 +684,15 @@ def _predict_marked_paragraph(
         unmarked_outside = _predict_marker_removal(source_outside, role)
     if unmarked is None or unmarked_outside is None:
         return None
-    run_content = _predict_marker_insertion(unmarked, marker, tracked=tracked)
+    run_content = _predict_marker_insertion(
+        unmarked, marker, tracked=tracked, typed=literal
+    )
     outside = (
         source_outside
         if tracked
-        else _predict_marker_insertion(unmarked_outside, marker, tracked=False)
+        else _predict_marker_insertion(
+            unmarked_outside, marker, tracked=False, typed=literal
+        )
     )
     if run_content is None or outside is None:
         return None
@@ -651,15 +717,47 @@ def _marked_text(marker: str, body: str) -> str:
     return f"{marker} {body}" if body else marker
 
 
+def _marker_stands_first(paragraph_xml: str, marker: str, *, typed: bool) -> bool:
+    """Whether *marker*'s own text node stands where the paragraph's number did.
+
+    Read off the XML, run by run and child by child, never off the normalized
+    text: that reading turns a leading tab into a space and strips it, so it
+    reads a marker written behind the tab exactly as one written ahead of it.
+    For an automatic number the marker must be the first content child of the
+    paragraph's first run with any content; replacing a typed marker, the
+    paragraph's first text node, where the typed marker began.
+    """
+
+    items = [item for run in paragraph_run_content_signature(paragraph_xml) for item in run]
+    if typed:
+        items = [item for item in items if item[0] == "t"]
+    return bool(items) and items[0][:2] == ("t", marker)
+
+
+def _misplaced_marker(index: int, where: str, marker: str, *, typed: bool) -> str:
+    place = (
+        "the paragraph's first text node, where the typed marker it replaces stood"
+        if typed
+        else "the first content of the paragraph's first run with any"
+    )
+    return f"Paragraph {index}{where}: CSI marker {marker!r} is not {place}."
+
+
 def _verify_marked_paragraph(
     index: int,
     after: str,
     marker: str,
     expected_body: str,
     *,
+    typed: bool = False,
     describe: Locator,
 ) -> None:
-    """Prove the edit added the marker and changed nothing else in the text."""
+    """Prove the edit added the marker and changed nothing else in the text.
+
+    The text is read normalized, which cannot tell where the marker went, so
+    its place is proven separately on the XML. A marker in the wrong place is
+    this application's defect, never the document's, and is reported so.
+    """
 
     actual = paragraph_text_from_block(after)
     if not actual.startswith(marker):
@@ -675,6 +773,12 @@ def _verify_marked_paragraph(
             _HIERARCHY,
             f"Paragraph {index}{describe(index)} changed beyond its numbering "
             "marker; the conversion was withheld.",
+            describe.at(index),
+        )
+    if not _marker_stands_first(after, marker, typed=typed):
+        raise EngineError(
+            _PREDICTION,
+            _misplaced_marker(index, describe(index), marker, typed=typed),
             describe.at(index),
         )
 
@@ -782,6 +886,7 @@ def _verify_prediction(
     predicted: List[Tuple[int, str, str]],
     *,
     describe: Locator,
+    typed_markers: AbstractSet[int] = frozenset(),
 ) -> None:
     """Assert the finished document is exactly the document that was predicted.
 
@@ -792,7 +897,9 @@ def _verify_prediction(
     * every predicted paragraph leads with its predicted marker -- tested on
       the text rather than on whether the paragraph changed, because a typed
       Canadian ``PART 1`` converts to a CSI ``PART 1`` and correctly leaves the
-      text untouched; and
+      text untouched, and then on the XML, where the marker's own text node
+      must stand where the number did (see :func:`_marker_stands_first`;
+      *typed_markers* are the paragraphs whose typed marker it replaced); and
     * no paragraph outside the prediction changed its text at all, which is the
       half that catches an edit nobody asked for.
     """
@@ -806,6 +913,13 @@ def _verify_prediction(
                 _PREDICTION,
                 f"Paragraph {index}{describe(index)} was predicted to lead with "
                 f"CSI marker {marker!r} but does not.",
+                describe.at(index),
+            )
+        typed = index in typed_markers
+        if not _marker_stands_first(after_blocks[index][2], marker, typed=typed):
+            raise EngineError(
+                _PREDICTION,
+                _misplaced_marker(index, describe(index), marker, typed=typed),
                 describe.at(index),
             )
 
@@ -1244,11 +1358,14 @@ def plan_canadian_to_csi(
         converted = _insert_marker(
             stripped,
             marker,
+            typed=literal is not None,
             tracked=tracked,
             revision_id=next(revision_ids) if tracked else 0,
             revision_date=date,
         )
-        _verify_marked_paragraph(index, converted, marker, body, describe=locate)
+        _verify_marked_paragraph(
+            index, converted, marker, body, typed=literal is not None, describe=locate
+        )
         if expectation is None:
             # Checked only now, so a paragraph the edit itself refuses is
             # reported in the edit's own, actionable terms. Reaching here means
@@ -1297,7 +1414,13 @@ def plan_canadian_to_csi(
         prepare_xml_text_for_utf8(converted_document),
         "word/document.xml (converted)",
     )
-    _verify_prediction(blocks, after_blocks, predicted, describe=locate)
+    _verify_prediction(
+        blocks,
+        after_blocks,
+        predicted,
+        describe=locate,
+        typed_markers=frozenset(literal_indices),
+    )
     expected = ExpectedParagraphChanges(
         changes=expected_changes,
         roles=effective_role_by_index,

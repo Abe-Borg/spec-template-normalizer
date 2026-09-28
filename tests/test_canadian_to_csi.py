@@ -860,6 +860,18 @@ def _blocks(*texts: str):
     ]
 
 
+def _marked(marker: str, text: str):
+    """A converted paragraph as the converter writes it: the marker's own text
+    node and its tab, joined to the front of the paragraph's run."""
+
+    return (
+        0,
+        0,
+        f'<w:p><w:r><w:t xml:space="preserve">{marker}</w:t><w:tab/>'
+        f'<w:t xml:space="preserve">{text}</w:t></w:r></w:p>',
+    )
+
+
 def test_prediction_catches_a_marker_that_was_never_written() -> None:
     """A predicted paragraph that did not receive its marker fails closed.
 
@@ -871,7 +883,7 @@ def test_prediction_catches_a_marker_that_was_never_written() -> None:
     with pytest.raises(EngineError) as raised:
         _verify_prediction(
             _blocks("GENERAL", "SUMMARY"),
-            _blocks("PART 1\tGENERAL", "SUMMARY"),
+            [_marked("PART 1", "GENERAL"), *_blocks("SUMMARY")],
             [(0, "PART", "PART 1"), (1, "ARTICLE", "1.1")],
             describe=_no_locator,
         )
@@ -885,7 +897,7 @@ def test_prediction_catches_an_edit_nobody_asked_for() -> None:
     with pytest.raises(EngineError) as raised:
         _verify_prediction(
             _blocks("GENERAL", "Untouched prose."),
-            _blocks("PART 1\tGENERAL", "Quietly rewritten."),
+            [_marked("PART 1", "GENERAL"), *_blocks("Quietly rewritten.")],
             [(0, "PART", "PART 1")],
             describe=_no_locator,
         )
@@ -896,7 +908,7 @@ def test_prediction_catches_an_edit_nobody_asked_for() -> None:
 def test_prediction_accepts_the_document_it_predicted() -> None:
     _verify_prediction(
         _blocks("GENERAL", "Untouched prose."),
-        _blocks("PART 1\tGENERAL", "Untouched prose."),
+        [_marked("PART 1", "GENERAL"), *_blocks("Untouched prose.")],
         [(0, "PART", "PART 1")],
         describe=_no_locator,
     )
