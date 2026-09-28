@@ -670,7 +670,8 @@ def test_run_content_check_reports_that_it_ran_when_a_later_check_fails(tmp_path
     # numbering check refused it; the diagnostics event must be able to say so.
     # Format-only predicts no change, and says that too. The package census is
     # taken before any check, so it is on record as well: the body and the
-    # numbering part changed.
+    # numbering part changed. So is the revision census: the fixture carries
+    # no tracked revision on either side.
     assert verification == {
         "body_signature_paragraphs_compared": 1,
         "body_paragraphs_expected_changed": 0,
@@ -678,6 +679,9 @@ def test_run_content_check_reports_that_it_ran_when_a_later_check_fails(tmp_path
         "package_members_changed": 2,
         "package_members_added": 0,
         "package_members_removed": 0,
+        "revisions_before": 0,
+        "revisions_after": 0,
+        "revisions_added_by_application": 0,
     }
 
 
@@ -1319,11 +1323,15 @@ def test_conversion_gate_reports_its_counters_when_the_paragraph_count_changes(
     assert verification == {
         "body_signature_paragraphs_compared": 0,
         "body_paragraphs_expected_changed": 3,
-        # Taken before any check: only the body changed.
+        # Taken before any check: only the body changed, and neither side
+        # carries a tracked revision (the conversion is untracked).
         "package_members_compared": 6,
         "package_members_changed": 1,
         "package_members_added": 0,
         "package_members_removed": 0,
+        "revisions_before": 0,
+        "revisions_after": 0,
+        "revisions_added_by_application": 0,
     }
 
 
@@ -1354,9 +1362,13 @@ def test_format_only_gate_reports_its_counters_when_an_earlier_body_check_fails(
     assert verification == {
         "body_signature_paragraphs_compared": 0,
         "body_paragraphs_expected_changed": 0,
-        # Taken before any check: only the body changed.
+        # Taken before any check: only the body changed, and neither side
+        # carries a tracked revision.
         "package_members_compared": 6,
         "package_members_changed": 1,
         "package_members_added": 0,
         "package_members_removed": 0,
+        "revisions_before": 0,
+        "revisions_after": 0,
+        "revisions_added_by_application": 0,
     }

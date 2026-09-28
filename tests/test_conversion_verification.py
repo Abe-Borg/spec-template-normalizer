@@ -24,7 +24,10 @@ from pathlib import Path
 
 import pytest
 
-from spec_formatter.style_application.core.canadian_to_csi import plan_canadian_to_csi
+from spec_formatter.style_application.core.canadian_to_csi import (
+    apply_canadian_to_csi,
+    plan_canadian_to_csi,
+)
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -454,3 +457,194 @@ def test_tracked_markers_do_not_disturb_the_package(converted_tracked) -> None:
     assert set(before_members) == set(after_members)
     changed = {n for n in before_members if before_members[n] != after_members[n]}
     assert changed == {"word/document.xml"}
+
+
+# --- Revision ids in a document whose own ids are already high ------------
+#
+# The converter used to number its revisions from a fixed 900000 "without
+# needing to scan". This source already uses that range: a bookmark, a comment
+# and a reviewer's insertion in the body, and a reviewer's insertion inside a
+# footnote, which only a scan of the other parts can see.
+
+_HIGH_ID_AUTHOR = "Specification Formatter"
+_HIGH_ID_DATE = 'w:date="2026-01-01T00:00:00Z"'
+
+
+def _high_id_document_xml() -> str:
+    paragraphs = []
+    for index, (role, text) in enumerate(_BODY):
+        run = f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r>'
+        if index == 0:
+            run = (
+                '<w:bookmarkStart w:id="900000" w:name="_Toc1"/>'
+                f'{run}<w:bookmarkEnd w:id="900000"/>'
+            )
+        if index == 3:
+            run = (
+                '<w:commentRangeStart w:id="900001"/>'
+                f"{run}<w:commentRangeEnd w:id=\"900001\"/>"
+                '<w:r><w:commentReference w:id="900001"/></w:r>'
+            )
+        if index == 5:
+            run += (
+                f'<w:ins w:id="900002" w:author="Reviewer" {_HIGH_ID_DATE}>'
+                '<w:r><w:t xml:space="preserve"> Added under review.</w:t></w:r></w:ins>'
+            )
+        paragraphs.append(
+            f'<w:p><w:pPr><w:pStyle w:val="{_ROLE_STYLE[role]}"/></w:pPr>{run}</w:p>'
+        )
+    return f'<w:document xmlns:w="{W}"><w:body>{"".join(paragraphs)}</w:body></w:document>'
+
+
+_HIGH_ID_COMMENTS = (
+    f'<w:comments xmlns:w="{W}"><w:comment w:id="900001" w:author="Reviewer" '
+    f'{_HIGH_ID_DATE}><w:p><w:r><w:t>Check this.</w:t></w:r></w:p></w:comment>'
+    "</w:comments>"
+)
+# 900005 is where the old base put the third paragraph's property revision.
+_HIGH_ID_FOOTNOTES = (
+    f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p>'
+    f'<w:ins w:id="900005" w:author="Reviewer" {_HIGH_ID_DATE}>'
+    "<w:r><w:t>A note under review.</w:t></w:r></w:ins></w:p></w:footnote>"
+    "</w:footnotes>"
+)
+
+
+def _high_id_parts(document_xml: str) -> dict[str, str]:
+    return {
+        "[Content_Types].xml": _CONTENT_TYPES,
+        "_rels/.rels": _ROOT_RELS,
+        "word/document.xml": document_xml,
+        "word/styles.xml": _styles_xml(),
+        "word/numbering.xml": _numbering_xml(),
+        "word/settings.xml": _TRACKING_ON,
+        "word/comments.xml": _HIGH_ID_COMMENTS,
+        "word/footnotes.xml": _HIGH_ID_FOOTNOTES,
+    }
+
+
+@pytest.fixture
+def converted_high_ids(tmp_path: Path) -> tuple[Path, Path]:
+    """Convert through the directory entry point, which sees every part."""
+
+    parts = _high_id_parts(_high_id_document_xml())
+    before = tmp_path / "before.docx"
+    with zipfile.ZipFile(before, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, payload in parts.items():
+            z.writestr(name, payload)
+
+    extracted = tmp_path / "extracted"
+    for name, payload in parts.items():
+        path = extracted / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload.encode("utf-8"))
+    apply_canadian_to_csi(
+        extracted,
+        {
+            "classifications": [
+                {"paragraph_index": index, "csi_role": role}
+                for index, (role, _text) in enumerate(_BODY)
+            ]
+        },
+        [],
+    )
+    after = tmp_path / "after.docx"
+    with zipfile.ZipFile(after, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in parts:
+            z.writestr(name, (extracted / name).read_bytes())
+    return before, after
+
+
+# Every element whose w:id is an annotation id, and the subset that are
+# revisions. Written out here rather than borrowed, so the two lists can
+# disagree with the engine's.
+_PAIRED_ANNOTATIONS = {
+    "bookmarkStart", "bookmarkEnd",
+    "commentRangeStart", "commentRangeEnd", "commentReference", "comment",
+    "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd",
+    "customXmlInsRangeStart", "customXmlInsRangeEnd",
+    "customXmlDelRangeStart", "customXmlDelRangeEnd",
+    "customXmlMoveFromRangeStart", "customXmlMoveFromRangeEnd",
+    "customXmlMoveToRangeStart", "customXmlMoveToRangeEnd",
+}
+_REVISION_ELEMENTS = {
+    "ins", "del", "moveFrom", "moveTo", "cellIns", "cellDel", "cellMerge",
+    "rPrChange", "pPrChange", "sectPrChange", "tblPrChange", "tblPrExChange",
+    "tblGridChange", "trPrChange", "tcPrChange", "numberingChange",
+}
+
+
+def _annotations(path: Path) -> list[tuple[str, str, int, str | None]]:
+    """(part, local name, id, author) for every annotation in every word part."""
+
+    found = []
+    with zipfile.ZipFile(path) as z:
+        for name in z.namelist():
+            if not name.startswith("word/") or not name.endswith(".xml"):
+                continue
+            for element in ET.fromstring(z.read(name)).iter():
+                if not element.tag.startswith(f"{{{W}}}"):
+                    continue
+                local = element.tag.split("}", 1)[1]
+                if local not in _PAIRED_ANNOTATIONS | _REVISION_ELEMENTS:
+                    continue
+                raw = element.get(_q("id"))
+                if raw is None or not re.fullmatch(r"-?\d+", raw):
+                    continue
+                found.append((name, local, int(raw), element.get(_q("author"))))
+    return found
+
+
+def _allocated_ids(path: Path) -> list[int]:
+    return [
+        revision_id
+        for _part, local, revision_id, author in _annotations(path)
+        if local in _REVISION_ELEMENTS and author == _HIGH_ID_AUTHOR
+    ]
+
+
+def test_allocated_ids_collide_with_no_id_in_the_source(converted_high_ids) -> None:
+    before, after = converted_high_ids
+    source_ids = {revision_id for _p, _l, revision_id, _a in _annotations(before)}
+    assert {900000, 900001, 900002, 900005} <= source_ids, "fixture must reach the old base"
+
+    allocated = _allocated_ids(after)
+    # One insertion and one property revision per converted paragraph.
+    assert len(allocated) == 2 * len(_BODY)
+    assert not set(allocated) & source_ids
+
+
+def test_allocated_ids_are_distinct_from_each_other(converted_high_ids) -> None:
+    _before, after = converted_high_ids
+    allocated = _allocated_ids(after)
+    assert allocated, "check must not pass vacuously"
+    assert len(set(allocated)) == len(allocated)
+
+
+def test_revision_ids_are_unique_among_revisions_in_the_output(converted_high_ids) -> None:
+    """Unique among revision elements, and only among them.
+
+    Valid OOXML repeats an id across a paired annotation -- a bookmark's start
+    and end, a comment's range and reference and the comment itself -- so
+    requiring every id in the package to differ would reject ordinary
+    documents. Those pairs must still be intact.
+    """
+
+    before, after = converted_high_ids
+    revision_ids = [
+        revision_id
+        for _part, local, revision_id, _author in _annotations(after)
+        if local in _REVISION_ELEMENTS
+    ]
+    assert len(revision_ids) == 2 * len(_BODY) + 2
+    assert len(set(revision_ids)) == len(revision_ids)
+
+    def paired(path: Path) -> list[tuple[str, str, int]]:
+        return sorted(
+            (part, local, revision_id)
+            for part, local, revision_id, _author in _annotations(path)
+            if local in _PAIRED_ANNOTATIONS
+        )
+
+    assert paired(after) == paired(before)
+    assert [local for _p, local, rid in paired(after) if rid == 900001].count("comment") == 1

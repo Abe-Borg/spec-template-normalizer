@@ -77,6 +77,10 @@ spec_formatter/style_application/core/expected_changes.py
     what a conversion predicts about every paragraph it changes, the one
     comparison the converters and the final gate hold it to, and the
     projection of this application's own tracked revisions
+spec_formatter/style_application/core/revisions.py
+    tracked revisions: the census by author and kind the final gate and the
+    header/footer importer count with, the annotation-id space, and the scan
+    the reverse converter allocates its revision ids above
 spec_formatter/style_application/core/canadian_to_csi.py
     Canadian -> typed CSI marker conversion
 spec_formatter/style_application/core/header_parity.py
@@ -117,6 +121,10 @@ tests/test_package_change_whitelist.py
     every package member outside a mode's remit held to byte identity: the
     census, the policy-derived remit, the header/footer manifest cross-check,
     and out-of-remit damage injected into each mode's packaged output
+tests/test_revision_accounting.py
+    the revision census in every mode, damage only it can see, the tracked
+    reverse conversion's exact delta, header/footer revisions counted and
+    reported, and revision ids allocated above every existing annotation id
 docs/docx_method_hardening/
     the multi-session hardening program derived from the spec-formatting
     method documents: the implementation plan, the machine-checked progress
@@ -540,6 +548,41 @@ untracked path would have inherited bold or size by joining the run -- and the
 run-property invariant cannot catch that, since it removes this application's
 insertions before comparing.
 
+Both revisions are part of the prediction. `_predict_marked_paragraph` records
+them on the paragraph's `ExpectedParagraphChange.own_revisions` (`("ins",
+"pPrChange")` for an automatic source), and the converter and the final gate
+both require each predicted paragraph to carry exactly those in this
+application's name, beyond what it carried already (`own_revision_kinds`).
+`without_own_revisions` still projects out only the `w:ins`: its consumers
+compare runs, and a `w:pPrChange` holds none. The `w:pPrChange` is accounted
+for by that per-paragraph check and by the gate's revision census (see
+"Tracked revisions are counted" under "Target shell, packaging, and
+invariants"), never by projecting it away.
+
+**Revision ids are allocated above every id the package uses.** A `w:id` on a
+revision shares one space with every annotation -- bookmarks, comment ranges,
+references and the comments themselves, permission ranges, other revisions --
+and a reviewer's ids reach any size. The converter used to start at a fixed
+900000 "without needing to scan", which only moved the collision somewhere
+less likely. `apply_canadian_to_csi` now reads every XML part below `word/`
+of a tracked target (`highest_annotation_id_in_package` in `core/revisions.py`:
+footnotes, endnotes, comments, headers and footers, and the styles and
+numbering parts, which can carry property revisions too). A part is XML when
+its extension is `.xml` in any case -- OPC part names are case-insensitive, so
+a case-sensitive `*.xml` glob misses `word/comments.XML` on Linux -- or when
+`[Content_Types].xml` declares an XML content type for it, by `Override` or
+by its extension's `Default`. Then
+`plan_canadian_to_csi(highest_annotation_id=...)` allocates from one above the
+highest of those and of the body's own, monotonically, in document order (a
+paragraph's `w:pPrChange` before its `w:ins`). An id past 2**31 - 1, which Word
+reads as a signed 32-bit integer, fails closed rather than being written.
+Uniqueness is asserted among *revision* elements only: a paired annotation
+legitimately repeats its id (`w:bookmarkStart`/`w:bookmarkEnd`, a comment's
+range, reference and the comment itself), so "every `w:id` in the package is
+unique" would reject ordinary documents. `tests/test_conversion_verification.py`
+checks it independently: the allocated ids collide with no source annotation
+id, are distinct, and revision ids are unique across every output part.
+
 Replacing a *typed* marker under tracking fails closed instead. The insertion is
 trackable but the deletion rewrites `w:t` contents inside shared code both
 converters use; publishing a reviewable insertion beside an unrecorded deletion
@@ -819,10 +862,29 @@ and to point the header at them.
   dependency sets and remap relationships/IDs. Header/footer section metadata
   substitution is restricted to corroborated section/division/title/filename
   slots in just-imported parts, including mirrored DrawingML/VML text boxes;
-  ambiguous shells or incomplete target tokens fail closed.
+  ambiguous shells or incomplete target tokens fail closed. Replacing the
+  target's header set deletes its parts, and the architect's parts arrive with
+  whatever pending changes they carry, so `_remove_existing_hf_files` counts
+  the tracked revisions in each target part before deleting it and
+  `_write_hf_parts` counts those in each architect part it writes
+  (`HeaderFooterImportResult.revisions_discarded` / `revisions_imported`, per
+  part). Each part that carried any gets a `WARNING: Discarded tracked
+  revisions in replaced target part <name>: <n>` or `WARNING: Imported tracked
+  revisions in architect part <name>: <n>` line, whitelisted into `run.log` by
+  exactly those two prefixes (a bare `WARNING` prefix would let any warning's
+  text through). `apply_environment_to_target` copies the totals into the
+  manifest (`revisions_discarded`, `revisions_imported`), the
+  `apply_environment` event records them as
+  `header_footer_revisions_discarded` / `header_footer_revisions_imported` on
+  every shell run, zero included, and a warning-level
+  `header_footer_revisions` event (`discarded`, `imported`) is emitted when
+  either is non-zero, so the fact survives any diagnostics verbosity and
+  counts among `run.json`'s warnings. A target part that cannot be parsed
+  fails rather than being discarded uncounted.
 - `phase2_invariants.py` verifies body, numbering, protected structure,
   section, header/footer, even/odd header parity, relationship, and package
-  contracts, every package member outside the mode's remit, plus **effective
+  contracts, every tracked revision in the body, every package member outside
+  the mode's remit, plus **effective
   paragraph geometry**. That last one covers the class every
   other check is blind to: identical text, identical numbering semantics,
   identical run structure and valid XSD, with every paragraph rendering
@@ -887,8 +949,10 @@ and to point the header at them.
   application or repackaging did to a paragraph's text published. Now each
   converter predicts, before it edits, what every paragraph it changes will
   read afterwards: an `ExpectedParagraphChange` per paragraph index, holding
-  the visible text, the exact run-content signature, and the signature with
-  this application's own tracked insertions projected out.
+  the visible text, the exact run-content signature, the signature with
+  this application's own tracked insertions projected out, and the revision
+  kinds the edit adds in this application's name (`own_revisions`, empty for
+  every untracked edit).
 
   The prediction is **worked out, never read back**: from the *source*
   paragraph's signature and the planned edit (`_predict_marker_removal` in
@@ -912,7 +976,10 @@ and to point the header at them.
   as predicted, match the predicted run content, and match it again with the
   application's own revisions projected out, which is what tells a tracked
   marker still inside its `w:ins` from one made permanent text (the wrapper is
-  not run content). A failure is `conversion_prediction_mismatch`, placed by
+  not run content), and carry exactly the revisions in this application's name
+  it carried before plus `own_revisions` (`own_revision_kinds`: a
+  `w:pPrChange` holds no run content, so nothing else sees one lost, doubled
+  or on the wrong paragraph). A failure is `conversion_prediction_mismatch`, placed by
   SECTION and heading from the roles the converter recorded, and names the
   kind of difference, never the text. Format-only passes the empty prediction
   -- the WI-02 check is this comparison with nothing predicted -- keeps its
@@ -972,6 +1039,32 @@ and to point the header at them.
   the document relates another part -- a known defect of those steps that this
   check records rather than refuses; narrowing the shell to related parts
   belongs with that fix.
+- **Tracked revisions are counted**, in every mode. The body check sees runs,
+  not the revision a run sits in, and the run-property check sees a lost
+  revision only where it changes a run path, so a reviewer's `w:del` turned
+  into a `w:ins`, a `w:pPrChange` dropped, or a reviewer's revision re-signed
+  in this application's name all used to publish. `verify_phase2_invariants`
+  counts every revision element in `word/document.xml`, before and after, by
+  `(author, kind)` (`revision_census` in `core/revisions.py`: parsed and
+  namespace-aware, the whole ECMA-376 17.13.5 family in `REVISION_KINDS`,
+  move and custom-XML range markers included), and requires every author but
+  this application to keep exactly the revisions they had, kind by kind, and
+  `MARKER_REVISION_AUTHOR` to carry exactly what it carried plus
+  `ExpectedParagraphChanges.own_revisions_added()` -- nothing in every mode,
+  except one `w:ins` and one `w:pPrChange` per paragraph a tracked
+  `canadian_to_csi` run converts. The expected delta is the converter's
+  prediction, never read back off the output. A difference fails with
+  `INVARIANT FAIL: tracked revisions in word/document.xml changed (<kind> by
+  this application|another author: expected <n>, found <m>; ...)` -- a plain
+  `RuntimeError`, kinds and counts only, never an author's name (personal
+  data) or text. Like the package census it is taken and recorded as the gate
+  starts (`revisions_before`, `revisions_after`,
+  `revisions_added_by_application`, which reach the `build_output` event on
+  success and on every failure) and enforced after the body, section and
+  run-property checks, which report their own findings first, and before the
+  package remit. Revisions in other parts are covered by the package census
+  (outside the remit they must be byte-identical) and, for a replaced header
+  set, by the importer's counts above.
 - `docx_decomposer.py` extracts targets safely; `docx_patch.py` assembles and
   validates replacements before publication.
 
@@ -1381,6 +1474,18 @@ the argument. The `diagnostics` block in `run.json` and the per-target
 free error text, document text, or model-authored strings into a diagnostics
 field; emit numbers, bools, and validated identifiers only.
 
+Tracked revisions reach the artifacts as counts only. The `build_output` event
+carries the body's revision census (`revisions_before`, `revisions_after`,
+`revisions_added_by_application`); on an architect-shell run the
+`apply_environment` event carries `header_footer_revisions_discarded` and
+`header_footer_revisions_imported`, and a warning-level
+`header_footer_revisions` event (`discarded`, `imported`) follows when either
+is non-zero. Each `audit.json` carries these through its `diagnostics` array,
+which holds every engine event of the target whatever the diagnostics level;
+`run.json` counts the warning event among its `diagnostics.warnings`. The part
+each count came from is named only in `run.log`, on the `WARNING:` lines
+described under the header/footer importer.
+
 `FormatRunResult` retains `success`, `succeeded`, `failed`, `output_paths`, and
 the historical `output_dir`, and adds `run_id`, `conversion_mode`,
 `output_root`, `run_dir`, `manifest_path`, and `diagnostics_path`.
@@ -1407,6 +1512,7 @@ python -m pytest tests/test_final_gate_text_identity.py \
 python -m pytest tests/test_error_location.py -q
 python -m pytest tests/test_header_parity.py -q
 python -m pytest tests/test_package_change_whitelist.py -q
+python -m pytest tests/test_revision_accounting.py -q
 python -m pytest tests/test_docx_method_hardening_tracker.py -q
 python docs/docx_method_hardening/probes/probe_style_import_w14.py
 python docs/docx_method_hardening/probes/probe_format_only_gate.py
@@ -1541,6 +1647,16 @@ Before considering a formatter change complete:
   prediction.
 - Comparing an unpredicted paragraph with this application's revisions
   projected out, which hides a marker inserted where none was predicted.
+- Proving revisions preserved through run content alone. The signature does
+  not record a run's container, and a `w:pPrChange` or a `w:del` re-signed by
+  another name holds no difference in run content at all; the revision census
+  compares by author and kind.
+- Numbering revisions from a fixed base. Allocate above the highest annotation
+  id in every part of the package; a reviewer's ids can be anywhere.
+- Asserting that every `w:id` in a package is unique. Paired annotations share
+  one; uniqueness holds among revision elements only.
+- Deleting a target part, or writing an architect one, without counting the
+  tracked revisions it carries.
 - Proving content unchanged with whitespace-normalized text alone. The same
   collapsing function on both sides cannot see a lost tab, break, soft
   hyphen, non-breaking space, doubled space, `xml:space="preserve"`, or

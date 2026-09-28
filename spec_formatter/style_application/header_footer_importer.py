@@ -19,6 +19,7 @@ from .core.ooxml_namespaces import (
     serialize_package_relationships,
 )
 from .core.ooxml_text import prepare_xml_text_for_utf8, read_xml_text
+from .core.revisions import count_revisions
 from .core.registry import (
     MAX_HEADER_FOOTER_MEDIA_BYTES,
     MAX_HEADER_FOOTER_MEDIA_TOTAL_BYTES,
@@ -82,6 +83,12 @@ class HeaderFooterImportResult:
     #: what decides whether the target's ``w:evenAndOddHeaders`` is kept or
     #: made to match the architect's.
     replaced_target_parts: bool = False
+    #: Tracked revision elements, by part name, in each target part the
+    #: replacement deleted (their pending changes went with them) and in each
+    #: architect part it wrote (their pending changes arrive in the target).
+    #: Only parts carrying at least one are listed; counts, never content.
+    revisions_discarded: Dict[str, int] = field(default_factory=dict)
+    revisions_imported: Dict[str, int] = field(default_factory=dict)
 
 
 def _iter_hf_entries(registry: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
@@ -136,8 +143,16 @@ def _resolve_media_bytes(media_item: Dict[str, Any]) -> bytes | None:
 def _remove_existing_hf_files(
     target_extract_dir: Path,
     log: List[str],
+    discarded_revisions: Dict[str, int] | None = None,
 ) -> Tuple[set[str], set[str]]:
-    """Remove target parts identified by document relationship type."""
+    """Remove target parts identified by document relationship type.
+
+    Any pending tracked change inside a removed part goes with it, so each
+    part's revisions are counted before it is deleted, into
+    ``discarded_revisions``, and a part that carried any is reported with a
+    ``WARNING:`` line naming it and the count. A part that cannot be parsed
+    fails here rather than being discarded uncounted.
+    """
     rels_path = target_extract_dir / "word" / "_rels" / "document.xml.rels"
     if not rels_path.is_file():
         return set(), set()
@@ -164,11 +179,23 @@ def _remove_existing_hf_files(
         path = target_extract_dir / name
         if not path.exists():
             continue
+        discarded = (
+            count_revisions(path.read_bytes(), f"{name} (target header/footer part)")
+            if name in part_names
+            else 0
+        )
         path.unlink()
         if name in part_names:
             log.append(f"Removed old part: {name}")
         else:
             log.append(f"Removed old rels: {name}")
+        if discarded:
+            if discarded_revisions is not None:
+                discarded_revisions[name] = discarded
+            log.append(
+                "WARNING: Discarded tracked revisions in replaced target part "
+                f"{name}: {discarded}"
+            )
     return part_names, rels_names
 
 
@@ -348,10 +375,16 @@ def _write_hf_parts(
             rels_xml=rels_xml,
         )
 
+        # The architect's pending changes arrive in the target as someone's
+        # pending changes nobody on the target side made: counted, and
+        # reported, before the part is written.
+        imported = count_revisions(xml_content, f"{part_name} (architect header/footer part)")
         part_path = target_extract_dir / part_name
         part_path.parent.mkdir(parents=True, exist_ok=True)
         part_path.write_text(prepare_xml_text_for_utf8(xml_content), encoding="utf-8")
         result.part_names.add(part_name)
+        if imported:
+            result.revisions_imported[part_name] = imported
         # The reader paired with the rewriter that later points these
         # references at their clones: a reference missed here would get none.
         result.style_ids.update(referenced_style_ids(xml_content, CONTENT_STYLE_REFERENCES))
@@ -362,6 +395,11 @@ def _write_hf_parts(
         )
         part_to_type[part_name] = kind
         log.append(f"Wrote {kind} part: {part_name}")
+        if imported:
+            log.append(
+                "WARNING: Imported tracked revisions in architect part "
+                f"{part_name}: {imported}"
+            )
 
         rels_name = entry.get("rels_part_name")
         target_by_rid: Dict[str, str] = {}
@@ -827,7 +865,9 @@ def import_headers_footers(target_extract_dir: Path, registry: Dict[str, Any], l
         log.append("No architect headers/footers are reachable from mapped sections; preserving target parts")
         return result
 
-    removed_parts, removed_rels = _remove_existing_hf_files(target_extract_dir, log)
+    removed_parts, removed_rels = _remove_existing_hf_files(
+        target_extract_dir, log, result.revisions_discarded
+    )
     result.replaced_target_parts = True
     result.removed_part_names.update(removed_parts)
     result.removed_rels_names.update(removed_rels)

@@ -27,6 +27,7 @@ closed rather than publishing a document whose numbers are a guess.
 
 from __future__ import annotations
 
+import itertools
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -79,6 +80,7 @@ from .marker_tools import (
     _wq,
 )
 from .ooxml_text import prepare_xml_text_for_utf8, read_xml_text, write_xml_text
+from .revisions import highest_annotation_id_in_package, max_annotation_id
 from .sectpr_tools import extract_all_sectpr_blocks
 from .untrusted_xml import parse_untrusted_xml
 from .xml_helpers import (
@@ -135,10 +137,33 @@ def _paragraph_mark_revision(paragraph_xml: str) -> Optional[str]:
 
 
 
-#: Revision ids must be unique within the document. The source's own ids are
-#: Word's, in the low thousands at most; starting well above that keeps the
-#: application's insertions from colliding with them without needing to scan.
-_MARKER_REVISION_ID_BASE = 900000
+#: The largest revision id this converter will write. ``w:id`` is an
+#: ``ST_DecimalNumber``, unbounded in the schema, but Word reads it as a signed
+#: 32-bit integer, so an id past this is one Word may not open.
+_MAX_REVISION_ID = 2**31 - 1
+
+
+def _first_free_revision_id(document_xml: str, highest_elsewhere: Optional[int]) -> int:
+    """The first revision id above every annotation id the package uses.
+
+    A revision's ``w:id`` shares one space with every annotation in the
+    document -- bookmarks, comment ranges and references, the comments
+    themselves, permission ranges and every other revision -- and a reviewer's
+    ids reach any size Word likes. A fixed base only moves the collision
+    somewhere less likely; allocating above the highest id actually present
+    removes it. ``highest_elsewhere`` is the highest id in the package's other
+    parts (headers, footers, notes, comments), which the body cannot show.
+    """
+
+    candidates = [
+        value
+        for value in (
+            max_annotation_id(document_xml, "word/document.xml"),
+            highest_elsewhere,
+        )
+        if value is not None
+    ]
+    return max(0, max(candidates, default=-1) + 1)
 
 
 def _utc_revision_date() -> str:
@@ -578,8 +603,11 @@ def _predict_marked_paragraph(
     Canadian marker, when there is one, comes off as
     :func:`_predict_marker_removal` says, and the CSI marker goes on as
     :func:`_predict_marker_insertion` says. Tracked, the paragraph outside this
-    application's own revisions is the source, untouched. ``None`` when the
-    source gives no place to form the prediction.
+    application's own revisions is the source, untouched, and the paragraph
+    gains revisions in this application's name: the marker's ``w:ins`` and,
+    where automatic numbering is cancelled, the ``w:pPrChange`` that lets a
+    rejection restore it. ``None`` when the source gives no place to form the
+    prediction.
     """
 
     source = paragraph_run_content_signature(paragraph_xml)
@@ -602,10 +630,14 @@ def _predict_marked_paragraph(
     )
     if run_content is None or outside is None:
         return None
+    own_revisions: Tuple[str, ...] = ()
+    if tracked:
+        own_revisions = ("ins",) if literal else ("ins", "pPrChange")
     return ExpectedParagraphChange(
         visible_text=_marked_text(marker, body),
         run_content=run_content,
         run_content_outside_own_revisions=outside,
+        own_revisions=own_revisions,
     )
 
 
@@ -871,8 +903,14 @@ def plan_canadian_to_csi(
     numbering_xml: str = "",
     settings_xml: str = "",
     revision_date: str = "",
+    highest_annotation_id: Optional[int] = None,
 ) -> ConversionPlan:
-    """Validate and build the complete document edit before writing anything."""
+    """Validate and build the complete document edit before writing anything.
+
+    ``highest_annotation_id`` is the highest annotation id in the package's
+    parts other than the body; tracked markers are numbered above it and above
+    every id in ``document_xml``.
+    """
 
     items = classifications.get("classifications")
     if not isinstance(items, list):
@@ -1103,6 +1141,12 @@ def plan_canadian_to_csi(
     # markers are tracked too.
     tracked = source_tracks_revisions(settings_xml)
     date = revision_date or _utc_revision_date()
+    first_revision_id = (
+        _first_free_revision_id(document_xml, highest_annotation_id) if tracked else 0
+    )
+    # Allocated in document order, which within a paragraph puts the property
+    # revision in w:pPr before the marker's insertion.
+    revision_ids = itertools.count(first_revision_id)
 
     # The counter walk runs to completion *before* any paragraph is touched,
     # and the list it produces is then asserted against the finished document.
@@ -1125,6 +1169,12 @@ def plan_canadian_to_csi(
                 locate.at(index),
             )
         predicted.append((index, role, _csi_marker(role, counters)))
+
+    if tracked and first_revision_id + 2 * len(predicted) - 1 > _MAX_REVISION_ID:
+        raise ValueError(
+            "No revision id is free above the annotation ids this document "
+            f"already uses for {2 * len(predicted)} tracked marker revisions."
+        )
 
     replacements: Dict[int, str] = {}
     edits: List[MarkerEdit] = []
@@ -1185,7 +1235,7 @@ def plan_canadian_to_csi(
                     styles_xml,
                 ),
                 tracked=tracked,
-                revision_id=_MARKER_REVISION_ID_BASE + 2 * len(edits) + 1,
+                revision_id=next(revision_ids) if tracked else 0,
                 revision_date=date,
             )
             source_kind = "automatic"
@@ -1195,7 +1245,7 @@ def plan_canadian_to_csi(
             stripped,
             marker,
             tracked=tracked,
-            revision_id=_MARKER_REVISION_ID_BASE + 2 * len(edits),
+            revision_id=next(revision_ids) if tracked else 0,
             revision_date=date,
         )
         _verify_marked_paragraph(index, converted, marker, body, describe=locate)
@@ -1295,6 +1345,7 @@ def apply_canadian_to_csi(
     styles_path = Path(extract_dir) / "word" / "styles.xml"
     numbering_path = Path(extract_dir) / "word" / "numbering.xml"
     settings_path = Path(extract_dir) / "word" / "settings.xml"
+    settings_xml = read_xml_text(settings_path) if settings_path.is_file() else ""
     plan = plan_canadian_to_csi(
         read_xml_text(document_path),
         read_xml_text(styles_path),
@@ -1302,8 +1353,13 @@ def apply_canadian_to_csi(
         numbering_xml=(
             read_xml_text(numbering_path) if numbering_path.is_file() else ""
         ),
-        settings_xml=(
-            read_xml_text(settings_path) if settings_path.is_file() else ""
+        settings_xml=settings_xml,
+        # Only a tracked conversion writes revision ids, so only it pays for
+        # reading every part to find the ids already taken.
+        highest_annotation_id=(
+            highest_annotation_id_in_package(Path(extract_dir))
+            if source_tracks_revisions(settings_xml)
+            else None
         ),
     )
     write_xml_text(document_path, plan.document_xml)

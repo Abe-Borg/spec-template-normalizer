@@ -866,6 +866,8 @@ def apply_environment_to_target(
         "style_ids": set(),
         "direct_num_ids": set(),
         "replaced_target_parts": False,
+        "revisions_discarded": 0,
+        "revisions_imported": 0,
     }
     # The target keeps its own switch unless its header set is replaced: the
     # switch governs how those headers render, so it belongs with them.
@@ -888,6 +890,9 @@ def apply_environment_to_target(
             "style_ids": set(imported.style_ids),
             "direct_num_ids": set(imported.direct_num_ids),
             "replaced_target_parts": imported.replaced_target_parts,
+            # Totals only: the per-part counts are already in the log.
+            "revisions_discarded": sum(imported.revisions_discarded.values()),
+            "revisions_imported": sum(imported.revisions_imported.values()),
         }
         if imported.replaced_target_parts:
             applied = apply_header_parity(target_extract_dir, registry, log)
