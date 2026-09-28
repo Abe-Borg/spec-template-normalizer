@@ -608,12 +608,39 @@ alphabetic level that runs past `z` fails closed rather than writing `aa.`,
 because the shared `_ROLE_MARKERS` tables only ever match a single letter, so
 `aa.` would produce a document this application could not read back.
 
-An **untracked** marker is inserted **into the paragraph's existing first text
-run**, not as new runs. It then inherits that run's character formatting (a
-bold heading gets a bold number), and the paragraph's run structure is
-unchanged, which is what the run-property invariant in `phase2_invariants.py`
-checks. Adding runs would trip that invariant for a change that loses no
-formatting at all; the answer is not to widen the invariant.
+**A marker stands where the number stood.** Word renders an automatic number
+ahead of everything in the paragraph -- the number, its suffix tab, then the
+paragraph's runs -- so a tab, break, carriage return, positional tab or symbol
+before the first text *follows* the number. The marker for an automatically
+numbered paragraph therefore goes before the first content child of the
+paragraph's **first run with any content**, after that run's `w:rPr` and an
+inert `w:lastRenderedPageBreak`, and that run may be a text-less one ahead of
+the run holding the text (`_first_run_content`; a run holding nothing else is
+passed over). Written before the first `w:t` instead, as it used to be, a line
+Word showed as `1.1<tab><tab>SUMMARY` came out `<tab>1.1<tab>SUMMARY`, which
+every normalized text check reads identically. A *typed* Canadian marker being
+replaced is different: it stood where its author typed it, often behind tabs
+typed ahead of it to indent the level, so its replacement goes before the
+paragraph's first `w:t`, where the typed marker began, and keeps that
+indentation. A run holding only a drawing is not run content here, as in the
+run-content signature, so a marker still follows a leading inline drawing.
+
+Both places are proven on the XML, not on the text: `_marker_stands_first`
+requires the marker's own text node to be the first run content (automatic) or
+the first text node (typed), in `_verify_marked_paragraph` and again in
+`_verify_prediction` (`typed_markers` names the typed ones). A misplaced marker
+is this application's defect, so it fails `conversion_prediction_mismatch`;
+`_predict_marker_insertion` predicts the same placement on the signature, so
+the exact prediction and the final gate hold it too. The field and revision
+refusal still covers everything before the first text: a leading tab inside a
+tracked insertion or a field, or after a complex field, is refused as before.
+
+An **untracked** marker is inserted **into that run**, not as new runs. It then
+inherits that run's character formatting (a bold heading gets a bold number),
+and the paragraph's run structure is unchanged, which is what the run-property
+invariant in `phase2_invariants.py` checks. Adding runs would trip that
+invariant for a change that loses no formatting at all; the answer is not to
+widen the invariant.
 
 A **tracked** marker cannot do that -- a revision is a subtree, so it must be
 its own run inside `w:ins`, which shifts every later run index and sibling
@@ -624,8 +651,8 @@ structure is identical to the source again. The projection is scoped by author,
 so a reviewer's pending edits stay in the comparison -- losing run formatting
 inside one of those is as damaging as losing it anywhere else.
 
-That `w:ins` is the *sibling* of the run holding the first text, placed before
-it, and the run is found as an element. Searching back for the nearest `<w:r`
+That `w:ins` is the *sibling* of the run an untracked marker would have joined,
+placed before it and carrying its `w:rPr`, and the run is found as an element. Searching back for the nearest `<w:r`
 also matches `<w:rPr`, which put the revision inside every formatted run ahead
 of the run's own properties: a `w:r` holding a `w:ins`, invalid OOXML that the
 package validator, checking well-formedness rather than the schema, published.
@@ -1621,6 +1648,12 @@ Before considering a formatter change complete:
 - Writing a marker from the classified role without proving it matches the
   list level the document actually renders.
 - Placing a generated marker inside a field result or tracked insertion.
+- Placing a marker for an automatic number after a leading tab, break or
+  symbol by inserting it before the paragraph's first `w:t`. Word renders the
+  number ahead of all run content; the marker goes before the first content of
+  the first run with any. (A typed marker's replacement stays where the typed
+  marker began, inside the author's indentation.) Prove the place on the XML:
+  normalized text reads a leading tab as nothing.
 - Finding a run by searching back for `<w:r`, which also matches `<w:rPr`.
   Locate the run as an element (`iter_element_xml_blocks`), or a tracked
   marker's `w:ins` lands inside a formatted run.

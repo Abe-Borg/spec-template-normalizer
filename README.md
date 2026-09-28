@@ -345,6 +345,17 @@ target's own formatting alone. The marker joins the paragraph's existing first
 run, so it picks up that run's character formatting rather than arriving in the
 document default.
 
+The marker goes exactly where Word showed the number. Word draws an automatic
+number ahead of everything in the paragraph, so when a paragraph's text starts
+with a tab, a line break or a symbol, the number came first and the tab after
+it. The marker is written in front of that tab, as the number was, not behind
+it.
+A typed Canadian marker is different: it stood where its author typed it, often
+after tabs typed in front of it to indent the level, so its CSI replacement
+takes its place and keeps that indentation. The application checks the
+marker's position in the file's structure, not just the text, because a
+leading tab reads as nothing in a plain text comparison.
+
 Taking the automatic numbering away also takes away anything the numbering
 definition was supplying, and in most Canadian templates that includes the
 indentation: the list styles set a numbering level and no indent of their own,
@@ -363,8 +374,9 @@ group. Rejecting them all restores the file exactly. Your own pending edits are
 carried through untouched either way. With tracking off, the markers are
 written as ordinary text as before. Either way `run.json` records which
 happened, so it is never left to inference. A tracked marker is a run of its
-own, placed just before the run that holds the paragraph's text and carrying
-that run's character formatting, so a bold heading still gets a bold number.
+own, placed just before the run an untracked marker would have joined and
+carrying that run's character formatting, so a bold heading still gets a bold
+number.
 Every revision the conversion writes is numbered above the highest id the file
 already uses — its bookmarks, comments, and your own pending revisions,
 wherever in the file they are — so none can collide with an id Word already
@@ -713,6 +725,10 @@ fails instead of publishing a header that still names the architect's section.
   one Word list, starting at 1, without restarts or level overrides, and with
   every paragraph on that list converted. An unnumbered paragraph is preserved
   rather than given an invented marker.
+- Canadian-to-CSI writes each marker where Word showed the number — ahead of a
+  leading tab or line break for an automatic number, in the typed marker's
+  place for a typed one — and proves that position in the file's structure,
+  not only in its text.
 - Canadian conversion edits only recognized leading numbering markers in
   classified paragraphs and verifies that substantive text and protected OOXML
   remain unchanged. When it fails closed, the detailed message names the
