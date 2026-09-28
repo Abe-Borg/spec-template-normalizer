@@ -125,6 +125,11 @@ tests/test_revision_accounting.py
     the revision census in every mode, damage only it can see, the tracked
     reverse conversion's exact delta, header/footer revisions counted and
     reported, and revision ids allocated above every existing annotation id
+tests/test_conversion_verification.py, tests/test_independent_verification_all_modes.py
+    the independent verifiers: standard library only, no code shared with the
+    engine, every expectation written by hand before the engine runs --
+    canadian_to_csi in the first, the other three modes end to end in the
+    second (whitelist, exact text, revisions, ids, header parity, namespaces)
 docs/docx_method_hardening/
     the multi-session hardening program derived from the spec-formatting
     method documents: the implementation plan, the machine-checked progress
@@ -1533,7 +1538,8 @@ python -m pytest tests/test_sanitized_format_only_corpus.py -q
 python -m pytest tests/test_builtin_scheme.py tests/test_canadian_to_csi.py \
     tests/test_architect_free_modes.py -q
 python -m pytest tests/test_geometry_invariant.py \
-    tests/test_conversion_verification.py -q
+    tests/test_conversion_verification.py \
+    tests/test_independent_verification_all_modes.py -q
 python -m pytest tests/test_final_gate_text_identity.py \
     tests/test_conversion_prediction.py -q
 python -m pytest tests/test_error_location.py -q
@@ -1551,10 +1557,23 @@ of single-PR sessions; its tracker is the only record of where the program
 stands and the test keeps it honest; each probe exits non-zero while the
 defect it reproduces still exists.
 
-`tests/test_conversion_verification.py` is deliberately written against the
-standard library alone and shares no helper code with the engine. Keep it that
-way: its value is that it can disagree with the engine's own invariants, which
-is exactly what a suite written from the same mental model cannot do.
+`tests/test_conversion_verification.py` (the reverse conversion) and
+`tests/test_independent_verification_all_modes.py` (Format-only and both
+forward Canadian modes) are deliberately written against the standard library
+alone and share no helper code with the engine. Keep them that way: their value
+is that they can disagree with the engine's own invariants, which is exactly
+what a suite written from the same mental model cannot do. The second imports
+exactly one thing from `spec_formatter`, the public entry point, to *produce*
+the output it checks; a test in it parses its own imports and fails on any
+other. Its expectations -- every paragraph's exact text with tabs, breaks,
+revisions and fields spelled out, the package members each mode may touch
+and is predicted to touch, the revision census, the even/odd switch -- are
+written by hand in the test source before the engine runs: never derived from
+`ApplicationPolicy`, never read back off the output. And each of its checks is
+also run against the real output damaged the way a defect would damage it, and
+must reject that, so a check that has stopped being able to fail is noticed.
+A change that makes a prediction there wrong is a change to what a mode does:
+fix the prediction only once the new behaviour is understood and intended.
 
 Rendered geometry is proved outside the test suite, because LibreOffice is not
 available everywhere and does not implement pStyle-linked numbering levels

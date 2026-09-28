@@ -772,10 +772,15 @@ could quote the document would be a redaction hole rather than a diagnostic.
 `tests/test_conversion_verification.py` re-checks a conversion using only the
 standard library, sharing no code with the engine. A suite written from the
 same mental model as the code can agree with it by making the same mistake;
-this one is built so it can disagree. `tests/test_geometry_invariant.py` covers
-the indentation check directly, and `scripts/proof_render.py` compares where
-words actually land in two rendered documents when a change warrants proving
-against a renderer rather than against the markup.
+this one is built so it can disagree. `tests/test_independent_verification_all_modes.py`
+does the same for Format-only and both CSI → Canadian modes, end to end through
+the public entry point, with every expectation — each paragraph's exact text,
+the package parts each mode may touch, the tracked revisions, the even/odd
+header switch — written out by hand before the engine runs.
+`tests/test_geometry_invariant.py` covers the indentation check directly, and
+`scripts/proof_render.py` compares where words actually land in two rendered
+documents when a change warrants proving against a renderer rather than
+against the markup.
 
 `tests/style_application_regression/test_run_content_signature.py` covers the
 exact run-content comparison behind Format-only's body-text check, and
