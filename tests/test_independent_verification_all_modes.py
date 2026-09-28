@@ -138,7 +138,8 @@ NOTE_TEXT = (
 )
 
 #: A table: out of scope in every mode. The second cell starts with a typed
-#: marker that no mode may treat as a list item.
+#: marker that no mode may treat as a list item. A reviewer's tracked move
+#: runs from the first cell to the second, each end inside its named range.
 TABLE = (
     '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr>'
     '<w:tblGrid><w:gridCol w:w="4000"/><w:gridCol w:w="4000"/></w:tblGrid><w:tr>'
@@ -146,12 +147,21 @@ TABLE = (
     '<w:r><w:t xml:space="preserve">Pipe </w:t></w:r>'
     f'<w:ins w:id="15" {REVIEWER}><w:r><w:t>size</w:t></w:r></w:ins>'
     f'<w:del w:id="16" {REVIEWER}><w:r><w:delText>diameter</w:delText></w:r></w:del>'
+    f'<w:moveFromRangeStart w:id="41" {REVIEWER} w:name="move1"/>'
+    f'<w:moveFrom w:id="42" {REVIEWER}><w:r><w:t xml:space="preserve"> schedule</w:t></w:r>'
+    '</w:moveFrom><w:moveFromRangeEnd w:id="41"/>'
     "</w:p></w:tc>"
     '<w:tc><w:tcPr><w:tcW w:w="4000" w:type="dxa"/></w:tcPr><w:p>'
-    "<w:r><w:t>A.</w:t><w:tab/><w:t>Not a list item</w:t></w:r></w:p></w:tc>"
-    "</w:tr></w:tbl>"
+    "<w:r><w:t>A.</w:t><w:tab/><w:t>Not a list item</w:t></w:r>"
+    f'<w:moveToRangeStart w:id="43" {REVIEWER} w:name="move1"/>'
+    f'<w:moveTo w:id="44" {REVIEWER}><w:r><w:t xml:space="preserve"> schedule</w:t></w:r>'
+    '</w:moveTo><w:moveToRangeEnd w:id="43"/>'
+    "</w:p></w:tc></w:tr></w:tbl>"
 )
-TABLE_TEXTS = ("Pipe {+size+}{-diameter-}", "A.\tNot a list item")
+TABLE_TEXTS = (
+    "Pipe {+size+}{-diameter-}[moveFromRangeStart 41]{< schedule<}[moveFromRangeEnd 41]",
+    "A.\tNot a list item[moveToRangeStart 43]{> schedule>}[moveToRangeEnd 43]",
+)
 
 #: A paragraph holding a VML text box, and the text box's own paragraph.
 TEXT_BOX = (
@@ -355,6 +365,13 @@ ARCHITECT_MODE_REVISIONS = {
     ("Reviewer", "del"): 2,
     ("Reviewer", "rPrChange"): 1,
     ("Reviewer", "pPrChange"): 1,
+    ("Reviewer", "moveFrom"): 1,
+    ("Reviewer", "moveTo"): 1,
+    ("Reviewer", "moveFromRangeStart"): 1,
+    ("Reviewer", "moveToRangeStart"): 1,
+    # A range's end carries only the id it shares with its start.
+    (None, "moveFromRangeEnd"): 1,
+    (None, "moveToRangeEnd"): 1,
 }
 FORMAT_ONLY_REVISIONS = {**ARCHITECT_MODE_REVISIONS, ("Reviewer", "ins"): 4}
 
@@ -960,7 +977,19 @@ def _text_of(element: ET.Element) -> str:
     return text
 
 
-def _render_run(run: ET.Element, *, deleted: bool) -> str:
+#: Which text and field-instruction elements a run may hold, by the revision
+#: it sits in. Deleted text is w:delText and only deleted text is, so a w:t
+#: inside a deletion, or a w:delText outside one, renders as what it is not.
+#: Moved-from text is both deleted and still in the document; either is read.
+_TEXT_TAGS = {
+    "plain": ({"t"}, {"instrText"}),
+    "deleted": ({"delText"}, {"delInstrText"}),
+    "moved_from": ({"t", "delText"}, {"instrText", "delInstrText"}),
+}
+
+
+def _render_run(run: ET.Element, *, context: str) -> str:
+    text_tags, instruction_tags = _TEXT_TAGS[context]
     out = []
     for child in run:
         if child.tag in _DRAWINGS:
@@ -969,11 +998,9 @@ def _render_run(run: ET.Element, *, deleted: bool) -> str:
         local = _local(child)
         if local in _INERT_RUN_CHILDREN:
             continue
-        # Deleted text is w:delText and only deleted text is: a w:t inside a
-        # deletion, or a w:delText outside one, is not what it claims to be.
-        if local == ("delText" if deleted else "t"):
+        if local in text_tags:
             out.append(_text_of(child))
-        elif local == ("delInstrText" if deleted else "instrText"):
+        elif local in instruction_tags:
             out.append(f"[instr {child.text or ''}]")
         elif local == "tab":
             out.append("\t")
@@ -1002,18 +1029,24 @@ def _render_run(run: ET.Element, *, deleted: bool) -> str:
     return "".join(out)
 
 
-def _render(element: ET.Element, *, deleted: bool = False) -> str:
+def _render(element: ET.Element, *, context: str = "plain") -> str:
     out = []
     for child in element:
         local = _local(child)
         if local in ("p", "pPr"):
             continue
         if local == "r":
-            out.append(_render_run(child, deleted=deleted))
+            out.append(_render_run(child, context=context))
         elif local in _WRAPPERS:
             opening, closing = _WRAPPERS[local]
-            inner = _render(child, deleted=deleted or local in ("del", "moveFrom"))
-            out.append(opening + inner + closing)
+            inner_context = context
+            if local == "del":
+                inner_context = "deleted"
+            elif local == "moveFrom" and context == "plain":
+                inner_context = "moved_from"
+            out.append(opening + _render(child, context=inner_context) + closing)
+        elif local in _REVISION_RANGES:
+            out.append(f"[{local} {child.get(_w('id'))}]")
         elif local == "bookmarkStart":
             out.append(f"[bm {child.get(_w('id'))} {child.get(_w('name'))}]")
         elif local == "bookmarkEnd":
@@ -1043,10 +1076,12 @@ _REVISION_RANGES = {
     "customXmlMoveFromRangeStart", "customXmlMoveFromRangeEnd",
     "customXmlMoveToRangeStart", "customXmlMoveToRangeEnd",
 }
+#: Annotations whose id is shared by design: a bookmark's two ends, a
+#: comment's range, reference and body, and every revision range's two ends.
 _PAIRED_ANNOTATIONS = {
     "bookmarkStart", "bookmarkEnd", "commentRangeStart", "commentRangeEnd",
     "commentReference", "comment",
-}
+} | _REVISION_RANGES
 
 
 def _revision_census(document: bytes) -> dict[tuple[str | None, str], int]:
@@ -1060,7 +1095,13 @@ def _revision_census(document: bytes) -> dict[tuple[str | None, str], int]:
     return dict(counts)
 
 
-def _annotations(members: dict[str, bytes]) -> list[tuple[str, str, str]]:
+def _annotation_id(raw: str) -> int | str:
+    """An id as Word reads it: ``01`` and ``1`` are the same annotation."""
+
+    return int(raw) if re.fullmatch(r"[+-]?\d+", raw.strip()) else raw
+
+
+def _annotations(members: dict[str, bytes]) -> list[tuple[str, str, int | str]]:
     """(part, local name, id) for every revision and paired annotation."""
 
     found = []
@@ -1074,7 +1115,7 @@ def _annotations(members: dict[str, bytes]) -> list[tuple[str, str, str]]:
             if local in _REVISION_ELEMENTS | _PAIRED_ANNOTATIONS:
                 identifier = element.get(_w("id"))
                 if identifier is not None:
-                    found.append((name, local, identifier))
+                    found.append((name, local, _annotation_id(identifier)))
     return found
 
 
@@ -1128,7 +1169,11 @@ def _declared_namespaces_cover_markup_compatibility(name: str, payload: bytes) -
             for attribute, value in item.attrib.items():
                 if attribute in (f"{{{MC}}}Ignorable", f"{{{MC}}}MustUnderstand"):
                     named.extend(value.split())
-                elif attribute == f"{{{MC}}}ProcessContent":
+                elif attribute in (
+                    f"{{{MC}}}ProcessContent",
+                    f"{{{MC}}}PreserveElements",
+                    f"{{{MC}}}PreserveAttributes",
+                ):
                     named.extend(token.split(":", 1)[0] for token in value.split())
                 elif attribute == "Requires" and item.tag == f"{{{MC}}}Choice":
                     named.extend(value.split())
@@ -1329,7 +1374,7 @@ def _check_revision_ids(mode: str, before: Members, after: Members) -> None:
     duplicated = sorted(value for value, count in Counter(identifiers).items() if count > 1)
     assert not duplicated, duplicated
 
-    def paired(members: Members) -> list[tuple[str, str, str]]:
+    def paired(members: Members) -> list[tuple[str, str, int | str]]:
         return [item for item in _annotations(members) if item[1] in _PAIRED_ANNOTATIONS]
 
     assert paired(before), "check must not pass vacuously"
@@ -1539,6 +1584,14 @@ MUTATIONS = {
         _in_document(b'<w:del w:id="16" ', b'<w:del w:id="15" '),
         _check_revision_ids,
     ),
+    "a revision id duplicated under another spelling": (
+        _in_document(b'<w:del w:id="16" ', b'<w:del w:id="015" '),
+        _check_revision_ids,
+    ),
+    "a move range's end renumbered": (
+        _in_document(b'<w:moveFromRangeEnd w:id="41"/>', b'<w:moveFromRangeEnd w:id="45"/>'),
+        _check_revision_ids,
+    ),
     "a bookmark's end renumbered": (
         _in_document(b'<w:bookmarkEnd w:id="31"/>', b'<w:bookmarkEnd w:id="32"/>'),
         _check_revision_ids,
@@ -1561,6 +1614,12 @@ MUTATIONS = {
     ),
     "an ignorable prefix left undeclared": (
         _in_document(b'mc:Ignorable="w14"', b'mc:Ignorable="w14 w15"'),
+        _check_namespaces,
+    ),
+    "an undeclared prefix in a preserve list": (
+        _in_document(
+            b'mc:Ignorable="w14"', b'mc:Ignorable="w14" mc:PreserveElements="w15:x"'
+        ),
         _check_namespaces,
     ),
     "a content-type-only XML part malformed": (

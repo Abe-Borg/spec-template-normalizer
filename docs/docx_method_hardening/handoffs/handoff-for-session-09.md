@@ -29,10 +29,10 @@ first tool call, in this order:
   - Baseline before any change: `python -m pytest -q` gave 1670 passed,
     1 skipped. The skip is the GUI test, which needs `tkinter`.
   - After the change:
-    - `tests/test_independent_verification_all_modes.py`: 76 passed
-      (3 modes x (9 checks + 15 mutation self-tests), 3 prediction-table
+    - `tests/test_independent_verification_all_modes.py`: 85 passed
+      (3 modes x (9 checks + 18 mutation self-tests), 3 prediction-table
       checks, 1 import check);
-    - `python -m pytest -q`: 1746 passed, 1 skipped;
+    - `python -m pytest -q`: 1755 passed, 1 skipped;
     - `python -m pytest tests/test_sanitized_format_only_corpus.py -q`:
       2 passed;
     - `tests/test_engine_identity.py` (no fingerprinted file touched) and
@@ -56,12 +56,19 @@ first tool call, in this order:
       section properties without a shell likewise; the imported headers and
       footers read as the architect's; both inputs are byte-identical after
       the run.
-    - **The checks can fail.** Each check is a function, and fifteen
+    - **The checks can fail.** Each check is a function, and eighteen
       mutations of every mode's real output must each be rejected by the
       check that exists to find it. Two mutations first exposed gaps in the
       verifier itself (a `ParseError` escaping as a non-assertion, and a
       `w:t` inside a deletion rendering like `w:delText`); both were fixed
       before the PR.
+    - **After review of PR 68** (Codex, three P2 findings, all fixed): move
+      and custom-XML range markers count as paired annotations (the fixture
+      gained a tracked move with its named ranges), ids compare as numbers
+      (`01` is `1`), and `mc:PreserveElements` / `mc:PreserveAttributes`
+      prefixes are checked. Each has a mutation that the reverted fix lets
+      through. A fourth finding (the placeholder handoff) was already fixed
+      by the commit that wrote this file.
     - **Predicted first.** The two architect modes matched the hand-written
       predictions on their first run. The standalone run was withheld by the
       engine (finding 1 below), so its fixture gives the target a numbering

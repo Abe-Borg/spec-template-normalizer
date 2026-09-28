@@ -1179,7 +1179,8 @@ shares no code with the engine.
   cannot see (doubled spaces, edge spaces, tabs and breaks beside spaces,
   non-breaking spaces, soft and non-breaking hyphens, a carriage return, a
   positional tab, a symbol, a field), a reviewer's insertions, deletions,
-  paragraph-mark insertion and property revisions, a bookmark, a comment
+  paragraph-mark insertion, property revisions and a tracked move with its
+  named ranges, a bookmark, a comment
   range and reference, a footnote reference, a hyperlink, a table, an empty
   paragraph and a VML text box -- in paragraphs each mode leaves alone as
   well as in the ones it converts or restyles. The target also carries
@@ -1194,9 +1195,10 @@ shares no code with the engine.
   paragraph, nested ones included, in a notation that spells out tabs,
   breaks, revision containers, fields, references and bookmarks, and reads a
   text node without `xml:space="preserve"` as Word does, edge whitespace
-  dropped. (3) The revision census by author and kind. (4) Revision ids unique
-  among revision elements across every output part, paired annotations held
-  to the source. (5) Even/odd parity: on for the Format-only architect, off
+  dropped. (3) The revision census by author and kind. (4) Revision ids,
+  read as numbers as Word reads them, unique among revision elements across
+  every output part; paired annotations (bookmarks, comment ranges, and the
+  move and custom-XML range markers) held to the source. (5) Even/odd parity: on for the Format-only architect, off
   (a dormant even header) for the Canadian one against a target whose switch
   is on, and the standalone target's settings part byte-identical. (6) Every
   XML part parses, and every prefix a markup-compatibility attribute names is
@@ -1207,14 +1209,19 @@ shares no code with the engine.
   byte-identical after the run.
 - **The checks can fail.** Each check is a function of the mode and the two
   packages, and `test_each_check_rejects_the_damage_it_exists_to_find` runs
-  fifteen mutations of every mode's real output (a dropped tab, a lost
+  eighteen mutations of every mode's real output (a dropped tab, a lost
   `xml:space`, deleted text made plain, a table attribute, a revision
-  re-signed or dropped, a duplicated id, a footnotes change, a stray or
-  dropped member, the even/odd switch flipped, an undeclared ignorable
-  prefix, a malformed content-type-only part) through the check that exists
-  to find each. Two of them first showed gaps in the verifier itself, both
-  fixed before the PR: a parse failure surfaced as `ParseError` rather than a
-  check failure, and a `w:t` inside a deletion rendered like `w:delText`.
+  re-signed or dropped, a duplicated id, in the same or another spelling, a
+  move range's end renumbered, a footnotes change, a stray or dropped member,
+  the even/odd switch flipped, an undeclared prefix in an ignorable or a
+  preserve list, a malformed content-type-only part) through the check that
+  exists to find each. Two of them first showed gaps in the verifier itself,
+  both fixed before the PR: a parse failure surfaced as `ParseError` rather
+  than a check failure, and a `w:t` inside a deletion rendered like
+  `w:delText`. After review of PR 68, range markers count as paired
+  annotations, ids compare as numbers, and `mc:PreserveElements` and
+  `mc:PreserveAttributes` are checked like `mc:ProcessContent`; each fix has
+  its own mutation, which the reverted fix lets through.
 - **Predicted first.** The predictions were written before the engine ran,
   and the two architect modes matched them on the first run. The standalone
   run did not publish at all: the engine withheld it (below), so its fixture
