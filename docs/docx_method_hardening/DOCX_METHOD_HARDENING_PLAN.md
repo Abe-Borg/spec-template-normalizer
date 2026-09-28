@@ -1165,13 +1165,81 @@ output.
 beside the existing independent verifier and repeats the rule that it
 shares no code with the engine.
 
+*As implemented (session 08):*
+
+- **One module, self-contained.** `tests/test_independent_verification_all_modes.py`
+  writes its own fixtures as literal XML (a target per mode, and an architect
+  for the two architect modes, with a Format-only and a Canadian list), its
+  own architect classifier, and its own readers. It imports nothing from
+  another test module either, so nothing the engine's own suite believes can
+  leak in. `test_module_imports_nothing_from_the_engine` parses the module's
+  imports and allows only the standard library, `pytest`, and
+  `from spec_formatter import format_specifications`.
+- **What the fixtures carry.** Every run-content kind a normalized reading
+  cannot see (doubled spaces, edge spaces, tabs and breaks beside spaces,
+  non-breaking spaces, soft and non-breaking hyphens, a carriage return, a
+  positional tab, a symbol, a field), a reviewer's insertions, deletions,
+  paragraph-mark insertion and property revisions, a bookmark, a comment
+  range and reference, a footnote reference, a hyperlink, a table, an empty
+  paragraph and a VML text box -- in paragraphs each mode leaves alone as
+  well as in the ones it converts or restyles. The target also carries
+  footnotes, comments, a theme, a font table, a header of its own, a
+  `[trash]` item and `customXml/item2.data`, which only `[Content_Types].xml`
+  declares XML. The standalone target's settings are UTF-16.
+- **The checks, per mode.** (1) The whitelist: a remit written from the mode
+  (`REMIT`) and resolved through the packages' relationships, so a settings,
+  theme or header part is recognised as Word finds it; plus the exact
+  predicted changed, added and removed sets, the architect's header set
+  matched through the output's relationships. (2) Exact text of every
+  paragraph, nested ones included, in a notation that spells out tabs,
+  breaks, revision containers, fields, references and bookmarks, and reads a
+  text node without `xml:space="preserve"` as Word does, edge whitespace
+  dropped. (3) The revision census by author and kind. (4) Revision ids unique
+  among revision elements across every output part, paired annotations held
+  to the source. (5) Even/odd parity: on for the Format-only architect, off
+  (a dormant even header) for the Canadian one against a target whose switch
+  is on, and the standalone target's settings part byte-identical. (6) Every
+  XML part parses, and every prefix a markup-compatibility attribute names is
+  declared in scope. Beyond the plan: paragraphs a mode does not edit are
+  held to element identity (attributes and properties, not only text),
+  tables in every mode and section properties without a shell; the imported
+  headers and footers read as the architect's; and both inputs are
+  byte-identical after the run.
+- **The checks can fail.** Each check is a function of the mode and the two
+  packages, and `test_each_check_rejects_the_damage_it_exists_to_find` runs
+  fifteen mutations of every mode's real output (a dropped tab, a lost
+  `xml:space`, deleted text made plain, a table attribute, a revision
+  re-signed or dropped, a duplicated id, a footnotes change, a stray or
+  dropped member, the even/odd switch flipped, an undeclared ignorable
+  prefix, a malformed content-type-only part) through the check that exists
+  to find each. Two of them first showed gaps in the verifier itself, both
+  fixed before the PR: a parse failure surfaced as `ParseError` rather than a
+  check failure, and a `w:t` inside a deletion rendered like `w:delText`.
+- **Predicted first.** The predictions were written before the engine ran,
+  and the two architect modes matched them on the first run. The standalone
+  run did not publish at all: the engine withheld it (below), so its fixture
+  now gives the target a numbering part of its own, and says why.
+- **Found, not fixed** (handoff 09). (a) `_verify_target_header_footer_preserved`
+  compares the target's header and footer `<Relationship>` elements as raw
+  text, but the engine's own writers re-serialize
+  `word/_rels/document.xml.rels` with ElementTree (`Target="header9.xml" />`).
+  So a target that keeps its own header set is withheld with
+  `INVARIANT FAIL: relationship subset changed` whenever a relationship is
+  added to it: the standalone mode on any target with a header and no
+  numbering part, and the architect modes when the architect has no header
+  parts and the shell or numbering import wires in a part the target lacks.
+  It fails closed, never publishes a bad file. (b) The header/footer importer
+  keeps an architect part's revision ids as they were, so an imported pending
+  revision can share its id with one in the target's body; that publishes.
+- **No engine change**, no new counter, code, stage or policy field.
+
 **Definition of done**
 
-- [ ] New stdlib-only verifier covers `format_only`, `csi_to_canadian` and `csi_to_canadian_standalone`.
-- [ ] Predictions are hand-written in the test source; no assertion derives its expectation from engine output.
-- [ ] The module imports nothing from the engine except the public entry point that produces the output.
-- [ ] `CLAUDE.md` updated.
-- [ ] Full suite green on the PR.
+- [x] New stdlib-only verifier covers `format_only`, `csi_to_canadian` and `csi_to_canadian_standalone`.
+- [x] Predictions are hand-written in the test source; no assertion derives its expectation from engine output.
+- [x] The module imports nothing from the engine except the public entry point that produces the output.
+- [x] `CLAUDE.md` updated.
+- [x] Full suite green on the PR.
 
 ## 5. Optional work items
 
