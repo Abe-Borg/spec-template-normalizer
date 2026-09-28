@@ -860,6 +860,18 @@ def _blocks(*texts: str):
     ]
 
 
+def _marked(marker: str, text: str):
+    """A converted paragraph as the converter writes it: the marker's own text
+    node and its tab, joined to the front of the paragraph's run."""
+
+    return (
+        0,
+        0,
+        f'<w:p><w:r><w:t xml:space="preserve">{marker}</w:t><w:tab/>'
+        f'<w:t xml:space="preserve">{text}</w:t></w:r></w:p>',
+    )
+
+
 def test_prediction_catches_a_marker_that_was_never_written() -> None:
     """A predicted paragraph that did not receive its marker fails closed.
 
@@ -871,7 +883,7 @@ def test_prediction_catches_a_marker_that_was_never_written() -> None:
     with pytest.raises(EngineError) as raised:
         _verify_prediction(
             _blocks("GENERAL", "SUMMARY"),
-            _blocks("PART 1\tGENERAL", "SUMMARY"),
+            [_marked("PART 1", "GENERAL"), *_blocks("SUMMARY")],
             [(0, "PART", "PART 1"), (1, "ARTICLE", "1.1")],
             describe=_no_locator,
         )
@@ -885,7 +897,7 @@ def test_prediction_catches_an_edit_nobody_asked_for() -> None:
     with pytest.raises(EngineError) as raised:
         _verify_prediction(
             _blocks("GENERAL", "Untouched prose."),
-            _blocks("PART 1\tGENERAL", "Quietly rewritten."),
+            [_marked("PART 1", "GENERAL"), *_blocks("Quietly rewritten.")],
             [(0, "PART", "PART 1")],
             describe=_no_locator,
         )
@@ -896,7 +908,7 @@ def test_prediction_catches_an_edit_nobody_asked_for() -> None:
 def test_prediction_accepts_the_document_it_predicted() -> None:
     _verify_prediction(
         _blocks("GENERAL", "Untouched prose."),
-        _blocks("PART 1\tGENERAL", "Untouched prose."),
+        [_marked("PART 1", "GENERAL"), *_blocks("Untouched prose.")],
         [(0, "PART", "PART 1")],
         describe=_no_locator,
     )
@@ -1079,3 +1091,296 @@ def test_reject_simulation_does_not_swallow_neighbouring_paragraphs() -> None:
         for _s, _e, block in iter_paragraph_xml_blocks(rejected)
     ]
     assert texts == ["Front matter.", "GENERAL", "SUMMARY"]
+
+
+# --- Marker placement before leading structural content -------------------
+#
+# Word renders an automatic number before everything in the paragraph: the
+# number, its suffix tab, then the paragraph's own runs, a leading tab or break
+# included. The typed marker that replaces the number must stand in the same
+# place. Written before the paragraph's first text node instead, it followed
+# any tab, break or symbol that came before the text, so a line Word showed as
+# "1.1<tab><tab>SUMMARY" came out as "<tab>1.1<tab>SUMMARY". The text checks
+# could not see it: a tab reads as a space there, and leading space is
+# stripped. Every expectation below is the exact paragraph content, written
+# out by hand.
+
+_MARKER_RUN_CONTENT = '<w:t xml:space="preserve">PART 1</w:t><w:tab/>'
+_MARKER_INS = '<w:ins w:author="Specification Formatter" w:date="2026-01-01T00:00:00Z">'
+_TRACKED_MARKER = f"{_MARKER_INS}<w:r>{_MARKER_RUN_CONTENT}</w:r></w:ins>"
+
+#: ``(source runs, untracked output, tracked output)`` for one PART heading
+#: whose number Word renders automatically.
+_LEADING_CONTENT = [
+    pytest.param(
+        "<w:r><w:tab/><w:t>GENERAL</w:t></w:r>",
+        f"<w:r>{_MARKER_RUN_CONTENT}<w:tab/><w:t>GENERAL</w:t></w:r>",
+        f"{_TRACKED_MARKER}<w:r><w:tab/><w:t>GENERAL</w:t></w:r>",
+        id="tab-before-the-text-in-its-run",
+    ),
+    pytest.param(
+        "<w:r><w:tab/></w:r><w:r><w:t>GENERAL</w:t></w:r>",
+        f"<w:r>{_MARKER_RUN_CONTENT}<w:tab/></w:r><w:r><w:t>GENERAL</w:t></w:r>",
+        f"{_TRACKED_MARKER}<w:r><w:tab/></w:r><w:r><w:t>GENERAL</w:t></w:r>",
+        id="tab-in-an-earlier-text-less-run",
+    ),
+    pytest.param(
+        "<w:r><w:lastRenderedPageBreak/><w:t>GENERAL</w:t></w:r>",
+        f"<w:r><w:lastRenderedPageBreak/>{_MARKER_RUN_CONTENT}<w:t>GENERAL</w:t></w:r>",
+        f"{_TRACKED_MARKER}<w:r><w:lastRenderedPageBreak/><w:t>GENERAL</w:t></w:r>",
+        id="inert-rendered-page-break",
+    ),
+    pytest.param(
+        "<w:r><w:br/><w:t>GENERAL</w:t></w:r>",
+        f"<w:r>{_MARKER_RUN_CONTENT}<w:br/><w:t>GENERAL</w:t></w:r>",
+        f"{_TRACKED_MARKER}<w:r><w:br/><w:t>GENERAL</w:t></w:r>",
+        id="line-break",
+    ),
+    pytest.param(
+        '<w:r><w:ptab w:relativeTo="margin" w:alignment="left" w:leader="none"/></w:r>'
+        "<w:r><w:t>GENERAL</w:t></w:r>",
+        f'<w:r>{_MARKER_RUN_CONTENT}<w:ptab w:relativeTo="margin" w:alignment="left" '
+        'w:leader="none"/></w:r><w:r><w:t>GENERAL</w:t></w:r>',
+        f'{_TRACKED_MARKER}<w:r><w:ptab w:relativeTo="margin" w:alignment="left" '
+        'w:leader="none"/></w:r><w:r><w:t>GENERAL</w:t></w:r>',
+        id="positional-tab-in-an-earlier-run",
+    ),
+    pytest.param(
+        '<w:r><w:sym w:font="Wingdings" w:char="F0FC"/><w:t>GENERAL</w:t></w:r>',
+        f'<w:r>{_MARKER_RUN_CONTENT}<w:sym w:font="Wingdings" w:char="F0FC"/>'
+        "<w:t>GENERAL</w:t></w:r>",
+        f'{_TRACKED_MARKER}<w:r><w:sym w:font="Wingdings" w:char="F0FC"/>'
+        "<w:t>GENERAL</w:t></w:r>",
+        id="symbol",
+    ),
+    # The marker goes after the run's properties and after an inert rendered
+    # page break, and the run it joins -- or, tracked, the run it precedes and
+    # copies -- is the one holding the tab, not the one holding the text.
+    pytest.param(
+        "<w:r><w:rPr><w:b/></w:rPr><w:lastRenderedPageBreak/><w:tab/></w:r>"
+        "<w:r><w:rPr><w:b/></w:rPr><w:t>GENERAL</w:t></w:r>",
+        f"<w:r><w:rPr><w:b/></w:rPr><w:lastRenderedPageBreak/>{_MARKER_RUN_CONTENT}"
+        "<w:tab/></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>GENERAL</w:t></w:r>",
+        f"{_MARKER_INS}<w:r><w:rPr><w:b/></w:rPr>{_MARKER_RUN_CONTENT}</w:r></w:ins>"
+        "<w:r><w:rPr><w:b/></w:rPr><w:lastRenderedPageBreak/><w:tab/></w:r>"
+        "<w:r><w:rPr><w:b/></w:rPr><w:t>GENERAL</w:t></w:r>",
+        id="formatted-run-with-a-page-break-then-a-tab",
+    ),
+    # Runs with no content at all -- properties only, or only a rendered page
+    # break -- are passed over: nothing in them renders after the number.
+    pytest.param(
+        "<w:r><w:rPr><w:i/></w:rPr></w:r><w:r><w:lastRenderedPageBreak/></w:r>"
+        "<w:r><w:cr/><w:t>GENERAL</w:t></w:r>",
+        "<w:r><w:rPr><w:i/></w:rPr></w:r><w:r><w:lastRenderedPageBreak/></w:r>"
+        f"<w:r>{_MARKER_RUN_CONTENT}<w:cr/><w:t>GENERAL</w:t></w:r>",
+        "<w:r><w:rPr><w:i/></w:rPr></w:r><w:r><w:lastRenderedPageBreak/></w:r>"
+        f"{_TRACKED_MARKER}<w:r><w:cr/><w:t>GENERAL</w:t></w:r>",
+        id="runs-without-content-first",
+    ),
+]
+
+
+def _convert_leading(runs: str, settings_xml: str = ""):
+    return plan_canadian_to_csi(
+        _document([f'<w:p><w:pPr><w:pStyle w:val="Geo0"/></w:pPr>{runs}</w:p>']),
+        _geometry_styles_xml(),
+        _classifications(["PART"]),
+        numbering_xml=_geometry_numbering_xml(),
+        settings_xml=settings_xml,
+        revision_date="2026-01-01T00:00:00Z",
+    )
+
+
+def _content_after_properties(document_xml: str, index: int = 0) -> str:
+    """A paragraph's content after its ``w:pPr``, with revision ids left out.
+
+    The last ``</w:pPr>`` closes the paragraph's own properties: a tracked
+    conversion nests the previous ones inside ``w:pPrChange``.
+    """
+
+    block = list(iter_paragraph_xml_blocks(document_xml))[index][2]
+    closing = block.rfind("</w:pPr>")
+    start = (
+        closing + len("</w:pPr>")
+        if closing >= 0
+        else block.index("<w:pPr/>") + len("<w:pPr/>")
+    )
+    return re.sub(r' w:id="\d+"', "", block[start : -len("</w:p>")])
+
+
+@pytest.mark.parametrize("source, untracked, _tracked", _LEADING_CONTENT)
+def test_untracked_marker_leads_the_paragraphs_run_content(
+    source: str, untracked: str, _tracked: str
+) -> None:
+    plan = _convert_leading(source)
+    assert _content_after_properties(plan.document_xml) == untracked
+    assert paragraph_text_from_block(
+        list(iter_paragraph_xml_blocks(plan.document_xml))[0][2]
+    ).startswith("PART 1")
+
+
+@pytest.mark.parametrize("source, _untracked, tracked", _LEADING_CONTENT)
+def test_tracked_marker_run_precedes_the_first_run_with_content(
+    source: str, _untracked: str, tracked: str
+) -> None:
+    plan = _convert_leading(source, _TRACKING_ON)
+    assert _content_after_properties(plan.document_xml) == tracked
+    # Rejecting the revisions gives back the source's runs exactly.
+    assert _content_after_properties(_reject_all(plan.document_xml)) == source
+
+
+@pytest.mark.parametrize(
+    "leading",
+    [
+        pytest.param(
+            '<w:ins w:id="5" w:author="Reviewer" w:date="2026-01-01T00:00:00Z">'
+            "<w:r><w:tab/></w:r></w:ins>",
+            id="tracked-insertion",
+        ),
+        pytest.param(
+            '<w:fldSimple w:instr=" SEQ Heading "><w:r><w:tab/></w:r></w:fldSimple>',
+            id="simple-field",
+        ),
+        pytest.param(
+            '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+            '<w:r><w:instrText xml:space="preserve"> SEQ Heading </w:instrText></w:r>'
+            '<w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:tab/></w:r>',
+            id="complex-field",
+        ),
+    ],
+)
+@pytest.mark.parametrize("settings_xml", ["", _TRACKING_ON], ids=["untracked", "tracked"])
+def test_a_field_or_revision_before_a_leading_tab_is_still_refused(
+    leading: str, settings_xml: str
+) -> None:
+    """Moving the marker earlier must not move it past the existing refusal.
+
+    A marker inside a tracked insertion or a field result dies when the
+    revision is rejected or the field is updated, and the numbering it
+    replaced is gone by then. The refusal still covers everything before the
+    paragraph's first text, so a leading tab inside such markup -- or one that
+    merely follows a field -- still stops the target.
+    """
+
+    with pytest.raises(EngineError) as raised:
+        _convert_leading(f"{leading}<w:r><w:t>GENERAL</w:t></w:r>", settings_xml)
+    assert raised.value.code == "canadian_to_csi_hierarchy"
+    assert "tracked change or field" in str(raised.value)
+
+
+def test_a_typed_marker_is_replaced_where_it_stood() -> None:
+    """A typed marker's replacement takes its place, after any leading tabs.
+
+    Unlike an automatic number, a typed one stands where the author typed it,
+    and a hand-numbered spec often indents its levels with tabs typed in
+    front of the marker. Moving the replacement ahead of those tabs would pull
+    every number out of the author's indentation.
+    """
+
+    rows = [
+        ("PART", '<w:r><w:t xml:space="preserve">PART 1 GENERAL</w:t></w:r>'),
+        ("ARTICLE", '<w:r><w:tab/><w:t xml:space="preserve">1.1 SUMMARY</w:t></w:r>'),
+        ("PARAGRAPH", "<w:r><w:tab/></w:r><w:r><w:tab/><w:t>.1 Text here.</w:t></w:r>"),
+    ]
+    plan = plan_canadian_to_csi(
+        _document([f"<w:p><w:pPr/>{runs}</w:p>" for _role, runs in rows]),
+        builtin_scheme.build_styles_xml(),
+        _classifications([role for role, _runs in rows]),
+        numbering_xml="",
+    )
+    assert _content_after_properties(plan.document_xml, 1) == (
+        '<w:r><w:tab/><w:t xml:space="preserve">1.1</w:t><w:tab/>'
+        '<w:t xml:space="preserve">SUMMARY</w:t></w:r>'
+    )
+    assert _content_after_properties(plan.document_xml, 2) == (
+        '<w:r><w:tab/></w:r><w:r><w:tab/><w:t xml:space="preserve">A.</w:t><w:tab/>'
+        "<w:t>Text here.</w:t></w:r>"
+    )
+
+
+def _place_after_leading_content(paragraph_xml: str, marker: str, **_kwargs) -> str:
+    """The old untracked placement: before the paragraph's first text node."""
+
+    first_text = re.search(r"<w:t[ >]", paragraph_xml)
+    assert first_text is not None
+    return (
+        paragraph_xml[: first_text.start()]
+        + f'<w:t xml:space="preserve">{marker}</w:t><w:tab/>'
+        + paragraph_xml[first_text.start():]
+    )
+
+
+def test_the_edit_check_refuses_a_marker_behind_leading_content(monkeypatch) -> None:
+    """Checked on the XML: a marker after a leading tab is not a leading marker.
+
+    The paragraph still *reads* "PART 1 GENERAL", which is all the text check
+    looks at. The structural check reads the run content and refuses it before
+    the prediction is consulted.
+    """
+
+    from spec_formatter.style_application.core import canadian_to_csi
+
+    monkeypatch.setattr(canadian_to_csi, "_insert_marker", _place_after_leading_content)
+    with pytest.raises(EngineError) as raised:
+        _convert_leading("<w:r><w:tab/><w:t>GENERAL</w:t></w:r>")
+    assert raised.value.code == "conversion_prediction_mismatch"
+    assert "first content" in str(raised.value)
+    assert raised.value.location is not None
+    assert raised.value.location.paragraph_index == 0
+    assert "GENERAL" not in str(raised.value)
+
+
+def test_the_prediction_check_refuses_a_marker_behind_leading_content() -> None:
+    before = '<w:p><w:r><w:tab/><w:t>GENERAL</w:t></w:r></w:p>'
+    leading = (
+        '<w:p><w:r><w:t xml:space="preserve">PART 1</w:t><w:tab/><w:tab/>'
+        "<w:t>GENERAL</w:t></w:r></w:p>"
+    )
+    behind = (
+        '<w:p><w:r><w:tab/><w:t xml:space="preserve">PART 1</w:t><w:tab/>'
+        "<w:t>GENERAL</w:t></w:r></w:p>"
+    )
+    _verify_prediction(
+        [(0, 0, before)], [(0, 0, leading)], [(0, "PART", "PART 1")], describe=_no_locator
+    )
+    with pytest.raises(EngineError) as raised:
+        _verify_prediction(
+            [(0, 0, before)], [(0, 0, behind)], [(0, "PART", "PART 1")], describe=_no_locator
+        )
+    assert raised.value.code == "conversion_prediction_mismatch"
+    assert "first content" in str(raised.value)
+
+
+def test_the_prediction_check_holds_a_typed_marker_to_the_first_text_node() -> None:
+    """Replacing a typed marker, the new one must be the paragraph's first text."""
+
+    before = '<w:p><w:r><w:tab/><w:t>PART 1 GENERAL</w:t></w:r></w:p>'
+    in_place = (
+        '<w:p><w:r><w:tab/><w:t xml:space="preserve">PART 1</w:t><w:tab/>'
+        "<w:t>GENERAL</w:t></w:r></w:p>"
+    )
+    _verify_prediction(
+        [(0, 0, before)],
+        [(0, 0, in_place)],
+        [(0, "PART", "PART 1")],
+        describe=_no_locator,
+        typed_markers=frozenset({0}),
+    )
+    # Each of these still reads "PART 1 GENERAL".
+    for misplaced in (
+        # The marker merged into the text it numbers...
+        '<w:p><w:r><w:tab/><w:t xml:space="preserve">PART 1 GENERAL</w:t></w:r></w:p>',
+        # ...or written behind a text node of its own.
+        '<w:p><w:r><w:t xml:space="preserve"> </w:t><w:t xml:space="preserve">PART 1'
+        "</w:t><w:tab/><w:t>GENERAL</w:t></w:r></w:p>",
+    ):
+        with pytest.raises(EngineError) as raised:
+            _verify_prediction(
+                [(0, 0, before)],
+                [(0, 0, misplaced)],
+                [(0, "PART", "PART 1")],
+                describe=_no_locator,
+                typed_markers=frozenset({0}),
+            )
+        assert raised.value.code == "conversion_prediction_mismatch"
+        assert "first text" in str(raised.value)

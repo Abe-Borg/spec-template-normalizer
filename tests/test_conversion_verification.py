@@ -92,10 +92,22 @@ def _styles_xml() -> str:
     )
 
 
+#: Leading structural content Word renders *after* an automatic number, as
+#: ``(runs before the text run, children before the text in it)``: a manual tab
+#: in a text-less run of its own, a tab inside the text run, and the rendered
+#: page break Word writes into the first run on every page, which is inert.
+_LEADING = {
+    3: ("<w:r><w:tab/></w:r>", ""),
+    4: ("", "<w:tab/>"),
+    6: ("", "<w:lastRenderedPageBreak/>"),
+}
+
+
 def _document_xml(*, tracked_insertion_at: int | None = None) -> str:
     paragraphs = []
     for index, (role, text) in enumerate(_BODY):
-        run = f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r>'
+        runs_before, inside = _LEADING.get(index, ("", ""))
+        run = f'{runs_before}<w:r>{inside}<w:t xml:space="preserve">{text}</w:t></w:r>'
         if index == tracked_insertion_at:
             run += (
                 '<w:ins w:id="900" w:author="Reviewer" w:date="2026-01-01T00:00:00Z">'
@@ -327,6 +339,58 @@ def test_structural_children_change_only_by_the_marker_tabs(converted) -> None:
         assert delta == 0, local
 
 
+#: The marker each paragraph of ``_BODY`` must receive, written out by hand.
+_EXPECTED_MARKERS = ["PART 1", "1.1", "A.", "1.", "2.", "1.2", "A.", "PART 2", "2.1", "A."]
+
+#: Run children that render nothing: the run's properties, and Word's note of
+#: where a page last ended.
+_INERT_RUN_CHILDREN = {_q("rPr"), _q("lastRenderedPageBreak")}
+
+
+def _first_run_content(paragraph: ET.Element) -> tuple[list[ET.Element], ET.Element | None]:
+    """The content children of the paragraph's first run that has any, and its parent.
+
+    Runs are taken in document order at any depth, so a run inside a revision
+    or a hyperlink counts where it stands.
+    """
+
+    parents = {child: parent for parent in paragraph.iter() for child in parent}
+    for run in paragraph.iter(_q("r")):
+        content = [child for child in run if child.tag not in _INERT_RUN_CHILDREN]
+        if content:
+            return content, parents[run]
+    return [], None
+
+
+def test_the_fixture_leads_paragraphs_with_structural_content(converted) -> None:
+    """Guard on the fixture: the placement checks below must have work to do."""
+
+    before, _after = converted
+    leading = [
+        index
+        for index, paragraph in enumerate(_paragraphs(before))
+        if _first_run_content(paragraph)[0][0].tag != _q("t")
+    ]
+    assert leading == [3, 4]
+
+
+def test_each_marker_is_the_first_run_content(converted) -> None:
+    """Word renders an automatic number before everything in the paragraph.
+
+    So the marker's own text node, then its tab, must be the first content of
+    the paragraph's first run with any -- ahead of a leading tab, and after
+    nothing but run properties and an inert rendered page break. Checked on the
+    elements, where a normalized text reading turns the leading tab into a
+    space and strips it.
+    """
+
+    _before, after = converted
+    for index, (paragraph, marker) in enumerate(zip(_paragraphs(after), _EXPECTED_MARKERS)):
+        content, _parent = _first_run_content(paragraph)
+        assert [child.tag for child in content[:2]] == [_q("t"), _q("tab")], index
+        assert content[0].text == marker, index
+
+
 def test_run_structure_is_unchanged(converted) -> None:
     """The marker joins an existing run rather than adding one."""
 
@@ -449,6 +513,20 @@ def test_accepting_every_revision_yields_the_numbered_document(converted_tracked
     assert markers == [
         "PART 1", "1.1", "A.", "1.", "2.", "1.2", "A.", "PART 2", "2.1", "A.",
     ]
+
+
+def test_each_tracked_marker_run_is_the_first_run_content(converted_tracked) -> None:
+    """Tracked, the marker is a run of its own inside this application's
+    insertion, and that run is the paragraph's first content: before a
+    text-less run holding a leading tab, not merely before the text."""
+
+    _before, after = converted_tracked
+    for index, (paragraph, marker) in enumerate(zip(_paragraphs(after), _EXPECTED_MARKERS)):
+        content, parent = _first_run_content(paragraph)
+        assert parent is not None and parent.tag == _q("ins"), index
+        assert parent.get(_q("author")) == "Specification Formatter", index
+        assert [child.tag for child in content] == [_q("t"), _q("tab")], index
+        assert content[0].text == marker, index
 
 
 def test_tracked_markers_do_not_disturb_the_package(converted_tracked) -> None:

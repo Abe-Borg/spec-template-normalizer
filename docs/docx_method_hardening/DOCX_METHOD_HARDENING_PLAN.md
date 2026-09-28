@@ -1068,13 +1068,71 @@ that the marker is the first run content.
 **Documentation.** `CLAUDE.md` "Common mistakes": placing a marker after a
 leading tab or break.
 
+*As implemented (session 07):*
+
+- **A plan refinement: typed markers are replaced in place.** The approach
+  above is right for an *automatically* numbered paragraph, whose number Word
+  renders ahead of every run. It is wrong for a *typed* Canadian marker the
+  converter replaces: that marker stood where its author typed it, and a
+  hand-numbered spec often indents its levels with tabs typed in front of the
+  marker (`<tab>.1<tab>Text`). Leading the run content there would pull every
+  replacement out of that indentation, a visible change the item exists to
+  prevent. So `_insert_marker(typed=...)` keeps the typed path where it was --
+  before the first `w:t`, where the typed marker began -- and only the
+  automatic path moves. The item's intent (the marker stands where the source
+  showed its number) is unchanged; the first Definition of done box is
+  worded to match. Typed replacement under tracking still fails closed, so
+  every tracked marker takes the automatic path.
+- **Placement.** `_first_run_content` finds the first run, in document order,
+  holding any direct child but `w:rPr` and `w:lastRenderedPageBreak`, and the
+  offset of that first content child; untracked, the marker is spliced there,
+  and tracked, the `w:ins` goes before that run and copies its `w:rPr`.
+  Out-of-scope subtrees are placeholders in the edit's view and are stripped
+  from the signature, so a run holding only a drawing is not run content in
+  either, and a marker still follows a leading inline drawing (recorded in
+  handoff 08).
+- **Refusal unchanged.** The field and revision refusal still searches
+  everything before the paragraph's first `w:t`. The marker is never written
+  after that point, so the slice covers anything that could enclose it: a
+  leading tab inside a tracked insertion or a simple field, or after a complex
+  field, is refused exactly as before (tested, tracked and untracked).
+- **Prediction.** `_predict_marker_insertion(typed=...)` restates the same
+  rule on the source signature: position 0 of the first non-empty run, or
+  before the first `t` item for a typed marker. It is worked out on the
+  signature, not read off the edit, so the converter's own exact check and
+  the final gate both hold the placement.
+- **Structural post-checks.** `_marker_stands_first` reads the run content
+  (the signature, on the XML) and requires the marker's own text node to be
+  the first run content, or for a typed marker the first text node.
+  `_verify_marked_paragraph(typed=...)` and
+  `_verify_prediction(typed_markers=...)` both run it after their text
+  checks. A misplaced marker is this application's defect, so both fail
+  `conversion_prediction_mismatch` rather than the hierarchy code, whose
+  remediation sends the user to check their heading levels. No new code,
+  stage or policy field.
+- **Tests.** `tests/test_canadian_to_csi.py`: eight leading-content shapes
+  (a tab in the text run, a tab in an earlier text-less run, an inert
+  rendered page break, a line break, a positional tab, a symbol, a formatted
+  run with a page break then a tab, and content-less runs first), each with
+  the exact untracked and tracked output written by hand, the tracked ones
+  also rejected back to the source; the three refusals; the typed placement;
+  and both post-checks. Three older `_verify_prediction` unit tests had fake
+  output with the marker and text in one `w:t`, which the converter never
+  writes; they now use the converter's shape.
+  `tests/test_conversion_verification.py`: the fixture gains a tab in a
+  text-less run, a tab in the text run and a rendered page break, with
+  element-level checks, untracked and tracked, that the marker is the first
+  run content. `tests/test_architect_free_modes.py`: the same end to end
+  through `format_specifications`, where the unchanged engine published the
+  misplaced marker as a success.
+
 **Definition of done**
 
-- [ ] Untracked markers lead the paragraph's run content structurally, not merely after whitespace normalization.
-- [ ] Structural post-check added to the edit verification and the prediction check.
-- [ ] Tests listed above added and passing.
-- [ ] `CLAUDE.md` updated.
-- [ ] Full suite green on the PR.
+- [x] Untracked markers lead the paragraph's run content structurally, not merely after whitespace normalization (a typed marker's replacement stands where the typed marker began; see *as implemented*).
+- [x] Structural post-check added to the edit verification and the prediction check.
+- [x] Tests listed above added and passing.
+- [x] `CLAUDE.md` updated.
+- [x] Full suite green on the PR.
 
 ### WI-08: Independent stdlib verifier for the other three modes
 
