@@ -347,3 +347,88 @@ def test_supplying_a_template_to_a_builtin_mode_is_rejected(tmp_path: Path) -> N
     assert diagnostic is not None
     assert diagnostic.code == "input_architect_not_accepted"
     assert "does not take an architect template" in diagnostic.message
+
+
+def _lead_paragraph_with(document: str, text: str, runs: str) -> str:
+    """Put *runs* at the front of the one paragraph whose runs read *text*."""
+
+    import re
+
+    paragraphs = [
+        match
+        for match in re.finditer(r"<w:p[ >][\s\S]*?</w:p>", document)
+        if f">{text}</w:t>" in match.group(0)
+    ]
+    assert len(paragraphs) == 1, text
+    paragraph = paragraphs[0].group(0)
+    properties_end = paragraph.index("</w:pPr>") + len("</w:pPr>")
+    led = paragraph[:properties_end] + runs + paragraph[properties_end:]
+    return document.replace(paragraph, led, 1)
+
+
+def test_canadian_to_csi_marker_leads_a_leading_tab_through_the_final_gate(
+    tmp_path: Path,
+) -> None:
+    """WI-07, end to end: the packaged output, after every later stage.
+
+    A Canadian paragraph whose runs begin with a tab renders as number, suffix
+    tab, that tab, then the text. The typed CSI marker must stand where the
+    number stood, first in the paragraph's run content, and the final gate --
+    which holds every paragraph to the converter's exact prediction -- must
+    accept that and nothing else.
+    """
+
+    import re
+    import xml.etree.ElementTree as ET
+
+    source = _write_docx(tmp_path / "spec.docx")
+    canadian = _run(tmp_path, source, CSI_TO_CANADIAN_STANDALONE, "canadian")
+    assert canadian.success, "\n".join(canadian.targets[0].log)
+    intermediate = canadian.targets[0].output_path
+    assert intermediate is not None
+
+    with zipfile.ZipFile(intermediate) as package:
+        parts = {name: package.read(name) for name in package.namelist()}
+    document = parts["word/document.xml"].decode("utf-8")
+    document = _lead_paragraph_with(document, "SUMMARY", "<w:r><w:tab/></w:r>")
+    document = _lead_paragraph_with(
+        document, "Provide listed quick-response sprinklers.", "<w:r><w:br/></w:r>"
+    )
+    parts["word/document.xml"] = document.encode("utf-8")
+    led = tmp_path / "led" / "spec_CANADIAN.docx"
+    led.parent.mkdir()
+    with zipfile.ZipFile(led, "w", zipfile.ZIP_DEFLATED) as package:
+        for name, payload in parts.items():
+            package.writestr(name, payload)
+
+    back = _run(tmp_path, led, CANADIAN_TO_CSI, "csi")
+    assert back.success, "\n".join(back.targets[0].log)
+    result = back.targets[0]
+    assert result.output_path is not None
+    validate_docx_package(result.output_path)
+
+    with zipfile.ZipFile(result.output_path) as package:
+        root = ET.fromstring(package.read("word/document.xml"))
+    w = f"{{{W_NS}}}"
+    inert = {f"{w}rPr", f"{w}lastRenderedPageBreak"}
+    found = {}
+    for paragraph in root.iter(f"{w}p"):
+        text = "".join(node.text or "" for node in paragraph.iter(f"{w}t"))
+        for expected, body in (("1.1", "SUMMARY"), ("A.", "Provide listed")):
+            if body in text:
+                first_run = next(
+                    run
+                    for run in paragraph.iter(f"{w}r")
+                    if any(child.tag not in inert for child in run)
+                )
+                found[expected] = [
+                    (child.tag[len(w):], child.text)
+                    for child in first_run
+                    if child.tag not in inert
+                ]
+    # The marker and its tab first, then the leading tab or break it joined.
+    assert found == {
+        "1.1": [("t", "1.1"), ("tab", None), ("tab", None)],
+        "A.": [("t", "A."), ("tab", None), ("br", None)],
+    }
+    assert re.search(r"1\.1\s+SUMMARY", " ".join(_text_lines(result.output_path)))
