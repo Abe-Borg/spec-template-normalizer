@@ -1125,6 +1125,23 @@ fallback), not a context-window limit; a response that stops at the
 output-token limit enters the bounded regeneration loop, while a refusal is
 terminal.
 
+A refusal is terminal in both classifiers, and each `ClassificationRefused`
+carries the `classification_refused` engine code from its constructor, so
+`run.json`, `audit.json` and the GUI say the model declined instead of
+publishing a fingerprinted `untrusted_error`. The provider names a category
+in `stop_details.category` (an open set: `cyber`, `bio`, `general_harms`,
+`reasoning_extraction`, ...), and Sonnet 5.5's `general_harms` can decline
+benign text, so the category is worth keeping: `llm_usage.refusal_category`
+reads it by shape only (a short lower-case identifier, else `None`), never
+touches the free-text `stop_details.explanation`, and the category reaches
+diagnostics as `refusal_category` -- on the target's `classify` event and on
+the architect's `init_failed` event. No server-side fallback is enabled, and
+that stays deliberate: the manifest records the model that produced a
+classification, and for the Sonnet 5.5 target classifier the fallback would
+retry only `cyber` and `frontier_llm` declines in any case.
+Neither prompt asks the model to write out its reasoning, which is what
+invites `reasoning_extraction` declines; keep it that way.
+
 ### `gui.py`
 
 Owns input collection, background execution, immutable active-run display,
@@ -1299,7 +1316,8 @@ Current codes: `header_footer_target_section_id_required`,
 `canadian_to_csi_tracked_hierarchy`, `geometry_not_preserved`,
 `conversion_prediction_mismatch`, `builtin_scheme_contract`, `classification_invalid_payload`,
 `classification_deterministic_override`,
-`classification_coverage_incomplete`, `paragraph_style_not_applied`,
+`classification_coverage_incomplete`, `classification_refused`,
+`paragraph_style_not_applied`,
 `numbering_importer_unavailable`, `style_import_namespace_conflict`,
 `template_section_shell_conflict`, `template_default_section_conflict`,
 `template_duplicate_section_index`.
@@ -1372,6 +1390,21 @@ size, the TTL may have expired, or the prefix may simply differ from the
 previous run's. Concurrent misses are not by themselves a correctness bug, and
 serializing requests to manufacture hits trades latency for them -- measure
 before assuming that trade is worth making.
+
+**The target system prompt ends with a think-first line.** Both classifiers
+answer through structured outputs, so the response text is JSON only and the
+model can work a classification out nowhere but in its thinking. Anthropic's
+Sonnet 5.5 guidance for reasoning tasks answered that way is to end the
+system prompt with `Think the problem through before you answer.`, which at
+`high` effort brings accuracy close to `xhigh` for a modest rise in output
+tokens. `phase2_run_instruction.txt` ends with that line and `_system_blocks`
+places the run instruction last (master prompt, `available_roles`, run
+instruction) so the line really is the end of the system prompt; it is in
+the prompt file, not in code, so `prompt_fingerprints.target` in `run.json`
+records it. The architect prompt does not carry it: Opus 5.5 at `high`
+already thinks at length on a template, and its guidance gives no such line.
+Effort is explicit on both (`high`); Opus 5.5 defaults to `medium`, and a
+different level is a measured change, not a carried-over one.
 
 **There is no target-classification cache, and the obvious key is wrong.**
 None exists because classification spend was judged immaterial. Keying one on

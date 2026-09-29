@@ -493,6 +493,54 @@ def test_refusal_is_terminal(monkeypatch):
     assert sleeps == []
 
 
+class _RefusalStream(_ScriptedStream):
+    def __init__(self, stop_details):
+        super().__init__("", stop_reason="refusal")
+        self.stop_details = stop_details
+
+    def get_final_message(self):
+        return types.SimpleNamespace(
+            stop_reason="refusal",
+            stop_details=self.stop_details,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stop_details", "expected"),
+    [
+        (
+            types.SimpleNamespace(
+                type="refusal",
+                category="general_harms",
+                explanation="Free text the provider wrote about the request.",
+            ),
+            "general_harms",
+        ),
+        ({"type": "refusal", "category": "cyber", "explanation": "Free text."}, "cyber"),
+        (types.SimpleNamespace(type="refusal", category=None, explanation=None), None),
+        (None, None),
+        (types.SimpleNamespace(category="Not an identifier!"), None),
+    ],
+)
+def test_refusal_carries_its_code_and_only_an_identifier_category(
+    monkeypatch, stop_details, expected
+):
+    from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS
+    from spec_formatter.style_application.core.llm_classifier import ClassificationRefused
+
+    _run(monkeypatch, [_RefusalStream(stop_details)])
+
+    with pytest.raises(ClassificationRefused) as caught:
+        classify_target_document(_unresolved_bundle(), ["PART"], api_key="k", model="m")
+
+    error = caught.value
+    assert error.safe_error_code == "classification_refused"
+    assert error.safe_error_message == ERROR_REMEDIATIONS["classification_refused"]
+    assert error.refusal_category == expected
+    assert f"category={expected or 'none'}" in str(error)
+    assert "Free text" not in str(error)
+
+
 def test_max_tokens_regenerates_with_the_retry_requirement(monkeypatch):
     _sdk, messages, _sleeps, _constructed = _run(
         monkeypatch,
@@ -587,8 +635,15 @@ def test_system_prefix_is_one_cached_block_and_user_turn_is_compact(monkeypatch)
     assert block["type"] == "text"
     assert block["cache_control"] == {"type": "ephemeral"}
     assert block["text"].startswith(PHASE2_MASTER_PROMPT.strip())
-    assert PHASE2_RUN_INSTRUCTION.strip() in block["text"]
-    assert block["text"].endswith('available_roles: ["PART"]')
+    assert 'available_roles: ["PART"]' in block["text"]
+    # The run instruction closes the system prompt, and it closes with the
+    # think-first line: a structured-output response is JSON only, so the
+    # model can work a classification out nowhere but in its thinking.
+    assert block["text"].endswith(PHASE2_RUN_INSTRUCTION.strip())
+    assert block["text"].index('available_roles: ["PART"]') < block["text"].index(
+        PHASE2_RUN_INSTRUCTION.strip()
+    )
+    assert block["text"].endswith("Think the problem through before you answer.")
     content = kwargs["messages"][0]["content"]
     assert content.startswith('available_roles: ["PART"]\n\n{')
     assert "\n  " not in content  # compact JSON, no indentation

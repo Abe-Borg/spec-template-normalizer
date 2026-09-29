@@ -13,12 +13,13 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set
 
-from ...llm_usage import UsageCollector, attach_usage
+from ...llm_usage import UsageCollector, attach_usage, refusal_category
 from .classification import (
     PHASE2_MASTER_PROMPT,
     PHASE2_RUN_INSTRUCTION,
     coerce_to_final_classifications,
 )
+from .errors import attach_engine_error
 
 
 # Sonnet 5.5's tokenizer (shared with Sonnet 5) produces ~30% more tokens for the same text than the
@@ -41,10 +42,16 @@ def _wire_json(value: Any) -> str:
 def _system_blocks(available_roles: list) -> List[dict]:
     """The byte-stable request prefix, marked for prompt caching.
 
-    The master prompt, run instruction, and role list do not change between
+    The master prompt, role list, and run instruction do not change between
     chunks, retries, or targets in one run, so they form one cached system
     block. Together they clear the model's minimum cacheable prefix, which the
     3.3 KB master prompt alone did not.
+
+    The run instruction goes last because it ends with the think-first line
+    Anthropic recommends for reasoning tasks answered through structured
+    outputs, and that guidance places the line at the end of the system
+    prompt: the JSON-only response leaves thinking as the only place the
+    model can work a classification out.
     """
 
     return [
@@ -52,10 +59,10 @@ def _system_blocks(available_roles: list) -> List[dict]:
             "type": "text",
             "text": (
                 PHASE2_MASTER_PROMPT.strip()
-                + "\n\n"
-                + PHASE2_RUN_INSTRUCTION.strip()
                 + "\n\navailable_roles: "
                 + json.dumps(list(available_roles))
+                + "\n\n"
+                + PHASE2_RUN_INSTRUCTION.strip()
             ),
             "cache_control": {"type": "ephemeral"},
         }
@@ -83,7 +90,17 @@ class ClassificationRefused(RuntimeError):
     Terminal: a refusal is not transient and regenerating the same request
     would not change the outcome. No server-side fallback is attempted
     because the run manifest records the model that produced the result.
+
+    It carries the ``classification_refused`` engine code, so ``run.json``,
+    the target's ``audit.json`` and the GUI say the model declined instead of
+    publishing an opaque fingerprint, and ``refusal_category`` holds the
+    provider's category (``None`` when it named none) for diagnostics.
     """
+
+    def __init__(self, message: str, category: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.refusal_category = category
+        attach_engine_error(self, "classification_refused")
 
 
 class _NeverRaised(Exception):
@@ -613,9 +630,11 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                         stop_reason = getattr(final_message, "stop_reason", None)
                 usage.record_response(final_message)
                 if stop_reason == "refusal":
+                    category = refusal_category(final_message)
                     raise ClassificationRefused(
                         "LLM refused the target-classification request "
-                        "(stop_reason=refusal)"
+                        f"(stop_reason=refusal, category={category or 'none'})",
+                        category=category,
                     )
                 if stop_reason == "max_tokens":
                     raise ValueError(

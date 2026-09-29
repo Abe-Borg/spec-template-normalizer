@@ -996,6 +996,60 @@ def test_max_tokens_response_enters_bounded_regeneration(monkeypatch) -> None:
     assert "max_tokens" in prompts[1]
 
 
+def test_refusal_carries_its_code_and_the_provider_category(monkeypatch) -> None:
+    """A decline is published as ``classification_refused``, not as noise.
+
+    The category is read by shape only; the provider's free-text explanation
+    never reaches the exception message.
+    """
+    from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS
+
+    _install_fake_anthropic(monkeypatch)
+
+    class RefusalStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_final_text(self):
+            return ""
+
+        def get_final_message(self):
+            return types.SimpleNamespace(
+                stop_reason="refusal",
+                stop_details=types.SimpleNamespace(
+                    type="refusal",
+                    category="cyber",
+                    explanation="Free text the provider wrote about the request.",
+                ),
+            )
+
+    class Messages:
+        def stream(self, **_kwargs):
+            return RefusalStream()
+
+    client = types.SimpleNamespace(messages=Messages())
+
+    with pytest.raises(llm_classifier.ClassificationRefused) as caught:
+        _request_json_response(
+            client,
+            "system",
+            "user",
+            "model",
+            response_schema=llm_classifier._instruction_response_schema(),
+            max_attempts=3,
+        )
+
+    error = caught.value
+    assert error.safe_error_code == "classification_refused"
+    assert error.safe_error_message == ERROR_REMEDIATIONS["classification_refused"]
+    assert error.refusal_category == "cyber"
+    assert "category=cyber" in str(error)
+    assert "Free text" not in str(error)
+
+
 def test_refusal_is_terminal_and_never_regenerated(monkeypatch) -> None:
     _install_fake_anthropic(monkeypatch)
     calls = 0

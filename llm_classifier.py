@@ -14,7 +14,8 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from spec_formatter.llm_usage import UsageCollector, attach_usage
+from spec_formatter.llm_usage import UsageCollector, attach_usage, refusal_category
+from spec_formatter.style_application.core.errors import attach_engine_error
 from paragraph_rules import (
     is_classifiable_paragraph,
     infer_expected_roles,
@@ -52,7 +53,17 @@ class ClassificationRefused(ValueError):
     Terminal: regenerating the same request would not change the outcome,
     and no server-side fallback is used because the profile manifest records
     the model that produced the classification.
+
+    It carries the ``classification_refused`` engine code, so the failed
+    run's ``run.json`` and the GUI say the model declined instead of
+    publishing an opaque fingerprint, and ``refusal_category`` holds the
+    provider's category (``None`` when it named none) for diagnostics.
     """
+
+    def __init__(self, message: str, category: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.refusal_category = category
+        attach_engine_error(self, "classification_refused")
 
 
 def _count_input_tokens(client: Any, model: str, system: str, user_message: str) -> Optional[int]:
@@ -364,9 +375,11 @@ def _call_api(
                         "completing its JSON (stop_reason=max_tokens)"
                     )
                 if stop_reason == "refusal":
+                    category = refusal_category(final_message)
                     raise ClassificationRefused(
                         "LLM refused the template-classification request "
-                        "(stop_reason=refusal)"
+                        f"(stop_reason=refusal, category={category or 'none'})",
+                        category=category,
                     )
                 if stop_reason not in (None, "end_turn"):
                     raise ValueError(

@@ -10,6 +10,7 @@ import pytest
 from spec_formatter.llm_usage import (
     UsageCollector,
     attach_usage,
+    refusal_category,
     usage_from_exception,
     usage_numbers,
 )
@@ -157,3 +158,20 @@ def test_attaching_usage_never_replaces_the_real_failure():
 def test_usage_numbers_reads_a_bare_object_without_usage():
     assert usage_numbers(object()) == {}
     assert usage_numbers(None) == {}
+
+
+def test_refusal_category_is_accepted_by_shape_and_nothing_else():
+    def refused(details):
+        return types.SimpleNamespace(stop_reason="refusal", stop_details=details)
+
+    # The category set is open, so a category added later is still read.
+    assert refusal_category(refused(types.SimpleNamespace(category="general_harms"))) == "general_harms"
+    assert refusal_category(refused({"category": "reasoning_extraction"})) == "reasoning_extraction"
+    assert refusal_category(refused(types.SimpleNamespace(category="a_future_category"))) == "a_future_category"
+    # No category, no details, or anything that is not a short identifier.
+    assert refusal_category(refused(types.SimpleNamespace(category=None))) is None
+    assert refusal_category(refused(None)) is None
+    assert refusal_category(types.SimpleNamespace(stop_reason="end_turn")) is None
+    assert refusal_category(None) is None
+    for unsafe in ("Cyber", "two words", "cyber\n", "x" * 49, "", 7, True):
+        assert refusal_category(refused({"category": unsafe})) is None

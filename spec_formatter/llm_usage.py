@@ -19,6 +19,7 @@ is a lower bound.
 
 from __future__ import annotations
 
+import re
 import threading
 from typing import Any, Dict, Optional
 
@@ -54,6 +55,32 @@ def usage_numbers(final_message: Any) -> Dict[str, int]:
             continue
         numbers[name] = value
     return numbers
+
+
+# Refusal categories are an open set the provider extends (``cyber``, ``bio``,
+# ``general_harms``, ``reasoning_extraction``, ...), so they are accepted by
+# shape rather than by list: a short lower-case identifier and nothing else.
+_REFUSAL_CATEGORY_RX = re.compile(r"[a-z][a-z0-9_]{0,47}")
+
+
+def refusal_category(final_message: Any) -> Optional[str]:
+    """Return the category a refusal named, or ``None`` when it named none.
+
+    ``stop_details`` is populated only when ``stop_reason == "refusal"``, and
+    its ``category`` may itself be null. Only an identifier-shaped value is
+    returned, so the category can reach diagnostics without carrying anything
+    else the response held (``stop_details.explanation`` is free text and is
+    never read).
+    """
+
+    details = getattr(final_message, "stop_details", None)
+    if isinstance(details, dict):
+        category = details.get("category")
+    else:
+        category = getattr(details, "category", None)
+    if isinstance(category, str) and _REFUSAL_CATEGORY_RX.fullmatch(category):
+        return category
+    return None
 
 
 class UsageCollector:

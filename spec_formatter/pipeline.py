@@ -2336,7 +2336,11 @@ def format_specifications(
         # one run that most needs a cost record - the one that produced no
         # profile and no output - would report nothing.
         recorder.record_usage("architect", usage_from_exception(exc))
-        recorder.error("pipeline", "init_failed", error_type=type(exc).__name__.lower())
+        init_failed_fields: dict[str, Any] = {"error_type": type(exc).__name__.lower()}
+        refused_category = getattr(exc, "refusal_category", None)
+        if isinstance(refused_category, str):
+            init_failed_fields["refusal_category"] = refused_category
+        recorder.error("pipeline", "init_failed", **init_failed_fields)
         manifest_path = _write_initialization_failure_artifacts(
             run_id=run_id,
             conversion_mode=conversion_mode,

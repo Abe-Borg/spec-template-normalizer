@@ -539,6 +539,43 @@ def test_initialization_failure_still_publishes_a_diagnostics_stream(
     assert manifest["paths"]["diagnostics_log"] == str(diagnostics_path)
 
 
+def test_an_architect_refusal_is_published_with_its_code_and_category(
+    tmp_path: Path,
+) -> None:
+    from llm_classifier import ClassificationRefused
+    from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS
+
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = _write_input(tmp_path / "target.docx", b"target-original")
+
+    def refusing_analyzer(**_kwargs):
+        raise ClassificationRefused(
+            "template text=<w:t>CONFIDENTIAL</w:t>", category="general_harms"
+        )
+
+    with pytest.raises(ClassificationRefused) as caught:
+        pipeline.format_specifications(
+            architect,
+            [target],
+            tmp_path / "formatted",
+            api_key="never-persist-this-secret",
+            cache_dir=tmp_path / "profile-cache",
+            _template_analyzer=refusing_analyzer,
+        )
+
+    run_dir = caught.value.run_dir
+    manifest_text = (run_dir / "run.json").read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    assert manifest["error_code"] == "classification_refused"
+    assert manifest["error"] == ERROR_REMEDIATIONS["classification_refused"]
+    diagnostics_text = (run_dir / "diagnostics.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in diagnostics_text.splitlines() if line.strip()]
+    init_failed = [event for event in events if event["event"] == "init_failed"]
+    assert init_failed[-1]["fields"]["refusal_category"] == "general_harms"
+    for text in (manifest_text, diagnostics_text):
+        assert "CONFIDENTIAL" not in text
+
+
 def test_run_artifacts_strip_document_text_from_logs_errors_and_audits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
