@@ -1037,7 +1037,7 @@ def test_cost_guard_uses_the_api_token_count_when_available(monkeypatch) -> None
     with pytest.raises(ValueError, match="measures 150,001 tokens.*cost guard"):
         classify_document(_plain_bundle(3), "master", "run", api_key="k")
 
-    assert counted["model"] == "claude-opus-5"
+    assert counted["model"] == "claude-opus-5-5"
     assert counted["system"][0]["text"] == "master"
     assert counted["messages"][0]["content"].startswith("run")
 

@@ -1237,7 +1237,7 @@ def process_single_file(
     output_dir: Path,
     source_tokens: Optional[Dict[str, str]] = None,
     arch_root: Optional[Path] = None,
-    model: str = "claude-sonnet-5",
+    model: str = "claude-sonnet-5-5",
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
     conversion_mode: str = FORMAT_ONLY,
 ) -> BatchResult:
