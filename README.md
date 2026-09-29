@@ -516,7 +516,19 @@ number of API streams at once. The default is 4 concurrent requests; set the
 change it. Transient failures (rate limits, connection errors, 5xx responses)
 are retried a bounded number of times, honouring a `retry-after` header when
 one is sent; an invalid key, a bad request, or a model refusal fails the target
-immediately instead of retrying.
+immediately instead of retrying. A refusal is reported as its own error code,
+`classification_refused`, rather than as an unexplained failure, and the
+category the provider gave for it (for example `general_harms` or `cyber`) is
+recorded as `refusal_category` in `diagnostics.jsonl` -- on the target's
+`classify` event, or on the `init_failed` event when the architect template
+was the document declined. The provider's free-text explanation is never
+recorded.
+
+Both classifiers request structured JSON output, so the model can reason only
+in its (unreturned) thinking. The target classifier's system prompt therefore
+ends with the line Anthropic recommends for Sonnet 5.5 in that situation,
+"Think the problem through before you answer.", which trades a modest
+increase in output tokens for accuracy close to a higher effort level.
 
 Both classifiers send their byte-stable prompt prefix as a cached system
 block, and the target classifier sends compact JSON, so repeated chunks and

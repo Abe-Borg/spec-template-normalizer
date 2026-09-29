@@ -797,3 +797,66 @@ def test_failed_classification_still_reports_what_it_spent(
     assert fields["usage_complete"] is False
     # The failure text is document-derived and must not ride along.
     assert SECRET_TEXT not in json.dumps(result.diagnostics)
+
+
+def test_a_refused_classification_is_reported_as_a_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A safeguard decline reaches the result as its own code and category.
+
+    It used to fail as an ordinary exception, so ``run.json`` and the GUI
+    showed only a fingerprinted ``untrusted_error`` and nobody could tell the
+    model had declined, let alone under which category.
+    """
+    from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS
+    from spec_formatter.style_application.core.llm_classifier import (
+        ClassificationRefused,
+    )
+
+    extract_dir = _seed_extract(tmp_path)
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source package")
+
+    class FakeDecomposer:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def extract(self, *, output_dir: Path) -> Path:
+            del output_dir
+            return extract_dir
+
+    monkeypatch.setattr(batch_runner, "DocxDecomposer", FakeDecomposer)
+    monkeypatch.setattr(
+        batch_runner,
+        "build_phase2_slim_bundle",
+        lambda *_args, **_kwargs: {
+            "paragraphs": [{"paragraph_index": 0}],
+            "deterministic_classifications": [],
+            "deterministic_ignored_paragraphs": [],
+        },
+    )
+
+    def refuse(**_kwargs):
+        raise ClassificationRefused(SECRET_TEXT, category="general_harms")
+
+    monkeypatch.setattr(batch_runner, "classify_target_document", refuse)
+
+    result = batch_runner.process_single_file(
+        docx_path=source,
+        arch_registry={"PARAGRAPH": "Body"},
+        env_registry={},
+        arch_styles_xml="<w:styles/>",
+        available_roles=["PARAGRAPH"],
+        api_key="key",
+        output_dir=tmp_path / "output",
+    )
+
+    assert result.success is False
+    assert result.stage == "classification"
+    assert result.error_code == "classification_refused"
+    assert result.safe_error == ERROR_REMEDIATIONS["classification_refused"]
+    classify_events = [e for e in result.diagnostics if e.get("event") == "classify"]
+    assert classify_events, result.diagnostics
+    assert classify_events[-1]["fields"]["refusal_category"] == "general_harms"
+    assert SECRET_TEXT not in json.dumps(result.diagnostics)

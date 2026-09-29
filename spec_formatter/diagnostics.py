@@ -88,6 +88,7 @@ _STRING_VALUE_KEYS = frozenset(
         "policy",
         "provenance",
         "reason",
+        "refusal_category",
         "role",
         "source_kind",
         "status",

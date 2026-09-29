@@ -114,6 +114,13 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "Not every classifiable paragraph received exactly one disposition. Run "
         "the target again; if it repeats, report the target."
     ),
+    "classification_refused": (
+        "The model declined to classify this document: a provider safety check "
+        "stopped the request, so nothing was produced from it. Ordinary "
+        "specification text can occasionally trigger this. Run it again; if it "
+        "repeats, report the document with the refusal category recorded in "
+        "diagnostics.jsonl."
+    ),
     "paragraph_style_not_applied": (
         "A classified paragraph did not carry its assigned style after "
         "formatting, so the output was withheld. This is a defect in the "

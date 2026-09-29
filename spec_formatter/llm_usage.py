@@ -19,6 +19,7 @@ is a lower bound.
 
 from __future__ import annotations
 
+import re
 import threading
 from typing import Any, Dict, Optional
 
@@ -54,6 +55,69 @@ def usage_numbers(final_message: Any) -> Dict[str, int]:
             continue
         numbers[name] = value
     return numbers
+
+
+# Refusal categories are an open set the provider extends (``cyber``, ``bio``,
+# ``general_harms``, ``reasoning_extraction``, ...), so they are accepted by
+# shape rather than by list: a short lower-case identifier and nothing else.
+_REFUSAL_CATEGORY_RX = re.compile(r"[a-z][a-z0-9_]{0,47}")
+
+
+def streamed_stop_details(stream: Any) -> Any:
+    """Consume ``stream`` and return the ``stop_details`` its events carried.
+
+    A streamed response reports ``stop_details`` on the ``message_delta``
+    event, beside ``stop_reason``. The pinned SDK's stream accumulator copies
+    ``stop_reason``, ``stop_sequence`` and usage from that event onto the
+    message ``get_final_message()`` returns, but not ``stop_details`` (its
+    ``Message`` type has no such field), so a refusal's category is visible
+    only on the raw event. Consuming the events here leaves the stream
+    finished, and its final-message helpers work as before.
+
+    A stream that cannot be iterated (a test double offering only the
+    final-message helpers) yields ``None``.
+    """
+
+    try:
+        events = iter(stream)
+    except TypeError:
+        return None
+    details = None
+    for event in events:
+        if getattr(event, "type", None) != "message_delta":
+            continue
+        delta = getattr(event, "delta", None)
+        if isinstance(delta, dict):
+            value = delta.get("stop_details")
+        else:
+            value = getattr(delta, "stop_details", None)
+        if value is not None:
+            details = value
+    return details
+
+
+def refusal_category(final_message: Any, stop_details: Any = None) -> Optional[str]:
+    """Return the category a refusal named, or ``None`` when it named none.
+
+    ``stop_details`` is populated only when ``stop_reason == "refusal"``, and
+    its ``category`` may itself be null. It is read from the final message
+    when the SDK carries it there, and otherwise from ``stop_details`` as
+    :func:`streamed_stop_details` captured it off the stream. Only an
+    identifier-shaped value is returned, so the category can reach
+    diagnostics without carrying anything else the response held
+    (``stop_details.explanation`` is free text and is never read).
+    """
+
+    details = getattr(final_message, "stop_details", None)
+    if details is None:
+        details = stop_details
+    if isinstance(details, dict):
+        category = details.get("category")
+    else:
+        category = getattr(details, "category", None)
+    if isinstance(category, str) and _REFUSAL_CATEGORY_RX.fullmatch(category):
+        return category
+    return None
 
 
 class UsageCollector:

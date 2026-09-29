@@ -1312,6 +1312,9 @@ def process_single_file(
                     # propagates, or the run reports this target as free.
                     observed_usage = usage_from_exception(exc)
                     _set_usage_fields(phase, observed_usage)
+                    category = getattr(exc, "refusal_category", None)
+                    if isinstance(category, str):
+                        phase.set(refusal_category=category)
                     raise
                 # Token accounting travels out of the classifier as counts
                 # only; it is diagnostics, not part of the disposition payload.

@@ -21,3 +21,5 @@ IMPORTANT:
 - Only skip truly empty/structural section-break paragraphs and "END OF SECTION" lines; classify visible paragraphs even when they contain w:sectPr
 - Do not invent roles that aren't in available_roles
 - When uncertain between two roles, prefer the more specific one (e.g., SUBPARAGRAPH over PARAGRAPH)
+
+Think the problem through before you answer.

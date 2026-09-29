@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import types
 
@@ -10,6 +11,8 @@ import pytest
 from spec_formatter.llm_usage import (
     UsageCollector,
     attach_usage,
+    refusal_category,
+    streamed_stop_details,
     usage_from_exception,
     usage_numbers,
 )
@@ -157,3 +160,119 @@ def test_attaching_usage_never_replaces_the_real_failure():
 def test_usage_numbers_reads_a_bare_object_without_usage():
     assert usage_numbers(object()) == {}
     assert usage_numbers(None) == {}
+
+
+def test_refusal_category_is_accepted_by_shape_and_nothing_else():
+    def refused(details):
+        return types.SimpleNamespace(stop_reason="refusal", stop_details=details)
+
+    # The category set is open, so a category added later is still read.
+    assert refusal_category(refused(types.SimpleNamespace(category="general_harms"))) == "general_harms"
+    assert refusal_category(refused({"category": "reasoning_extraction"})) == "reasoning_extraction"
+    assert refusal_category(refused(types.SimpleNamespace(category="a_future_category"))) == "a_future_category"
+    # No category, no details, or anything that is not a short identifier.
+    assert refusal_category(refused(types.SimpleNamespace(category=None))) is None
+    assert refusal_category(refused(None)) is None
+    assert refusal_category(types.SimpleNamespace(stop_reason="end_turn")) is None
+    assert refusal_category(None) is None
+    for unsafe in ("Cyber", "two words", "cyber\n", "x" * 49, "", 7, True):
+        assert refusal_category(refused({"category": unsafe})) is None
+
+
+def _sse_client(*bodies):
+    """A real pinned-SDK client whose requests replay recorded SSE bodies.
+
+    Fabricated final messages cannot show what the SDK's stream accumulator
+    drops; replaying the wire events through the real client can.
+    """
+    import httpx
+    import anthropic
+
+    pending = list(bodies)
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=pending.pop(0),
+        )
+
+    return anthropic.Anthropic(
+        api_key="k",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _sse_body(stop_reason, *, text=None, stop_details=None):
+    """The wire events of one streamed response, as the API sends them."""
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "m",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        }
+    ]
+    if text is not None:
+        events += [
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+            {"type": "content_block_stop", "index": 0},
+        ]
+    delta = {"stop_reason": stop_reason, "stop_sequence": None}
+    if stop_details is not None:
+        delta["stop_details"] = stop_details
+    events += [
+        {"type": "message_delta", "delta": delta, "usage": {"output_tokens": 3}},
+        {"type": "message_stop"},
+    ]
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+    ).encode("utf-8")
+
+
+def test_a_streamed_refusal_category_survives_the_pinned_sdk():
+    """The category is on the raw message_delta, not on the final message.
+
+    The pinned SDK's accumulator copies stop_reason, stop_sequence and usage
+    off message_delta but not stop_details, so reading the final message
+    alone always found no category.
+    """
+    client = _sse_client(
+        _sse_body(
+            "refusal",
+            stop_details={
+                "type": "refusal",
+                "category": "general_harms",
+                "explanation": "Free text the provider wrote.",
+            },
+        )
+    )
+    with client.messages.stream(
+        model="m", max_tokens=16, messages=[{"role": "user", "content": "x"}]
+    ) as stream:
+        details = streamed_stop_details(stream)
+        final_message = stream.get_final_message()
+
+    assert final_message.stop_reason == "refusal"
+    assert final_message.content == []
+    assert refusal_category(final_message, details) == "general_harms"
+
+
+def test_streamed_stop_details_tolerates_a_stream_it_cannot_iterate():
+    class FinalOnly:
+        def get_final_message(self):
+            return types.SimpleNamespace(stop_reason="refusal")
+
+    assert streamed_stop_details(FinalOnly()) is None
+    # The final message wins when an SDK carries the details there.
+    message = types.SimpleNamespace(stop_details={"category": "cyber"})
+    assert refusal_category(message, {"category": "bio"}) == "cyber"

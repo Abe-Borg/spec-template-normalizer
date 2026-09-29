@@ -493,6 +493,54 @@ def test_refusal_is_terminal(monkeypatch):
     assert sleeps == []
 
 
+class _RefusalStream(_ScriptedStream):
+    def __init__(self, stop_details):
+        super().__init__("", stop_reason="refusal")
+        self.stop_details = stop_details
+
+    def get_final_message(self):
+        return types.SimpleNamespace(
+            stop_reason="refusal",
+            stop_details=self.stop_details,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stop_details", "expected"),
+    [
+        (
+            types.SimpleNamespace(
+                type="refusal",
+                category="general_harms",
+                explanation="Free text the provider wrote about the request.",
+            ),
+            "general_harms",
+        ),
+        ({"type": "refusal", "category": "cyber", "explanation": "Free text."}, "cyber"),
+        (types.SimpleNamespace(type="refusal", category=None, explanation=None), None),
+        (None, None),
+        (types.SimpleNamespace(category="Not an identifier!"), None),
+    ],
+)
+def test_refusal_carries_its_code_and_only_an_identifier_category(
+    monkeypatch, stop_details, expected
+):
+    from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS
+    from spec_formatter.style_application.core.llm_classifier import ClassificationRefused
+
+    _run(monkeypatch, [_RefusalStream(stop_details)])
+
+    with pytest.raises(ClassificationRefused) as caught:
+        classify_target_document(_unresolved_bundle(), ["PART"], api_key="k", model="m")
+
+    error = caught.value
+    assert error.safe_error_code == "classification_refused"
+    assert error.safe_error_message == ERROR_REMEDIATIONS["classification_refused"]
+    assert error.refusal_category == expected
+    assert f"category={expected or 'none'}" in str(error)
+    assert "Free text" not in str(error)
+
+
 def test_max_tokens_regenerates_with_the_retry_requirement(monkeypatch):
     _sdk, messages, _sleeps, _constructed = _run(
         monkeypatch,
@@ -587,8 +635,15 @@ def test_system_prefix_is_one_cached_block_and_user_turn_is_compact(monkeypatch)
     assert block["type"] == "text"
     assert block["cache_control"] == {"type": "ephemeral"}
     assert block["text"].startswith(PHASE2_MASTER_PROMPT.strip())
-    assert PHASE2_RUN_INSTRUCTION.strip() in block["text"]
-    assert block["text"].endswith('available_roles: ["PART"]')
+    assert 'available_roles: ["PART"]' in block["text"]
+    # The run instruction closes the system prompt, and it closes with the
+    # think-first line: a structured-output response is JSON only, so the
+    # model can work a classification out nowhere but in its thinking.
+    assert block["text"].endswith(PHASE2_RUN_INSTRUCTION.strip())
+    assert block["text"].index('available_roles: ["PART"]') < block["text"].index(
+        PHASE2_RUN_INSTRUCTION.strip()
+    )
+    assert block["text"].endswith("Think the problem through before you answer.")
     content = kwargs["messages"][0]["content"]
     assert content.startswith('available_roles: ["PART"]\n\n{')
     assert "\n  " not in content  # compact JSON, no indentation
@@ -816,3 +871,110 @@ def test_deterministic_only_target_reports_no_requests(monkeypatch):
     # could not tell you" are different answers and must look different.
     assert result["usage"]["requests_attempted"] == 0
     assert result["usage"]["usage_complete"] is True
+
+
+def _sse_client(*bodies):
+    """A real pinned-SDK client whose requests replay recorded SSE bodies.
+
+    Fabricated final messages cannot show what the SDK's stream accumulator
+    drops; replaying the wire events through the real client can.
+    """
+    import httpx
+    import anthropic
+
+    pending = list(bodies)
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=pending.pop(0),
+        )
+
+    return anthropic.Anthropic(
+        api_key="k",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _sse_body(stop_reason, *, text=None, stop_details=None):
+    """The wire events of one streamed response, as the API sends them."""
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "m",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        }
+    ]
+    if text is not None:
+        events += [
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+            {"type": "content_block_stop", "index": 0},
+        ]
+    delta = {"stop_reason": stop_reason, "stop_sequence": None}
+    if stop_details is not None:
+        delta["stop_details"] = stop_details
+    events += [
+        {"type": "message_delta", "delta": delta, "usage": {"output_tokens": 3}},
+        {"type": "message_stop"},
+    ]
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+    ).encode("utf-8")
+
+
+def _classify_over_sse(monkeypatch, *bodies):
+    """Run classify_target_document against the real SDK over replayed SSE."""
+    import anthropic
+    from spec_formatter.style_application.core import llm_classifier as lc
+
+    client = _sse_client(*bodies)
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: client)
+    monkeypatch.setattr(lc.time, "sleep", lambda _seconds: None)
+    return classify_target_document(_unresolved_bundle(), ["PART"], api_key="k", model="m")
+
+
+def test_a_real_streamed_refusal_without_text_is_a_refusal_with_its_category(monkeypatch):
+    """A refusal with no text block used to escape as the SDK's RuntimeError.
+
+    get_final_text() raises when a response holds no text block, and it ran
+    before the stop-reason check, so a real refusal never became
+    ClassificationRefused and its category was never read.
+    """
+    from spec_formatter.llm_usage import usage_from_exception
+    from spec_formatter.style_application.core.llm_classifier import ClassificationRefused
+
+    with pytest.raises(ClassificationRefused) as caught:
+        _classify_over_sse(
+            monkeypatch,
+            _sse_body(
+                "refusal",
+                stop_details={"type": "refusal", "category": "general_harms", "explanation": "x"},
+            ),
+        )
+
+    assert caught.value.safe_error_code == "classification_refused"
+    assert caught.value.refusal_category == "general_harms"
+    usage = usage_from_exception(caught.value)
+    assert usage["input_tokens"] == 10 and usage["output_tokens"] == 3
+
+
+def test_a_real_output_limit_stop_without_text_regenerates(monkeypatch):
+    result = _classify_over_sse(
+        monkeypatch,
+        _sse_body("max_tokens"),
+        _sse_body("end_turn", text=_GOOD),
+    )
+
+    assert result["classifications"] == [{"paragraph_index": 0, "csi_role": "PART"}]
+    assert result["usage"]["requests_attempted"] == 2
