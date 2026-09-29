@@ -13,7 +13,12 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set
 
-from ...llm_usage import UsageCollector, attach_usage, refusal_category
+from ...llm_usage import (
+    UsageCollector,
+    attach_usage,
+    refusal_category,
+    streamed_stop_details,
+)
 from .classification import (
     PHASE2_MASTER_PROMPT,
     PHASE2_RUN_INSTRUCTION,
@@ -624,13 +629,25 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                             ),
                         }],
                     ) as stream:
-                        response_text = stream.get_final_text()
+                        # The events are consumed first because a refusal's
+                        # stop_details reach only the raw message_delta
+                        # event; the SDK's final message does not carry them.
+                        stop_details = streamed_stop_details(stream)
                         get_final_message = getattr(stream, "get_final_message", None)
                         final_message = get_final_message() if get_final_message else None
                         stop_reason = getattr(final_message, "stop_reason", None)
+                        # Text only after the stop reason: get_final_text()
+                        # raises when the response holds no text block, which
+                        # is what a refusal or an output-limit stop can look
+                        # like, and that error used to pre-empt both checks.
+                        response_text = (
+                            ""
+                            if stop_reason in ("refusal", "max_tokens")
+                            else stream.get_final_text()
+                        )
                 usage.record_response(final_message)
                 if stop_reason == "refusal":
-                    category = refusal_category(final_message)
+                    category = refusal_category(final_message, stop_details)
                     raise ClassificationRefused(
                         "LLM refused the target-classification request "
                         f"(stop_reason=refusal, category={category or 'none'})",

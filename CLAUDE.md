@@ -1135,7 +1135,23 @@ benign text, so the category is worth keeping: `llm_usage.refusal_category`
 reads it by shape only (a short lower-case identifier, else `None`), never
 touches the free-text `stop_details.explanation`, and the category reaches
 diagnostics as `refusal_category` -- on the target's `classify` event and on
-the architect's `init_failed` event. No server-side fallback is enabled, and
+the architect's `init_failed` event.
+
+Two facts about the pinned SDK (`anthropic==0.84.0`) shape how a streamed
+response is read, and both classifiers follow them. The stream accumulator
+copies `stop_reason`, `stop_sequence` and usage off the `message_delta`
+event onto the message `get_final_message()` returns, but not
+`stop_details` -- its `Message` type has no such field -- so the category is
+visible only on the raw event: `llm_usage.streamed_stop_details` consumes
+the stream's events first and captures it, and `refusal_category` prefers
+the final message's copy should a later SDK carry one. And
+`get_final_text()` raises `RuntimeError` when a response holds no text
+block, which is what a refusal or an output-limit stop can look like, so the
+text is read only after the stop-reason checks; reading it first let that
+error pre-empt both, so a real refusal never became `ClassificationRefused`
+and a text-less output-limit stop skipped regeneration. Tests of this path
+replay recorded SSE through the real client over an `httpx.MockTransport`,
+because a fabricated final message cannot show what the accumulator drops. No server-side fallback is enabled, and
 that stays deliberate: the manifest records the model that produced a
 classification, and for the Sonnet 5.5 target classifier the fallback would
 retry only `cyber` and `frontier_llm` declines in any case.

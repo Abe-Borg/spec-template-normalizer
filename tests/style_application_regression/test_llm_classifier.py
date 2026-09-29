@@ -871,3 +871,110 @@ def test_deterministic_only_target_reports_no_requests(monkeypatch):
     # could not tell you" are different answers and must look different.
     assert result["usage"]["requests_attempted"] == 0
     assert result["usage"]["usage_complete"] is True
+
+
+def _sse_client(*bodies):
+    """A real pinned-SDK client whose requests replay recorded SSE bodies.
+
+    Fabricated final messages cannot show what the SDK's stream accumulator
+    drops; replaying the wire events through the real client can.
+    """
+    import httpx
+    import anthropic
+
+    pending = list(bodies)
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=pending.pop(0),
+        )
+
+    return anthropic.Anthropic(
+        api_key="k",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _sse_body(stop_reason, *, text=None, stop_details=None):
+    """The wire events of one streamed response, as the API sends them."""
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "m",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        }
+    ]
+    if text is not None:
+        events += [
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+            {"type": "content_block_stop", "index": 0},
+        ]
+    delta = {"stop_reason": stop_reason, "stop_sequence": None}
+    if stop_details is not None:
+        delta["stop_details"] = stop_details
+    events += [
+        {"type": "message_delta", "delta": delta, "usage": {"output_tokens": 3}},
+        {"type": "message_stop"},
+    ]
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+    ).encode("utf-8")
+
+
+def _classify_over_sse(monkeypatch, *bodies):
+    """Run classify_target_document against the real SDK over replayed SSE."""
+    import anthropic
+    from spec_formatter.style_application.core import llm_classifier as lc
+
+    client = _sse_client(*bodies)
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: client)
+    monkeypatch.setattr(lc.time, "sleep", lambda _seconds: None)
+    return classify_target_document(_unresolved_bundle(), ["PART"], api_key="k", model="m")
+
+
+def test_a_real_streamed_refusal_without_text_is_a_refusal_with_its_category(monkeypatch):
+    """A refusal with no text block used to escape as the SDK's RuntimeError.
+
+    get_final_text() raises when a response holds no text block, and it ran
+    before the stop-reason check, so a real refusal never became
+    ClassificationRefused and its category was never read.
+    """
+    from spec_formatter.llm_usage import usage_from_exception
+    from spec_formatter.style_application.core.llm_classifier import ClassificationRefused
+
+    with pytest.raises(ClassificationRefused) as caught:
+        _classify_over_sse(
+            monkeypatch,
+            _sse_body(
+                "refusal",
+                stop_details={"type": "refusal", "category": "general_harms", "explanation": "x"},
+            ),
+        )
+
+    assert caught.value.safe_error_code == "classification_refused"
+    assert caught.value.refusal_category == "general_harms"
+    usage = usage_from_exception(caught.value)
+    assert usage["input_tokens"] == 10 and usage["output_tokens"] == 3
+
+
+def test_a_real_output_limit_stop_without_text_regenerates(monkeypatch):
+    result = _classify_over_sse(
+        monkeypatch,
+        _sse_body("max_tokens"),
+        _sse_body("end_turn", text=_GOOD),
+    )
+
+    assert result["classifications"] == [{"paragraph_index": 0, "csi_role": "PART"}]
+    assert result["usage"]["requests_attempted"] == 2

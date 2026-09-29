@@ -14,7 +14,12 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from spec_formatter.llm_usage import UsageCollector, attach_usage, refusal_category
+from spec_formatter.llm_usage import (
+    UsageCollector,
+    attach_usage,
+    refusal_category,
+    streamed_stop_details,
+)
 from spec_formatter.style_application.core.errors import attach_engine_error
 from paragraph_rules import (
     is_classifiable_paragraph,
@@ -361,7 +366,10 @@ def _call_api(
                 system=_cached_system_blocks(system),
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
-                raw = stream.get_final_text()
+                # The events are consumed first because a refusal's
+                # stop_details reach only the raw message_delta event; the
+                # SDK's final message does not carry them.
+                stop_details = streamed_stop_details(stream)
                 final_message = stream.get_final_message()
                 # Before the stop-reason checks below: a refusal and an
                 # output-limit response are both billed, and both used to
@@ -375,7 +383,7 @@ def _call_api(
                         "completing its JSON (stop_reason=max_tokens)"
                     )
                 if stop_reason == "refusal":
-                    category = refusal_category(final_message)
+                    category = refusal_category(final_message, stop_details)
                     raise ClassificationRefused(
                         "LLM refused the template-classification request "
                         f"(stop_reason=refusal, category={category or 'none'})",
@@ -386,7 +394,11 @@ def _call_api(
                         "LLM response ended unexpectedly "
                         f"(stop_reason={stop_reason})"
                     )
-                return raw
+                # Text only after the stop reason: get_final_text() raises
+                # when the response holds no text block, which is what a
+                # refusal or an output-limit stop can look like, and that
+                # error used to pre-empt both checks above.
+                return stream.get_final_text()
         except (anthropic.APIConnectionError, anthropic.RateLimitError) as e:
             last_error = e
             if attempt < 2:

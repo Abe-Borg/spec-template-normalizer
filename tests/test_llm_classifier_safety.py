@@ -1258,3 +1258,104 @@ def test_call_api_without_a_collector_still_works():
     """The collector is optional; nothing requires callers to pass one."""
     client = _usage_client([('{"ok": 1}', _usage_message())])
     assert llm_classifier._call_api(client, "sys", "user", "model") == '{"ok": 1}'
+
+
+def _sse_client(*bodies):
+    """A real pinned-SDK client whose requests replay recorded SSE bodies.
+
+    Fabricated final messages cannot show what the SDK's stream accumulator
+    drops; replaying the wire events through the real client can.
+    """
+    import httpx
+    import anthropic
+
+    pending = list(bodies)
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=pending.pop(0),
+        )
+
+    return anthropic.Anthropic(
+        api_key="k",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _sse_body(stop_reason, *, text=None, stop_details=None):
+    """The wire events of one streamed response, as the API sends them."""
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "m",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        }
+    ]
+    if text is not None:
+        events += [
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+            {"type": "content_block_stop", "index": 0},
+        ]
+    delta = {"stop_reason": stop_reason, "stop_sequence": None}
+    if stop_details is not None:
+        delta["stop_details"] = stop_details
+    events += [
+        {"type": "message_delta", "delta": delta, "usage": {"output_tokens": 3}},
+        {"type": "message_stop"},
+    ]
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+    ).encode("utf-8")
+
+
+def test_a_real_streamed_refusal_without_text_reaches_the_architect_as_a_refusal() -> None:
+    client = _sse_client(
+        _sse_body(
+            "refusal",
+            stop_details={"type": "refusal", "category": "cyber", "explanation": "x"},
+        )
+    )
+
+    with pytest.raises(llm_classifier.ClassificationRefused) as caught:
+        _request_json_response(
+            client,
+            "system",
+            "user",
+            "model",
+            response_schema=llm_classifier._instruction_response_schema(),
+            max_attempts=3,
+        )
+
+    assert caught.value.safe_error_code == "classification_refused"
+    assert caught.value.refusal_category == "cyber"
+
+
+def test_a_real_output_limit_stop_without_text_regenerates_the_architect(monkeypatch) -> None:
+    monkeypatch.setattr(llm_classifier.time, "sleep", lambda _seconds: None)
+    client = _sse_client(
+        _sse_body("max_tokens"),
+        _sse_body("end_turn", text='{"notes": []}'),
+    )
+
+    parsed = _request_json_response(
+        client,
+        "system",
+        "user",
+        "model",
+        response_schema=llm_classifier._instruction_response_schema(),
+        max_attempts=2,
+    )
+
+    assert parsed == {"notes": []}
