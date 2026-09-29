@@ -68,11 +68,11 @@ def test_sanitize_fields_keeps_strings_only_under_whitelisted_keys() -> None:
     cleaned = diag.sanitize_fields(
         {
             "mode": "format_only",  # whitelisted -> kept
-            "model": "claude-sonnet-5",  # whitelisted -> kept
+            "model": "claude-sonnet-5-5",  # whitelisted -> kept
             "detail": "csi_to_canadian",  # clean token, non-whitelisted -> dropped
         }
     )
-    assert cleaned == {"mode": "format_only", "model": "claude-sonnet-5"}
+    assert cleaned == {"mode": "format_only", "model": "claude-sonnet-5-5"}
 
 
 def test_sanitize_fields_rejects_secret_shaped_and_document_token_keys() -> None:

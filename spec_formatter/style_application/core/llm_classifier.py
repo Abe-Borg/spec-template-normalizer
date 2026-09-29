@@ -21,7 +21,7 @@ from .classification import (
 )
 
 
-# Sonnet 5's tokenizer produces ~30% more tokens for the same text than the
+# Sonnet 5.5's tokenizer (shared with Sonnet 5) produces ~30% more tokens for the same text than the
 # pre-4.7 tokenizers, so estimate conservatively at ~3 chars/token.
 _CHARS_PER_TOKEN = 3
 _MAX_BUNDLE_TOKENS = 80_000
@@ -524,7 +524,7 @@ def _merge_chunk_results(chunk_results: List[dict]) -> dict:
     }
 
 
-def classify_target_document(slim_bundle: dict, available_roles: list, api_key: str, model: str = "claude-sonnet-5") -> dict:
+def classify_target_document(slim_bundle: dict, available_roles: list, api_key: str, model: str = "claude-sonnet-5-5") -> dict:
     unresolved_paragraphs = slim_bundle.get("paragraphs", [])
     if not unresolved_paragraphs:
         deterministic_only = coerce_to_final_classifications(
@@ -585,8 +585,8 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
 
         while True:
             try:
-                # No sampling params (temperature/top_p/top_k): Sonnet 5 and
-                # Opus 4.7+ reject non-default values with a 400.
+                # No sampling params (temperature/top_p/top_k): Sonnet 5.5 and
+                # Opus 5.5 reject non-default values with a 400.
                 usage.record_attempt()
                 with _REQUEST_LIMITER:
                     with client.messages.stream(

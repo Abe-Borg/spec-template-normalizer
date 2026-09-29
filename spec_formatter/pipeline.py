@@ -2142,7 +2142,7 @@ def format_specifications(
     force_template_analysis: bool = False,
     max_workers: int = 3,
     template_model: str = template_analysis.DEFAULT_MODEL,
-    target_model: str = "claude-sonnet-5",
+    target_model: str = "claude-sonnet-5-5",
     conversion_mode: str = FORMAT_ONLY,
     diagnostics_level: str = "info",
     template_prompt_dir: Optional[Path] = None,

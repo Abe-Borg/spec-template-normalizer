@@ -1000,7 +1000,7 @@ def classify_document(
     master_prompt: str,
     run_instruction: str,
     api_key: str,
-    model: str = "claude-opus-5",
+    model: str = "claude-opus-5-5",
     max_patch_attempts: int = 3,
     max_response_attempts: int = DEFAULT_RESPONSE_ATTEMPTS,
     *,
@@ -1053,7 +1053,7 @@ def classify_document(
 
     # _call_api owns the bounded retry policy. Disable the SDK's implicit
     # retries so transport attempts do not multiply behind that policy.
-    # Opus 4.8 turns run longer at high effort on large documents; allow the
+    # Opus 5.5 turns run longer at high effort on large documents; allow the
     # SDK-default 10-minute read window, but keep the short connect timeout
     # so an unreachable endpoint fails fast instead of stalling every retry.
     client = anthropic.Anthropic(

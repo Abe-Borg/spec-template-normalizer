@@ -55,7 +55,7 @@ from phase1_validator import validate_phase1_contracts
 # break, and package extraction helpers (profiles may differ for documents
 # with tracked changes or revision-marked section properties).
 PIPELINE_VERSION = "2.5.0"
-DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_MODEL = "claude-opus-5-5"
 ProgressCallback = Callable[[str], None]
 Classifier = Callable[..., Dict[str, Any]]
 

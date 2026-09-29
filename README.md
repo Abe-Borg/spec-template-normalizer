@@ -577,7 +577,7 @@ identity, and prompt hashes, so neither a wire-contract change nor a change to
 the engine's repair or capture logic can silently reuse an older profile. After
 a fresh analysis, older profiles of the same template beyond the newest two
 are removed from the cache. The architect template is analysed with
-`claude-opus-5` and targets are classified with `claude-sonnet-5`; no
+`claude-opus-5-5` and targets are classified with `claude-sonnet-5-5`; no
 server-side model fallback is enabled, so the model a run records is the model
 that produced it.
 
