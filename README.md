@@ -68,6 +68,12 @@ Most users do not need Python. Download the latest **SpecificationFormatterSetup
 from the [Releases page](https://github.com/abe-borg/spec-template-normalizer/releases/latest)
 and run it. It installs per-user (no admin prompt) with a Start-menu shortcut.
 
+Before anything is installed, the installer shows a **License Agreement** page:
+a short plain-language description of the license above its full text (see
+[License](#license)). **I do not accept** is preselected and **Next** stays
+disabled until you choose **I accept the agreement**. Updates launched from the
+app run the same installer, so the page appears on every update too.
+
 The app is **not code-signed**, so the first time you run the installer Windows
 SmartScreen shows *"Windows protected your PC."* Choose **More info → Run
 anyway**. (The download is still integrity-checked: the in-app updater verifies
@@ -825,3 +831,9 @@ holder to arrange commercial terms.
 Third-party components bundled with the application are licensed by their own
 copyright holders under their own terms; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The Windows installer displays this license and requires the user to accept it
+before installing (see [Download for Windows](#download-for-windows)), and the
+installed app folder carries `LICENSE` and `THIRD_PARTY_NOTICES.md`.
+`tests/test_installer_license.py` fails if the installer's license page is
+removed, stops describing the license, or can be skipped or pre-accepted.
