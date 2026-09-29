@@ -38,8 +38,15 @@ DefaultGroupName=Specification Formatter
 DisableProgramGroupPage=yes
 ; Specification Formatter is source-available under the PolyForm Noncommercial
 ; License 1.0.0: commercial use needs a separate license, so the installer puts
-; the user on notice rather than burying the terms in the app folder. Drop this
-; line if the extra wizard page is not wanted.
+; the user on notice rather than burying the terms in the app folder. LicenseFile
+; adds the License Agreement page: the full LICENSE text with "I accept" / "I do
+; not accept" choices, "I do not accept" preselected, and Next disabled until the
+; user picks "I accept". [Messages] below describes the license in plain words
+; above the text. Do not remove this line or skip wpLicense in [Code]:
+; tests/test_installer_license.py fails if the page can be bypassed. (Only a
+; command-line /SILENT or /VERYSILENT install skips it, as with every wizard
+; page; the in-app updater launches the installer interactively.) Inno reads a
+; BOM-less text file in the ANSI code page, so LICENSE is kept ASCII.
 LicenseFile=..\..\LICENSE
 ; Per-user install: no admin/UAC prompt, which keeps the unsigned experience as
 ; smooth as possible (the user only sees the one SmartScreen notice, not an
@@ -61,6 +68,12 @@ RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Messages]
+; Replaces the stock "Please read the following License Agreement" line on the
+; License Agreement page, so the user learns what the license means before the
+; full text. Keep it ASCII and free of "%" (Inno message placeholders).
+LicenseLabel3={#MyAppName} is source-available software under the PolyForm Noncommercial License 1.0.0 (full text below). You may use, modify, and share it for any noncommercial purpose. Commercial use, including formatting specifications on a paid project, requires a separate license from the copyright holder. It comes as is, without any warranty. You must accept the agreement to install.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

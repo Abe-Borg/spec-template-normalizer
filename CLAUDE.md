@@ -1761,6 +1761,19 @@ Copyright 2025 Abraham Borg. Released under the PolyForm Noncommercial License
 redistribution permitted, and commercial use requiring a separate license. This
 is deliberately not an OSI-approved open source license.
 
+The Windows installer (`packaging/windows/installer.iss`) puts the user on
+notice before installing: `LicenseFile` adds Inno Setup's License Agreement
+page with the full `LICENSE` text, "I do not accept" preselected and Next
+disabled until the user picks "I accept", and a `[Messages]` `LicenseLabel3`
+override describes the license in plain words above it (noncommercial use
+permitted, commercial use needs a separate license, no warranty). The updater's
+`spawn_installer` launches the installer with no switches, so every update
+shows the page too; only a command-line `/SILENT` or `/VERYSILENT` install
+skips it. `tests/test_installer_license.py` holds all of that: do not drop the
+page, skip `wpLicense` or preselect the accept radio in `[Code]`, override the
+radio captions, or add a silent switch to the updater. Inno reads a BOM-less
+text file in the ANSI code page, so `LICENSE` stays ASCII.
+
 Third-party dependency licenses are inventoried in `THIRD_PARTY_NOTICES.md`.
 All runtime dependencies are permissive except `certifi` (MPL-2.0, file-level
 copyleft, bundled unmodified).
