@@ -685,7 +685,10 @@ def test_target_numbering_inherited_through_basedOn_survives_format_only(
 
     asked: list[int] = []
 
-    def stand_in_model(slim_bundle, available_roles, api_key, model="stand-in"):
+    def stand_in_model(
+        slim_bundle, available_roles, api_key, model="stand-in", *, target_effort="high"
+    ):
+        assert target_effort == "high"
         # Answers as a model plausibly would, merged by the real classifier code.
         answers = [
             {"paragraph_index": paragraph["paragraph_index"], "csi_role": "SUBPARAGRAPH"}

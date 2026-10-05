@@ -8,6 +8,7 @@ locate, or transfer a bundle themselves.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import queue
@@ -1064,6 +1065,9 @@ _KNOWN_SAFE_ERROR_MESSAGES = {
         "conversion_mode must be one of: canadian_to_csi, csi_to_canadian, csi_to_canadian_standalone, format_only"
     ),
     "invalid_max_workers": "max_workers must be an integer.",
+    "invalid_target_effort": (
+        "target_effort must be one of: low, medium, high, xhigh, max."
+    ),
     "output_create_failed": "Output directory could not be created.",
     "api_key_invalid_type": "Anthropic API key must be text.",
 }
@@ -1489,6 +1493,8 @@ def _format_one_target(
     processor: TargetProcessor,
     conversion_mode: str,
     on_started: Optional[Callable[[], None]] = None,
+    *,
+    target_effort: str = "high",
 ) -> TargetFormatResult:
     start = time.monotonic()
     processor_log: tuple[str, ...] = ()
@@ -1513,6 +1519,25 @@ def _format_one_target(
         snapshot = staging_dir / "source.docx"
         with diag.timed(diag_events, "target", "snapshot"):
             snapshot_sha256 = _snapshot_input(target, snapshot)
+        # Inspect before calling: retrying on TypeError could repeat a paid
+        # classification when the error came from inside the processor.
+        processor_options: dict[str, Any] = {}
+        try:
+            parameters = inspect.signature(processor).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or (
+                parameter.name == "target_effort"
+                and parameter.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            )
+            for parameter in parameters
+        ):
+            processor_options["target_effort"] = target_effort
         result = processor(
             docx_path=snapshot,
             arch_registry=shared.arch_registry,
@@ -1526,6 +1551,7 @@ def _format_one_target(
             model=model,
             role_specs=shared.role_specs,
             conversion_mode=conversion_mode,
+            **processor_options,
         )
         # The processor writes into an isolated staging directory. Its final
         # path diagnostics therefore point at files that are deleted when the
@@ -1791,6 +1817,7 @@ def _write_run_artifacts(
     events: Sequence[str],
     secrets: Sequence[str],
     recorder: diag.DiagnosticsRecorder,
+    target_effort: str = "high",
 ) -> tuple[tuple[TargetFormatResult, ...], Path, Path]:
     """Publish per-target audits, diagnostics, run.log, and the run manifest."""
 
@@ -1922,6 +1949,7 @@ def _write_run_artifacts(
         "models": {
             "template": template_model,
             "target": target_model,
+            "target_effort": target_effort,
         },
         "prompt_fingerprints": {
             "template": profile_metadata.get("producer", {}).get("prompts", {}),
@@ -1954,6 +1982,7 @@ def _write_initialization_failure_artifacts(
     error: Exception,
     secrets: Sequence[str],
     recorder: diag.DiagnosticsRecorder,
+    target_effort: str = "high",
     failure_phase: str = "initialization",
     results: Optional[Sequence[TargetFormatResult]] = None,
 ) -> Path:
@@ -2114,7 +2143,11 @@ def _write_initialization_failure_artifacts(
         },
         **_numbering_source(conversion_mode, architect, architect_hash),
         "template_profile": None,
-        "models": {"template": template_model, "target": target_model},
+        "models": {
+            "template": template_model,
+            "target": target_model,
+            "target_effort": target_effort,
+        },
         "prompt_fingerprints": {"target": _target_prompt_fingerprints()},
         "error_type": type(error).__name__,
         "error_code": error_diagnostic.code,
@@ -2143,6 +2176,7 @@ def format_specifications(
     max_workers: int = 3,
     template_model: str = template_analysis.DEFAULT_MODEL,
     target_model: str = "claude-sonnet-5-5",
+    target_effort: str = "high",
     conversion_mode: str = FORMAT_ONLY,
     diagnostics_level: str = "info",
     template_prompt_dir: Optional[Path] = None,
@@ -2168,6 +2202,11 @@ def format_specifications(
     ``SPEC_FORMATTER_DIAGNOSTICS_LEVEL`` environment variable overrides it so a
     field build can be asked for verbose diagnostics without a code change.
     Diagnostics never contain secrets or document text.
+
+    ``target_effort`` selects the target classifier's adaptive-thinking effort
+    (``low``/``medium``/``high``/``xhigh``/``max``), defaulting to ``high``.
+    ``SPEC_FORMATTER_TARGET_EFFORT`` overrides it when nonempty, allowing
+    measured comparisons without changing the default.
     """
 
     started_utc = _utc_now()
@@ -2271,6 +2310,16 @@ def format_specifications(
             code="invalid_max_workers",
             message=message,
         )
+    target_effort = os.environ.get("SPEC_FORMATTER_TARGET_EFFORT", "") or target_effort
+    if not isinstance(target_effort, str) or target_effort not in (
+        "low", "medium", "high", "xhigh", "max"
+    ):
+        message = _KNOWN_SAFE_ERROR_MESSAGES["invalid_target_effort"]
+        raise _attach_safe_error_diagnostic(
+            ValueError(message),
+            code="invalid_target_effort",
+            message=message,
+        )
     normalized_api_key = api_key.strip()
     policy = application_policy_for_mode(conversion_mode)
     architect, targets, destination = _validate_inputs(
@@ -2350,6 +2399,7 @@ def format_specifications(
             targets=targets,
             template_model=template_model,
             target_model=target_model,
+            target_effort=target_effort,
             started_utc=started_utc,
             events=events,
             error=exc,
@@ -2388,6 +2438,7 @@ def format_specifications(
                         f"Processing target {index + 1} of {len(targets)}: "
                         f"{target.name}"
                     ),
+                    target_effort=target_effort,
                 )
                 futures[future] = (index + 1, target)
                 future.add_done_callback(
@@ -2492,6 +2543,7 @@ def format_specifications(
             profile=profile,
             template_model=template_model,
             target_model=target_model,
+            target_effort=target_effort,
             started_utc=started_utc,
             finished_utc=finished_utc,
             targets=ordered_results,
@@ -2514,6 +2566,7 @@ def format_specifications(
                 targets=targets,
                 template_model=template_model,
                 target_model=target_model,
+                target_effort=target_effort,
                 started_utc=started_utc,
                 events=events,
                 error=exc,

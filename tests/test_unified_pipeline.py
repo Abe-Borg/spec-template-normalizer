@@ -1706,6 +1706,146 @@ def test_invalid_max_workers_has_stable_diagnostic_before_filesystem_writes(
     )
 
 
+@pytest.mark.parametrize("effort", [None, "low", "medium", "high", "xhigh", "max"])
+def test_target_effort_reaches_processor_and_manifest(tmp_path, monkeypatch, effort):
+    monkeypatch.delenv("SPEC_FORMATTER_TARGET_EFFORT", raising=False)
+    architect = _write_input(tmp_path / "architect.docx", b"architect")
+    target = _write_input(tmp_path / "target.docx", b"target")
+    _calls, analyzer, loader, processor = _fake_dependencies(monkeypatch)
+    received = []
+
+    def capture(**kwargs):
+        received.append(kwargs["target_effort"])
+        return processor(**kwargs)
+
+    options = {} if effort is None else {"target_effort": effort}
+    result = pipeline.format_specifications(
+        architect, [target], tmp_path / "output", "key",
+        cache_dir=tmp_path / "cache", _template_analyzer=analyzer,
+        _config_loader=loader, _target_processor=capture, **options,
+    )
+    assert result.success
+    assert received == [effort or "high"]
+    assert json.loads(result.manifest_path.read_text())["models"]["target_effort"] == (effort or "high")
+
+
+@pytest.mark.parametrize("environment, argument, expected", [
+    ("medium", "low", "medium"), ("medium", None, "medium"), ("", "low", "low"),
+])
+def test_target_effort_environment_overrides_argument(
+    tmp_path, monkeypatch, environment, argument, expected
+):
+    monkeypatch.setenv("SPEC_FORMATTER_TARGET_EFFORT", environment)
+    _calls, analyzer, loader, processor = _fake_dependencies(monkeypatch)
+    received = []
+
+    def capture(**kwargs):
+        received.append(kwargs["target_effort"])
+        return processor(**kwargs)
+
+    result = pipeline.format_specifications(
+        _write_input(tmp_path / "architect.docx", b"architect"),
+        [_write_input(tmp_path / "target.docx", b"target")], tmp_path / "output", "key",
+        target_effort=argument, cache_dir=tmp_path / "cache",
+        _template_analyzer=analyzer, _config_loader=loader, _target_processor=capture,
+    )
+    assert result.success
+    assert received == [expected]
+    assert json.loads(result.manifest_path.read_text())["models"]["target_effort"] == expected
+
+
+@pytest.mark.parametrize("effort", ["", "HIGH", "unknown", None, True, 1, [], {}])
+def test_invalid_target_effort_has_safe_diagnostic_before_writes(
+    tmp_path, monkeypatch, effort
+):
+    monkeypatch.delenv("SPEC_FORMATTER_TARGET_EFFORT", raising=False)
+    with pytest.raises(ValueError) as raised:
+        pipeline.format_specifications(
+            None, [], tmp_path / "output", "key",
+            target_effort=effort,
+        )
+    assert not (tmp_path / "output").exists()
+    assert pipeline.safe_error_diagnostic(raised.value) == pipeline.SafeErrorDiagnostic(
+        code="invalid_target_effort",
+        message="target_effort must be one of: low, medium, high, xhigh, max.",
+    )
+
+
+def test_invalid_target_effort_environment_is_validated(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPEC_FORMATTER_TARGET_EFFORT", "invalid")
+    with pytest.raises(ValueError) as raised:
+        pipeline.format_specifications(None, [], tmp_path / "output", "key")
+    assert raised.value.safe_error_code == "invalid_target_effort"
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("accepts_effort", [False, True])
+def test_target_effort_preserves_explicit_processor_signatures(tmp_path, monkeypatch, accepts_effort):
+    _calls, analyzer, loader, processor = _fake_dependencies(monkeypatch)
+    received = []
+
+    def legacy(docx_path, arch_registry, env_registry, arch_styles_xml,
+               available_roles, api_key, output_dir, source_tokens, arch_root,
+               model, role_specs, conversion_mode):
+        received.append("legacy")
+        return processor(docx_path=docx_path, output_dir=output_dir)
+
+    def additive(docx_path, arch_registry, env_registry, arch_styles_xml,
+                 available_roles, api_key, output_dir, source_tokens, arch_root,
+                 model, role_specs, conversion_mode, *, target_effort="high"):
+        received.append(target_effort)
+        return processor(docx_path=docx_path, output_dir=output_dir)
+
+    result = pipeline.format_specifications(
+        _write_input(tmp_path / "architect.docx", b"architect"),
+        [_write_input(tmp_path / "target.docx", b"target")], tmp_path / "output", "key",
+        target_effort="medium", cache_dir=tmp_path / "cache",
+        _template_analyzer=analyzer, _config_loader=loader,
+        _target_processor=additive if accepts_effort else legacy,
+    )
+    assert result.success
+    assert received == ["medium" if accepts_effort else "legacy"]
+
+
+def test_processor_type_error_is_not_retried(tmp_path, monkeypatch):
+    _calls, analyzer, loader, _processor = _fake_dependencies(monkeypatch)
+    attempts = []
+
+    def fail(**kwargs):
+        attempts.append(kwargs["target_effort"])
+        raise TypeError("failure inside the processor")
+
+    result = pipeline.format_specifications(
+        _write_input(tmp_path / "architect.docx", b"architect"),
+        [_write_input(tmp_path / "target.docx", b"target")], tmp_path / "output", "key",
+        target_effort="low", cache_dir=tmp_path / "cache",
+        _template_analyzer=analyzer, _config_loader=loader, _target_processor=fail,
+    )
+    assert result.failed == 1
+    assert attempts == ["low"]
+
+
+@pytest.mark.parametrize("phase", ["initialization", "publication"])
+def test_target_effort_recorded_on_run_failures(tmp_path, monkeypatch, phase):
+    _calls, analyzer, loader, processor = _fake_dependencies(monkeypatch)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected failure")
+
+    if phase == "publication":
+        monkeypatch.setattr(pipeline, "_write_run_artifacts", fail)
+    with pytest.raises(RuntimeError) as raised:
+        pipeline.format_specifications(
+            _write_input(tmp_path / "architect.docx", b"architect"),
+            [_write_input(tmp_path / "target.docx", b"target")], tmp_path / "output", "key",
+            target_effort="medium", cache_dir=tmp_path / "cache",
+            _template_analyzer=fail if phase == "initialization" else analyzer,
+            _config_loader=loader, _target_processor=processor,
+        )
+    manifest = json.loads(raised.value.manifest_path.read_text())
+    assert manifest["models"]["target_effort"] == "medium"
+
+
 def test_output_directory_creation_failure_has_path_free_diagnostic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
