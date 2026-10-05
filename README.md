@@ -192,6 +192,33 @@ identifiers -- never document text or secrets -- and the verbosity is set with
 `diagnostics_level` (`debug`/`info`/`warning`/`error`, default `info`) or the
 `SPEC_FORMATTER_DIAGNOSTICS_LEVEL` environment variable, which overrides it.
 
+Target classification uses adaptive thinking at `target_effort="high"` by
+default. For measured comparisons, `format_specifications(target_effort=...)`
+accepts `low`, `medium`, `high`, `xhigh`, or `max`. A nonempty
+`SPEC_FORMATTER_TARGET_EFFORT` environment variable overrides the argument;
+invalid values fail input validation with `invalid_target_effort` before any
+run directory is created. The effective value is recorded as
+`models.target_effort` in `run.json` and `fields.effort` on the target `classify`
+diagnostics event. The architect classifier's effort is unchanged.
+
+Run the same targets with the same template, model, prompts, and conversion
+mode at each effort, then compare the resulting run directories:
+
+```bash
+python scripts/compare_runs.py path/to/high-run path/to/medium-run path/to/low-run
+```
+
+The script uses only Python's standard library. It matches targets by source
+SHA-256 and compares each pair's `paragraph_index` plus `csi_role` or ignored
+disposition from the target audits. It reports input, output, cache-read, and
+cache-write tokens per target and run, including incomplete usage. It reads
+only JSON artifacts, works with copied run directories, and never reads DOCX
+or paragraph text. Missing targets or dispositions are reported as unavailable;
+unknown counters stay unknown. Duplicate source hashes within one run are
+rejected as ambiguous. Use `--json` for a machine-readable report. Agreement
+measures consistency between runs; assess classification accuracy separately
+before changing the default effort.
+
 Folder discovery ignores Word lock files, this application's own outputs
 (`_FORMATTED.docx`, `_CANADIAN_FORMATTED.docx`, `_CANADIAN.docx`, `_CSI.docx`),
 and legacy `_PHASE2_FORMATTED.docx` outputs. If the architect is present in a

@@ -417,6 +417,19 @@ def test_client_disables_sdk_retries_and_sets_a_connect_timeout(monkeypatch):
     assert timeout.read == 600.0
 
 
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_target_effort_used_on_initial_request_and_regeneration(monkeypatch, effort):
+    _sdk, messages, _sleeps, _constructed = _run(
+        monkeypatch, [_ScriptedStream("invalid JSON"), _ScriptedStream(_GOOD)]
+    )
+    classify_target_document(
+        _unresolved_bundle(), ["PART"], api_key="k", model="m", target_effort=effort
+    )
+    assert len(messages.calls) == 2
+    assert [call["output_config"]["effort"] for call in messages.calls] == [effort, effort]
+    assert all(call["thinking"] == {"type": "adaptive"} for call in messages.calls)
+
+
 def test_authentication_error_makes_one_request_and_never_sleeps(monkeypatch):
     sdk, messages, sleeps, _constructed = _run(monkeypatch, [])
     messages.outcomes = [sdk.AuthenticationError("invalid x-api-key")]

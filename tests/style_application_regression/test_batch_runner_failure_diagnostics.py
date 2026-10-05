@@ -41,6 +41,42 @@ def _seed_extract(tmp_path: Path) -> Path:
     return extract_dir
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_effort_reaches_classifier_and_diagnostics_on_success_and_failure(
+    tmp_path, monkeypatch, fails
+):
+    extract_dir = _seed_extract(tmp_path)
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source")
+    monkeypatch.setattr(batch_runner, "DocxDecomposer", lambda _path: SimpleNamespace(
+        extract=lambda **_kwargs: extract_dir,
+    ))
+    monkeypatch.setattr(batch_runner, "build_phase2_slim_bundle", lambda *_args, **_kwargs: {
+        "paragraphs": [{"paragraph_index": 0}],
+    })
+    received = []
+
+    def classify(*, slim_bundle, available_roles, api_key, model, target_effort):
+        received.append(target_effort)
+        if fails:
+            raise RuntimeError("classification failed")
+        return {"classifications": [], "ignored_paragraphs": []}
+
+    monkeypatch.setattr(batch_runner, "classify_target_document", classify)
+    monkeypatch.setattr(batch_runner, "_apply_classified_target", lambda **_kwargs: (
+        tmp_path / "out.docx", None, {}, {}, {},
+    ))
+    result = batch_runner.process_single_file(
+        source, {}, {}, "<w:styles/>", ["PART"], "key", tmp_path / "output",
+        target_effort="medium",
+    )
+    assert result.success is (not fails)
+    assert received == ["medium"]
+    event = next(e for e in result.diagnostics if e["event"] == "classify")
+    assert event["fields"]["effort"] == "medium"
+    assert batch_runner.diag.sanitize_event(event)["fields"]["effort"] == "medium"
+
+
 def _bundle_and_classifications() -> tuple[dict, dict]:
     bundle = {
         "paragraphs": [{"paragraph_index": 0, "text": SECRET_TEXT}],

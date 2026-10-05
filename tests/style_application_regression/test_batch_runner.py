@@ -28,9 +28,12 @@ def _write_header(tmp_path, body):
 
 
 def test_new_role_specs_parameter_does_not_break_existing_positional_callers():
-    assert list(signature(process_single_file).parameters)[-3:] == [
+    parameters = signature(process_single_file).parameters
+    assert [name for name, value in parameters.items()
+            if value.kind == value.POSITIONAL_OR_KEYWORD][-3:] == [
         "model", "role_specs", "conversion_mode"
     ]
+    assert parameters["target_effort"].kind == parameters["target_effort"].KEYWORD_ONLY
 
 
 def test_unreachable_batch_entry_points_are_gone():

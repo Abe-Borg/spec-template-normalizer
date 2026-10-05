@@ -78,6 +78,7 @@ _STRING_VALUE_KEYS = frozenset(
         "conversion_mode",
         "csi_role",
         "disposition",
+        "effort",
         "event",
         "kind",
         "level",

@@ -1422,6 +1422,31 @@ already thinks at length on a template, and its guidance gives no such line.
 Effort is explicit on both (`high`); Opus 5.5 defaults to `medium`, and a
 different level is a measured change, not a carried-over one.
 
+The target's `high` default is preserved, but the public API now accepts
+`target_effort` (`low`, `medium`, `high`, `xhigh`, `max`). A nonempty
+`SPEC_FORMATTER_TARGET_EFFORT` overrides the argument, following diagnostics
+level precedence. Invalid effective values fail before filesystem writes with
+the input-validation code `invalid_target_effort`, beside
+`invalid_max_workers` in `pipeline.py`. The option is keyword-only and reaches
+`process_single_file`, `classify_target_document`, and every request's
+`output_config.effort`, including regenerations. Injected target processors
+receive it only when signature inspection shows keyword support; never call
+and catch `TypeError` to probe support or retry a processor on that basis.
+`models.target_effort` records the effective setting in successful and failed
+`run.json` manifests; the target `classify` event records `fields.effort`.
+Architect effort remains `high`.
+
+`python scripts/compare_runs.py HIGH_RUN MEDIUM_RUN [LOW_RUN ...]` compares
+two or more runs using standard library Python only. It matches source SHA-256
+and compares audit `paragraph_index` plus `csi_role` or ignored disposition,
+never text or ignored reasons. It reports pairwise agreement and each target's
+four observed token counters from the full audit `classify` event (available
+even when run diagnostics are level-filtered), preserving unknown counts and
+`usage_complete`. Missing targets or dispositions are unavailable, not agreement;
+duplicate source hashes in one run are ambiguous and rejected. `--json` emits
+the report as JSON. Keep template, model, prompts, mode, and targets fixed when
+measuring effort. Agreement is consistency, not evidence of accuracy by itself.
+
 **There is no target-classification cache, and the obvious key is wrong.**
 None exists because classification spend was judged immaterial. Keying one on
 the target's hash plus the available role names would serve a *wrong*

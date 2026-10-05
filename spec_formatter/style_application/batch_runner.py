@@ -1240,6 +1240,8 @@ def process_single_file(
     model: str = "claude-sonnet-5-5",
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
     conversion_mode: str = FORMAT_ONLY,
+    *,
+    target_effort: str = "high",
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log: List[str] = []
@@ -1298,13 +1300,19 @@ def process_single_file(
                     "All paragraphs classified deterministically; Anthropic request skipped"
                 )
             with diag.timed(per_file_diag, "target", "classify") as phase:
-                phase.set(unresolved_sent=unresolved, llm_used=bool(unresolved), model=model)
+                phase.set(
+                    unresolved_sent=unresolved,
+                    llm_used=bool(unresolved),
+                    model=model,
+                    effort=target_effort,
+                )
                 try:
                     classifications = classify_target_document(
                         slim_bundle=bundle,
                         available_roles=available_roles,
                         api_key=api_key,
                         model=model,
+                        target_effort=target_effort,
                     )
                 except BaseException as exc:
                     # A refusal, an exhausted regeneration, or a merge failure

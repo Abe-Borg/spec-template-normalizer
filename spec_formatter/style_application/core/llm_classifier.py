@@ -218,11 +218,13 @@ def _retry_requirement(error: Exception, allowed_indices: Set[int]) -> str:
     )
 
 
-def _classification_output_config(available_roles: list) -> dict:
+def _classification_output_config(
+    available_roles: list, *, target_effort: str = "high"
+) -> dict:
     """Return the shared Anthropic structured-output contract."""
 
     return {
-        "effort": "high",
+        "effort": target_effort,
         "format": {
             "type": "json_schema",
             "schema": {
@@ -546,7 +548,14 @@ def _merge_chunk_results(chunk_results: List[dict]) -> dict:
     }
 
 
-def classify_target_document(slim_bundle: dict, available_roles: list, api_key: str, model: str = "claude-sonnet-5-5") -> dict:
+def classify_target_document(
+    slim_bundle: dict,
+    available_roles: list,
+    api_key: str,
+    model: str = "claude-sonnet-5-5",
+    *,
+    target_effort: str = "high",
+) -> dict:
     unresolved_paragraphs = slim_bundle.get("paragraphs", [])
     if not unresolved_paragraphs:
         deterministic_only = coerce_to_final_classifications(
@@ -615,7 +624,9 @@ def classify_target_document(slim_bundle: dict, available_roles: list, api_key: 
                         model=model,
                         max_tokens=128000,
                         thinking={"type": "adaptive"},
-                        output_config=_classification_output_config(available_roles),
+                        output_config=_classification_output_config(
+                            available_roles, target_effort=target_effort
+                        ),
                         system=system_blocks,
                         messages=[{
                             "role": "user",
