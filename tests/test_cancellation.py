@@ -34,6 +34,7 @@ def _run(tmp_path, targets, event, **kwargs):
 def _assert_artifacts(result, statuses):
     assert result.cancelled and not result.success
     manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["schema_version"] == 4
     assert manifest["status"] == "cancelled"
     assert manifest["status"] in RUN_STATUSES
     assert len(manifest["targets"]) == len(statuses) == len(result.targets)
@@ -44,6 +45,7 @@ def _assert_artifacts(result, statuses):
     assert not (result.run_dir / ".staging").exists()
     for item, record, expected in zip(result.targets, manifest["targets"], statuses):
         audit = json.loads(item.audit_path.read_text())
+        assert audit["schema_version"] == 4
         assert record["success"] == audit["success"] == item.success == (expected == "succeeded")
         assert record["usage"] == audit["usage"] == item.usage
         assert record["audit_path"] == str(item.audit_path)

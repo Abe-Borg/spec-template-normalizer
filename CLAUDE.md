@@ -1576,8 +1576,12 @@ described under "Error codes and stages", `null` when the engine knew none.
 `run.log` prints the same sentence on a `WHERE:` line under the error it
 belongs to, and the failing diagnostics phase event carries the bare
 `paragraph_index` (an int, so it survives the diagnostics field boundary that
-drops the section number for having whitespace in it). Both artifact schema
-versions are 3; version 3 is exactly this addition.
+drops the section number for having whitespace in it). Version 3 introduced
+the location field. Both artifact schema versions are now 4: version 4 adds
+the `cancelled` run status and target stage, plus per-target observed `usage`
+in run records and audits. All publication paths emit version 4, including
+initialization and publication failures; consumers must select the matching
+schema rather than treating these as version 3 artifacts.
 
 `run.log` and `run.json` derive a target's failure identity from the same
 `target_error_diagnostic()`, so the log line, the manifest record and the GUI

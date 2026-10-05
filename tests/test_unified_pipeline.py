@@ -356,7 +356,7 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
     assert api_key not in manifest_text
     assert api_key not in run_log_text
     manifest = json.loads(manifest_text)
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     assert manifest["run_id"] == result.run_id
     assert manifest["conversion_mode"] == pipeline.FORMAT_ONLY
     assert manifest["application"]["version"] == spec_formatter.__version__
@@ -391,7 +391,7 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
     ).hexdigest()
     assert target_result.audit_path is not None
     audit = json.loads(target_result.audit_path.read_text(encoding="utf-8"))
-    assert audit["schema_version"] == 3
+    assert audit["schema_version"] == 4
     assert audit["disposition_counts"] == target_result.audit_summary
     assert audit["application_audit"]["paragraph_indices"] == [0]
     assert "original_text_preview" not in manifest_text
@@ -1844,6 +1844,10 @@ def test_target_effort_recorded_on_run_failures(tmp_path, monkeypatch, phase):
         )
     manifest = json.loads(raised.value.manifest_path.read_text())
     assert manifest["models"]["target_effort"] == "medium"
+    assert manifest["schema_version"] == 4
+    for record in manifest["targets"]:
+        audit = json.loads(Path(record["audit_path"]).read_text())
+        assert audit["schema_version"] == 4
 
 
 def test_output_directory_creation_failure_has_path_free_diagnostic(

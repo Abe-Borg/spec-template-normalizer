@@ -78,8 +78,10 @@ _MAX_WORKERS = 6
 # Version 3 added ``error_location`` to every failure record. It is always
 # present, null when the engine knew no placement, so a reader can rely on it
 # rather than having to tell "no location" from "an older run".
-_RUN_MANIFEST_VERSION = 3
-_RUN_AUDIT_VERSION = 3
+# Version 4 adds cancelled run status/stages and per-target observed usage to
+# run records and audits. Closed-schema consumers must distinguish it from v3.
+_RUN_MANIFEST_VERSION = 4
+_RUN_AUDIT_VERSION = 4
 # Contract 3: manifest version 2 with the committed engine fingerprint.
 _PROFILE_CONTRACT_VERSION = "3"
 _PROFILE_CACHE_KEEP = 2

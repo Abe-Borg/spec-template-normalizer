@@ -148,6 +148,10 @@ stopped and, when the engine failed on a known condition, a stable
 the closed sets are listed in CLAUDE.md. API keys and document text are never
 written to run metadata.
 
+`run.json` and target audits use artifact schema version 4, which introduces
+cancellation outcomes and per-target observed usage. Consumers selecting a
+schema by `schema_version` must support version 4 for new run artifacts.
+
 ### Finding the paragraph a failure is about
 
 A remediation sentence is fixed, so on its own it can only say "check the
