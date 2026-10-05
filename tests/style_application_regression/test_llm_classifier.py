@@ -83,6 +83,9 @@ def test_classify_calls_llm_for_unresolved(monkeypatch):
     assert ignored_schema["items"]["properties"]["reason"]["enum"] == [
         "non_csi_content"
     ]
+    schema = output_config["format"]["schema"]
+    assert set(schema["properties"]) == {"classifications", "ignored_paragraphs"}
+    assert set(schema["required"]) == set(schema["properties"])
 
 
 def test_user_message_exposes_only_unresolved_paragraphs():
@@ -96,8 +99,8 @@ def test_user_message_exposes_only_unresolved_paragraphs():
         },
     }
 
-    content = _build_user_message(bundle, ["PART"])
-    prompt_bundle = json.loads(content[content.rfind("\n\n{") + 2:])
+    content = _build_user_message(bundle)
+    prompt_bundle = json.loads(content)
 
     assert prompt_bundle == {
         "paragraphs": [{"paragraph_index": 3, "text": "A"}],
@@ -279,14 +282,15 @@ def test_merge_chunk_results_conflict_raises():
 class _CountingMessages:
     def __init__(self):
         self.call_count = 0
+        self.calls = []
         self.lock = threading.Lock()
 
     def stream(self, **kwargs):
         with self.lock:
             self.call_count += 1
+            self.calls.append(kwargs)
         content = kwargs["messages"][0]["content"]
-        json_start = content.rfind("\n\n{")
-        slim_bundle = json.loads(content[json_start + 2:])
+        slim_bundle = json.loads(content)
         classifications = [
             {"paragraph_index": p["paragraph_index"], "csi_role": "PART"}
             for p in slim_bundle.get("paragraphs", [])
@@ -321,6 +325,20 @@ def test_chunk_classification_runs_all_chunks(monkeypatch):
 
     assert fake.messages.call_count == 2
     assert len(result["classifications"]) == 8
+
+
+def test_cached_system_block_is_byte_stable_across_chunks_and_targets(monkeypatch):
+    fake = _CountingClient()
+    monkeypatch.setitem(__import__("sys").modules, "anthropic", types.SimpleNamespace(Anthropic=lambda **_kwargs: fake))
+    for target, count in (("first", 320), ("second", 330)):
+        bundle = {"paragraphs": [{"paragraph_index": i, "text": f"{target} requirement {i}"} for i in range(count)],
+                  "available_roles": ["PART"]}
+        result = classify_target_document(bundle, ["PART"], api_key="x", model="m")
+        assert len(result["classifications"]) == count
+    assert len(fake.messages.calls) == 4
+    blocks = [json.dumps(call["system"], separators=(",", ":")).encode("utf-8") for call in fake.messages.calls]
+    assert len(set(blocks)) == 1
+    assert all("available_roles" not in call["messages"][0]["content"] for call in fake.messages.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +600,7 @@ def test_request_limiter_bounds_concurrent_streams(monkeypatch):
                 state["peak"] = max(state["peak"], state["in_flight"])
             time.sleep(0.02)
             content = kwargs["messages"][0]["content"]
-            slim_bundle = json.loads(content[content.rfind("\n\n{") + 2:])
+            slim_bundle = json.loads(content)
             payload = json.dumps({
                 "classifications": [
                     {"paragraph_index": p["paragraph_index"], "csi_role": "PART"}
@@ -658,7 +676,8 @@ def test_system_prefix_is_one_cached_block_and_user_turn_is_compact(monkeypatch)
     )
     assert block["text"].endswith("Think the problem through before you answer.")
     content = kwargs["messages"][0]["content"]
-    assert content.startswith('available_roles: ["PART"]\n\n{')
+    assert content.startswith('{')
+    assert "available_roles" not in content
     assert "\n  " not in content  # compact JSON, no indentation
     assert PHASE2_RUN_INSTRUCTION.strip() not in content
 
@@ -680,8 +699,8 @@ def test_chunker_measures_the_bytes_the_request_sends():
     # is sent, so an indent=2 layout can no longer under-count by a third.
     chunks = _split_bundle_into_chunks(bundle, max_chars=compact)
     assert len(chunks) == 1
-    sent = _build_user_message(bundle, ["PART"])
-    assert sent.endswith(_wire_json({"paragraphs": paragraphs}))
+    sent = _build_user_message(bundle)
+    assert sent == _wire_json({"paragraphs": paragraphs})
 
 
 def test_usage_numbers_are_summed_across_requests(monkeypatch):
@@ -737,7 +756,7 @@ def _overlap_client(monkeypatch, answers):
             # A regeneration attempt appends the retry requirement after the
             # JSON, so decode the object rather than the whole tail.
             slim_bundle, _end = json.JSONDecoder().raw_decode(
-                content[content.find("\n\n{") + 2:]
+                content
             )
             chunk_index = slim_bundle["_chunk_info"]["chunk_index"]
             with self.lock:

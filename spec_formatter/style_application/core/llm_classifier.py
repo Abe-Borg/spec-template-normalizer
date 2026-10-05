@@ -35,9 +35,9 @@ _MAX_BUNDLE_TOKENS = 80_000
 _MAX_BUNDLE_CHARS = _MAX_BUNDLE_TOKENS * _CHARS_PER_TOKEN
 _CHUNK_OVERLAP = 20
 
-# The chunker measures exactly the bytes the request sends: compact JSON with
-# sorted keys. The old chunker measured compact JSON but sent indent=2, a
-# 1.35x under-count, and compact input is about a third smaller anyway.
+# The chunker measures the projected user turn, including tables and context,
+# as compact JSON with sorted keys. json.dumps escapes non-ASCII by default,
+# so its character count is also its UTF-8 byte count on the wire.
 _JSON_WIRE_KWARGS = {"separators": (",", ":"), "sort_keys": True}
 
 
@@ -192,20 +192,77 @@ def _final_stop_reason(stream: Any) -> Optional[str]:
     return getattr(get_final_message(), "stop_reason", None)
 
 
-def _build_user_message(slim_bundle: dict, available_roles: list) -> str:
+def _project_request_bundle(slim_bundle: dict) -> dict:
+    """Compact only the wire payload; local classification/audit data stays intact."""
+
+    paragraphs = slim_bundle.get("paragraphs", [])
+    patterns = {}
+    conflicting_levels = set()
+    level_keys = []
+    for paragraph in paragraphs:
+        pattern = paragraph.get("numbering_pattern")
+        effective = paragraph.get("effective_numPr")
+        key = None
+        # build_phase2_slim_bundle resolves every pattern from effective_numPr
+        # and one fixed document catalog. Direct numPr may be absent (inherited
+        # numbering) or different; it is never the table reference.
+        if (
+            isinstance(pattern, dict)
+            and isinstance(effective, dict)
+            and isinstance(pattern.get("numId"), str)
+            and isinstance(pattern.get("ilvl"), str)
+            and pattern["numId"] == effective.get("numId")
+            and pattern["ilvl"] == effective.get("ilvl", "0")
+        ):
+            key = (pattern["numId"], pattern["ilvl"])
+            if key in patterns and patterns[key] != pattern:
+                conflicting_levels.add(key)
+            patterns[key] = pattern
+        level_keys.append(key)
+
+    projected = []
+    numbering_levels = {}
+    for i, (paragraph, key) in enumerate(zip(paragraphs, level_keys)):
+        # Keep nested values verbatim: e.g. a false bold hint or an empty
+        # numbering lvlText conveys a fact even in a nonempty dictionary.
+        row = {
+            name: value for name, value in paragraph.items()
+            if value is not None and value is not False
+            and value != "" and value != {} and value != []
+        }
+        for field, neighbour in (("prev_text", i - 1), ("next_text", i + 1)):
+            if (
+                0 <= neighbour < len(paragraphs)
+                and paragraph.get(field) == paragraphs[neighbour].get("text", "")[:80]
+            ):
+                row.pop(field, None)
+        if key is not None and key not in conflicting_levels:
+            num_id, ilvl = key
+            numbering_levels.setdefault(num_id, {})[ilvl] = {
+                name: value for name, value in patterns[key].items()
+                if name not in ("numId", "ilvl")
+            }
+            row.pop("numbering_pattern", None)
+        # Unexpected inconsistent/custom bundles retain their inline patterns
+        # rather than losing evidence by sharing a conflicting table entry.
+        projected.append(row)
+
+    prompt_bundle = {"paragraphs": projected}
+    if numbering_levels:
+        prompt_bundle["numbering_levels"] = numbering_levels
+    if "_chunk_info" in slim_bundle:
+        prompt_bundle["_chunk_info"] = slim_bundle["_chunk_info"]
+    return prompt_bundle
+
+
+def _build_user_message(slim_bundle: dict) -> str:
     # Only unresolved paragraphs belong in the model request.  The complete
     # bundle also contains deterministic classifications and filtered paragraph
     # indices for local audit/reassembly; exposing those indices invites the
     # model to echo entries that validation correctly rejects.
-    prompt_bundle = {"paragraphs": slim_bundle.get("paragraphs", [])}
-    if "_chunk_info" in slim_bundle:
-        prompt_bundle["_chunk_info"] = slim_bundle["_chunk_info"]
     # The run instruction and role list live in the cached system block; the
     # user turn carries only what changes per chunk.
-    return (
-        "available_roles: " + json.dumps(list(available_roles))
-        + "\n\n" + _wire_json(prompt_bundle)
-    )
+    return _wire_json(_project_request_bundle(slim_bundle))
 
 
 def _retry_requirement(error: Exception, allowed_indices: Set[int]) -> str:
@@ -262,12 +319,8 @@ def _classification_output_config(
                             "required": ["paragraph_index", "reason"],
                         },
                     },
-                    "notes": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
                 },
-                "required": ["classifications", "ignored_paragraphs", "notes"],
+                "required": ["classifications", "ignored_paragraphs"],
             },
         },
     }
@@ -377,41 +430,42 @@ def _validate_classifications(classifications: dict, available_roles: list, allo
 def _split_bundle_into_chunks(slim_bundle: dict, max_chars: int = _MAX_BUNDLE_CHARS) -> List[dict]:
     paragraphs = slim_bundle.get("paragraphs", [])
     roles = slim_bundle.get("available_roles", [])
-    filter_report = slim_bundle.get("filter_report", {})
 
-    full_json = _wire_json({"paragraphs": paragraphs})
+    full_json = _build_user_message(slim_bundle)
     if len(full_json) <= max_chars and len(paragraphs) <= 300:
         return [slim_bundle]
-
-    overhead = len(_wire_json({
-        "available_roles": roles,
-        "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
-        "paragraphs": []
-    }))
-    # Chunks carry an emptied filter_report, so size them from the paragraph
-    # payload alone (a filter_report-dominated bundle would wildly inflate the
-    # per-paragraph average). Clamp the chunk size above _CHUNK_OVERLAP so the
-    # window always advances — otherwise `start = end - _CHUNK_OVERLAP` can
-    # move backwards and loop forever.
-    avg_para_size = len(_wire_json(paragraphs)) / max(len(paragraphs), 1)
-    paras_per_chunk = max(_CHUNK_OVERLAP + 10, int((max_chars - overhead) / max(avg_para_size, 1)))
 
     chunks = []
     start = 0
     while start < len(paragraphs):
-        end = min(start + paras_per_chunk, len(paragraphs))
-        chunk_paras = paragraphs[start:end]
-        chunk = {
-            "available_roles": roles,
-            "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
-            "paragraphs": chunk_paras,
-            "_chunk_info": {
-                "chunk_index": len(chunks),
-                "paragraph_range": [chunk_paras[0]["paragraph_index"], chunk_paras[-1]["paragraph_index"]] if chunk_paras else [0, 0]
+        def make_chunk(end: int) -> dict:
+            return {
+                "available_roles": roles,
+                "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
+                "paragraphs": paragraphs[start:end],
+                "_chunk_info": {
+                    "chunk_index": len(chunks),
+                    "paragraph_range": [paragraphs[start]["paragraph_index"], paragraphs[end - 1]["paragraph_index"]],
+                },
             }
-        }
-        chunks.append(chunk)
-        start = end - _CHUNK_OVERLAP if end < len(paragraphs) else end
+
+        # Size the complete projected request, including its shared levels,
+        # boundary neighbour text and chunk metadata. An average row size
+        # cannot bound requests with uneven text/formatting or list metadata.
+        low, high = start + 1, min(start + 300, len(paragraphs))
+        end = start + 1
+        while low <= high:
+            candidate = (low + high) // 2
+            if len(_build_user_message(make_chunk(candidate))) <= max_chars:
+                end = candidate
+                low = candidate + 1
+            else:
+                high = candidate - 1
+        chunks.append(make_chunk(end))
+        # A single oversize paragraph must still be sent. Shrink the overlap
+        # for tight budgets so every window advances, even a singleton.
+        overlap = min(_CHUNK_OVERLAP, end - start - 1)
+        start = end - overlap if end < len(paragraphs) else end
     return chunks
 
 
@@ -605,7 +659,7 @@ def classify_target_document(
         if len(chunks) > 1:
             print(f"  Processing chunk {i + 1}/{len(chunks)}...")
 
-        user_message = _build_user_message(chunk, available_roles)
+        user_message = _build_user_message(chunk)
         max_regenerations = 2
         allowed_indices = {
             p.get("paragraph_index")

@@ -794,6 +794,15 @@ writer.
 Paragraph indices are tied to the `word/document.xml` paragraph sequence.
 Preserve that index and visible-text contract when changing XML parsing.
 
+`core/llm_classifier.py` projects only the model request: it omits empty/null/
+false top-level fields, shares numbering patterns by `effective_numPr.numId`
+and `ilvl`, and retains neighbour text when the adjacent request row cannot
+supply it. Chunk limits measure that projected compact JSON, including shared
+levels and boundary context. Keep the complete slim bundle unchanged for
+deterministic rules, reassembly, and audits. Target structured output requires
+only `classifications` and `ignored_paragraphs`; local validators still accept
+legacy `notes` or their absence.
+
 ### `spec_formatter/style_application/core/style_import.py`
 
 Imports only the requested architect style closure. Materialize effective

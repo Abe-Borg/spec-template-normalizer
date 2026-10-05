@@ -575,8 +575,13 @@ increase in output tokens for accuracy close to a higher effort level.
 
 Both classifiers send their byte-stable prompt prefix as a cached system
 block, and the target classifier sends compact JSON, so repeated chunks and
-regeneration attempts reuse the cached prefix and input is about a third
-smaller. The `classify` phase event in `diagnostics.jsonl` records
+regeneration attempts can reuse the cached prefix. Target requests omit empty
+fields, share numbering patterns by effective list ID/level, and include
+neighbour text only when it is unavailable in adjacent request rows; chunk
+limits measure this projected payload. The full local slim bundle and audits
+are unchanged. Target responses require only classifications and ignored
+paragraphs; legacy responses with notes remain accepted.
+The `classify` phase event in `diagnostics.jsonl` records
 `requests`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and
 `cache_creation_input_tokens` for each target, so cache reuse is visible per
 run. When two overlapping chunks disagree about a paragraph, the classifier
