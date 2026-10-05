@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -21,6 +22,7 @@ from spec_formatter.llm_usage import (
     streamed_stop_details,
 )
 from spec_formatter.style_application.core.errors import attach_engine_error
+from spec_formatter.cancellation import check_cancelled, wait_for_retry
 from paragraph_rules import (
     is_classifiable_paragraph,
     infer_expected_roles,
@@ -320,6 +322,7 @@ def _call_api(
     response_schema: Optional[dict] = None,
     response_format_state: Optional[Dict[str, bool]] = None,
     usage: Optional[UsageCollector] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> str:
     """Single API call with retry logic. Returns raw response text.
 
@@ -349,6 +352,7 @@ def _call_api(
     # get one chance to run.
     attempt = 0
     while attempt < 3:  # initial + 2 transient retries
+        check_cancelled(cancel_event)
         try:
             output_config = {"effort": "high"}
             if active_schema is not None:
@@ -369,13 +373,14 @@ def _call_api(
                 # The events are consumed first because a refusal's
                 # stop_details reach only the raw message_delta event; the
                 # SDK's final message does not carry them.
-                stop_details = streamed_stop_details(stream)
+                stop_details = streamed_stop_details(stream, cancel_event)
                 final_message = stream.get_final_message()
                 # Before the stop-reason checks below: a refusal and an
                 # output-limit response are both billed, and both used to
                 # raise with their usage unread.
                 if usage is not None:
                     usage.record_response(final_message)
+                check_cancelled(cancel_event)
                 stop_reason = final_message.stop_reason
                 if stop_reason == "max_tokens":
                     raise ValueError(
@@ -402,7 +407,7 @@ def _call_api(
         except (anthropic.APIConnectionError, anthropic.RateLimitError) as e:
             last_error = e
             if attempt < 2:
-                time.sleep(2 ** (attempt + 1))
+                wait_for_retry(cancel_event, 2 ** (attempt + 1))
             attempt += 1
         except anthropic.APIStatusError as e:
             if active_schema is not None and _is_structured_output_compilation_error(e):
@@ -420,7 +425,7 @@ def _call_api(
                 raise
             last_error = e
             if attempt < 2:
-                time.sleep(2 ** (attempt + 1))
+                wait_for_retry(cancel_event, 2 ** (attempt + 1))
             attempt += 1
     raise last_error  # type: ignore[misc]
 
@@ -475,6 +480,7 @@ def _request_json_response(
     max_attempts: int,
     response_transform: Optional[Callable[[dict], dict]] = None,
     usage: Optional[UsageCollector] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict:
     """Request and validate JSON, regenerating unusable output when allowed."""
     if type(max_attempts) is not int or max_attempts < 1:
@@ -483,6 +489,7 @@ def _request_json_response(
     last_error: Optional[ValueError] = None
     response_format_state = {"enabled": True}
     for attempt in range(max_attempts):
+        check_cancelled(cancel_event)
         prompt = (
             user_message
             if attempt == 0
@@ -503,6 +510,7 @@ def _request_json_response(
                 response_schema=response_schema,
                 response_format_state=response_format_state,
                 usage=usage,
+                **({"cancel_event": cancel_event} if cancel_event is not None else {}),
             )
             parsed = _parse_response(raw)
             return (
@@ -1030,6 +1038,7 @@ def classify_document(
     max_response_attempts: int = DEFAULT_RESPONSE_ATTEMPTS,
     *,
     usage_collector: Optional[UsageCollector] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict:
     """
     Classify all paragraphs in a slim bundle using the Anthropic API.
@@ -1066,6 +1075,7 @@ def classify_document(
     # old indent=2 layout). The estimate runs first so an obviously oversized
     # bundle never creates a client or makes a request; the API's own count
     # then replaces the estimate for the real decision.
+    check_cancelled(cancel_event)
     bundle_json = json.dumps(slim_bundle, separators=(",", ":"), sort_keys=True)
     _check_input_cost_guard(
         estimate_tokens(master_prompt + run_instruction + bundle_json),
@@ -1087,6 +1097,7 @@ def classify_document(
         max_retries=0,
     )
     user_message = f"{run_instruction}\n\nSlim bundle:\n{bundle_json}"
+    check_cancelled(cancel_event)
     measured_tokens = _count_input_tokens(client, model, master_prompt, user_message)
     if measured_tokens is not None:
         _check_input_cost_guard(measured_tokens, measured=True)
@@ -1100,6 +1111,7 @@ def classify_document(
         max_attempts=max_response_attempts,
         response_transform=_normalize_instruction_roles,
         usage=usage_collector,
+        **({"cancel_event": cancel_event} if cancel_event is not None else {}),
     )
 
     normalized_exclusions = _normalize_known_exclusions(instructions, slim_bundle)
@@ -1134,6 +1146,7 @@ def classify_document(
 
     # Attempt validation; if coverage mismatch, try targeted patching
     for patch_attempt in range(max_patch_attempts + 1):
+        check_cancelled(cancel_event)
         try:
             validate_instructions(instructions, slim_bundle=slim_bundle)
             return instructions  # Clean pass
@@ -1162,6 +1175,7 @@ def classify_document(
                 response_schema=_patch_response_schema(),
                 max_attempts=max_response_attempts,
                 usage=usage_collector,
+                **({"cancel_event": cancel_event} if cancel_event is not None else {}),
             )
             _validate_patch_result(patch_result, missing, instructions)
 

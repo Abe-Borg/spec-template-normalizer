@@ -25,6 +25,7 @@ from .classification import (
     coerce_to_final_classifications,
 )
 from .errors import attach_engine_error
+from ...cancellation import RunCancelled, check_cancelled, request_slot, wait_for_retry
 
 
 # Sonnet 5.5's tokenizer (shared with Sonnet 5) produces ~30% more tokens for the same text than the
@@ -555,7 +556,9 @@ def classify_target_document(
     model: str = "claude-sonnet-5-5",
     *,
     target_effort: str = "high",
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict:
+    check_cancelled(cancel_event)
     unresolved_paragraphs = slim_bundle.get("paragraphs", [])
     if not unresolved_paragraphs:
         deterministic_only = coerce_to_final_classifications(
@@ -615,11 +618,12 @@ def classify_target_document(
         transport_attempt = 0
 
         while True:
+            check_cancelled(cancel_event)
             try:
                 # No sampling params (temperature/top_p/top_k): Sonnet 5.5 and
                 # Opus 5.5 reject non-default values with a 400.
-                usage.record_attempt()
-                with _REQUEST_LIMITER:
+                with request_slot(_REQUEST_LIMITER, cancel_event):
+                    usage.record_attempt()
                     with client.messages.stream(
                         model=model,
                         max_tokens=128000,
@@ -643,9 +647,11 @@ def classify_target_document(
                         # The events are consumed first because a refusal's
                         # stop_details reach only the raw message_delta
                         # event; the SDK's final message does not carry them.
-                        stop_details = streamed_stop_details(stream)
+                        stop_details = streamed_stop_details(stream, cancel_event)
                         get_final_message = getattr(stream, "get_final_message", None)
                         final_message = get_final_message() if get_final_message else None
+                        usage.record_response(final_message)
+                        check_cancelled(cancel_event)
                         stop_reason = getattr(final_message, "stop_reason", None)
                         # Text only after the stop reason: get_final_text()
                         # raises when the response holds no text block, which
@@ -656,7 +662,6 @@ def classify_target_document(
                             if stop_reason in ("refusal", "max_tokens")
                             else stream.get_final_text()
                         )
-                usage.record_response(final_message)
                 if stop_reason == "refusal":
                     category = refusal_category(final_message, stop_details)
                     raise ClassificationRefused(
@@ -676,7 +681,7 @@ def classify_target_document(
                 retry_error = e
                 if regeneration < max_regenerations:
                     print(f"  JSON parse error, retrying ({regeneration + 1}/{max_regenerations})...")
-                    time.sleep(2 ** regeneration)
+                    wait_for_retry(cancel_event, 2 ** regeneration)
                     regeneration += 1
                 else:
                     response_length = len(response_text.strip())
@@ -692,13 +697,13 @@ def classify_target_document(
                 if regeneration < max_regenerations:
                     wait = 2 ** (regeneration + 1)
                     print(f"  Classification attempt failed: {e}, retrying in {wait}s ({regeneration + 1}/{max_regenerations})...")
-                    time.sleep(wait)
+                    wait_for_retry(cancel_event, wait)
                     regeneration += 1
                 else:
                     raise RuntimeError(
                         f"LLM classification failed after {max_regenerations + 1} attempts: {e}"
                     )
-            except ClassificationRefused:
+            except (ClassificationRefused, RunCancelled):
                 raise
             except Exception as e:
                 # Transport failures: retry only what can heal. A bad key, a
@@ -710,7 +715,7 @@ def classify_target_document(
                     f"  Transient API failure: {e}; retrying in {delay:g}s "
                     f"({transport_attempt + 1}/{_TRANSPORT_RETRIES})..."
                 )
-                time.sleep(delay)
+                wait_for_retry(cancel_event, delay)
                 transport_attempt += 1
 
     # Every failure below - a refused chunk, exhausted regeneration, an
@@ -731,6 +736,7 @@ def classify_target_document(
                     i = futures[future]
                     chunk_results[i] = future.result()
 
+        check_cancelled(cancel_event)
         if len(chunk_results) > 1:
             conflicts = _chunk_conflicts(chunk_results)
             if conflicts:

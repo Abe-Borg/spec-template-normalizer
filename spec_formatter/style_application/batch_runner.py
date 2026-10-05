@@ -7,6 +7,7 @@ import json
 import re
 import os
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,7 +15,8 @@ from typing import Any, Dict, List, Optional
 
 from .. import builtin_scheme
 from .. import diagnostics as diag
-from ..llm_usage import usage_from_exception
+from ..llm_usage import UsageCollector, usage_from_exception
+from ..cancellation import RunCancelled, cancellation_kwargs, check_cancelled
 from .arch_env_applier import apply_environment_to_target
 from .core.canadian_to_csi import apply_canadian_to_csi
 from .core.classification import (
@@ -1242,11 +1244,12 @@ def process_single_file(
     conversion_mode: str = FORMAT_ONLY,
     *,
     target_effort: str = "high",
+    cancel_event: Optional[threading.Event] = None,
 ) -> BatchResult:
     start = time.monotonic()
     per_file_log: List[str] = []
     per_file_diag: List[Dict[str, Any]] = []
-    observed_usage: Dict[str, Any] = {}
+    observed_usage: Dict[str, Any] = UsageCollector().snapshot()
     filename = docx_path.name
     output_path: Optional[Path] = None
     conversion_report: Optional[CanadianConversionReport] = None
@@ -1256,6 +1259,7 @@ def process_single_file(
     stage = "validation"
 
     try:
+        check_cancelled(cancel_event)
         conversion_mode = validate_conversion_mode(conversion_mode)
         with tempfile.TemporaryDirectory(prefix="phase2_") as tmp_root:
             digest = hashlib.sha256(str(docx_path.resolve()).encode("utf-8")).hexdigest()[:8]
@@ -1289,6 +1293,16 @@ def process_single_file(
             )
 
             stage = "classification_preflight"
+            # Until classification completes these candidates have no verified
+            # disposition. Cancellation must not report zero unresolved merely
+            # because application never started.
+            audit_summary = {
+                "styled": 0,
+                "ignored": 0,
+                "out_of_scope": len(bundle.get("filter_report", {}).get("paragraphs_out_of_scope", [])),
+                "unresolved": unresolved + deterministic + len(bundle.get("deterministic_ignored_paragraphs", [])),
+            }
+            check_cancelled(cancel_event)
             if unresolved > 0 and not api_key:
                 raise ValueError("Anthropic API key is required when unresolved paragraphs exist.")
 
@@ -1313,6 +1327,7 @@ def process_single_file(
                         api_key=api_key,
                         model=model,
                         target_effort=target_effort,
+                        **cancellation_kwargs(classify_target_document, cancel_event),
                     )
                 except BaseException as exc:
                     # A refusal, an exhausted regeneration, or a merge failure
@@ -1332,6 +1347,7 @@ def process_single_file(
                 _set_usage_fields(phase, usage)
 
             stage = "application"
+            check_cancelled(cancel_event)
             (
                 output_path,
                 conversion_report,
@@ -1376,6 +1392,8 @@ def process_single_file(
             usage=observed_usage,
         )
     except Exception as exc:
+        if isinstance(exc, RunCancelled):
+            stage = "cancelled"
         if isinstance(exc, ApplicationStageError):
             stage = exc.stage
             conversion_report = exc.conversion_report
@@ -1401,5 +1419,3 @@ def process_single_file(
             error_location=_safe_error_location(exc),
             usage=observed_usage,
         )
-
-

@@ -317,6 +317,7 @@ class FormatWorker(threading.Thread):
         self.max_workers = max_workers
         self.conversion_mode = conversion_mode
         self.events = events
+        self.cancel_event = threading.Event()
 
     def _progress(
         self,
@@ -345,6 +346,7 @@ class FormatWorker(threading.Thread):
                 max_workers=self.max_workers,
                 conversion_mode=self.conversion_mode,
                 progress_event=self._progress,
+                cancel_event=self.cancel_event,
             )
             self.events.put(("complete", result))
         except Exception as exc:
@@ -399,6 +401,7 @@ class App(ctk.CTk):
         self.output_is_automatic = False
         self.events: queue.Queue = queue.Queue()
         self.worker: Optional[FormatWorker] = None
+        self._close_when_idle = False
         self.last_result: Optional[FormatRunResult] = None
         self.failed_run_dir: Optional[Path] = None
         self.active_output_dir: Optional[Path] = None
@@ -666,6 +669,16 @@ class App(ctk.CTk):
             font=_font(17, "bold"),
         )
         self.run_button.pack(side="left", fill="x", expand=True)
+        self.cancel_button = ctk.CTkButton(
+            action_row,
+            text="Cancel",
+            command=self._cancel_run,
+            width=90,
+            height=48,
+            state="disabled",
+            font=_font(14),
+        )
+        self.cancel_button.pack(side="left", padx=(10, 0))
         self.open_button = ctk.CTkButton(
             action_row,
             text="Open Output Folder",
@@ -992,6 +1005,7 @@ class App(ctk.CTk):
         )
         self._show_run_summary(active=True)
         self.run_button.configure(state="disabled", text="PROCESSING...")
+        self.cancel_button.configure(state="normal", text="Cancel")
         self._lock_run_controls()
         self.open_button.configure(state="disabled")
         self.status_label.configure(text="Checking files", text_color=COLORS["secondary"])
@@ -1039,12 +1053,16 @@ class App(ctk.CTk):
         finally:
             # Re-arm unconditionally: a rendering error must never leave the
             # pump dead with the controls locked and the spinner running.
-            self.after(100, self._poll_events)
+            if getattr(self, "_close_when_idle", False) and (self.worker is None or not self.worker.is_alive()):
+                self.destroy()
+            else:
+                self.after(100, self._poll_events)
 
     def _finish_busy_state(self) -> None:
         self.progress.stop()
         self.progress.set(0)
         self.run_button.configure(state="normal", text="FORMAT SPECS")
+        self.cancel_button.configure(state="disabled", text="Cancel")
         self._unlock_run_controls()
         self._show_run_summary(active=False)
 
@@ -1053,6 +1071,9 @@ class App(ctk.CTk):
         self.last_result = result
         run_dir = result_run_directory(result) or self.active_output_dir
         status, summary = summarize_batch_results(result.targets)
+        if getattr(result, "cancelled", False):
+            status = "cancelled"
+            summary = f"Run cancelled: {result.succeeded} document(s) published."
         color = {
             "success": COLORS["success"],
             "partial": COLORS["warning"],
@@ -1103,7 +1124,11 @@ class App(ctk.CTk):
         if diagnostics_path is not None:
             self._append_log(f"Diagnostics log: {diagnostics_path}")
         self.active_output_dir = None
-        if status == "success":
+        if getattr(self, "_close_when_idle", False):
+            return
+        if status == "cancelled":
+            messagebox.showinfo("Run cancelled", summary, parent=self)
+        elif status == "success":
             messagebox.showinfo("Formatting complete", summary, parent=self)
         elif status == "partial":
             messagebox.showwarning(
@@ -1128,7 +1153,8 @@ class App(ctk.CTk):
                 self._append_log(f"Run manifest: {manifest_path}")
             self.open_button.configure(state="normal")
         self.active_output_dir = None
-        messagebox.showerror("Formatting failed", message, parent=self)
+        if not getattr(self, "_close_when_idle", False):
+            messagebox.showerror("Formatting failed", message, parent=self)
 
     def _open_output(self) -> None:
         output = result_run_directory(self.last_result) if self.last_result is not None else None
@@ -1144,13 +1170,23 @@ class App(ctk.CTk):
         except OSError as exc:
             messagebox.showerror("Could not open folder", str(exc))
 
+    def _cancel_run(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            self.worker.cancel_event.set()
+            self.cancel_button.configure(state="disabled", text="Cancelling...")
+            self.status_label.configure(text="Cancelling; saving run artifacts...")
+
     def _on_close(self) -> None:
         if self.worker is not None and self.worker.is_alive():
-            messagebox.showwarning(
+            if self._close_when_idle:
+                return
+            if messagebox.askyesno(
                 "Formatting is still running",
-                "Wait for the active formatting run to finish before closing.",
+                "Cancel the active run and close after its run artifacts are saved?",
                 parent=self,
-            )
+            ):
+                self._close_when_idle = True
+                self._cancel_run()
             return
         self.destroy()
 

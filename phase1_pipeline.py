@@ -15,6 +15,7 @@ import hashlib
 import json
 import shutil
 import tempfile
+import threading
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,7 @@ from llm_classifier import (
 )
 from paragraph_rules import is_classifiable_paragraph
 from spec_formatter.llm_usage import UsageCollector, attach_usage
+from spec_formatter.cancellation import cancellation_kwargs, check_cancelled
 from spec_formatter.resources import architect_prompt_dir
 from phase1_bundle import (
     BundleArtifacts,
@@ -141,6 +143,7 @@ def run_phase1(
     prompt_dir: Optional[Path] = None,
     progress: Optional[ProgressCallback] = None,
     classifier: Optional[Classifier] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Phase1Result:
     """Analyze *source_docx* and atomically publish one validated Phase 1 bundle."""
     source_docx = Path(source_docx)
@@ -170,6 +173,7 @@ def run_phase1(
 
     work_dir = Path(tempfile.mkdtemp(prefix=".phase1-work-", dir=str(output_root)))
     try:
+        check_cancelled(cancel_event)
         snapshot_path = work_dir / "source" / source_docx.name
         _emit(progress, f"Snapshotting {source_docx.name}...")
         _snapshot_source(source_docx, snapshot_path)
@@ -201,7 +205,10 @@ def run_phase1(
         }
         if usage_collector is not None:
             classify_kwargs["usage_collector"] = usage_collector
+        check_cancelled(cancel_event)
+        classify_kwargs.update(cancellation_kwargs(classify, cancel_event))
         instructions = _normalize_instruction_roles(classify(**classify_kwargs))
+        check_cancelled(cancel_event)
         validate_instructions(instructions, slim_bundle=slim_bundle)
         coverage, handled, classifiable = compute_coverage(slim_bundle, instructions)
         if coverage != 1.0:

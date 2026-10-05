@@ -1336,7 +1336,7 @@ Current codes: `header_footer_target_section_id_required`,
 `paragraph_style_not_applied`,
 `numbering_importer_unavailable`, `style_import_namespace_conflict`,
 `template_section_shell_conflict`, `template_default_section_conflict`,
-`template_duplicate_section_index`.
+`template_duplicate_section_index`, `run_cancelled`.
 
 `stage` is public on `BatchResult`, `TargetFormatResult`, `audit.json`, and
 `run.json`: the last checkpoint reached. The sets are closed and tested
@@ -1354,8 +1354,32 @@ Current codes: `header_footer_target_section_id_required`,
   `application_reporting`, `output_publication`, `complete`
 - runner (before the shared path): `validation`, `extraction`,
   `bundle_build`, `classification_preflight`, `classification`,
-  `application`
-- pipeline: `not_started`, `processing`, `publication`, `complete`
+  `application`, `cancelled`
+- pipeline: `not_started`, `processing`, `publication`, `complete`, `cancelled`
+
+Run statuses (`RUN_STATUSES` in `core/errors.py`) are `succeeded`,
+`partial_failure`, `failed`, and `cancelled`. Cancellation takes precedence
+even when some targets have already published successfully.
+
+`format_specifications(cancel_event=None)` accepts an optional
+`threading.Event`. When set, no new target or classifier request starts;
+attempts, regeneration, architect coverage patches, overlap re-asks, and
+transport retries all check it. Retry backoff waits on the event. Request-slot
+waits are cancellable too. A stream may finish or close on its next event;
+an early close leaves that attempt's usage unknown, never zero, under
+`spec_formatter/llm_usage.py`. Each target's audit and run record includes its
+observed usage, and the run totals stay independent of diagnostics verbosity.
+
+Already published DOCX files remain available. Unpublished cancelled targets
+carry `run_cancelled` and stage `cancelled`, publish no DOCX, and still receive
+an audit. The API returns `FormatRunResult.cancelled=True` after workers exit,
+run artifacts are saved, and staging is removed. Injected processors and
+classifiers retain old signatures: inspect keyword support before the single
+call, never execute and retry after `TypeError`.
+
+The GUI's Cancel button only sets the worker's event. Closing during a run
+offers to cancel and defers window destruction until the worker exits; all
+artifact publication and cleanup remains in the engine.
 
 ## Concurrency, retries, and caches
 
