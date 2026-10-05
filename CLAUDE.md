@@ -401,6 +401,25 @@ per-target outcomes, and the raised error carries `run_dir` and
 `TemplateProfile.provenance` when the profile is selected, not by
 re-validating the bundle after the outputs are already published.
 
+### Architect Canadian preflight
+
+In architect `csi_to_canadian` mode, initialization calls
+`core/registry.preflight_validate_canadian_architect()` once on the loaded
+profile before any target is dispatched or classified. It reuses the unchanged
+`_validate_canadian_role_contract` for ARTICLE and PARAGRAPH,
+`_validate_complete_article_hierarchy` for PART/ARTICLE/PARAGRAPH, and
+`_validate_architect_numbering` for ARTICLE and PARAGRAPH. A failure carries
+`canadian_architect_contract` through the existing initialization-failure path,
+which writes `run.json`, `run.log`, diagnostics, and per-target not-started
+audits.
+
+This is a deliberate tightening for templates whose ARTICLE or PARAGRAPH
+contract is broken or missing, even when a particular target would not use
+those roles. It adds no new numbering rules or more forgiving checks. Deeper
+roles stay validated per target, and the unchanged per-target checks remain
+the authority for every conversion. Format-only and the built-in scheme keep
+their existing preflight behavior.
+
 ## Runs without an architect template
 
 `csi_to_canadian_standalone` and `canadian_to_csi` take a target and nothing

@@ -28,6 +28,12 @@ from .opc_paths import (
 )
 from .header_parity import architect_even_and_odd_headers
 from .section_mapping import choose_section_sources
+from .csi_to_canadian import (
+    _validate_canadian_role_contract,
+    _validate_complete_article_hierarchy,
+    _validate_architect_numbering,
+)
+from .errors import EngineError
 
 
 PHASE1_BUNDLE_FORMAT = "spec-template-normalizer.phase1"
@@ -1481,6 +1487,33 @@ def _validate_numbering_consistency(
                 f"numbering.nums[{idx}] (numId={nid}) references "
                 f"abstractNumId={ref_aid} which is not defined in abstract_nums"
             )
+
+
+def preflight_validate_canadian_architect(
+    role_specs: Optional[Dict[str, Dict[str, Any]]],
+    template_registry: Dict[str, Any],
+) -> None:
+    """Check the common CSI roles once, before architect-mode target dispatch.
+
+    This deliberately requires ARTICLE and PARAGRAPH even when a target might
+    not use them. Deeper roles and target evidence remain the converter's
+    responsibility; these are the converter's existing validators, unchanged.
+    """
+    specs = role_specs if isinstance(role_specs, dict) else {}
+    roles = {"ARTICLE", "PARAGRAPH"}
+    try:
+        for role in sorted(roles):
+            _validate_canadian_role_contract(role, specs.get(role))
+        _validate_complete_article_hierarchy(specs, roles | {"PART"})
+        _validate_architect_numbering(
+            template_registry.get("numbering", {}).get("numbering_xml") or "",
+            specs,
+            roles,
+        )
+    except ValueError as exc:
+        # Numbering resolution uses target-side codes in the converter. Here
+        # any failure concerns only the shared architect profile.
+        raise EngineError("canadian_architect_contract", str(exc)) from exc
 
 
 def preflight_validate_registries(
