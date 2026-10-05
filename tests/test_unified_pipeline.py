@@ -356,7 +356,7 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
     assert api_key not in manifest_text
     assert api_key not in run_log_text
     manifest = json.loads(manifest_text)
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     assert manifest["run_id"] == result.run_id
     assert manifest["conversion_mode"] == pipeline.FORMAT_ONLY
     assert manifest["application"]["version"] == spec_formatter.__version__
@@ -391,7 +391,7 @@ def test_run_manifest_log_and_audits_capture_provenance_without_api_key(
     ).hexdigest()
     assert target_result.audit_path is not None
     audit = json.loads(target_result.audit_path.read_text(encoding="utf-8"))
-    assert audit["schema_version"] == 3
+    assert audit["schema_version"] == 4
     assert audit["disposition_counts"] == target_result.audit_summary
     assert audit["application_audit"]["paragraph_indices"] == [0]
     assert "original_text_preview" not in manifest_text
@@ -1624,6 +1624,16 @@ def test_canadian_mode_reaches_target_processor_and_uses_distinct_output_name(
     calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
     received_modes: list[str] = []
 
+    def canadian_config_loader(bundle_dir: Path) -> SharedConfig:
+        from dataclasses import replace
+        from spec_formatter import builtin_scheme
+
+        return replace(
+            config_loader(bundle_dir),
+            role_specs=builtin_scheme.build_role_specs(),
+            env_registry=builtin_scheme.build_env_registry(),
+        )
+
     def capturing_processor(**kwargs) -> BatchResult:
         received_modes.append(kwargs["conversion_mode"])
         return processor(**kwargs)
@@ -1637,7 +1647,7 @@ def test_canadian_mode_reaches_target_processor_and_uses_distinct_output_name(
         max_workers=1,
         conversion_mode=pipeline.CSI_TO_CANADIAN,
         _template_analyzer=analyzer,
-        _config_loader=config_loader,
+        _config_loader=canadian_config_loader,
         _target_processor=capturing_processor,
     )
 
@@ -1844,6 +1854,10 @@ def test_target_effort_recorded_on_run_failures(tmp_path, monkeypatch, phase):
         )
     manifest = json.loads(raised.value.manifest_path.read_text())
     assert manifest["models"]["target_effort"] == "medium"
+    assert manifest["schema_version"] == 4
+    for record in manifest["targets"]:
+        audit = json.loads(Path(record["audit_path"]).read_text())
+        assert audit["schema_version"] == 4
 
 
 def test_output_directory_creation_failure_has_path_free_diagnostic(
@@ -2273,6 +2287,69 @@ def test_run_artifacts_prefer_the_engine_error_code_over_classified_text(
     audit = json.loads(audit_text)
     assert audit["error_code"] == "classification_coverage_incomplete"
     assert audit["error"] == record["error"]
+
+
+@pytest.mark.parametrize("diagnostics_level", ["info", "warning"])
+def test_real_target_cost_guard_reaches_run_and_audit_json(
+    tmp_path, monkeypatch, diagnostics_level
+):
+    import anthropic
+
+    from spec_formatter.llm_usage import UsageCollector
+    from spec_formatter.style_application import batch_runner
+    from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS
+    from tests.test_unified_roundtrip import W_NS, _rewrite_docx_parts, _write_docx
+
+    monkeypatch.setenv("SPEC_FORMATTER_MAX_TARGET_PARAGRAPHS", "3")
+
+    def unexpected_client(*_args, **_kwargs):
+        pytest.fail("Oversized target constructed an Anthropic client")
+
+    monkeypatch.setattr(anthropic, "Anthropic", unexpected_client)
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = tmp_path / "target.docx"
+    _write_docx(target, architect=False)
+    body = "".join(
+        f"<w:p><w:r><w:t>Confidential target requirement {i}.</w:t></w:r></w:p>"
+        for i in range(4)
+    )
+    _rewrite_docx_parts(target, {
+        "word/document.xml": (
+            f'<w:document xmlns:w="{W_NS}"><w:body>{body}</w:body></w:document>'
+        ),
+    })
+    original = target.read_bytes()
+    _calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+
+    # Only architect preparation is stubbed. The real target extraction,
+    # bundle builder, preflight, and reporting path run together.
+    result = pipeline.format_specifications(
+        architect, [target], tmp_path / "formatted", api_key="offline-test-key",
+        cache_dir=tmp_path / "cache", diagnostics_level=diagnostics_level,
+        _template_analyzer=analyzer, _config_loader=config_loader,
+        _target_processor=batch_runner.process_single_file,
+    )
+
+    item = result.targets[0]
+    assert result.failed == 1
+    assert item.output_path is None
+    assert item.usage == UsageCollector().snapshot()
+    assert target.read_bytes() == original
+    assert architect.read_bytes() == b"architect-original"
+    assert not list(result.run_dir.glob("*.docx"))
+    bundle_event = next(event for event in item.diagnostics if event["event"] == "slim_bundle")
+    assert bundle_event["fields"]["unresolved"] == 4
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    audit = json.loads(item.audit_path.read_text(encoding="utf-8"))
+    for record in (manifest["targets"][0], audit):
+        assert record["success"] is False
+        assert record["stage"] == "classification_preflight"
+        assert record["error_code"] == "target_too_large"
+        assert record["error"] == ERROR_REMEDIATIONS["target_too_large"]
+    assert manifest["targets"][0]["output_path"] is None
+    assert manifest["diagnostics"]["usage"]["target"] == UsageCollector().snapshot()
+    artifact_text = result.manifest_path.read_text() + item.audit_path.read_text()
+    assert "Confidential target requirement" not in artifact_text
 
 
 def test_target_error_diagnostic_falls_back_to_text_classification_without_a_code() -> None:

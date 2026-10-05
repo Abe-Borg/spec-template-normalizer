@@ -590,9 +590,13 @@ def _architect_numbering(*, canadian: bool) -> str:
     if canadian:
         levels = (
             '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/>'
-            '<w:lvlText w:val=".%1"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>'
+            '<w:lvlText w:val="PART %1"/></w:lvl>'
             '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/>'
-            '<w:lvlText w:val=".%2"/><w:pPr><w:ind w:left="1440" w:hanging="360"/></w:pPr></w:lvl>'
+            '<w:lvlText w:val="%1.%2"/></w:lvl>'
+            '<w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="decimal"/>'
+            '<w:lvlText w:val=".%3"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>'
+            '<w:lvl w:ilvl="3"><w:start w:val="1"/><w:numFmt w:val="decimal"/>'
+            '<w:lvlText w:val=".%4"/><w:pPr><w:ind w:left="1440" w:hanging="360"/></w:pPr></w:lvl>'
         )
     else:
         levels = (
@@ -609,10 +613,16 @@ def _architect_numbering(*, canadian: bool) -> str:
 
 
 def _write_architect(path: Path, *, canadian: bool, even_and_odd: bool) -> Path:
+    exemplars = (
+        ((0, "GENERAL"), (1, "SUMMARY"),
+         (2, "Architect paragraph one"), (3, "Architect paragraph two"))
+        if canadian else
+        ((0, "Architect paragraph one"), (1, "Architect paragraph two"))
+    )
     body = "".join(
         f'<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="5"/></w:numPr></w:pPr>'
         f"<w:r><w:t>{text}</w:t></w:r></w:p>"
-        for ilvl, text in ((0, "Architect paragraph one"), (1, "Architect paragraph two"))
+        for ilvl, text in exemplars
     )
     section = (
         '<w:sectPr><w:headerReference w:type="default" r:id="rIdHdrDefault"/>'
@@ -675,7 +685,7 @@ def _write_architect(path: Path, *, canadian: bool, even_and_odd: bool) -> Path:
 
 
 def _template_classifier(**kwargs):
-    """The architect's two numbered paragraphs become PARAGRAPH and SUBPARAGRAPH.
+    """Classify the list exemplars, including PART/ARTICLE for Canadian mode.
 
     Written here rather than borrowed from another test module, so this file
     depends on nothing but the public entry point.
@@ -686,11 +696,17 @@ def _template_classifier(**kwargs):
         for item in kwargs["slim_bundle"].get("paragraphs", [])
         if item.get("skip_reason") is None
     ]
-    assert len(classifiable) == 2, "the architect fixture has two classifiable paragraphs"
-    rows = (
-        (classifiable[0], "PARAGRAPH", "CSI_Paragraph__ARCH", "CSI Paragraph"),
-        (classifiable[1], "SUBPARAGRAPH", "CSI_Subparagraph__ARCH", "CSI Subparagraph"),
-    )
+    assert len(classifiable) in {2, 4}, "the architect fixture has two or four exemplars"
+    roles = [
+        ("PARAGRAPH", "CSI_Paragraph__ARCH", "CSI Paragraph"),
+        ("SUBPARAGRAPH", "CSI_Subparagraph__ARCH", "CSI Subparagraph"),
+    ]
+    if len(classifiable) == 4:
+        roles = [
+            ("PART", "CSI_Part__ARCH", "CSI Part"),
+            ("ARTICLE", "CSI_Article__ARCH", "CSI Article"),
+        ] + roles
+    rows = [(paragraph, *role) for paragraph, role in zip(classifiable, roles)]
     return {
         "create_styles": [
             {

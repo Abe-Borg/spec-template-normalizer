@@ -29,7 +29,8 @@ from . import __version__ as APPLICATION_VERSION
 from . import builtin_scheme
 from . import diagnostics as diag
 from . import template_analysis
-from .llm_usage import usage_from_exception
+from .llm_usage import UsageCollector, normalize_usage, usage_from_exception
+from .cancellation import RunCancelled, cancellation_kwargs, check_cancelled
 from .resources import TARGET_PROMPT_FILES, architect_prompt_dir, target_prompt_dir
 from .style_application.batch_runner import (
     BatchResult,
@@ -55,6 +56,7 @@ from .style_application.core.conversion_modes import (
     validate_conversion_mode,
 )
 from .style_application.core.csi_to_canadian import CanadianConversionReport
+from .style_application.core.registry import preflight_validate_canadian_architect
 
 
 ProgressCallback = Callable[[str], None]
@@ -77,8 +79,10 @@ _MAX_WORKERS = 6
 # Version 3 added ``error_location`` to every failure record. It is always
 # present, null when the engine knew no placement, so a reader can rely on it
 # rather than having to tell "no location" from "an older run".
-_RUN_MANIFEST_VERSION = 3
-_RUN_AUDIT_VERSION = 3
+# Version 4 adds cancelled run status/stages and per-target observed usage to
+# run records and audits. Closed-schema consumers must distinguish it from v3.
+_RUN_MANIFEST_VERSION = 4
+_RUN_AUDIT_VERSION = 4
 # Contract 3: manifest version 2 with the committed engine fingerprint.
 _PROFILE_CONTRACT_VERSION = "3"
 _PROFILE_CACHE_KEEP = 2
@@ -165,6 +169,7 @@ class FormatRunResult:
     run_dir: Optional[Path] = None
     manifest_path: Optional[Path] = None
     diagnostics_path: Optional[Path] = None
+    cancelled: bool = False
 
     def __post_init__(self) -> None:
         # Keep the historical ``output_dir`` attribute as a concrete alias of
@@ -186,7 +191,7 @@ class FormatRunResult:
 
     @property
     def success(self) -> bool:
-        return bool(self.targets) and self.failed == 0
+        return bool(self.targets) and self.failed == 0 and not self.cancelled
 
     @property
     def output_paths(self) -> tuple[Path, ...]:
@@ -636,9 +641,11 @@ def prepare_template_profile(
     progress: Optional[ProgressCallback] = None,
     classifier: Optional[TemplateClassifier] = None,
     analyzer: TemplateAnalyzer = template_analysis.run_phase1,
+    cancel_event: Optional[threading.Event] = None,
 ) -> TemplateProfile:
     """Return a current, strictly validated profile for *architect_template*."""
 
+    check_cancelled(cancel_event)
     architect = Path(architect_template).resolve()
     cache_root = Path(cache_dir).resolve() / _PROFILE_CACHE_NAMESPACE
     source_sha256 = _stable_source_sha256(architect)
@@ -685,6 +692,8 @@ def prepare_template_profile(
     analyzer_kwargs["prompt_dir"] = effective_prompt_dir
     if classifier is not None:
         analyzer_kwargs["classifier"] = classifier
+    check_cancelled(cancel_event)
+    analyzer_kwargs.update(cancellation_kwargs(analyzer, cancel_event))
     phase1_result = analyzer(**analyzer_kwargs)
     manifest = template_analysis.validate_bundle_directory(
         phase1_result.bundle_dir,
@@ -839,7 +848,9 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     _atomic_write_bytes(path, encoded)
 
 
-def _publish_output(source: Path, destination: Path) -> str:
+def _publish_output(
+    source: Path, destination: Path, cancel_event: Optional[threading.Event] = None,
+) -> str:
     """Copy from short staging, then atomically publish inside the run folder."""
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -852,6 +863,7 @@ def _publish_output(source: Path, destination: Path) -> str:
                 digest.update(chunk)
             writer.flush()
             os.fsync(writer.fileno())
+        check_cancelled(cancel_event)
         os.replace(partial, destination)
         published_digest = _stable_source_sha256(destination)
         if published_digest != digest.hexdigest():
@@ -1181,6 +1193,9 @@ _SAFE_OPERATIONAL_PREFIXES = (
     "END ENVIRONMENT APPLICATION",
     "Extracting DOCX",
     "Failed ",
+    "Cancelled ",
+    "Cancelled:",
+    "Run cancelled;",
     "Formatted ",
     "Identifying the template",
     "Imported ",
@@ -1483,6 +1498,21 @@ def _validate_output_plan(
             )
 
 
+def _cancelled_target(target: Path) -> TargetFormatResult:
+    error = RunCancelled()
+    return TargetFormatResult(
+        source_path=target,
+        success=False,
+        output_path=None,
+        log=(),
+        error=str(error),
+        error_code=error.safe_error_code,
+        duration_seconds=0.0,
+        stage="cancelled",
+        usage=UsageCollector().snapshot(),
+    )
+
+
 def _format_one_target(
     target: Path,
     final_output: Path,
@@ -1495,12 +1525,13 @@ def _format_one_target(
     on_started: Optional[Callable[[], None]] = None,
     *,
     target_effort: str = "high",
+    cancel_event: Optional[threading.Event] = None,
 ) -> TargetFormatResult:
     start = time.monotonic()
     processor_log: tuple[str, ...] = ()
     # Initialised before the try: the processor can raise before returning a
     # result, and a target that failed that way still has no usage to lose.
-    observed_usage: dict[str, Any] = {}
+    observed_usage: dict[str, Any] = UsageCollector().snapshot()
     conversion_report: Optional[CanadianConversionReport] = None
     snapshot_sha256: Optional[str] = None
     audit_summary = _empty_audit_summary()
@@ -1511,9 +1542,11 @@ def _format_one_target(
     # the engine's own phase events.  Carries counts/timings only, never text.
     diag_events: list[dict[str, Any]] = []
     try:
+        check_cancelled(cancel_event)
         stage = "processing"
         if on_started is not None:
             on_started()
+        check_cancelled(cancel_event)
         # Deliberately avoid carrying user-controlled filenames into the work
         # tree.  This keeps Windows paths short even for deeply nested inputs.
         snapshot = staging_dir / "source.docx"
@@ -1538,6 +1571,7 @@ def _format_one_target(
             for parameter in parameters
         ):
             processor_options["target_effort"] = target_effort
+        check_cancelled(cancel_event)
         result = processor(
             docx_path=snapshot,
             arch_registry=shared.arch_registry,
@@ -1552,6 +1586,7 @@ def _format_one_target(
             role_specs=shared.role_specs,
             conversion_mode=conversion_mode,
             **processor_options,
+            **cancellation_kwargs(processor, cancel_event),
         )
         # The processor writes into an isolated staging directory. Its final
         # path diagnostics therefore point at files that are deleted when the
@@ -1569,7 +1604,7 @@ def _format_one_target(
         audit_summary = _normalize_audit_summary(
             getattr(result, "audit_summary", None)
         )
-        observed_usage = dict(getattr(result, "usage", {}) or {})
+        observed_usage = normalize_usage(getattr(result, "usage", {}))
         audit = _normalize_audit_details(getattr(result, "audit", None))
         numbering_checks = _normalize_numbering_checks(
             getattr(result, "numbering_checks", None)
@@ -1597,6 +1632,7 @@ def _format_one_target(
                 usage=observed_usage,
             )
         stage = "publication"
+        check_cancelled(cancel_event)
         if result.output_path is None or not result.output_path.is_file():
             raise RuntimeError("Style application reported success without an output DOCX.")
         if _stable_source_sha256(target) != snapshot_sha256:
@@ -1604,7 +1640,10 @@ def _format_one_target(
                 f"{target.name} changed during formatting. Finish saving it and run again."
             )
         with diag.timed(diag_events, "target", "publish"):
-            output_sha256 = _publish_output(result.output_path, final_output)
+            output_sha256 = _publish_output(
+                result.output_path, final_output,
+                **cancellation_kwargs(_publish_output, cancel_event),
+            )
         return TargetFormatResult(
             source_path=target,
             success=True,
@@ -1623,12 +1662,16 @@ def _format_one_target(
             usage=observed_usage,
         )
     except Exception as exc:
+        if isinstance(exc, RunCancelled):
+            stage = "cancelled"
+        error_diagnostic = safe_error_diagnostic(exc, (api_key,))
         return TargetFormatResult(
             source_path=target,
             success=False,
             output_path=None,
             log=processor_log + (f"FAILED: {exc}",),
             error=str(exc),
+            error_code=error_diagnostic.code if error_diagnostic else None,
             duration_seconds=time.monotonic() - start,
             conversion_report=conversion_report,
             source_sha256=snapshot_sha256,
@@ -1637,7 +1680,7 @@ def _format_one_target(
             numbering_checks=numbering_checks,
             stage=stage,
             diagnostics=tuple(diag_events),
-            usage=observed_usage,
+            usage=normalize_usage(usage_from_exception(exc)) or observed_usage,
         )
 
 
@@ -1791,6 +1834,7 @@ def _target_audit_payload(
             secrets,
         ),
         "disposition_counts": dict(item.audit_summary),
+        "usage": normalize_usage(item.usage),
         "numbering_checks": _redact_json(item.numbering_checks, secrets),
         "application_audit": _redact_json(item.audit, secrets),
         "conversion_report": _redact_json(conversion, secrets),
@@ -1818,6 +1862,7 @@ def _write_run_artifacts(
     secrets: Sequence[str],
     recorder: diag.DiagnosticsRecorder,
     target_effort: str = "high",
+    cancelled: bool = False,
 ) -> tuple[tuple[TargetFormatResult, ...], Path, Path]:
     """Publish per-target audits, diagnostics, run.log, and the run manifest."""
 
@@ -1907,6 +1952,7 @@ def _write_run_artifacts(
                     secrets,
                 ),
                 "disposition_counts": dict(item.audit_summary),
+                "usage": normalize_usage(item.usage),
                 "numbering_checks": _redact_json(item.numbering_checks, secrets),
             }
         )
@@ -1916,7 +1962,9 @@ def _write_run_artifacts(
         "run_id": run_id,
         "conversion_mode": conversion_mode,
         "status": (
-            "succeeded"
+            "cancelled"
+            if cancelled
+            else "succeeded"
             if failed == 0
             else "failed"
             if succeeded == 0
@@ -1985,6 +2033,7 @@ def _write_initialization_failure_artifacts(
     target_effort: str = "high",
     failure_phase: str = "initialization",
     results: Optional[Sequence[TargetFormatResult]] = None,
+    cancelled: bool = False,
 ) -> Path:
     """Persist a complete failed-run record when a run cannot finish.
 
@@ -2090,6 +2139,7 @@ def _write_initialization_failure_artifacts(
                     target_error.location if target_error else None, secrets
                 ),
                 "disposition_counts": _normalize_audit_summary(outcome.audit_summary),
+                "usage": normalize_usage(outcome.usage),
                 "numbering_checks": _redact_json(outcome.numbering_checks, secrets),
             }
         )
@@ -2121,7 +2171,7 @@ def _write_initialization_failure_artifacts(
         "schema_version": _RUN_MANIFEST_VERSION,
         "run_id": run_id,
         "conversion_mode": conversion_mode,
-        "status": "failed",
+        "status": "cancelled" if cancelled else "failed",
         "failure_phase": failure_phase,
         "started_utc": _iso_utc(started_utc),
         "finished_utc": _iso_utc(finished_utc),
@@ -2183,6 +2233,7 @@ def format_specifications(
     template_classifier: Optional[TemplateClassifier] = None,
     progress: Optional[ProgressCallback] = None,
     progress_event: Optional[ProgressEventCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
     _template_analyzer: TemplateAnalyzer = template_analysis.run_phase1,
     _config_loader: Callable[[Path], SharedConfig] = load_and_validate_shared_config,
     _target_processor: TargetProcessor = process_single_file,
@@ -2207,6 +2258,11 @@ def format_specifications(
     (``low``/``medium``/``high``/``xhigh``/``max``), defaulting to ``high``.
     ``SPEC_FORMATTER_TARGET_EFFORT`` overrides it when nonempty, allowing
     measured comparisons without changing the default.
+
+    Setting ``cancel_event`` stops new targets and model requests, wakes retry
+    backoff, and withholds unpublished DOCX files. Already published targets
+    keep their outputs. Cancellation returns a result with ``cancelled=True``
+    after all workers exit and the complete run artifacts are written.
     """
 
     started_utc = _utc_now()
@@ -2344,7 +2400,10 @@ def format_specifications(
         mode=conversion_mode,
     )
     profile: Optional[TemplateProfile] = None
+    shared: Optional[SharedConfig] = None
+    results_by_target: dict[Path, TargetFormatResult] = {}
     try:
+        check_cancelled(cancel_event)
         if policy.requires_architect_template:
             assert architect is not None  # guaranteed by _validate_inputs
             with recorder.timer("pipeline", "template_analysis") as phase:
@@ -2358,6 +2417,7 @@ def format_specifications(
                     progress=report,
                     classifier=template_classifier,
                     analyzer=_template_analyzer,
+                    cancel_event=cancel_event,
                 )
                 phase.set(reused=profile.reused)
                 recorder.record_usage("architect", dict(profile.usage))
@@ -2369,6 +2429,10 @@ def format_specifications(
             report("Validating the template profile...")
             with recorder.timer("pipeline", "config_load"):
                 shared = _config_loader(profile.bundle_dir)
+                if policy.convert_to_canadian:
+                    preflight_validate_canadian_architect(
+                        shared.role_specs, shared.env_registry
+                    )
         else:
             # Nothing is analyzed, cached, or requested from the model: the
             # scheme is built from committed constants, so there is no profile
@@ -2379,6 +2443,11 @@ def format_specifications(
                 phase.set(scheme_version=builtin_scheme.BUILTIN_SCHEME_VERSION)
         planned_outputs = _plan_output_paths(targets, run_dir, conversion_mode)
         _validate_output_plan(architect, targets, planned_outputs)
+        check_cancelled(cancel_event)
+    except RunCancelled as exc:
+        recorder.record_usage("architect", usage_from_exception(exc))
+        shared = None
+        report("Run cancelled; writing run artifacts...")
     except Exception as exc:
         drain_reported_events()
         # A failed architect analysis still sent requests. Without this the
@@ -2413,7 +2482,6 @@ def format_specifications(
             pass
         _remove_staging_dir(run_dir)
         raise
-    results_by_target: dict[Path, TargetFormatResult] = {}
 
     with tempfile.TemporaryDirectory(
         prefix="sf-",
@@ -2421,7 +2489,18 @@ def format_specifications(
         job_root = Path(job_temp)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures: dict[Future[TargetFormatResult], tuple[int, Path]] = {}
-            for index, target in enumerate(targets):
+            outstanding: set[Future[TargetFormatResult]] = set()
+            next_target = 0
+
+            def submit_available() -> None:
+                nonlocal next_target
+                while shared is not None and len(outstanding) < workers and next_target < len(targets):
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    submit_target(next_target, targets[next_target])
+                    next_target += 1
+
+            def submit_target(index: int, target: Path) -> None:
                 staging_dir = job_root / f"t{index:04d}"
                 report(f"Queued {index + 1} of {len(targets)}: {target.name}")
                 future = executor.submit(
@@ -2439,8 +2518,10 @@ def format_specifications(
                         f"{target.name}"
                     ),
                     target_effort=target_effort,
+                    cancel_event=cancel_event,
                 )
                 futures[future] = (index + 1, target)
+                outstanding.add(future)
                 future.add_done_callback(
                     lambda done_future: pending_events.put(("done", done_future))
                 )
@@ -2449,7 +2530,7 @@ def format_specifications(
                 drain_reported_events()
 
             completed = 0
-            outstanding = set(futures)
+            submit_available()
             while outstanding:
                 # A completion may already have been drained, by the
                 # submission loop or by ``report`` while another target was
@@ -2511,13 +2592,26 @@ def format_specifications(
                         f"out_of_scope={counts.get('out_of_scope', 0)}, "
                         f"unresolved={counts.get('unresolved', 0)}"
                     )
-                    status = "Formatted" if result.success else "Failed"
+                    status = (
+                        "Formatted" if result.success
+                        else "Cancelled" if result.error_code == "run_cancelled"
+                        else "Failed"
+                    )
                     report(
                         f"{status} {completed} of {len(targets)}: {target.name}"
                     )
+                submit_available()
             drain_reported_events()
 
+    for target in targets:
+        if target not in results_by_target:
+            result = _cancelled_target(target)
+            results_by_target[target] = result
+            recorder.record_usage("target", result.usage)
     ordered_results = tuple(results_by_target[target] for target in targets)
+    cancelled = (cancel_event is not None and cancel_event.is_set()) or any(
+        item.error_code == "run_cancelled" for item in ordered_results
+    )
     succeeded = sum(1 for item in ordered_results if item.success)
     failed = len(ordered_results) - succeeded
     recorder.info(
@@ -2527,7 +2621,10 @@ def format_specifications(
         succeeded=succeeded,
         failed=failed,
     )
-    complete_message = f"Complete: {succeeded} succeeded, {failed} failed."
+    complete_message = (
+        f"Cancelled: {succeeded} succeeded, {failed} incomplete."
+        if cancelled else f"Complete: {succeeded} succeeded, {failed} failed."
+    )
     complete_occurred_at = enqueue_event(complete_message)
     # Keep the durable log's terminal event while preserving the historical
     # guarantee that UI completion is emitted only after artifacts publish.
@@ -2550,6 +2647,7 @@ def format_specifications(
             events=events,
             secrets=(normalized_api_key,),
             recorder=recorder,
+            cancelled=cancelled,
         )
     except Exception as exc:
         # The DOCX files may already be published; the run directory must
@@ -2574,6 +2672,7 @@ def format_specifications(
                 recorder=recorder,
                 failure_phase="publication",
                 results=ordered_results,
+                cancelled=cancelled,
             )
         except Exception:  # pragma: no cover - the disk itself is failing
             pass
@@ -2595,6 +2694,7 @@ def format_specifications(
         run_dir=run_dir,
         manifest_path=manifest_path,
         diagnostics_path=diagnostics_path,
+        cancelled=cancelled,
     )
     _emit(progress, complete_message)
     _emit_progress_event(progress_event, complete_message, complete_occurred_at)

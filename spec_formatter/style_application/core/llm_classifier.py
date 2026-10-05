@@ -8,8 +8,9 @@ with retry logic, chunking for large documents, and coverage reporting.
 import json
 import os
 import threading
+import time
 import re
-from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set
 
 from ...llm_usage import (
@@ -24,6 +25,7 @@ from .classification import (
     coerce_to_final_classifications,
 )
 from .errors import attach_engine_error
+from ...cancellation import RunCancelled, check_cancelled, request_slot, wait_for_retry
 
 
 # Sonnet 5.5's tokenizer (shared with Sonnet 5) produces ~30% more tokens for the same text than the
@@ -33,9 +35,9 @@ _MAX_BUNDLE_TOKENS = 80_000
 _MAX_BUNDLE_CHARS = _MAX_BUNDLE_TOKENS * _CHARS_PER_TOKEN
 _CHUNK_OVERLAP = 20
 
-# The chunker measures exactly the bytes the request sends: compact JSON with
-# sorted keys. The old chunker measured compact JSON but sent indent=2, a
-# 1.35x under-count, and compact input is about a third smaller anyway.
+# The chunker measures the projected user turn, including tables and context,
+# as compact JSON with sorted keys. json.dumps escapes non-ASCII by default,
+# so its character count is also its UTF-8 byte count on the wire.
 _JSON_WIRE_KWARGS = {"separators": (",", ":"), "sort_keys": True}
 
 
@@ -86,6 +88,34 @@ _DEFAULT_MAX_CONCURRENT_REQUESTS = 4
 _MAX_CONCURRENT_REQUESTS_CEILING = 64
 _TRANSPORT_RETRIES = 2  # initial request + 2 retries for transient failures
 _MAX_RETRY_AFTER_SECONDS = 120.0
+
+
+class _ChunkStopEvent(threading.Event):
+    """Expose target failure and run cancellation to the existing checkpoints.
+
+    Setting this event stops siblings without cancelling unrelated targets.
+    Streams still use the original run event so paid requests can finish.
+    """
+
+    def __init__(self, cancel_event: Optional[threading.Event]) -> None:
+        super().__init__()
+        self._cancel_event = cancel_event
+
+    def is_set(self) -> bool:
+        return super().is_set() or (
+            self._cancel_event is not None and self._cancel_event.is_set()
+        )
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        if self._cancel_event is None:
+            return super().wait(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return self.is_set()
+            self._cancel_event.wait(0.1 if remaining is None else min(remaining, 0.1))
+        return True
 
 
 class ClassificationRefused(RuntimeError):
@@ -183,13 +213,6 @@ def _transport_retry_delay(
     return None
 
 
-def _wait_for_retry(stop_event: threading.Event, delay: float) -> None:
-    """Wait for backoff unless another chunk has already failed."""
-
-    if stop_event.wait(delay):
-        raise CancelledError("Target classification stopped after a chunk failed")
-
-
 def _final_stop_reason(stream: Any) -> Optional[str]:
     get_final_message = getattr(stream, "get_final_message", None)
     if get_final_message is None:
@@ -197,20 +220,77 @@ def _final_stop_reason(stream: Any) -> Optional[str]:
     return getattr(get_final_message(), "stop_reason", None)
 
 
-def _build_user_message(slim_bundle: dict, available_roles: list) -> str:
+def _project_request_bundle(slim_bundle: dict) -> dict:
+    """Compact only the wire payload; local classification/audit data stays intact."""
+
+    paragraphs = slim_bundle.get("paragraphs", [])
+    patterns = {}
+    conflicting_levels = set()
+    level_keys = []
+    for paragraph in paragraphs:
+        pattern = paragraph.get("numbering_pattern")
+        effective = paragraph.get("effective_numPr")
+        key = None
+        # build_phase2_slim_bundle resolves every pattern from effective_numPr
+        # and one fixed document catalog. Direct numPr may be absent (inherited
+        # numbering) or different; it is never the table reference.
+        if (
+            isinstance(pattern, dict)
+            and isinstance(effective, dict)
+            and isinstance(pattern.get("numId"), str)
+            and isinstance(pattern.get("ilvl"), str)
+            and pattern["numId"] == effective.get("numId")
+            and pattern["ilvl"] == effective.get("ilvl", "0")
+        ):
+            key = (pattern["numId"], pattern["ilvl"])
+            if key in patterns and patterns[key] != pattern:
+                conflicting_levels.add(key)
+            patterns[key] = pattern
+        level_keys.append(key)
+
+    projected = []
+    numbering_levels = {}
+    for i, (paragraph, key) in enumerate(zip(paragraphs, level_keys)):
+        # Keep nested values verbatim: e.g. a false bold hint or an empty
+        # numbering lvlText conveys a fact even in a nonempty dictionary.
+        row = {
+            name: value for name, value in paragraph.items()
+            if value is not None and value is not False
+            and value != "" and value != {} and value != []
+        }
+        for field, neighbour in (("prev_text", i - 1), ("next_text", i + 1)):
+            if (
+                0 <= neighbour < len(paragraphs)
+                and paragraph.get(field) == paragraphs[neighbour].get("text", "")[:80]
+            ):
+                row.pop(field, None)
+        if key is not None and key not in conflicting_levels:
+            num_id, ilvl = key
+            numbering_levels.setdefault(num_id, {})[ilvl] = {
+                name: value for name, value in patterns[key].items()
+                if name not in ("numId", "ilvl")
+            }
+            row.pop("numbering_pattern", None)
+        # Unexpected inconsistent/custom bundles retain their inline patterns
+        # rather than losing evidence by sharing a conflicting table entry.
+        projected.append(row)
+
+    prompt_bundle = {"paragraphs": projected}
+    if numbering_levels:
+        prompt_bundle["numbering_levels"] = numbering_levels
+    if "_chunk_info" in slim_bundle:
+        prompt_bundle["_chunk_info"] = slim_bundle["_chunk_info"]
+    return prompt_bundle
+
+
+def _build_user_message(slim_bundle: dict) -> str:
     # Only unresolved paragraphs belong in the model request.  The complete
     # bundle also contains deterministic classifications and filtered paragraph
     # indices for local audit/reassembly; exposing those indices invites the
     # model to echo entries that validation correctly rejects.
-    prompt_bundle = {"paragraphs": slim_bundle.get("paragraphs", [])}
-    if "_chunk_info" in slim_bundle:
-        prompt_bundle["_chunk_info"] = slim_bundle["_chunk_info"]
     # The run instruction and role list live in the cached system block; the
     # user turn carries only what changes per chunk.
-    return (
-        "available_roles: " + json.dumps(list(available_roles))
-        + "\n\n" + _wire_json(prompt_bundle)
-    )
+    return _wire_json(_project_request_bundle(slim_bundle))
 
 
 def _retry_requirement(error: Exception, allowed_indices: Set[int]) -> str:
@@ -267,12 +347,8 @@ def _classification_output_config(
                             "required": ["paragraph_index", "reason"],
                         },
                     },
-                    "notes": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
                 },
-                "required": ["classifications", "ignored_paragraphs", "notes"],
+                "required": ["classifications", "ignored_paragraphs"],
             },
         },
     }
@@ -382,41 +458,42 @@ def _validate_classifications(classifications: dict, available_roles: list, allo
 def _split_bundle_into_chunks(slim_bundle: dict, max_chars: int = _MAX_BUNDLE_CHARS) -> List[dict]:
     paragraphs = slim_bundle.get("paragraphs", [])
     roles = slim_bundle.get("available_roles", [])
-    filter_report = slim_bundle.get("filter_report", {})
 
-    full_json = _wire_json({"paragraphs": paragraphs})
+    full_json = _build_user_message(slim_bundle)
     if len(full_json) <= max_chars and len(paragraphs) <= 300:
         return [slim_bundle]
-
-    overhead = len(_wire_json({
-        "available_roles": roles,
-        "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
-        "paragraphs": []
-    }))
-    # Chunks carry an emptied filter_report, so size them from the paragraph
-    # payload alone (a filter_report-dominated bundle would wildly inflate the
-    # per-paragraph average). Clamp the chunk size above _CHUNK_OVERLAP so the
-    # window always advances — otherwise `start = end - _CHUNK_OVERLAP` can
-    # move backwards and loop forever.
-    avg_para_size = len(_wire_json(paragraphs)) / max(len(paragraphs), 1)
-    paras_per_chunk = max(_CHUNK_OVERLAP + 10, int((max_chars - overhead) / max(avg_para_size, 1)))
 
     chunks = []
     start = 0
     while start < len(paragraphs):
-        end = min(start + paras_per_chunk, len(paragraphs))
-        chunk_paras = paragraphs[start:end]
-        chunk = {
-            "available_roles": roles,
-            "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
-            "paragraphs": chunk_paras,
-            "_chunk_info": {
-                "chunk_index": len(chunks),
-                "paragraph_range": [chunk_paras[0]["paragraph_index"], chunk_paras[-1]["paragraph_index"]] if chunk_paras else [0, 0]
+        def make_chunk(end: int) -> dict:
+            return {
+                "available_roles": roles,
+                "filter_report": {"paragraphs_removed_entirely": [], "paragraphs_stripped": []},
+                "paragraphs": paragraphs[start:end],
+                "_chunk_info": {
+                    "chunk_index": len(chunks),
+                    "paragraph_range": [paragraphs[start]["paragraph_index"], paragraphs[end - 1]["paragraph_index"]],
+                },
             }
-        }
-        chunks.append(chunk)
-        start = end - _CHUNK_OVERLAP if end < len(paragraphs) else end
+
+        # Size the complete projected request, including its shared levels,
+        # boundary neighbour text and chunk metadata. An average row size
+        # cannot bound requests with uneven text/formatting or list metadata.
+        low, high = start + 1, min(start + 300, len(paragraphs))
+        end = start + 1
+        while low <= high:
+            candidate = (low + high) // 2
+            if len(_build_user_message(make_chunk(candidate))) <= max_chars:
+                end = candidate
+                low = candidate + 1
+            else:
+                high = candidate - 1
+        chunks.append(make_chunk(end))
+        # A single oversize paragraph must still be sent. Shrink the overlap
+        # for tight budgets so every window advances, even a singleton.
+        overlap = min(_CHUNK_OVERLAP, end - start - 1)
+        start = end - overlap if end < len(paragraphs) else end
     return chunks
 
 
@@ -561,7 +638,9 @@ def classify_target_document(
     model: str = "claude-sonnet-5-5",
     *,
     target_effort: str = "high",
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict:
+    check_cancelled(cancel_event)
     unresolved_paragraphs = slim_bundle.get("paragraphs", [])
     if not unresolved_paragraphs:
         deterministic_only = coerce_to_final_classifications(
@@ -603,20 +682,17 @@ def classify_target_document(
     chunk_results: List[dict] = [None] * len(chunks)
     system_blocks = _system_blocks(available_roles)
     usage = UsageCollector()
-    stop_event = threading.Event()
+    stop_event = _ChunkStopEvent(cancel_event)
+    request_cancel_event = stop_event if len(chunks) > 1 else cancel_event
     failure_lock = threading.Lock()
     first_failure: Optional[BaseException] = None
 
-    def _checkpoint() -> None:
-        if stop_event.is_set():
-            raise CancelledError("Target classification stopped after a chunk failed")
-
     def _classify_chunk_attempts(i: int, chunk: dict) -> dict:
-        _checkpoint()
+        check_cancelled(request_cancel_event)
         if len(chunks) > 1:
             print(f"  Processing chunk {i + 1}/{len(chunks)}...")
 
-        user_message = _build_user_message(chunk, available_roles)
+        user_message = _build_user_message(chunk)
         max_regenerations = 2
         allowed_indices = {
             p.get("paragraph_index")
@@ -629,14 +705,11 @@ def classify_target_document(
         transport_attempt = 0
 
         while True:
-            _checkpoint()
+            check_cancelled(request_cancel_event)
             try:
                 # No sampling params (temperature/top_p/top_k): Sonnet 5.5 and
                 # Opus 5.5 reject non-default values with a 400.
-                with _REQUEST_LIMITER:
-                    # A sibling may have failed while this worker waited for
-                    # a request slot. Count only attempts actually sent.
-                    _checkpoint()
+                with request_slot(_REQUEST_LIMITER, request_cancel_event):
                     usage.record_attempt()
                     with client.messages.stream(
                         model=model,
@@ -661,10 +734,11 @@ def classify_target_document(
                         # The events are consumed first because a refusal's
                         # stop_details reach only the raw message_delta
                         # event; the SDK's final message does not carry them.
-                        stop_details = streamed_stop_details(stream)
+                        stop_details = streamed_stop_details(stream, cancel_event)
                         get_final_message = getattr(stream, "get_final_message", None)
                         final_message = get_final_message() if get_final_message else None
                         usage.record_response(final_message)
+                        check_cancelled(cancel_event)
                         stop_reason = getattr(final_message, "stop_reason", None)
                         # Text only after the stop reason: get_final_text()
                         # raises when the response holds no text block, which
@@ -694,7 +768,7 @@ def classify_target_document(
                 retry_error = e
                 if regeneration < max_regenerations:
                     print(f"  JSON parse error, retrying ({regeneration + 1}/{max_regenerations})...")
-                    _wait_for_retry(stop_event, 2 ** regeneration)
+                    wait_for_retry(request_cancel_event, 2 ** regeneration)
                     regeneration += 1
                 else:
                     response_length = len(response_text.strip())
@@ -710,13 +784,13 @@ def classify_target_document(
                 if regeneration < max_regenerations:
                     wait = 2 ** (regeneration + 1)
                     print(f"  Classification attempt failed: {e}, retrying in {wait}s ({regeneration + 1}/{max_regenerations})...")
-                    _wait_for_retry(stop_event, wait)
+                    wait_for_retry(request_cancel_event, wait)
                     regeneration += 1
                 else:
                     raise RuntimeError(
                         f"LLM classification failed after {max_regenerations + 1} attempts: {e}"
                     )
-            except ClassificationRefused:
+            except (ClassificationRefused, RunCancelled):
                 raise
             except Exception as e:
                 # Transport failures: retry only what can heal. A bad key, a
@@ -728,15 +802,13 @@ def classify_target_document(
                     f"  Transient API failure: {e}; retrying in {delay:g}s "
                     f"({transport_attempt + 1}/{_TRANSPORT_RETRIES})..."
                 )
-                _wait_for_retry(stop_event, delay)
+                wait_for_retry(request_cancel_event, delay)
                 transport_attempt += 1
 
     def _classify_chunk(i: int, chunk: dict) -> dict:
         nonlocal first_failure
         try:
             return _classify_chunk_attempts(i, chunk)
-        except CancelledError:
-            raise
         except BaseException as exc:
             # Signal in the worker before it can take another queued chunk.
             # Sibling cancellations must never replace this original error.
@@ -772,6 +844,7 @@ def classify_target_document(
                 # usage; queued work is cancelled and retries stop at checkpoints.
                 executor.shutdown(wait=True, cancel_futures=True)
 
+        check_cancelled(cancel_event)
         if len(chunk_results) > 1:
             conflicts = _chunk_conflicts(chunk_results)
             if conflicts:

@@ -148,6 +148,10 @@ stopped and, when the engine failed on a known condition, a stable
 the closed sets are listed in CLAUDE.md. API keys and document text are never
 written to run metadata.
 
+`run.json` and target audits use artifact schema version 4, which introduces
+cancellation outcomes and per-target observed usage. Consumers selecting a
+schema by `schema_version` must support version 4 for new run artifacts.
+
 ### Finding the paragraph a failure is about
 
 A remediation sentence is fixed, so on its own it can only say "check the
@@ -488,6 +492,18 @@ the windowed executable has no console.
 
 ## Headless API
 
+During a GUI run, **Cancel** stops new work and saves the run artifacts.
+Closing the window offers to cancel, then closes after the worker exits.
+Already published documents remain in the run folder; cancelled targets
+publish no DOCX and still receive an audit. `run.json` reports `cancelled`.
+
+Headless callers can pass `cancel_event=threading.Event()` and call
+`cancel_event.set()` from another thread. The default is `None`. The API
+returns `result.cancelled=True` after saving artifacts and cleaning staging.
+Retry waits wake immediately; an in-flight stream can finish or close on its
+next event. Interrupted requests with no final usage are counted as unknown,
+so an incomplete token total is never presented as zero spend.
+
 `spec_formatter.format_specifications()` is the canonical programmatic entry
 point:
 
@@ -559,8 +575,13 @@ increase in output tokens for accuracy close to a higher effort level.
 
 Both classifiers send their byte-stable prompt prefix as a cached system
 block, and the target classifier sends compact JSON, so repeated chunks and
-regeneration attempts reuse the cached prefix and input is about a third
-smaller. The `classify` phase event in `diagnostics.jsonl` records
+regeneration attempts can reuse the cached prefix. Target requests omit empty
+fields, share numbering patterns by effective list ID/level, and include
+neighbour text only when it is unavailable in adjacent request rows; chunk
+limits measure this projected payload. The full local slim bundle and audits
+are unchanged. Target responses require only classifications and ignored
+paragraphs; legacy responses with notes remain accepted.
+The `classify` phase event in `diagnostics.jsonl` records
 `requests`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and
 `cache_creation_input_tokens` for each target, so cache reuse is visible per
 run. When two overlapping chunks disagree about a paragraph, the classifier
@@ -680,6 +701,17 @@ fails instead of publishing a header that still names the architect's section.
   at 150,000 tokens as a cost guard (measured with the API's token counter,
   with a size estimate as the fallback); the cap is not a context-window
   limit, and a template that exceeds it is refused before any request.
+- Target classification is capped at 2,000 unresolved paragraphs per DOCX,
+  roughly three times a generously sized 600-paragraph single section. The
+  count is independent of request serialization and excludes deterministic
+  classifications, locally ignored paragraphs, and out-of-scope content.
+  Above the cap, the target fails at `classification_preflight` with
+  `target_too_large` and a fixed instruction to split the document into
+  separate specification sections. No client is constructed or request sent,
+  and usage is an explicit, complete zero snapshot. Fully deterministic
+  targets are unaffected. Set `SPEC_FORMATTER_MAX_TARGET_PARAGRAPHS` to a
+  positive integer to raise (or lower) the cap; unset, invalid, zero, and
+  negative values keep the default guard.
 - Observed model usage is recorded for both the architect analysis and each
   target, including work that failed, and published under `diagnostics.usage`
   in `run.json`. A refusal or an exhausted retry is counted rather than

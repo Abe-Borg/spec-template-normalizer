@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,77 @@ from spec_formatter.style_application.core.csi_to_canadian import (
     CanadianConversionReport,
     ConversionIssue,
 )
+
+
+def test_format_worker_forwards_its_cancellation_event(monkeypatch):
+    captured = {}
+
+    def format_run(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(gui, "format_specifications", format_run)
+    worker = _worker(queue.Queue(), FORMAT_ONLY)
+    worker.cancel_event.set()
+    worker.run()
+    assert captured["cancel_event"] is worker.cancel_event
+    assert captured["cancel_event"].is_set()
+
+
+def test_gui_cancel_only_sets_event_and_disables_button():
+    event = threading.Event()
+    app = SimpleNamespace(
+        worker=SimpleNamespace(is_alive=lambda: True, cancel_event=event),
+        cancel_button=_FakeWidget(), status_label=_FakeWidget(),
+    )
+    gui.App._cancel_run(app)
+    assert event.is_set()
+    assert app.cancel_button.configurations[-1]["state"] == "disabled"
+
+
+@pytest.mark.parametrize("confirm", [True, False])
+def test_closing_active_run_offers_cancellation_and_waits_for_worker(monkeypatch, confirm):
+    event = threading.Event()
+    destroyed = []
+    app = SimpleNamespace(
+        worker=SimpleNamespace(is_alive=lambda: True, cancel_event=event),
+        cancel_button=_FakeWidget(), status_label=_FakeWidget(),
+        _close_when_idle=False, destroy=lambda: destroyed.append(True),
+    )
+    app._cancel_run = lambda: gui.App._cancel_run(app)
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *_args, **_kwargs: confirm)
+    gui.App._on_close(app)
+    assert event.is_set() == confirm
+    assert app._close_when_idle == confirm
+    assert not destroyed
+
+
+def test_close_after_cancellation_destroys_window_only_after_worker_exits():
+    destroyed, scheduled = [], []
+    alive = [True]
+    app = SimpleNamespace(
+        worker=SimpleNamespace(is_alive=lambda: alive[0]),
+        _close_when_idle=True, events=queue.Queue(),
+        destroy=lambda: destroyed.append(True),
+        after=lambda *args: scheduled.append(args),
+        _poll_events=lambda: None,
+    )
+    gui.App._poll_events(app)
+    assert scheduled and not destroyed
+    alive[0] = False
+    gui.App._poll_events(app)
+    assert destroyed == [True] and len(scheduled) == 1
+
+
+def test_busy_state_disables_cancel_button_after_run():
+    app = SimpleNamespace(
+        progress=SimpleNamespace(stop=lambda: None, set=lambda *_args: None),
+        run_button=_FakeWidget(), cancel_button=_FakeWidget(),
+        _unlock_run_controls=lambda: None, _show_run_summary=lambda **_kwargs: None,
+    )
+    gui.App._finish_busy_state(app)
+    assert app.cancel_button.configurations[-1]["state"] == "disabled"
+    assert app.run_button.configurations[-1]["state"] == "normal"
 
 
 def _worker(events: queue.Queue, mode: str) -> gui.FormatWorker:
@@ -592,4 +664,3 @@ def test_window_geometry_matches_the_pre_merge_layout():
     assert 'self.geometry("980x930")' in source
     assert "self.minsize(820, 720)" in source
     assert "reuse_var" not in source and "workers_var" not in source
-

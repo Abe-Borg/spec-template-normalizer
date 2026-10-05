@@ -401,6 +401,25 @@ per-target outcomes, and the raised error carries `run_dir` and
 `TemplateProfile.provenance` when the profile is selected, not by
 re-validating the bundle after the outputs are already published.
 
+### Architect Canadian preflight
+
+In architect `csi_to_canadian` mode, initialization calls
+`core/registry.preflight_validate_canadian_architect()` once on the loaded
+profile before any target is dispatched or classified. It reuses the unchanged
+`_validate_canadian_role_contract` for ARTICLE and PARAGRAPH,
+`_validate_complete_article_hierarchy` for PART/ARTICLE/PARAGRAPH, and
+`_validate_architect_numbering` for ARTICLE and PARAGRAPH. A failure carries
+`canadian_architect_contract` through the existing initialization-failure path,
+which writes `run.json`, `run.log`, diagnostics, and per-target not-started
+audits.
+
+This is a deliberate tightening for templates whose ARTICLE or PARAGRAPH
+contract is broken or missing, even when a particular target would not use
+those roles. It adds no new numbering rules or more forgiving checks. Deeper
+roles stay validated per target, and the unchanged per-target checks remain
+the authority for every conversion. Format-only and the built-in scheme keep
+their existing preflight behavior.
+
 ## Runs without an architect template
 
 `csi_to_canadian_standalone` and `canadian_to_csi` take a target and nothing
@@ -793,6 +812,15 @@ writer.
 
 Paragraph indices are tied to the `word/document.xml` paragraph sequence.
 Preserve that index and visible-text contract when changing XML parsing.
+
+`core/llm_classifier.py` projects only the model request: it omits empty/null/
+false top-level fields, shares numbering patterns by `effective_numPr.numId`
+and `ilvl`, and retains neighbour text when the adjacent request row cannot
+supply it. Chunk limits measure that projected compact JSON, including shared
+levels and boundary context. Keep the complete slim bundle unchanged for
+deterministic rules, reassembly, and audits. Target structured output requires
+only `classifications` and `ignored_paragraphs`; local validators still accept
+legacy `notes` or their absence.
 
 ### `spec_formatter/style_application/core/style_import.py`
 
@@ -1333,10 +1361,12 @@ Current codes: `header_footer_target_section_id_required`,
 `conversion_prediction_mismatch`, `builtin_scheme_contract`, `classification_invalid_payload`,
 `classification_deterministic_override`,
 `classification_coverage_incomplete`, `classification_refused`,
+`target_too_large` (unresolved target workload exceeds the configurable cost
+cap at `classification_preflight`; split the document into separate sections),
 `paragraph_style_not_applied`,
 `numbering_importer_unavailable`, `style_import_namespace_conflict`,
 `template_section_shell_conflict`, `template_default_section_conflict`,
-`template_duplicate_section_index`.
+`template_duplicate_section_index`, `run_cancelled`.
 
 `stage` is public on `BatchResult`, `TargetFormatResult`, `audit.json`, and
 `run.json`: the last checkpoint reached. The sets are closed and tested
@@ -1354,8 +1384,32 @@ Current codes: `header_footer_target_section_id_required`,
   `application_reporting`, `output_publication`, `complete`
 - runner (before the shared path): `validation`, `extraction`,
   `bundle_build`, `classification_preflight`, `classification`,
-  `application`
-- pipeline: `not_started`, `processing`, `publication`, `complete`
+  `application`, `cancelled`
+- pipeline: `not_started`, `processing`, `publication`, `complete`, `cancelled`
+
+Run statuses (`RUN_STATUSES` in `core/errors.py`) are `succeeded`,
+`partial_failure`, `failed`, and `cancelled`. Cancellation takes precedence
+even when some targets have already published successfully.
+
+`format_specifications(cancel_event=None)` accepts an optional
+`threading.Event`. When set, no new target or classifier request starts;
+attempts, regeneration, architect coverage patches, overlap re-asks, and
+transport retries all check it. Retry backoff waits on the event. Request-slot
+waits are cancellable too. A stream may finish or close on its next event;
+an early close leaves that attempt's usage unknown, never zero, under
+`spec_formatter/llm_usage.py`. Each target's audit and run record includes its
+observed usage, and the run totals stay independent of diagnostics verbosity.
+
+Already published DOCX files remain available. Unpublished cancelled targets
+carry `run_cancelled` and stage `cancelled`, publish no DOCX, and still receive
+an audit. The API returns `FormatRunResult.cancelled=True` after workers exit,
+run artifacts are saved, and staging is removed. Injected processors and
+classifiers retain old signatures: inspect keyword support before the single
+call, never execute and retry after `TypeError`.
+
+The GUI's Cancel button only sets the worker's event. Closing during a run
+offers to cancel and defers window destruction until the worker exits; all
+artifact publication and cleanup remains in the engine.
 
 ## Concurrency, retries, and caches
 
@@ -1552,8 +1606,12 @@ described under "Error codes and stages", `null` when the engine knew none.
 `run.log` prints the same sentence on a `WHERE:` line under the error it
 belongs to, and the failing diagnostics phase event carries the bare
 `paragraph_index` (an int, so it survives the diagnostics field boundary that
-drops the section number for having whitespace in it). Both artifact schema
-versions are 3; version 3 is exactly this addition.
+drops the section number for having whitespace in it). Version 3 introduced
+the location field. Both artifact schema versions are now 4: version 4 adds
+the `cancelled` run status and target stage, plus per-target observed `usage`
+in run records and audits. All publication paths emit version 4, including
+initialization and publication failures; consumers must select the matching
+schema rather than treating these as version 3 artifacts.
 
 `run.log` and `run.json` derive a target's failure identity from the same
 `target_error_diagnostic()`, so the log line, the manifest record and the GUI
