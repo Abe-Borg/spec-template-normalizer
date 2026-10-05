@@ -1624,6 +1624,16 @@ def test_canadian_mode_reaches_target_processor_and_uses_distinct_output_name(
     calls, analyzer, config_loader, processor = _fake_dependencies(monkeypatch)
     received_modes: list[str] = []
 
+    def canadian_config_loader(bundle_dir: Path) -> SharedConfig:
+        from dataclasses import replace
+        from spec_formatter import builtin_scheme
+
+        return replace(
+            config_loader(bundle_dir),
+            role_specs=builtin_scheme.build_role_specs(),
+            env_registry=builtin_scheme.build_env_registry(),
+        )
+
     def capturing_processor(**kwargs) -> BatchResult:
         received_modes.append(kwargs["conversion_mode"])
         return processor(**kwargs)
@@ -1637,7 +1647,7 @@ def test_canadian_mode_reaches_target_processor_and_uses_distinct_output_name(
         max_workers=1,
         conversion_mode=pipeline.CSI_TO_CANADIAN,
         _template_analyzer=analyzer,
-        _config_loader=config_loader,
+        _config_loader=canadian_config_loader,
         _target_processor=capturing_processor,
     )
 

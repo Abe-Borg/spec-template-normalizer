@@ -282,14 +282,23 @@ def _deterministic_classifier(**kwargs):
         item for item in kwargs["slim_bundle"].get("paragraphs", [])
         if item.get("skip_reason") is None
     ]
-    if len(classifiable) != 2:
+    if len(classifiable) not in {2, 4}:
         raise AssertionError(
-            "expected two classifiable architect paragraphs, got "
+            "expected two or four classifiable architect paragraphs, got "
             + json.dumps(classifiable, sort_keys=True)
         )
+    role_names = [
+        ("PARAGRAPH", "CSI_Paragraph__ARCH", "CSI Paragraph"),
+        ("SUBPARAGRAPH", "CSI_Subparagraph__ARCH", "CSI Subparagraph"),
+    ]
+    if len(classifiable) == 4:
+        role_names = [
+            ("PART", "CSI_Part__ARCH", "CSI Part"),
+            ("ARTICLE", "CSI_Article__ARCH", "CSI Article"),
+        ] + role_names
     role_rows = [
-        (classifiable[0], "PARAGRAPH", "CSI_Paragraph__ARCH", "CSI Paragraph"),
-        (classifiable[1], "SUBPARAGRAPH", "CSI_Subparagraph__ARCH", "CSI Subparagraph"),
+        (paragraph, *role_info)
+        for paragraph, role_info in zip(classifiable, role_names)
     ]
     return {
         "create_styles": [
@@ -625,7 +634,7 @@ def test_format_only_preserves_target_automatic_numbering_for_typed_architect_ro
 
 
 def _write_canadian_pair(tmp_path: Path) -> tuple[Path, Path]:
-    """An architect with a two-level Canadian list and a typed-CSI target."""
+    """A complete Canadian architect hierarchy and a typed-CSI target."""
 
     architect = tmp_path / "canadian-architect.docx"
     target = tmp_path / "csi-target.docx"
@@ -634,24 +643,34 @@ def _write_canadian_pair(tmp_path: Path) -> tuple[Path, Path]:
 
     with zipfile.ZipFile(architect) as package:
         architect_document = package.read("word/document.xml").decode("utf-8")
-        architect_numbering = package.read("word/numbering.xml").decode("utf-8")
     architect_document = architect_document.replace(
-        '<w:ilvl w:val="2"/><w:numId w:val="5"/>',
-        '<w:ilvl w:val="1"/><w:numId w:val="5"/>',
+        '<w:ilvl w:val="2"/>', '<w:ilvl w:val="3"/>', 1,
+    ).replace(
+        '<w:ilvl w:val="0"/>', '<w:ilvl w:val="2"/>', 1,
+    )
+    headings = "".join(
+        f'<w:p><w:pPr><w:numPr><w:ilvl w:val="{level}"/>'
+        '<w:numId w:val="5"/></w:numPr></w:pPr>'
+        f'<w:r><w:t>{text}</w:t></w:r></w:p>'
+        for level, text in [(0, "GENERAL"), (1, "SUMMARY")]
+    )
+    architect_document = architect_document.replace(
+        '<w:body>', '<w:body>' + headings,
         1,
     )
-    architect_numbering = architect_numbering.replace(
-        '<w:numFmt w:val="upperLetter"/><w:lvlText w:val="%1."/>',
-        '<w:numFmt w:val="decimal"/><w:lvlText w:val=".%1"/>',
-        1,
-    ).replace(
-        '<w:lvl w:ilvl="2">',
-        '<w:lvl w:ilvl="1">',
-        1,
-    ).replace(
-        '<w:lvlText w:val="%3)"/>',
-        '<w:lvlText w:val=".%2"/>',
-        1,
+    levels = "".join(
+        f'<w:lvl w:ilvl="{level}"><w:start w:val="1"/>'
+        f'<w:numFmt w:val="decimal"/><w:lvlText w:val="{text}"/>'
+        f'<w:pPr><w:ind w:left="{indent}" w:hanging="360"/></w:pPr></w:lvl>'
+        for level, text, indent in [
+            (0, "PART %1", 0), (1, "%1.%2", 0),
+            (2, ".%3", 720), (3, ".%4", 1440),
+        ]
+    )
+    architect_numbering = (
+        f'<w:numbering xmlns:w="{W_NS}"><w:abstractNum w:abstractNumId="5">'
+        f'<w:multiLevelType w:val="multilevel"/>{levels}</w:abstractNum>'
+        '<w:num w:numId="5"><w:abstractNumId w:val="5"/></w:num></w:numbering>'
     )
     _rewrite_docx_parts(
         architect,
@@ -718,8 +737,8 @@ def test_unified_canadian_mode_converts_typed_csi_markers_end_to_end(
         output_numbering = package.read("word/numbering.xml").decode("utf-8")
         output_settings = package.read("word/settings.xml")
     assert _xml_text_sequence(output_document)[:2] == ["Work Included", "Pumps"]
-    assert '<w:lvlText w:val=".%1"/>' in output_numbering
-    assert '<w:lvlText w:val=".%2"/>' in output_numbering
+    assert '<w:lvlText w:val=".%3"/>' in output_numbering
+    assert '<w:lvlText w:val=".%4"/>' in output_numbering
     assert b'<w:numId w:val="17"/>' not in output_document
     # Canadian conversion applies the architect's whole shell too, so its
     # even-page header renders in the output as it does in the template.

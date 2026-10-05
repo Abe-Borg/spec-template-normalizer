@@ -56,6 +56,7 @@ from .style_application.core.conversion_modes import (
     validate_conversion_mode,
 )
 from .style_application.core.csi_to_canadian import CanadianConversionReport
+from .style_application.core.registry import preflight_validate_canadian_architect
 
 
 ProgressCallback = Callable[[str], None]
@@ -2428,6 +2429,10 @@ def format_specifications(
             report("Validating the template profile...")
             with recorder.timer("pipeline", "config_load"):
                 shared = _config_loader(profile.bundle_dir)
+                if policy.convert_to_canadian:
+                    preflight_validate_canadian_architect(
+                        shared.role_specs, shared.env_registry
+                    )
         else:
             # Nothing is analyzed, cached, or requested from the model: the
             # scheme is built from committed constants, so there is no profile
