@@ -116,6 +116,7 @@ different timezone awareness than the current clock never blocks the check.
 | `SPEC_FORMATTER_DISABLE_UPDATE_CHECK` | Set truthy to turn off update checks entirely. `0`/`false`/`no`/`off`/empty keep checks on. |
 | `SPEC_FORMATTER_SELFCHECK_OUT` | Path the frozen `--selfcheck` writes its result to (used by CI, since the windowed exe has no stdout). |
 | `SPEC_FORMATTER_MAX_CONCURRENT_REQUESTS` | Maximum concurrent target-classification API requests across all targets and chunks (default 4, clamped to 1 to 64). |
+| `SPEC_FORMATTER_MAX_TARGET_PARAGRAPHS` | Maximum unresolved paragraphs per target DOCX (default 2,000). Positive integers override the cap; invalid or non-positive values keep the default. Fully deterministic targets are unaffected. |
 
 ## Building locally (optional)
 

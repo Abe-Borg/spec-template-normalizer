@@ -696,6 +696,17 @@ fails instead of publishing a header that still names the architect's section.
   at 150,000 tokens as a cost guard (measured with the API's token counter,
   with a size estimate as the fallback); the cap is not a context-window
   limit, and a template that exceeds it is refused before any request.
+- Target classification is capped at 2,000 unresolved paragraphs per DOCX,
+  roughly three times a generously sized 600-paragraph single section. The
+  count is independent of request serialization and excludes deterministic
+  classifications, locally ignored paragraphs, and out-of-scope content.
+  Above the cap, the target fails at `classification_preflight` with
+  `target_too_large` and a fixed instruction to split the document into
+  separate specification sections. No client is constructed or request sent,
+  and usage is an explicit, complete zero snapshot. Fully deterministic
+  targets are unaffected. Set `SPEC_FORMATTER_MAX_TARGET_PARAGRAPHS` to a
+  positive integer to raise (or lower) the cap; unset, invalid, zero, and
+  negative values keep the default guard.
 - Observed model usage is recorded for both the architect analysis and each
   target, including work that failed, and published under `diagnostics.usage`
   in `run.json`. A refusal or an exhausted retry is counted rather than

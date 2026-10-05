@@ -125,6 +125,10 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "repeats, report the document with the refusal category recorded in "
         "diagnostics.jsonl."
     ),
+    "target_too_large": (
+        "This target looks like more than one specification section. Split it "
+        "into separate section DOCX files and run those files again."
+    ),
     "paragraph_style_not_applied": (
         "A classified paragraph did not carry its assigned style after "
         "formatting, so the output was withheld. This is a defect in the "

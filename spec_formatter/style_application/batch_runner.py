@@ -75,6 +75,25 @@ except ImportError:
     HAS_NUMBERING_IMPORTER = False
 
 
+# Budget a generously long single section at about 600 unresolved paragraphs.
+# Roughly 3x headroom admits long sections while refusing likely project manuals
+# before chunking/regeneration can multiply their cost. Count unresolved
+# paragraphs rather than serialized JSON so payload-format changes cannot
+# silently weaken the guard; deterministic and out-of-scope content is free.
+DEFAULT_MAX_TARGET_PARAGRAPHS = 2_000
+_MAX_TARGET_PARAGRAPHS_ENV = "SPEC_FORMATTER_MAX_TARGET_PARAGRAPHS"
+
+
+def _max_target_paragraphs() -> int:
+    """Allow a positive integer override; invalid values keep the cost guard."""
+
+    try:
+        limit = int(os.environ.get(_MAX_TARGET_PARAGRAPHS_ENV, ""))
+    except ValueError:
+        return DEFAULT_MAX_TARGET_PARAGRAPHS
+    return limit if limit > 0 else DEFAULT_MAX_TARGET_PARAGRAPHS
+
+
 @dataclass
 class BatchResult:
     filename: str
@@ -1303,6 +1322,16 @@ def process_single_file(
                 "unresolved": unresolved + deterministic + len(bundle.get("deterministic_ignored_paragraphs", [])),
             }
             check_cancelled(cancel_event)
+            max_target_paragraphs = _max_target_paragraphs()
+            if unresolved > max_target_paragraphs:
+                # Classification has not started: no client or request exists,
+                # so report a known zero rather than missing usage telemetry.
+                observed_usage = UsageCollector().snapshot()
+                raise EngineError(
+                    "target_too_large",
+                    f"Target has {unresolved:,} unresolved paragraphs; "
+                    f"limit is {max_target_paragraphs:,}.",
+                )
             if unresolved > 0 and not api_key:
                 raise ValueError("Anthropic API key is required when unresolved paragraphs exist.")
 

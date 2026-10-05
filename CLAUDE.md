@@ -1333,6 +1333,8 @@ Current codes: `header_footer_target_section_id_required`,
 `conversion_prediction_mismatch`, `builtin_scheme_contract`, `classification_invalid_payload`,
 `classification_deterministic_override`,
 `classification_coverage_incomplete`, `classification_refused`,
+`target_too_large` (unresolved target workload exceeds the configurable cost
+cap at `classification_preflight`; split the document into separate sections),
 `paragraph_style_not_applied`,
 `numbering_importer_unavailable`, `style_import_namespace_conflict`,
 `template_section_shell_conflict`, `template_default_section_conflict`,

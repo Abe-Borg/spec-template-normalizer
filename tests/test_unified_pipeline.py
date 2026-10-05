@@ -2279,6 +2279,69 @@ def test_run_artifacts_prefer_the_engine_error_code_over_classified_text(
     assert audit["error"] == record["error"]
 
 
+@pytest.mark.parametrize("diagnostics_level", ["info", "warning"])
+def test_real_target_cost_guard_reaches_run_and_audit_json(
+    tmp_path, monkeypatch, diagnostics_level
+):
+    import anthropic
+
+    from spec_formatter.llm_usage import UsageCollector
+    from spec_formatter.style_application import batch_runner
+    from spec_formatter.style_application.core.errors import ERROR_REMEDIATIONS
+    from tests.test_unified_roundtrip import W_NS, _rewrite_docx_parts, _write_docx
+
+    monkeypatch.setenv("SPEC_FORMATTER_MAX_TARGET_PARAGRAPHS", "3")
+
+    def unexpected_client(*_args, **_kwargs):
+        pytest.fail("Oversized target constructed an Anthropic client")
+
+    monkeypatch.setattr(anthropic, "Anthropic", unexpected_client)
+    architect = _write_input(tmp_path / "architect.docx", b"architect-original")
+    target = tmp_path / "target.docx"
+    _write_docx(target, architect=False)
+    body = "".join(
+        f"<w:p><w:r><w:t>Confidential target requirement {i}.</w:t></w:r></w:p>"
+        for i in range(4)
+    )
+    _rewrite_docx_parts(target, {
+        "word/document.xml": (
+            f'<w:document xmlns:w="{W_NS}"><w:body>{body}</w:body></w:document>'
+        ),
+    })
+    original = target.read_bytes()
+    _calls, analyzer, config_loader, _processor = _fake_dependencies(monkeypatch)
+
+    # Only architect preparation is stubbed. The real target extraction,
+    # bundle builder, preflight, and reporting path run together.
+    result = pipeline.format_specifications(
+        architect, [target], tmp_path / "formatted", api_key="offline-test-key",
+        cache_dir=tmp_path / "cache", diagnostics_level=diagnostics_level,
+        _template_analyzer=analyzer, _config_loader=config_loader,
+        _target_processor=batch_runner.process_single_file,
+    )
+
+    item = result.targets[0]
+    assert result.failed == 1
+    assert item.output_path is None
+    assert item.usage == UsageCollector().snapshot()
+    assert target.read_bytes() == original
+    assert architect.read_bytes() == b"architect-original"
+    assert not list(result.run_dir.glob("*.docx"))
+    bundle_event = next(event for event in item.diagnostics if event["event"] == "slim_bundle")
+    assert bundle_event["fields"]["unresolved"] == 4
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    audit = json.loads(item.audit_path.read_text(encoding="utf-8"))
+    for record in (manifest["targets"][0], audit):
+        assert record["success"] is False
+        assert record["stage"] == "classification_preflight"
+        assert record["error_code"] == "target_too_large"
+        assert record["error"] == ERROR_REMEDIATIONS["target_too_large"]
+    assert manifest["targets"][0]["output_path"] is None
+    assert manifest["diagnostics"]["usage"]["target"] == UsageCollector().snapshot()
+    artifact_text = result.manifest_path.read_text() + item.audit_path.read_text()
+    assert "Confidential target requirement" not in artifact_text
+
+
 def test_target_error_diagnostic_falls_back_to_text_classification_without_a_code() -> None:
     from spec_formatter.pipeline import TargetFormatResult, target_error_diagnostic
 
