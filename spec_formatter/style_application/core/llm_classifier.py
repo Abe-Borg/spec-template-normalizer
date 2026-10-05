@@ -90,6 +90,34 @@ _TRANSPORT_RETRIES = 2  # initial request + 2 retries for transient failures
 _MAX_RETRY_AFTER_SECONDS = 120.0
 
 
+class _ChunkStopEvent(threading.Event):
+    """Expose target failure and run cancellation to the existing checkpoints.
+
+    Setting this event stops siblings without cancelling unrelated targets.
+    Streams still use the original run event so paid requests can finish.
+    """
+
+    def __init__(self, cancel_event: Optional[threading.Event]) -> None:
+        super().__init__()
+        self._cancel_event = cancel_event
+
+    def is_set(self) -> bool:
+        return super().is_set() or (
+            self._cancel_event is not None and self._cancel_event.is_set()
+        )
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        if self._cancel_event is None:
+            return super().wait(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return self.is_set()
+            self._cancel_event.wait(0.1 if remaining is None else min(remaining, 0.1))
+        return True
+
+
 class ClassificationRefused(RuntimeError):
     """The model refused the request (``stop_reason == "refusal"``).
 
@@ -654,8 +682,13 @@ def classify_target_document(
     chunk_results: List[dict] = [None] * len(chunks)
     system_blocks = _system_blocks(available_roles)
     usage = UsageCollector()
+    stop_event = _ChunkStopEvent(cancel_event)
+    request_cancel_event = stop_event if len(chunks) > 1 else cancel_event
+    failure_lock = threading.Lock()
+    first_failure: Optional[BaseException] = None
 
-    def _classify_chunk(i: int, chunk: dict) -> dict:
+    def _classify_chunk_attempts(i: int, chunk: dict) -> dict:
+        check_cancelled(request_cancel_event)
         if len(chunks) > 1:
             print(f"  Processing chunk {i + 1}/{len(chunks)}...")
 
@@ -672,11 +705,11 @@ def classify_target_document(
         transport_attempt = 0
 
         while True:
-            check_cancelled(cancel_event)
+            check_cancelled(request_cancel_event)
             try:
                 # No sampling params (temperature/top_p/top_k): Sonnet 5.5 and
                 # Opus 5.5 reject non-default values with a 400.
-                with request_slot(_REQUEST_LIMITER, cancel_event):
+                with request_slot(_REQUEST_LIMITER, request_cancel_event):
                     usage.record_attempt()
                     with client.messages.stream(
                         model=model,
@@ -735,7 +768,7 @@ def classify_target_document(
                 retry_error = e
                 if regeneration < max_regenerations:
                     print(f"  JSON parse error, retrying ({regeneration + 1}/{max_regenerations})...")
-                    wait_for_retry(cancel_event, 2 ** regeneration)
+                    wait_for_retry(request_cancel_event, 2 ** regeneration)
                     regeneration += 1
                 else:
                     response_length = len(response_text.strip())
@@ -751,7 +784,7 @@ def classify_target_document(
                 if regeneration < max_regenerations:
                     wait = 2 ** (regeneration + 1)
                     print(f"  Classification attempt failed: {e}, retrying in {wait}s ({regeneration + 1}/{max_regenerations})...")
-                    wait_for_retry(cancel_event, wait)
+                    wait_for_retry(request_cancel_event, wait)
                     regeneration += 1
                 else:
                     raise RuntimeError(
@@ -769,8 +802,21 @@ def classify_target_document(
                     f"  Transient API failure: {e}; retrying in {delay:g}s "
                     f"({transport_attempt + 1}/{_TRANSPORT_RETRIES})..."
                 )
-                wait_for_retry(cancel_event, delay)
+                wait_for_retry(request_cancel_event, delay)
                 transport_attempt += 1
+
+    def _classify_chunk(i: int, chunk: dict) -> dict:
+        nonlocal first_failure
+        try:
+            return _classify_chunk_attempts(i, chunk)
+        except BaseException as exc:
+            # Signal in the worker before it can take another queued chunk.
+            # Sibling cancellations must never replace this original error.
+            with failure_lock:
+                if first_failure is None:
+                    first_failure = exc
+                stop_event.set()
+            raise
 
     # Every failure below - a refused chunk, exhausted regeneration, an
     # overlap re-ask, the merge, or the coverage check - happens after
@@ -781,7 +827,8 @@ def classify_target_document(
             chunk_results[0] = _classify_chunk(0, chunks[0])
         else:
             max_workers = min(len(chunks), 6)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            try:
                 futures = {
                     executor.submit(_classify_chunk, i, chunk): i
                     for i, chunk in enumerate(chunks)
@@ -789,6 +836,13 @@ def classify_target_document(
                 for future in as_completed(futures):
                     i = futures[future]
                     chunk_results[i] = future.result()
+            except BaseException:
+                stop_event.set()
+                raise
+            finally:
+                # Drain only requests already in flight before snapshotting
+                # usage; queued work is cancelled and retries stop at checkpoints.
+                executor.shutdown(wait=True, cancel_futures=True)
 
         check_cancelled(cancel_event)
         if len(chunk_results) > 1:
@@ -847,4 +901,5 @@ def classify_target_document(
         print(f"Disposition coverage: {disposition_count}/{total_expected} (100.0%)")
         return result
     except BaseException as exc:
-        raise attach_usage(exc, usage)
+        failure = first_failure if first_failure is not None else exc
+        raise attach_usage(failure, usage)

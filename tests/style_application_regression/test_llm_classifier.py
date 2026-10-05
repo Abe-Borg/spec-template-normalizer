@@ -842,6 +842,10 @@ def test_overlap_re_ask_that_omits_a_disputed_index_fails_closed(monkeypatch):
 
 def _counted_stream(payload, stop_reason="end_turn"):
     class Stream(_ScriptedStream):
+        def __iter__(self):
+            # Exercise stream checkpoints as well as final-message accounting.
+            yield types.SimpleNamespace(type="message_start")
+
         def get_final_message(self):
             return types.SimpleNamespace(
                 stop_reason=stop_reason,
@@ -883,6 +887,252 @@ def test_usage_survives_exhausted_regeneration(monkeypatch):
     observed = usage_from_exception(raised.value)
     assert observed["requests_attempted"] >= 2
     assert observed["input_tokens"] == 100 * observed["responses_completed"]
+
+
+@pytest.mark.parametrize("terminal", ["refusal", "json", "validation", "api", "transport"])
+@pytest.mark.parametrize("sibling", ["success", "json", "validation", "max_tokens", "transport"])
+def test_terminal_chunk_failure_cancels_siblings_and_preserves_usage(
+    monkeypatch, terminal, sibling
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from spec_formatter.llm_usage import usage_from_exception
+    from spec_formatter.style_application.core import llm_classifier as lc
+
+    sibling_sent = threading.Event()
+    release_sibling = threading.Event()
+    calls = []
+    calls_at_shutdown = []
+    submitted = []
+    shutdown_options = []
+    original_wait = lc.wait_for_retry
+    run_event = threading.Event()
+
+    # Keep real stop checks while making the failing chunk's retries immediate.
+    monkeypatch.setattr(lc, "wait_for_retry", lambda stop, _delay: original_wait(stop, 0))
+
+    class ControlledExecutor(ThreadPoolExecutor):
+        def __init__(self, max_workers):
+            super().__init__(max_workers=2)
+
+        def submit(self, fn, i, chunk):
+            def run():
+                if i >= 2:
+                    assert release_sibling.wait(5)
+                return fn(i, chunk)
+
+            future = super().submit(run)
+            submitted.append(future)
+            return future
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            shutdown_options.append((wait, cancel_futures))
+            calls_at_shutdown.extend(calls)
+            # Cancel queued futures before letting the in-flight sibling finish.
+            super().shutdown(wait=False, cancel_futures=cancel_futures)
+            release_sibling.set()
+            super().shutdown(wait=wait)
+
+    monkeypatch.setattr(lc, "ThreadPoolExecutor", ControlledExecutor)
+    monkeypatch.setattr(lc, "_REQUEST_LIMITER", threading.BoundedSemaphore(2))
+    paragraphs = [{"paragraph_index": i, "text": f"P{i}"} for i in range(301)]
+    chunks = [
+        {"paragraphs": paragraphs[start:start + 30], "_chunk_info": {"chunk_index": i}}
+        for i, start in enumerate(range(0, len(paragraphs), 30))
+    ]
+    monkeypatch.setattr(lc, "_split_bundle_into_chunks", lambda _bundle: chunks)
+
+    class Messages:
+        def stream(self, **kwargs):
+            content = kwargs["messages"][0]["content"]
+            chunk, _end = json.JSONDecoder().raw_decode(content)
+            i = chunk["_chunk_info"]["chunk_index"]
+            calls.append(i)
+            if i == 0:
+                assert sibling_sent.wait(5)
+                outcome = terminal
+            else:
+                assert i == 1, "a chunk sent a request after the target failed"
+                sibling_sent.set()
+                assert release_sibling.wait(5)
+                outcome = sibling
+
+            if outcome == "api":
+                raise api_error
+            if outcome == "transport":
+                if i == 0:
+                    raise transport_error
+                raise sdk.APIConnectionError("sibling offline")
+            if outcome == "refusal":
+                return _counted_stream("", stop_reason="refusal")
+            if outcome == "json":
+                return _counted_stream("not json")
+            if outcome == "validation":
+                return _counted_stream('{"classifications": []}')
+            if outcome == "max_tokens":
+                return _counted_stream("", stop_reason="max_tokens")
+            return _counted_stream(json.dumps(_all_as("PART")(chunk)))
+
+    sdk = _fake_sdk(monkeypatch, types.SimpleNamespace(messages=Messages()), [])
+    api_error = sdk.APIStatusError("invalid request", status_code=400)
+    transport_error = sdk.APIConnectionError("offline")
+    expected_error = {
+        "refusal": lc.ClassificationRefused,
+        "json": ValueError,
+        "validation": RuntimeError,
+        "api": sdk.APIStatusError,
+        "transport": sdk.APIConnectionError,
+    }[terminal]
+
+    with pytest.raises(expected_error) as caught:
+        classify_target_document({"paragraphs": paragraphs}, ["PART"], api_key="k", model="m", cancel_event=run_event)
+
+    assert not run_event.is_set(), "one failed target must not cancel the run"
+    if terminal == "refusal":
+        assert caught.value.safe_error_code == "classification_refused"
+    elif terminal == "api":
+        assert caught.value is api_error
+    elif terminal == "transport":
+        assert caught.value is transport_error
+    else:
+        assert "after 3 attempts" in str(caught.value)
+
+    attempts = 3 if terminal in ("json", "validation", "transport") else 1
+    responses = (0 if terminal in ("api", "transport") else attempts) + (sibling != "transport")
+    assert calls.count(0) == attempts
+    assert calls.count(1) == 1
+    assert calls == calls_at_shutdown
+    assert shutdown_options == [(True, True)]
+    assert any(future.cancelled() for future in submitted)
+    expected_usage = {
+        "requests_attempted": attempts + 1,
+        "responses_completed": responses,
+        "responses_with_usage": responses,
+        "requests_with_unknown_usage": attempts + 1 - responses,
+        "usage_complete": responses == attempts + 1,
+    }
+    if responses:
+        expected_usage.update(
+            input_tokens=100 * responses, output_tokens=10 * responses,
+            cache_read_input_tokens=0, cache_creation_input_tokens=0,
+        )
+    assert usage_from_exception(caught.value) == expected_usage
+
+
+def test_refused_chunk_stops_sibling_waiting_for_request_slot(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from spec_formatter.llm_usage import usage_from_exception
+    from spec_formatter.style_application.core import llm_classifier as lc
+
+    first_sent = threading.Event()
+    waiting_for_slot = threading.Event()
+    shutdown_started = threading.Event()
+    calls = []
+
+    class DelayedLimiter:
+        def __init__(self):
+            self.semaphore = threading.BoundedSemaphore(1)
+
+        def acquire(self, timeout):
+            if first_sent.is_set():
+                waiting_for_slot.set()
+                # Model a request slot becoming available only after failure.
+                assert shutdown_started.wait(5)
+            return self.semaphore.acquire(timeout=timeout)
+
+        def release(self):
+            self.semaphore.release()
+
+    class ObservedExecutor(ThreadPoolExecutor):
+        def submit(self, fn, i, chunk):
+            future = super().submit(fn, i, chunk)
+            if i == 0:
+                assert first_sent.wait(5)
+            return future
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            shutdown_started.set()
+            super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    class RefusalStream(_ScriptedStream):
+        def get_final_message(self):
+            assert waiting_for_slot.wait(5)
+            return _counted_stream("", stop_reason="refusal").get_final_message()
+
+    class Messages:
+        def stream(self, **kwargs):
+            calls.append(kwargs)
+            first_sent.set()
+            return RefusalStream("")
+
+    _fake_sdk(monkeypatch, types.SimpleNamespace(messages=Messages()), [])
+    monkeypatch.setattr(lc, "ThreadPoolExecutor", ObservedExecutor)
+    monkeypatch.setattr(lc, "_REQUEST_LIMITER", DelayedLimiter())
+    monkeypatch.setattr(lc, "_split_bundle_into_chunks", lambda _bundle: [
+        {"paragraphs": [{"paragraph_index": i}]} for i in range(2)
+    ])
+
+    with pytest.raises(lc.ClassificationRefused) as caught:
+        classify_target_document(
+            {"paragraphs": [{"paragraph_index": i} for i in range(2)]},
+            ["PART"], api_key="k", model="m",
+        )
+
+    assert len(calls) == 1
+    usage = usage_from_exception(caught.value)
+    assert usage["requests_attempted"] == usage["responses_completed"] == 1
+    assert usage["input_tokens"] == 100
+    assert usage["usage_complete"] is True
+
+
+@pytest.mark.parametrize("sibling", ["json", "validation", "max_tokens", "transport"])
+def test_refused_chunk_interrupts_sibling_backoff(monkeypatch, sibling):
+    from spec_formatter.llm_usage import usage_from_exception
+    from spec_formatter.style_application.core import llm_classifier as lc
+
+    backoff_started = threading.Event()
+    calls = []
+    original_wait = lc.wait_for_retry
+
+    def wait_for_retry(stop_event, _delay):
+        backoff_started.set()
+        original_wait(stop_event, 5)
+
+    monkeypatch.setattr(lc, "wait_for_retry", wait_for_retry)
+    monkeypatch.setattr(lc, "_REQUEST_LIMITER", threading.BoundedSemaphore(2))
+    monkeypatch.setattr(lc, "_split_bundle_into_chunks", lambda _bundle: [
+        {"paragraphs": [{"paragraph_index": i}], "_chunk_info": {"chunk_index": i}}
+        for i in range(2)
+    ])
+
+    class Messages:
+        def stream(self, **kwargs):
+            chunk = json.loads(kwargs["messages"][0]["content"])
+            i = chunk["_chunk_info"]["chunk_index"]
+            calls.append(i)
+            if i == 0:
+                assert backoff_started.wait(5)
+                return _counted_stream("", stop_reason="refusal")
+            if sibling == "transport":
+                raise sdk.APIConnectionError("offline")
+            return _counted_stream(
+                "not json" if sibling == "json" else '{"classifications": []}',
+                stop_reason="max_tokens" if sibling == "max_tokens" else "end_turn",
+            )
+
+    sdk = _fake_sdk(monkeypatch, types.SimpleNamespace(messages=Messages()), [])
+    with pytest.raises(lc.ClassificationRefused) as caught:
+        classify_target_document(
+            {"paragraphs": [{"paragraph_index": i} for i in range(2)]},
+            ["PART"], api_key="k", model="m",
+        )
+
+    assert sorted(calls) == [0, 1]
+    assert caught.value.safe_error_code == "classification_refused"
+    usage = usage_from_exception(caught.value)
+    assert usage["requests_attempted"] == 2
+    assert usage["responses_completed"] == (1 if sibling == "transport" else 2)
 
 
 def test_deterministic_only_target_reports_no_requests(monkeypatch):
