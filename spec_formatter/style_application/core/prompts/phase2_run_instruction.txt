@@ -9,8 +9,7 @@ Output schema:
   ],
   "ignored_paragraphs": [
     { "paragraph_index": 13, "reason": "non_csi_content" }
-  ],
-  "notes": []
+  ]
 }
 
 IMPORTANT:

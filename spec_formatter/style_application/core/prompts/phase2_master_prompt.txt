@@ -4,6 +4,9 @@ You will be given:
 1. A slim JSON bundle of paragraphs from an MEP specification
 2. A list of AVAILABLE ROLES that the target architect template supports
 
+The request's numbering_levels table stores each numbering_pattern once under its numId and ilvl, referenced by the paragraph's effective_numPr (ilvl defaults to "0").
+Absent optional fields are empty/null/false; omitted prev_text or next_text is the adjacent input paragraph's text truncated to 80 characters.
+
 Your job:
 - Give EVERY input paragraph exactly one disposition
 - Classify CSI structure into a role from the available_roles list
