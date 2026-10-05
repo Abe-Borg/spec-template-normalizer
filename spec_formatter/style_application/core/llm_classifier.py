@@ -8,9 +8,8 @@ with retry logic, chunking for large documents, and coverage reporting.
 import json
 import os
 import threading
-import time
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set
 
 from ...llm_usage import (
@@ -182,6 +181,13 @@ def _transport_retry_delay(
         status = getattr(error, "status_code", 0) or 0
         return backoff if status >= 500 else None
     return None
+
+
+def _wait_for_retry(stop_event: threading.Event, delay: float) -> None:
+    """Wait for backoff unless another chunk has already failed."""
+
+    if stop_event.wait(delay):
+        raise CancelledError("Target classification stopped after a chunk failed")
 
 
 def _final_stop_reason(stream: Any) -> Optional[str]:
@@ -597,8 +603,16 @@ def classify_target_document(
     chunk_results: List[dict] = [None] * len(chunks)
     system_blocks = _system_blocks(available_roles)
     usage = UsageCollector()
+    stop_event = threading.Event()
+    failure_lock = threading.Lock()
+    first_failure: Optional[BaseException] = None
 
-    def _classify_chunk(i: int, chunk: dict) -> dict:
+    def _checkpoint() -> None:
+        if stop_event.is_set():
+            raise CancelledError("Target classification stopped after a chunk failed")
+
+    def _classify_chunk_attempts(i: int, chunk: dict) -> dict:
+        _checkpoint()
         if len(chunks) > 1:
             print(f"  Processing chunk {i + 1}/{len(chunks)}...")
 
@@ -615,11 +629,15 @@ def classify_target_document(
         transport_attempt = 0
 
         while True:
+            _checkpoint()
             try:
                 # No sampling params (temperature/top_p/top_k): Sonnet 5.5 and
                 # Opus 5.5 reject non-default values with a 400.
-                usage.record_attempt()
                 with _REQUEST_LIMITER:
+                    # A sibling may have failed while this worker waited for
+                    # a request slot. Count only attempts actually sent.
+                    _checkpoint()
+                    usage.record_attempt()
                     with client.messages.stream(
                         model=model,
                         max_tokens=128000,
@@ -646,6 +664,7 @@ def classify_target_document(
                         stop_details = streamed_stop_details(stream)
                         get_final_message = getattr(stream, "get_final_message", None)
                         final_message = get_final_message() if get_final_message else None
+                        usage.record_response(final_message)
                         stop_reason = getattr(final_message, "stop_reason", None)
                         # Text only after the stop reason: get_final_text()
                         # raises when the response holds no text block, which
@@ -656,7 +675,6 @@ def classify_target_document(
                             if stop_reason in ("refusal", "max_tokens")
                             else stream.get_final_text()
                         )
-                usage.record_response(final_message)
                 if stop_reason == "refusal":
                     category = refusal_category(final_message, stop_details)
                     raise ClassificationRefused(
@@ -676,7 +694,7 @@ def classify_target_document(
                 retry_error = e
                 if regeneration < max_regenerations:
                     print(f"  JSON parse error, retrying ({regeneration + 1}/{max_regenerations})...")
-                    time.sleep(2 ** regeneration)
+                    _wait_for_retry(stop_event, 2 ** regeneration)
                     regeneration += 1
                 else:
                     response_length = len(response_text.strip())
@@ -692,7 +710,7 @@ def classify_target_document(
                 if regeneration < max_regenerations:
                     wait = 2 ** (regeneration + 1)
                     print(f"  Classification attempt failed: {e}, retrying in {wait}s ({regeneration + 1}/{max_regenerations})...")
-                    time.sleep(wait)
+                    _wait_for_retry(stop_event, wait)
                     regeneration += 1
                 else:
                     raise RuntimeError(
@@ -710,8 +728,23 @@ def classify_target_document(
                     f"  Transient API failure: {e}; retrying in {delay:g}s "
                     f"({transport_attempt + 1}/{_TRANSPORT_RETRIES})..."
                 )
-                time.sleep(delay)
+                _wait_for_retry(stop_event, delay)
                 transport_attempt += 1
+
+    def _classify_chunk(i: int, chunk: dict) -> dict:
+        nonlocal first_failure
+        try:
+            return _classify_chunk_attempts(i, chunk)
+        except CancelledError:
+            raise
+        except BaseException as exc:
+            # Signal in the worker before it can take another queued chunk.
+            # Sibling cancellations must never replace this original error.
+            with failure_lock:
+                if first_failure is None:
+                    first_failure = exc
+                stop_event.set()
+            raise
 
     # Every failure below - a refused chunk, exhausted regeneration, an
     # overlap re-ask, the merge, or the coverage check - happens after
@@ -722,7 +755,8 @@ def classify_target_document(
             chunk_results[0] = _classify_chunk(0, chunks[0])
         else:
             max_workers = min(len(chunks), 6)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            try:
                 futures = {
                     executor.submit(_classify_chunk, i, chunk): i
                     for i, chunk in enumerate(chunks)
@@ -730,6 +764,13 @@ def classify_target_document(
                 for future in as_completed(futures):
                     i = futures[future]
                     chunk_results[i] = future.result()
+            except BaseException:
+                stop_event.set()
+                raise
+            finally:
+                # Drain only requests already in flight before snapshotting
+                # usage; queued work is cancelled and retries stop at checkpoints.
+                executor.shutdown(wait=True, cancel_futures=True)
 
         if len(chunk_results) > 1:
             conflicts = _chunk_conflicts(chunk_results)
@@ -787,4 +828,5 @@ def classify_target_document(
         print(f"Disposition coverage: {disposition_count}/{total_expected} (100.0%)")
         return result
     except BaseException as exc:
-        raise attach_usage(exc, usage)
+        failure = first_failure if first_failure is not None else exc
+        raise attach_usage(failure, usage)
