@@ -23,6 +23,8 @@ import re
 import threading
 from typing import Any, Dict, Optional
 
+from .cancellation import check_cancelled
+
 #: Provider usage counters this project understands. A field the provider
 #: adds later is ignored rather than guessed at.
 USAGE_FIELDS = (
@@ -38,6 +40,27 @@ USAGE_FIELDS = (
 #: would mark ordinary responses incomplete. Input and output are always
 #: billed, so a response missing either is only partly accounted for.
 REQUIRED_USAGE_FIELDS = ("input_tokens", "output_tokens")
+
+
+def normalize_usage(value: Any) -> Dict[str, Any]:
+    """Keep only observed counters and the completeness flag at boundaries.
+
+    Injected processors can return arbitrary mappings. Publishing their usage
+    must not turn a counts-only field into another channel for document text.
+    An empty mapping remains empty: unavailable telemetry is not known zero.
+    """
+
+    if not isinstance(value, dict):
+        return {}
+    fields = (*USAGE_FIELDS, "requests_attempted", "responses_completed",
+              "responses_with_usage", "requests_with_unknown_usage")
+    result = {
+        key: value[key] for key in fields
+        if isinstance(value.get(key), int) and not isinstance(value[key], bool)
+    }
+    if isinstance(value.get("usage_complete"), bool):
+        result["usage_complete"] = value["usage_complete"]
+    return result
 
 
 def usage_numbers(final_message: Any) -> Dict[str, int]:
@@ -63,7 +86,7 @@ def usage_numbers(final_message: Any) -> Dict[str, int]:
 _REFUSAL_CATEGORY_RX = re.compile(r"[a-z][a-z0-9_]{0,47}")
 
 
-def streamed_stop_details(stream: Any) -> Any:
+def streamed_stop_details(stream: Any, cancel_event: Optional[threading.Event] = None) -> Any:
     """Consume ``stream`` and return the ``stop_details`` its events carried.
 
     A streamed response reports ``stop_details`` on the ``message_delta``
@@ -84,6 +107,9 @@ def streamed_stop_details(stream: Any) -> Any:
         return None
     details = None
     for event in events:
+        # Exiting the caller's stream context closes an interrupted response.
+        # Its attempt remains unknown: no final usage was observed.
+        check_cancelled(cancel_event)
         if getattr(event, "type", None) != "message_delta":
             continue
         delta = getattr(event, "delta", None)

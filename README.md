@@ -148,6 +148,10 @@ stopped and, when the engine failed on a known condition, a stable
 the closed sets are listed in CLAUDE.md. API keys and document text are never
 written to run metadata.
 
+`run.json` and target audits use artifact schema version 4, which introduces
+cancellation outcomes and per-target observed usage. Consumers selecting a
+schema by `schema_version` must support version 4 for new run artifacts.
+
 ### Finding the paragraph a failure is about
 
 A remediation sentence is fixed, so on its own it can only say "check the
@@ -487,6 +491,18 @@ writes its result to the file named by `SPEC_FORMATTER_SELFCHECK_OUT` because
 the windowed executable has no console.
 
 ## Headless API
+
+During a GUI run, **Cancel** stops new work and saves the run artifacts.
+Closing the window offers to cancel, then closes after the worker exits.
+Already published documents remain in the run folder; cancelled targets
+publish no DOCX and still receive an audit. `run.json` reports `cancelled`.
+
+Headless callers can pass `cancel_event=threading.Event()` and call
+`cancel_event.set()` from another thread. The default is `None`. The API
+returns `result.cancelled=True` after saving artifacts and cleaning staging.
+Retry waits wake immediately; an in-flight stream can finish or close on its
+next event. Interrupted requests with no final usage are counted as unknown,
+so an incomplete token total is never presented as zero spend.
 
 `spec_formatter.format_specifications()` is the canonical programmatic entry
 point:

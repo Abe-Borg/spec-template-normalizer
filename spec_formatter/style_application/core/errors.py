@@ -31,6 +31,10 @@ from typing import Any, Mapping, Optional
 from .section_numbers import section_number_display_form
 
 ERROR_REMEDIATIONS: Mapping[str, str] = {
+    "run_cancelled": (
+        "The run was cancelled. Published documents are available in the run "
+        "folder; check the selected inputs and start a new run for cancelled targets."
+    ),
     "header_footer_target_section_id_required": (
         "The architect header/footer names its section number, but this target "
         "has no recognisable SECTION number to put in its place. Add or fix the "
@@ -178,6 +182,7 @@ ENGINE_STAGES: tuple[str, ...] = (
 
 #: Stages the target runner records before the shared path is entered.
 RUNNER_STAGES: tuple[str, ...] = (
+    "cancelled",
     "validation",
     "extraction",
     "bundle_build",
@@ -188,11 +193,16 @@ RUNNER_STAGES: tuple[str, ...] = (
 
 #: Stages the pipeline records around the runner.
 PIPELINE_STAGES: tuple[str, ...] = (
+    "cancelled",
     "not_started",
     "processing",
     "publication",
     "complete",
 )
+
+#: Terminal statuses on run.json, including a run with both published and
+#: cancelled targets.
+RUN_STATUSES: tuple[str, ...] = ("succeeded", "partial_failure", "failed", "cancelled")
 
 
 #: Where a paragraph sits relative to the headings of its section. Closed, so
@@ -379,6 +389,7 @@ __all__ = [
     "ErrorLocation",
     "PIPELINE_STAGES",
     "RUNNER_STAGES",
+    "RUN_STATUSES",
     "attach_engine_error",
     "remediation_for",
     "safe_error_location",
