@@ -223,7 +223,7 @@ jobs:
           # GitHub never marks it "latest" -- the updater reads
           # releases/latest/download/latest.json, so stable installs are not
           # auto-offered an RC.
-          flags=(--verify-tag --title "Specification Formatter ${tag}" --notes "${notes}")
+          flags=(--verify-tag --title "Specification Formatter ${tag}" --notes "${notes}" --generate-notes)
           if [[ "${version}" == *rc* ]]; then
             flags+=(--prerelease)
           else
