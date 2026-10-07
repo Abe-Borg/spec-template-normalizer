@@ -39,7 +39,8 @@ def test_engine_error_keeps_detail_and_carries_a_fixed_remediation():
 
 
 def test_remediations_are_fixed_sentences_without_placeholders():
-    assert 15 <= len(ERROR_REMEDIATIONS) <= 25
+    # The Haiku prompt-price guard adds one actionable classification code.
+    assert 15 <= len(ERROR_REMEDIATIONS) <= 26
     for code, sentence in ERROR_REMEDIATIONS.items():
         assert re.fullmatch(r"[a-z][a-z0-9_]+", code)
         assert sentence.strip() and "{" not in sentence and "}" not in sentence

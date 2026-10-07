@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox
 
 from spec_formatter import __version__, secrets, updates
 from spec_formatter.app_paths import default_config_dir
+from spec_formatter.model_config import DEFAULT_TARGET_MODEL, TARGET_MODEL_CHOICES
 from spec_formatter.pipeline import (
     CANADIAN_TO_CSI,
     CSI_TO_CANADIAN,
@@ -63,6 +64,8 @@ def _font(size: int, weight: str = "normal", family: str = UI_FONT) -> ctk.CTkFo
 # FormatWorker keeps its parameters so headless callers can still choose.
 DEFAULT_REUSE_TEMPLATE_ANALYSIS = True
 DEFAULT_MAX_WORKERS = 3
+_TARGET_MODEL_IDS = dict(TARGET_MODEL_CHOICES)
+_TARGET_MODEL_LABELS = {model: label for label, model in TARGET_MODEL_CHOICES}
 KEYRING_UNAVAILABLE_STATUS = (
     "Could not save the API key to the system keyring; it will not be remembered."
 )
@@ -196,6 +199,7 @@ class ActiveRunSummary:
     conversion_mode: str
     reuse_template_analysis: bool
     max_workers: int
+    target_model: str = DEFAULT_TARGET_MODEL
 
 
 _MODE_LABELS = {
@@ -237,6 +241,7 @@ def active_run_summary_text(summary: ActiveRunSummary, *, active: bool = True) -
         f"{len(summary.target_inputs)} target selection(s) | "
         f"{summary.max_workers} worker(s) | {analysis}\n"
         f"Template: {_summary_template_line(summary)}\n"
+        f"Target model: {_TARGET_MODEL_LABELS.get(summary.target_model, summary.target_model)}\n"
         f"Output root: {summary.output_root}"
     )
 
@@ -305,6 +310,8 @@ class FormatWorker(threading.Thread):
         max_workers: int,
         conversion_mode: str,
         events: queue.Queue,
+        *,
+        target_model: str = DEFAULT_TARGET_MODEL,
     ) -> None:
         super().__init__(daemon=False)
         self.architect_template = architect_template
@@ -317,6 +324,7 @@ class FormatWorker(threading.Thread):
         self.max_workers = max_workers
         self.conversion_mode = conversion_mode
         self.events = events
+        self.target_model = target_model
         self.cancel_event = threading.Event()
 
     def _progress(
@@ -344,6 +352,7 @@ class FormatWorker(threading.Thread):
                 cache_dir=default_template_cache_dir(),
                 force_template_analysis=not self.reuse_template_analysis,
                 max_workers=self.max_workers,
+                target_model=self.target_model,
                 conversion_mode=self.conversion_mode,
                 progress_event=self._progress,
                 cancel_event=self.cancel_event,
@@ -394,6 +403,7 @@ class App(ctk.CTk):
         # override is ephemeral and must not silently overwrite the saved key.
         self.remember_key_var = ctk.BooleanVar(value=bool(stored_key) and not env_key)
         self.conversion_mode_var = ctk.StringVar(value=FORMAT_ONLY)
+        self.target_model_var = ctk.StringVar(value=TARGET_MODEL_CHOICES[0][0])
         self.mode_controls: list[ctk.CTkRadioButton] = []
         self.run_affecting_controls: list[object] = []
         self._locked_run_control_states: list[tuple[object, str]] = []
@@ -587,6 +597,31 @@ class App(ctk.CTk):
             font=_font(12),
         )
         self.mode_hint_label.pack(anchor="w", padx=22, pady=(7, 0))
+
+        model_row = ctk.CTkFrame(card, fg_color="transparent")
+        model_row.pack(fill="x", padx=22, pady=(10, 0))
+        ctk.CTkLabel(
+            model_row, text="Target AI model", text_color=COLORS["secondary"],
+            font=_font(13),
+        ).pack(side="left", padx=(0, 12))
+        self.target_model_menu = ctk.CTkOptionMenu(
+            model_row,
+            variable=self.target_model_var,
+            values=[label for label, _model in TARGET_MODEL_CHOICES],
+            height=32,
+            width=170,
+            fg_color=COLORS["input"],
+            button_color=COLORS["border"],
+            button_hover_color=COLORS["accent_hover"],
+            text_color=COLORS["text"],
+            font=_font(13),
+        )
+        self.target_model_menu.pack(side="left")
+        self.run_affecting_controls.append(self.target_model_menu)
+        ctk.CTkLabel(
+            model_row, text="Haiku is the lower-cost default.",
+            text_color=COLORS["muted"], font=_font(12),
+        ).pack(side="left", padx=(12, 0))
 
         self._section_label(card, "4   Output folder", top=18)
         self.output_entry, self.output_button = self._path_row(
@@ -990,6 +1025,7 @@ class App(ctk.CTk):
             conversion_mode=conversion_mode,
             reuse_template_analysis=DEFAULT_REUSE_TEMPLATE_ANALYSIS,
             max_workers=DEFAULT_MAX_WORKERS,
+            target_model=_TARGET_MODEL_IDS[self.target_model_var.get()],
         )
         api_key = self.api_key_var.get()
         self.last_result = None
@@ -1021,6 +1057,7 @@ class App(ctk.CTk):
             max_workers=active_run.max_workers,
             conversion_mode=active_run.conversion_mode,
             events=self.events,
+            target_model=active_run.target_model,
         )
         self.worker.start()
 

@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from .. import builtin_scheme
 from .. import diagnostics as diag
+from ..model_config import DEFAULT_TARGET_MODEL
 from ..llm_usage import UsageCollector, usage_from_exception
 from ..cancellation import RunCancelled, cancellation_kwargs, check_cancelled
 from .arch_env_applier import apply_environment_to_target
@@ -1258,7 +1259,7 @@ def process_single_file(
     output_dir: Path,
     source_tokens: Optional[Dict[str, str]] = None,
     arch_root: Optional[Path] = None,
-    model: str = "claude-sonnet-5-5",
+    model: str = DEFAULT_TARGET_MODEL,
     role_specs: Optional[Dict[str, Dict[str, Any]]] = None,
     conversion_mode: str = FORMAT_ONLY,
     *,

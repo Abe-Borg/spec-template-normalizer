@@ -24,16 +24,21 @@ from .classification import (
     PHASE2_RUN_INSTRUCTION,
     coerce_to_final_classifications,
 )
-from .errors import attach_engine_error
+from .errors import EngineError, attach_engine_error
+from ...model_config import DEFAULT_TARGET_MODEL, HAIKU_TARGET_MODEL
 from ...cancellation import RunCancelled, check_cancelled, request_slot, wait_for_retry
 
 
-# Sonnet 5.5's tokenizer (shared with Sonnet 5) produces ~30% more tokens for the same text than the
-# pre-4.7 tokenizers, so estimate conservatively at ~3 chars/token.
+# Haiku 5.5 and Sonnet 5.5 share the newer tokenizer, which produces ~30%
+# more tokens than pre-4.7 models. Leave room for the system prompt and schema
+# below Haiku's 100k-token pricing boundary; check the complete request too.
 _CHARS_PER_TOKEN = 3
 _MAX_BUNDLE_TOKENS = 80_000
 _MAX_BUNDLE_CHARS = _MAX_BUNDLE_TOKENS * _CHARS_PER_TOKEN
 _CHUNK_OVERLAP = 20
+# Token counting is an estimate, not an exact billing count. Reserve 5,000
+# tokens below Haiku's 100,000-token pricing boundary for estimation drift.
+_HAIKU_MAX_PROMPT_TOKENS = 95_000
 
 # The chunker measures the projected user turn, including tables and context,
 # as compact JSON with sorted keys. json.dumps escapes non-ASCII by default,
@@ -43,6 +48,35 @@ _JSON_WIRE_KWARGS = {"separators": (",", ":"), "sort_keys": True}
 
 def _wire_json(value: Any) -> str:
     return json.dumps(value, **_JSON_WIRE_KWARGS)
+
+
+def _check_haiku_prompt_size(client: Any, request: dict) -> None:
+    """Reserve pricing headroom on every Haiku attempt, including regenerations.
+
+    Count the same system, messages, thinking and output schema that inference
+    will receive. The 95k budget leaves 5k below the pricing boundary because
+    the provider's count is an estimate. Token-counter failures follow the
+    caller's transport policy; they never permit unchecked inference. Clients
+    without a counter use the ASCII JSON byte count as a conservative bound.
+    Token-count requests do not generate tokens and are not inference usage.
+    """
+
+    if request["model"] != HAIKU_TARGET_MODEL:
+        return
+    counted_request = {key: value for key, value in request.items() if key != "max_tokens"}
+    counter = getattr(client.messages, "count_tokens", None)
+    if callable(counter):
+        tokens = getattr(counter(**counted_request), "input_tokens", None)
+        if type(tokens) is not int or tokens < 0:
+            raise RuntimeError("Token counter returned invalid input_tokens")
+    else:
+        tokens = len(_wire_json(counted_request))
+    if tokens > _HAIKU_MAX_PROMPT_TOKENS:
+        raise EngineError(
+            "classification_prompt_too_large",
+            f"Haiku classification prompt is estimated at {tokens:,} tokens; "
+            f"the request budget is {_HAIKU_MAX_PROMPT_TOKENS:,}.",
+        )
 
 
 def _system_blocks(available_roles: list) -> List[dict]:
@@ -635,7 +669,7 @@ def classify_target_document(
     slim_bundle: dict,
     available_roles: list,
     api_key: str,
-    model: str = "claude-sonnet-5-5",
+    model: str = DEFAULT_TARGET_MODEL,
     *,
     target_effort: str = "high",
     cancel_event: Optional[threading.Event] = None,
@@ -707,30 +741,33 @@ def classify_target_document(
         while True:
             check_cancelled(request_cancel_event)
             try:
-                # No sampling params (temperature/top_p/top_k): Sonnet 5.5 and
-                # Opus 5.5 reject non-default values with a 400.
-                with request_slot(_REQUEST_LIMITER, request_cancel_event):
-                    usage.record_attempt()
-                    with client.messages.stream(
-                        model=model,
-                        max_tokens=128000,
-                        thinking={"type": "adaptive"},
-                        output_config=_classification_output_config(
-                            available_roles, target_effort=target_effort
+                request = {
+                    "model": model,
+                    "max_tokens": 128000,
+                    "thinking": {"type": "adaptive"},
+                    "output_config": _classification_output_config(
+                        available_roles, target_effort=target_effort
+                    ),
+                    "system": system_blocks,
+                    "messages": [{
+                        "role": "user",
+                        "content": (
+                            user_message
+                            if regeneration == 0
+                            else user_message + _retry_requirement(
+                                retry_error or ValueError("prior response was not usable"),
+                                allowed_indices,
+                            )
                         ),
-                        system=system_blocks,
-                        messages=[{
-                            "role": "user",
-                            "content": (
-                                user_message
-                                if regeneration == 0
-                                else user_message + _retry_requirement(
-                                    retry_error or ValueError("prior response was not usable"),
-                                    allowed_indices,
-                                )
-                            ),
-                        }],
-                    ) as stream:
+                    }],
+                }
+                # No sampling params or assistant prefill: Haiku 5.5 rejects
+                # them. Count and stream under the same process-wide limiter.
+                with request_slot(_REQUEST_LIMITER, request_cancel_event):
+                    _check_haiku_prompt_size(client, request)
+                    check_cancelled(request_cancel_event)
+                    usage.record_attempt()
+                    with client.messages.stream(**request) as stream:
                         # The events are consumed first because a refusal's
                         # stop_details reach only the raw message_delta
                         # event; the SDK's final message does not carry them.
@@ -740,13 +777,17 @@ def classify_target_document(
                         usage.record_response(final_message)
                         check_cancelled(cancel_event)
                         stop_reason = getattr(final_message, "stop_reason", None)
+                        blocks = getattr(final_message, "content", None)
+                        has_text = not isinstance(blocks, list) or any(
+                            getattr(block, "type", None) == "text" for block in blocks
+                        )
                         # Text only after the stop reason: get_final_text()
                         # raises when the response holds no text block, which
                         # is what a refusal or an output-limit stop can look
                         # like, and that error used to pre-empt both checks.
                         response_text = (
                             ""
-                            if stop_reason in ("refusal", "max_tokens")
+                            if stop_reason in ("refusal", "max_tokens") or not has_text
                             else stream.get_final_text()
                         )
                 if stop_reason == "refusal":
@@ -763,6 +804,9 @@ def classify_target_document(
                     )
                 parsed = _parse_classification_response(response_text)
                 return _validate_classifications(parsed, available_roles, allowed_indices)
+            except EngineError:
+                # A cost-guard failure cannot be fixed by regenerating JSON.
+                raise
             except json.JSONDecodeError as e:
                 # Malformed output: regenerate with the stricter instruction.
                 retry_error = e

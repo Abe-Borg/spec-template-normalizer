@@ -129,6 +129,12 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "This target looks like more than one specification section. Split it "
         "into separate section DOCX files and run those files again."
     ),
+    "classification_prompt_too_large": (
+        "This target's estimated prompt exceeds Haiku's 95,000-token request "
+        "budget, which reserves room below the higher-price threshold. Split the "
+        "document into smaller specification sections, or select Sonnet 5.5 "
+        "as the target model and run it again."
+    ),
     "paragraph_style_not_applied": (
         "A classified paragraph did not carry its assigned style after "
         "formatting, so the output was withheld. This is a defect in the "

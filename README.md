@@ -118,8 +118,10 @@ In the single window:
 2. Choose the architect's template DOCX, if the mode uses one.
 3. Add target DOCX files, or add a folder containing target specs.
 4. Choose the output folder.
-5. Enter the Anthropic API key when needed.
-6. Click **Format Specs**.
+5. Choose the **Target AI model**: **Haiku 5.5** is the default; **Sonnet 5.5**
+   is also available. Architect-template analysis uses Opus 5.5 with either choice.
+6. Enter the Anthropic API key when needed.
+7. Click **Format Specs**.
 
 Each run creates an isolated directory below the selected output root:
 
@@ -196,8 +198,12 @@ identifiers -- never document text or secrets -- and the verbosity is set with
 `diagnostics_level` (`debug`/`info`/`warning`/`error`, default `info`) or the
 `SPEC_FORMATTER_DIAGNOSTICS_LEVEL` environment variable, which overrides it.
 
-Target classification uses adaptive thinking at `target_effort="high"` by
-default. For measured comparisons, `format_specifications(target_effort=...)`
+Target classification defaults to `target_model="claude-haiku-5-5"` with
+adaptive thinking at `target_effort="high"`. Python callers can select
+`target_model="claude-sonnet-5-5"`, just as desktop users can select Sonnet.
+The selected model is locked for the active run and recorded in
+`models.target` in `run.json`; there is no automatic model fallback.
+For measured comparisons, `format_specifications(target_effort=...)`
 accepts `low`, `medium`, `high`, `xhigh`, or `max`. A nonempty
 `SPEC_FORMATTER_TARGET_EFFORT` environment variable overrides the argument;
 invalid values fail input validation with `invalid_target_effort` before any
@@ -567,11 +573,12 @@ recorded as `refusal_category` in `diagnostics.jsonl` -- on the target's
 was the document declined. The provider's free-text explanation is never
 recorded.
 
-Both classifiers request structured JSON output, so the model can reason only
-in its (unreturned) thinking. The target classifier's system prompt therefore
-ends with the line Anthropic recommends for Sonnet 5.5 in that situation,
-"Think the problem through before you answer.", which trades a modest
-increase in output tokens for accuracy close to a higher effort level.
+Both classifiers request structured JSON output and adaptive thinking. The
+target system prompt ends with "Think the problem through before you answer."
+Thinking blocks are read by type; a Haiku reply containing only thinking and
+no visible answer uses the same bounded JSON regeneration as an empty reply.
+Usage from that attempt is retained, and thinking text is never treated as
+classification JSON.
 
 Both classifiers send their byte-stable prompt prefix as a cached system
 block, and the target classifier sends compact JSON, so repeated chunks and
@@ -643,7 +650,8 @@ identity, and prompt hashes, so neither a wire-contract change nor a change to
 the engine's repair or capture logic can silently reuse an older profile. After
 a fresh analysis, older profiles of the same template beyond the newest two
 are removed from the cache. The architect template is analysed with
-`claude-opus-5-5` and targets are classified with `claude-sonnet-5-5`; no
+`claude-opus-5-5` and targets default to `claude-haiku-5-5`, with
+`claude-sonnet-5-5` available as an explicit choice; no
 server-side model fallback is enabled, so the model a run records is the model
 that produced it.
 
@@ -712,6 +720,17 @@ fails instead of publishing a header that still names the architect's section.
   targets are unaffected. Set `SPEC_FORMATTER_MAX_TARGET_PARAGRAPHS` to a
   positive integer to raise (or lower) the cap; unset, invalid, zero, and
   negative values keep the default guard.
+- Haiku target requests are checked against a 95,000-token estimated prompt
+  budget before every inference attempt, including JSON regenerations. This
+  reserves 5,000 tokens below its 100,000-token pricing threshold because the
+  provider's token count is an estimate rather than an exact billing count. The
+  token counter receives the complete system prompt, user message, adaptive
+  thinking setting, and output schema. Counter failures follow the bounded
+  transport retry policy and never permit an unchecked inference. Clients
+  without a token counter use the ASCII JSON byte count as a conservative
+  bound. An oversized prompt fails with `classification_prompt_too_large`;
+  split the document into smaller sections or select Sonnet. Token-count
+  requests generate no tokens and are excluded from inference usage.
 - Observed model usage is recorded for both the architect analysis and each
   target, including work that failed, and published under `diagnostics.usage`
   in `run.json`. A refusal or an exhausted retry is counted rather than
