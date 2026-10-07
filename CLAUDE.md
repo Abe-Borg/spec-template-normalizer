@@ -1371,8 +1371,8 @@ Current codes: `header_footer_target_section_id_required`,
 `classification_coverage_incomplete`, `classification_refused`,
 `target_too_large` (unresolved target workload exceeds the configurable cost
 cap at `classification_preflight`; split the document into separate sections),
-`classification_prompt_too_large` (a complete Haiku prompt, including a
-regeneration's instructions, exceeds 100,000 tokens at `classification`;
+`classification_prompt_too_large` (a complete Haiku prompt estimate, including a
+regeneration's instructions, exceeds the 95,000-token budget at `classification`;
 split the target into smaller sections or select Sonnet),
 `paragraph_style_not_applied`,
 `numbering_importer_unavailable`, `style_import_namespace_conflict`,
@@ -1474,8 +1474,10 @@ before assuming that trade is worth making.
 
 **Haiku is the target default, with a prompt-price guard.** Architect analysis
 stays on Opus 5.5. The target's 80k-token character estimate leaves headroom
-below Haiku's 100k pricing boundary; `_check_haiku_prompt_size` checks the full
-request with the model's token counter before each inference attempt, under
+below Haiku's 100k pricing boundary; `_check_haiku_prompt_size` enforces a 95k
+estimated prompt budget, reserving 5k for drift in the provider's token-count
+estimate. It checks the full request with the model's token counter before
+each inference attempt, under
 the same request limiter. It includes the system prefix, user message (with
 any retry requirement), thinking configuration, and JSON output schema.
 Counting errors use the existing transport retry policy and never bypass the

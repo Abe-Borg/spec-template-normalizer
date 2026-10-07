@@ -36,7 +36,9 @@ _CHARS_PER_TOKEN = 3
 _MAX_BUNDLE_TOKENS = 80_000
 _MAX_BUNDLE_CHARS = _MAX_BUNDLE_TOKENS * _CHARS_PER_TOKEN
 _CHUNK_OVERLAP = 20
-_HAIKU_MAX_PROMPT_TOKENS = 100_000
+# Token counting is an estimate, not an exact billing count. Reserve 5,000
+# tokens below Haiku's 100,000-token pricing boundary for estimation drift.
+_HAIKU_MAX_PROMPT_TOKENS = 95_000
 
 # The chunker measures the projected user turn, including tables and context,
 # as compact JSON with sorted keys. json.dumps escapes non-ASCII by default,
@@ -49,11 +51,12 @@ def _wire_json(value: Any) -> str:
 
 
 def _check_haiku_prompt_size(client: Any, request: dict) -> None:
-    """Keep every Haiku attempt, including regenerations, in its cheap tier.
+    """Reserve pricing headroom on every Haiku attempt, including regenerations.
 
     Count the same system, messages, thinking and output schema that inference
-    will receive. Token-counter failures follow the caller's transport policy;
-    they never silently permit a more expensive inference request. Clients
+    will receive. The 95k budget leaves 5k below the pricing boundary because
+    the provider's count is an estimate. Token-counter failures follow the
+    caller's transport policy; they never permit unchecked inference. Clients
     without a counter use the ASCII JSON byte count as a conservative bound.
     Token-count requests do not generate tokens and are not inference usage.
     """
@@ -71,8 +74,8 @@ def _check_haiku_prompt_size(client: Any, request: dict) -> None:
     if tokens > _HAIKU_MAX_PROMPT_TOKENS:
         raise EngineError(
             "classification_prompt_too_large",
-            f"Haiku classification prompt is {tokens:,} tokens; "
-            f"the low-cost limit is {_HAIKU_MAX_PROMPT_TOKENS:,}.",
+            f"Haiku classification prompt is estimated at {tokens:,} tokens; "
+            f"the request budget is {_HAIKU_MAX_PROMPT_TOKENS:,}.",
         )
 
 

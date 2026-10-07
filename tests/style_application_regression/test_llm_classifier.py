@@ -1275,13 +1275,14 @@ def test_a_real_output_limit_stop_without_text_regenerates(monkeypatch):
 
 
 @pytest.mark.parametrize("effort", ["high", "medium"])
-def test_haiku_default_counts_the_full_request_and_reads_text_after_thinking(monkeypatch, effort):
+@pytest.mark.parametrize("tokens", [94_999, 95_000])
+def test_haiku_default_counts_the_full_request_and_reads_text_after_thinking(monkeypatch, effort, tokens):
     import anthropic
 
     requests = []
     client = _sse_client(
         _sse_body("end_turn", text=_GOOD, thinking=True),
-        token_counts=[100_000], requests=requests,
+        token_counts=[tokens], requests=requests,
     )
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: client)
     result = classify_target_document(_unresolved_bundle(), ["PART"], "offline-key", target_effort=effort)
@@ -1325,7 +1326,8 @@ def test_haiku_thinking_only_reply_regenerates_and_keeps_paid_usage(monkeypatch)
 
 
 @pytest.mark.parametrize("after_bad_reply", [False, True])
-def test_haiku_above_100k_never_sends_the_expensive_attempt(monkeypatch, after_bad_reply):
+@pytest.mark.parametrize("tokens", [95_001, 99_999, 100_000, 100_001])
+def test_haiku_reserves_headroom_before_initial_and_regenerated_attempts(monkeypatch, after_bad_reply, tokens):
     import anthropic
     from spec_formatter.llm_usage import usage_from_exception
     from spec_formatter.pipeline import safe_error_diagnostic
@@ -1335,7 +1337,7 @@ def test_haiku_above_100k_never_sends_the_expensive_attempt(monkeypatch, after_b
     requests = []
     client = _sse_client(
         *([_sse_body("end_turn", text="bad JSON")] if after_bad_reply else []),
-        token_counts=([100] if after_bad_reply else []) + [100_001], requests=requests,
+        token_counts=([100] if after_bad_reply else []) + [tokens], requests=requests,
     )
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: client)
     monkeypatch.setattr(lc.time, "sleep", lambda _seconds: None)
@@ -1344,6 +1346,7 @@ def test_haiku_above_100k_never_sends_the_expensive_attempt(monkeypatch, after_b
 
     diagnostic = safe_error_diagnostic(caught.value)
     assert diagnostic.code == "classification_prompt_too_large"
+    assert "95,000-token request budget" in diagnostic.message
     assert "Sonnet 5.5" in diagnostic.message
     inference = [body for path, body in requests if path == "/v1/messages"]
     assert len(inference) == int(after_bad_reply)

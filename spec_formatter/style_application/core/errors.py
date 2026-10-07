@@ -130,7 +130,8 @@ ERROR_REMEDIATIONS: Mapping[str, str] = {
         "into separate section DOCX files and run those files again."
     ),
     "classification_prompt_too_large": (
-        "This target needs a prompt above Haiku's low-cost limit. Split the "
+        "This target's estimated prompt exceeds Haiku's 95,000-token request "
+        "budget, which reserves room below the higher-price threshold. Split the "
         "document into smaller specification sections, or select Sonnet 5.5 "
         "as the target model and run it again."
     ),

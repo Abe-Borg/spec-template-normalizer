@@ -720,8 +720,10 @@ fails instead of publishing a header that still names the architect's section.
   targets are unaffected. Set `SPEC_FORMATTER_MAX_TARGET_PARAGRAPHS` to a
   positive integer to raise (or lower) the cap; unset, invalid, zero, and
   negative values keep the default guard.
-- Haiku target requests are checked against its 100,000-token low-cost prompt
-  limit before every inference attempt, including JSON regenerations. The
+- Haiku target requests are checked against a 95,000-token estimated prompt
+  budget before every inference attempt, including JSON regenerations. This
+  reserves 5,000 tokens below its 100,000-token pricing threshold because the
+  provider's token count is an estimate rather than an exact billing count. The
   token counter receives the complete system prompt, user message, adaptive
   thinking setting, and output schema. Counter failures follow the bounded
   transport retry policy and never permit an unchecked inference. Clients
