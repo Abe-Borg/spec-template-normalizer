@@ -1739,6 +1739,31 @@ def test_target_effort_reaches_processor_and_manifest(tmp_path, monkeypatch, eff
     assert json.loads(result.manifest_path.read_text())["models"]["target_effort"] == (effort or "high")
 
 
+@pytest.mark.parametrize("model", [None, "claude-sonnet-5-5"])
+def test_haiku_default_and_explicit_sonnet_reach_the_processor_and_manifest(tmp_path, monkeypatch, model):
+    architect = _write_input(tmp_path / "architect.docx", b"architect")
+    target = _write_input(tmp_path / "target.docx", b"target")
+    _calls, analyzer, loader, processor = _fake_dependencies(monkeypatch)
+    received = []
+
+    def capture(**kwargs):
+        received.append(kwargs["model"])
+        return processor(**kwargs)
+
+    options = {} if model is None else {"target_model": model}
+    result = pipeline.format_specifications(
+        architect, [target], tmp_path / "output", "key",
+        cache_dir=tmp_path / "cache", _template_analyzer=analyzer,
+        _config_loader=loader, _target_processor=capture, **options,
+    )
+    assert result.success
+    expected = model or "claude-haiku-5-5"
+    assert received == [expected]
+    models = json.loads(result.manifest_path.read_text())["models"]
+    assert models["target"] == expected
+    assert models["template"] == "claude-opus-5-5"
+
+
 @pytest.mark.parametrize("environment, argument, expected", [
     ("medium", "low", "medium"), ("medium", None, "medium"), ("", "low", "low"),
 ])

@@ -1204,6 +1204,14 @@ that fails unchecks "Remember" and shows `KEYRING_UNAVAILABLE_STATUS` instead
 of silently pretending the key was stored. The window opens at 980x930 with an
 820x720 minimum.
 
+The Target AI model menu defaults to Haiku 5.5 and also offers Sonnet 5.5.
+`spec_formatter/model_config.py` owns the target model IDs and default shared
+by the GUI, public pipeline, target runner, and classifier. The selection is
+captured in `ActiveRunSummary` and `FormatWorker`, displayed in the run
+summary, forwarded as `target_model`, and locked with the other run controls.
+The architect default remains Opus 5.5; changing the target model does not
+invalidate a compatible architect profile.
+
 ## Untrusted input and limits
 
 DOCX input and relationship metadata are untrusted.
@@ -1363,6 +1371,9 @@ Current codes: `header_footer_target_section_id_required`,
 `classification_coverage_incomplete`, `classification_refused`,
 `target_too_large` (unresolved target workload exceeds the configurable cost
 cap at `classification_preflight`; split the document into separate sections),
+`classification_prompt_too_large` (a complete Haiku prompt, including a
+regeneration's instructions, exceeds 100,000 tokens at `classification`;
+split the target into smaller sections or select Sonnet),
 `paragraph_style_not_applied`,
 `numbering_importer_unavailable`, `style_import_namespace_conflict`,
 `template_section_shell_conflict`, `template_default_section_conflict`,
@@ -1461,13 +1472,32 @@ previous run's. Concurrent misses are not by themselves a correctness bug, and
 serializing requests to manufacture hits trades latency for them -- measure
 before assuming that trade is worth making.
 
+**Haiku is the target default, with a prompt-price guard.** Architect analysis
+stays on Opus 5.5. The target's 80k-token character estimate leaves headroom
+below Haiku's 100k pricing boundary; `_check_haiku_prompt_size` checks the full
+request with the model's token counter before each inference attempt, under
+the same request limiter. It includes the system prefix, user message (with
+any retry requirement), thinking configuration, and JSON output schema.
+Counting errors use the existing transport retry policy and never bypass the
+check. A client without `count_tokens` uses the ASCII serialized request's
+byte count as a conservative bound. Oversized prompts are terminal
+`classification_prompt_too_large` errors, not JSON regenerations. Sonnet
+requests retain their existing chunking behavior. Counter calls generate no
+tokens and do not enter `UsageCollector`'s inference-attempt totals.
+
+**Thinking-only replies are empty answers.** The pinned SDK raises from
+`get_final_text()` when a successful turn contains only thinking blocks.
+The target classifier checks block types first and regenerates the empty
+answer through its existing bounded JSON policy; it retains observed usage
+and never parses thinking as JSON. Requests remain single-turn and do not
+replay account-bound thinking signatures or mutate a signed conversation.
+
 **The target system prompt ends with a think-first line.** Both classifiers
 answer through structured outputs, so the response text is JSON only and the
-model can work a classification out nowhere but in its thinking. Anthropic's
-Sonnet 5.5 guidance for reasoning tasks answered that way is to end the
-system prompt with `Think the problem through before you answer.`, which at
-`high` effort brings accuracy close to `xhigh` for a modest rise in output
-tokens. `phase2_run_instruction.txt` ends with that line and `_system_blocks`
+model can work a classification out nowhere but in its thinking. The existing
+`Think the problem through before you answer.` instruction is retained for
+both Haiku and Sonnet. `phase2_run_instruction.txt` ends with that line and
+`_system_blocks`
 places the run instruction last (master prompt, `available_roles`, run
 instruction) so the line really is the end of the system prompt; it is in
 the prompt file, not in code, so `prompt_fingerprints.target` in `run.json`

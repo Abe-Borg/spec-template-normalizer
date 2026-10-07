@@ -1155,7 +1155,7 @@ def test_deterministic_only_target_reports_no_requests(monkeypatch):
     assert result["usage"]["usage_complete"] is True
 
 
-def _sse_client(*bodies):
+def _sse_client(*bodies, token_counts=(), requests=None):
     """A real pinned-SDK client whose requests replay recorded SSE bodies.
 
     Fabricated final messages cannot show what the SDK's stream accumulator
@@ -1165,8 +1165,13 @@ def _sse_client(*bodies):
     import anthropic
 
     pending = list(bodies)
+    counts = list(token_counts)
 
     def handler(_request):
+        if requests is not None:
+            requests.append((_request.url.path, json.loads(_request.content)))
+        if _request.url.path.endswith("/count_tokens"):
+            return httpx.Response(200, json={"input_tokens": counts.pop(0)})
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -1180,7 +1185,7 @@ def _sse_client(*bodies):
     )
 
 
-def _sse_body(stop_reason, *, text=None, stop_details=None):
+def _sse_body(stop_reason, *, text=None, stop_details=None, thinking=False):
     """The wire events of one streamed response, as the API sends them."""
     events = [
         {
@@ -1197,11 +1202,18 @@ def _sse_body(stop_reason, *, text=None, stop_details=None):
             },
         }
     ]
-    if text is not None:
+    if thinking:
         events += [
-            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "opaque-account-bound-signature"}},
             {"type": "content_block_stop", "index": 0},
+        ]
+    if text is not None:
+        index = 1 if thinking else 0
+        events += [
+            {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}},
+            {"type": "content_block_stop", "index": index},
         ]
     delta = {"stop_reason": stop_reason, "stop_sequence": None}
     if stop_details is not None:
@@ -1260,3 +1272,98 @@ def test_a_real_output_limit_stop_without_text_regenerates(monkeypatch):
 
     assert result["classifications"] == [{"paragraph_index": 0, "csi_role": "PART"}]
     assert result["usage"]["requests_attempted"] == 2
+
+
+@pytest.mark.parametrize("effort", ["high", "medium"])
+def test_haiku_default_counts_the_full_request_and_reads_text_after_thinking(monkeypatch, effort):
+    import anthropic
+
+    requests = []
+    client = _sse_client(
+        _sse_body("end_turn", text=_GOOD, thinking=True),
+        token_counts=[100_000], requests=requests,
+    )
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: client)
+    result = classify_target_document(_unresolved_bundle(), ["PART"], "offline-key", target_effort=effort)
+
+    assert [path for path, _ in requests] == ["/v1/messages/count_tokens", "/v1/messages"]
+    counted, inference = [body for _, body in requests]
+    assert counted == {key: value for key, value in inference.items() if key not in ("max_tokens", "stream")}
+    assert inference["model"] == "claude-haiku-5-5"
+    assert inference["output_config"]["effort"] == effort
+    assert inference["output_config"]["format"]["type"] == "json_schema"
+    assert inference["thinking"] == {"type": "adaptive"}
+    assert inference["max_tokens"] == 128000
+    assert not {"temperature", "top_p", "top_k", "tools"}.intersection(inference)
+    assert inference["messages"][-1]["role"] == "user"
+    assert result["classifications"] == [{"paragraph_index": 0, "csi_role": "PART"}]
+    assert result["usage"]["requests_attempted"] == 1
+    assert result["usage"]["input_tokens"] == 10
+    assert result["usage"]["usage_complete"] is True
+
+
+def test_haiku_thinking_only_reply_regenerates_and_keeps_paid_usage(monkeypatch):
+    import anthropic
+    from spec_formatter.style_application.core import llm_classifier as lc
+
+    requests = []
+    client = _sse_client(
+        _sse_body("end_turn", thinking=True),
+        _sse_body("end_turn", text=_GOOD, thinking=True),
+        token_counts=[100, 200], requests=requests,
+    )
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: client)
+    monkeypatch.setattr(lc.time, "sleep", lambda _seconds: None)
+    result = classify_target_document(_unresolved_bundle(), ["PART"], "offline-key")
+
+    assert len(requests) == 4
+    assert "RETRY REQUIREMENT" in requests[-1][1]["messages"][0]["content"]
+    assert result["classifications"] == [{"paragraph_index": 0, "csi_role": "PART"}]
+    assert result["usage"]["requests_attempted"] == 2
+    assert result["usage"]["input_tokens"] == 20
+    assert result["usage"]["output_tokens"] == 6
+
+
+@pytest.mark.parametrize("after_bad_reply", [False, True])
+def test_haiku_above_100k_never_sends_the_expensive_attempt(monkeypatch, after_bad_reply):
+    import anthropic
+    from spec_formatter.llm_usage import usage_from_exception
+    from spec_formatter.pipeline import safe_error_diagnostic
+    from spec_formatter.style_application.core import llm_classifier as lc
+    from spec_formatter.style_application.core.errors import EngineError
+
+    requests = []
+    client = _sse_client(
+        *([_sse_body("end_turn", text="bad JSON")] if after_bad_reply else []),
+        token_counts=([100] if after_bad_reply else []) + [100_001], requests=requests,
+    )
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: client)
+    monkeypatch.setattr(lc.time, "sleep", lambda _seconds: None)
+    with pytest.raises(EngineError) as caught:
+        classify_target_document(_unresolved_bundle(), ["PART"], "offline-key")
+
+    diagnostic = safe_error_diagnostic(caught.value)
+    assert diagnostic.code == "classification_prompt_too_large"
+    assert "Sonnet 5.5" in diagnostic.message
+    inference = [body for path, body in requests if path == "/v1/messages"]
+    assert len(inference) == int(after_bad_reply)
+    usage = usage_from_exception(caught.value)
+    assert usage["requests_attempted"] == int(after_bad_reply)
+    if after_bad_reply:
+        assert usage["input_tokens"] == 10
+    else:
+        assert usage["responses_completed"] == 0
+        assert usage.get("input_tokens", 0) == 0
+    assert usage["usage_complete"] is True
+
+
+def test_haiku_counter_failure_never_sends_inference(monkeypatch):
+    sdk, messages, _sleeps, _constructed = _run(monkeypatch, [])
+
+    def unavailable(**_kwargs):
+        raise sdk.AuthenticationError("bad key")
+
+    messages.count_tokens = unavailable
+    with pytest.raises(sdk.AuthenticationError):
+        classify_target_document(_unresolved_bundle(), ["PART"], "offline-key")
+    assert messages.calls == []

@@ -29,6 +29,7 @@ from . import __version__ as APPLICATION_VERSION
 from . import builtin_scheme
 from . import diagnostics as diag
 from . import template_analysis
+from .model_config import DEFAULT_TARGET_MODEL
 from .llm_usage import UsageCollector, normalize_usage, usage_from_exception
 from .cancellation import RunCancelled, cancellation_kwargs, check_cancelled
 from .resources import TARGET_PROMPT_FILES, architect_prompt_dir, target_prompt_dir
@@ -2225,7 +2226,7 @@ def format_specifications(
     force_template_analysis: bool = False,
     max_workers: int = 3,
     template_model: str = template_analysis.DEFAULT_MODEL,
-    target_model: str = "claude-sonnet-5-5",
+    target_model: str = DEFAULT_TARGET_MODEL,
     target_effort: str = "high",
     conversion_mode: str = FORMAT_ONLY,
     diagnostics_level: str = "info",

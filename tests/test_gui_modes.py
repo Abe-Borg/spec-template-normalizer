@@ -133,6 +133,51 @@ def test_format_worker_forwards_each_output_mode(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("model", [None, "claude-sonnet-5-5"])
+def test_worker_uses_haiku_by_default_and_forwards_an_explicit_model(monkeypatch, model):
+    captured = {}
+    monkeypatch.setattr(gui, "format_specifications", lambda **kwargs: captured.update(kwargs))
+    options = {} if model is None else {"target_model": model}
+    worker = gui.FormatWorker(
+        Path("architect.docx"), (Path("target.docx"),), Path("output"),
+        "offline-key", True, 3, FORMAT_ONLY, queue.Queue(), **options,
+    )
+    worker.run()
+    assert captured["target_model"] == (model or "claude-haiku-5-5")
+
+
+def test_start_snapshots_the_selected_model_before_starting_the_worker(monkeypatch):
+    captured = {}
+    selected = {"label": "Sonnet 5.5"}
+
+    class Worker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def start(self):
+            selected["label"] = "Haiku 5.5"
+
+    monkeypatch.setattr(gui, "FormatWorker", Worker)
+    app = SimpleNamespace(
+        worker=None, conversion_mode_var=SimpleNamespace(get=lambda: FORMAT_ONLY),
+        architect_var=SimpleNamespace(get=lambda: "architect.docx"),
+        output_var=SimpleNamespace(get=lambda: "output"),
+        target_model_var=SimpleNamespace(get=lambda: selected["label"]),
+        api_key_var=SimpleNamespace(get=lambda: "offline-key"),
+        remember_key_var=SimpleNamespace(get=lambda: False),
+        target_inputs=[Path("target.docx")], events=queue.Queue(),
+        run_button=_FakeWidget(), cancel_button=_FakeWidget(), open_button=_FakeWidget(),
+        status_label=_FakeWidget(), progress=SimpleNamespace(start=lambda: None),
+        _clear_log=lambda: None, _append_log=lambda *_args: None,
+        _show_run_summary=lambda **_kwargs: None, _lock_run_controls=lambda: None,
+    )
+    gui.App._start(app)
+    assert captured["target_model"] == "claude-sonnet-5-5"
+    assert app.active_run_summary.target_model == "claude-sonnet-5-5"
+    assert "Target model: Sonnet 5.5" in gui.active_run_summary_text(app.active_run_summary)
+    assert selected["label"] == "Haiku 5.5"
+
+
 def test_format_worker_reports_pipeline_errors(monkeypatch):
     def fail(**_kwargs):
         raise ValueError("invalid Canadian template")
