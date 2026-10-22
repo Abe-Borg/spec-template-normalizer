@@ -27,8 +27,9 @@ would be the worst possible answer.
 
 1. Analyzes the architect's `.docx` template and captures its CSI paragraph
    styles, numbering, fonts, headers, footers, settings, and page layout.
-   *(Skipped entirely in the two modes that take no template — nothing is
-   analyzed, cached, or sent to the model.)*
+   *(Skipped entirely in the two modes that take no template — no template is
+   analyzed, cached, or sent to the model. Target paragraphs the rules cannot
+   settle are still classified by the model in every mode; see step 3.)*
 2. Validates and caches that template analysis by the template's SHA-256 hash,
    engine version, prompt hashes, classifier model, and profile-contract
    version.
@@ -692,6 +693,52 @@ recognisable `SectionID`, if they carry the architect's title the target must
 supply a `SectionTitle`, and every patched part is re-read to prove that no
 architect section number or title survived. A target that cannot fill a slot
 fails instead of publishing a header that still names the architect's section.
+
+## Why trust it?
+
+The app's **Why Trust It?** help button opens a short topic: one premise, eight
+claims, and the mechanism behind each. Its **I'm not convinced — show me
+exactly what runs →** button opens a long dossier on top of it, written for
+the engineer who puts their name on the output: where each part of the output
+comes from, which models run with which settings, everything that leaves your
+computer and where it goes (with a data-flow diagram), one card per action
+answering the same five questions (*You do / What runs / What is sent / AI
+involved / Bounded by*), what the AI can and cannot touch, exact definitions
+of the loaded words, the parts with no AI in them, security, money, the
+app's limits, and how to check every claim yourself.
+
+The same text is in [docs/TRUST.md](docs/TRUST.md), and
+[docs/TRUST_CLAIMS.md](docs/TRUST_CLAIMS.md) is the ledger that names the code
+behind every claim. In brief:
+
+- **What runs without you.** One thing: an update check about 1.5 seconds
+  after launch, at most once a day, which downloads a small `latest.json`
+  from github.com and sends no document data, key or version number. Set
+  `SPEC_FORMATTER_DISABLE_UPDATE_CHECK` to turn it off. Every AI request,
+  retries included, happens only inside a run you started.
+- **Where data goes.** Model requests go from your computer to
+  `api.anthropic.com` with your own key, only when a run needs AI: a new
+  template, or target paragraphs no rule could settle. They carry paragraph
+  excerpts (up to 200 characters each, plus up to 80 characters of each
+  neighbour), style and numbering hints and the app's prompts, never whole
+  files, images, headers, footers or file names. A template's first request
+  and each Haiku request are measured first with Anthropic's free
+  token-counting service. The `ANTHROPIC_BASE_URL` environment variable, which Anthropic's
+  library honours, would send all of this elsewhere; the app never sets it.
+- **What stays on disk.** Outputs and run records in the folder you choose.
+  The template cache in `%LOCALAPPDATA%\SpecificationFormatter\TemplateCache`,
+  which keeps the first 200 characters of every template paragraph and never
+  expires. Update state and downloaded installers in
+  `%LOCALAPPDATA%\SpecificationFormatter`. Uninstalling removes none of
+  these, nor a key saved with **Remember**.
+- **What the records do not say.** Each audit lists every paragraph's final
+  role, but not whether a rule or the AI chose it; `run.log` gives only the
+  counts.
+
+The trust surfaces are a contract: `tests/test_trust_surface.py` fails when a
+number, model, limit, host or setting they quote no longer matches the code,
+and `tests/test_trust_ui.py` checks that Level 2 opens on top of Level 1 and
+that one Escape closes one window.
 
 ## Safety guarantees
 

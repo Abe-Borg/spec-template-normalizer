@@ -69,6 +69,7 @@ hiddenimports += _h
 # imports -- bundle them explicitly so a frozen run can never miss one.
 hiddenimports += [
     "gui",
+    "trust_ui",
     "engine_identity",
     "phase1_pipeline",
     "phase1_bundle",
