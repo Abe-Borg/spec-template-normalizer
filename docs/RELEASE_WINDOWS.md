@@ -15,7 +15,7 @@ them directly. This runbook covers cutting a release.
 | Frozen entry | `packaging/windows/app_entry.py` | PyInstaller entry point; `--version` / `--selfcheck` flags for CI. |
 | Resource root | `spec_formatter/resources.py` | Resolves the bundled prompts, `LICENSE`, and notices under `sys._MEIPASS` in the frozen app and under the repo root otherwise; the pipeline and `--selfcheck` both use it. |
 | PyInstaller spec | `packaging/windows/specification-formatter.spec` | One-folder build → `dist/SpecificationFormatter/`. |
-| Installer | `packaging/windows/installer.iss` | Inno Setup → `dist/installer/SpecificationFormatterSetup.exe`. Shows the License Agreement page (plain-language description plus the full `LICENSE`); the user must choose "I accept" to continue. `tests/test_installer_license.py` guards it. |
+| Installer | `packaging/windows/installer.iss` | Inno Setup → `dist/installer/SpecificationFormatterSetup.exe`. Shows the License Agreement page (plain-language description plus the full `LICENSE`); the user must choose "I accept" to continue, on a fresh install and on every update. The license description names the author's email for commercial licensing; the Finished page and Add/Remove Programs (`AppContact`, `AppPublisherURL`) carry the author's email and LinkedIn profile from `spec_formatter/about.py`. `tests/test_installer_license.py` guards both. |
 | Manifest maker | `packaging/windows/make_manifest.py` | Computes the installer SHA-256 → `latest.json`. |
 | Version guard | `packaging/windows/check_release_version.py` | Fails the build if the tag ≠ `__version__`. |
 | Workflow | `.github/workflows/release.yml` | Builds on every relevant PR; builds **and publishes** on a `v*` tag. |

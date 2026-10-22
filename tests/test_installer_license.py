@@ -11,7 +11,9 @@ three facts:
   commercial use needs a separate license;
 * nothing in the script skips the page or preselects "I accept", and the
   in-app updater launches the installer interactively, so an update shows the
-  page too.
+  page too;
+* the installer names the author and carries the same email and LinkedIn
+  profile as the About dialog (``spec_formatter/about.py``).
 
 Inno Setup itself does the rest: with ``LicenseFile`` set, "I do not accept" is
 preselected and Next stays disabled until the user picks "I accept".
@@ -23,7 +25,7 @@ import re
 import sys
 from pathlib import Path, PureWindowsPath
 
-from spec_formatter import updates
+from spec_formatter import about, updates
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER_DIR = REPO_ROOT / "packaging" / "windows"
@@ -174,3 +176,49 @@ def test_updater_launches_the_installer_interactively_elsewhere(tmp_path, monkey
     updates.spawn_installer(installer)
 
     assert calls == [(([str(installer)],), {})]
+
+
+def test_installer_contact_details_match_the_about_dialog():
+    defines = _defines(_script_text())
+    assert defines["MyAppPublisher"] == about.AUTHOR_NAME
+    assert defines["MyAppContactEmail"] == about.AUTHOR_EMAIL
+    assert defines["MyAppLinkedInURL"] == about.AUTHOR_LINKEDIN_URL
+    assert defines["MyAppCopyright"] == about.COPYRIGHT_NOTICE
+    # The LICENSE notice names the same copyright holder and year.
+    first_line = (REPO_ROOT / "LICENSE").read_text(encoding="ascii").splitlines()[0]
+    assert first_line.startswith(f"Required Notice: {about.COPYRIGHT_NOTICE}")
+
+
+def test_add_remove_programs_shows_the_authors_contact_details():
+    text = _script_text()
+    assert _single_value(text, "Setup", "AppContact") == about.AUTHOR_EMAIL
+    assert _single_value(text, "Setup", "AppPublisherURL") == about.AUTHOR_LINKEDIN_URL
+    comments = _single_value(text, "Setup", "AppComments")
+    assert about.AUTHOR_EMAIL in comments
+    assert about.AUTHOR_LINKEDIN_URL in comments
+    assert _single_value(text, "Setup", "AppCopyright") == about.COPYRIGHT_NOTICE
+    assert _single_value(text, "Setup", "VersionInfoCopyright") == about.COPYRIGHT_NOTICE
+
+
+def test_license_page_says_whom_to_ask_for_a_commercial_license():
+    label = _single_value(_script_text(), "Messages", "LicenseLabel3")
+    assert about.AUTHOR_EMAIL in label
+
+
+def test_finished_page_shows_the_authors_contact_details():
+    text = _script_text()
+    for key in ("FinishedLabel", "FinishedLabelNoIcons"):
+        label = _single_value(text, "Messages", key)
+        assert label.isascii(), key
+        # Inno's own placeholders only: [name] and the %n line break.
+        assert label.replace("%n", "").count("%") == 0, key
+        assert "[name]" in label, key
+        assert about.AUTHOR_NAME in label, key
+        assert about.AUTHOR_EMAIL in label, key
+        assert about.AUTHOR_LINKEDIN_URL in label, key
+
+
+def test_about_links_are_well_formed():
+    assert about.author_mailto_url() == f"mailto:{about.AUTHOR_EMAIL}"
+    assert about.AUTHOR_LINKEDIN_URL.startswith("https://www.linkedin.com/in/")
+    assert about.linkedin_display_text() == "linkedin.com/in/abrahamborg"
