@@ -98,6 +98,15 @@ phase1_pipeline.py, phase1_bundle.py, docx_decomposer.py
     architect snapshot, analysis, profile construction, and validation
 gui.py
     input collection, immutable active-run display, progress, and results
+spec_formatter/trust.py
+    the words of the two trust surfaces (Why Trust It? and the "I'm not
+    convinced" dossier) as data, every quoted number pinned in FACTS
+trust_ui.py
+    draws those two dialogs: Level 2 stacked on Level 1, one Escape per window
+docs/TRUST.md, docs/TRUST_CLAIMS.md
+    the dossier rendered as Markdown (generated), and the claims ledger
+tests/test_trust_surface.py, tests/test_trust_ui.py
+    every trust fact held to its code source; the dialogs' behaviour
 schemas/
     formal architect-profile contracts
 tests/
@@ -1196,7 +1205,8 @@ invites `reasoning_extraction` declines; keep it that way.
 ### `gui.py`
 
 Owns input collection, background execution, immutable active-run display,
-progress/log rendering, and final status. It calls `format_specifications()` and
+progress/log rendering, and final status. Its **Why Trust It?** button opens
+`trust_ui.WhyTrustItDialog` (see "Trust surfaces"). It calls `format_specifications()` and
 displays `FormatRunResult`. Lock every run-affecting control while work is
 active, display all target processor log lines and audit counts, and open the
 actual `run_dir`. Never recreate pipeline business logic in the GUI.
@@ -1218,6 +1228,42 @@ captured in `ActiveRunSummary` and `FormatWorker`, displayed in the run
 summary, forwarded as `target_model`, and locked with the other run controls.
 The architect default remains Opus 5.5; changing the target model does not
 invalidate a compatible architect profile.
+
+## Trust surfaces
+
+**The trust surfaces are a contract. Any change to a behavior they describe
+updates them in the same change.** That means `spec_formatter/trust.py` (the
+words), `docs/TRUST.md` (regenerate it with
+`python -m spec_formatter.trust > docs/TRUST.md`), and the ledger
+`docs/TRUST_CLAIMS.md`. A trust document that has drifted from the code is
+worse than none.
+
+Update them when you add or change any of these:
+
+- a user action: a button, menu, link, checkbox, shortcut or dialog (each has
+  a runtime card answering *You do / What runs / What is sent / AI involved /
+  Bounded by*);
+- a network call, a host, or anything a request carries;
+- an automatic behavior: something that runs without a click, a retry, a
+  follow-up request, a timer;
+- a model, effort, thinking, token, timeout or other request setting;
+- a limit, cap or budget, or where data is kept and for how long.
+
+Every number, model ID, limit, host name, path and setting the copy quotes is
+a hand-written entry in `trust.FACTS`, and `tests/test_trust_surface.py` holds
+each one to the constant, literal or behaviour in the code. Do not make the
+copy read a constant directly to silence that test: the point is that a code
+change fails it until a person has re-read the words around the number. The
+same module fails on a digit in the copy that is not a fact, on a GUI control
+with no runtime card, on a new module that reaches the network, and on a
+stale `docs/TRUST.md`.
+
+`trust_ui.py` loads no images, fonts or anything from the network; the
+data-flow diagram is drawn on a Tk canvas. The further-reading links are the
+only addresses it can open, and only on a click. Keep it that way. The
+dossier never claims what the code does not do; where the code falls short of
+a claim worth making (for example, audits do not record which paragraphs the
+AI labelled), the copy says so and the ledger lists it as a finding.
 
 ## Untrusted input and limits
 
@@ -1718,6 +1764,8 @@ python -m pytest tests/test_header_parity.py -q
 python -m pytest tests/test_package_change_whitelist.py -q
 python -m pytest tests/test_revision_accounting.py -q
 python -m pytest tests/test_docx_method_hardening_tracker.py -q
+python -m pytest tests/test_trust_surface.py tests/test_trust_ui.py -q
+python -m spec_formatter.trust > docs/TRUST.md
 python docs/docx_method_hardening/probes/probe_style_import_w14.py
 python docs/docx_method_hardening/probes/probe_format_only_gate.py
 ```
@@ -1817,6 +1865,9 @@ Before considering a formatter change complete:
    files when formatting or shell behavior changes.
 10. Update prompts, schemas, validators, README, and this guide together for
     contract changes.
+11. Update the trust surfaces (`spec_formatter/trust.py`, `docs/TRUST.md`,
+    `docs/TRUST_CLAIMS.md`) when a user action, network call, automatic
+    behavior, model setting or limit changes.
 
 ## Common mistakes
 

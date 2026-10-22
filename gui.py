@@ -34,6 +34,7 @@ from spec_formatter.pipeline import (
 from spec_formatter.style_application.core.application_policy import (
     application_policy_for_mode,
 )
+import trust_ui
 
 
 COLORS = {
@@ -64,6 +65,9 @@ def _font(size: int, weight: str = "normal", family: str = UI_FONT) -> ctk.CTkFo
 # FormatWorker keeps its parameters so headless callers can still choose.
 DEFAULT_REUSE_TEMPLATE_ANALYSIS = True
 DEFAULT_MAX_WORKERS = 3
+# The once-a-day update check starts this long after the window opens, so it
+# never delays the first paint. The trust dossier quotes it.
+AUTO_UPDATE_CHECK_DELAY_MS = 1500
 _TARGET_MODEL_IDS = dict(TARGET_MODEL_CHOICES)
 _TARGET_MODEL_LABELS = {model: label for label, model in TARGET_MODEL_CHOICES}
 KEYRING_UNAVAILABLE_STATUS = (
@@ -422,6 +426,8 @@ class App(ctk.CTk):
         self._update_downloading = False
         self._update_download_cancelled = False
         self._update_dialog: Optional[ctk.CTkToplevel] = None
+        self._trust_dialog: Optional[trust_ui.WhyTrustItDialog] = None
+        self.help_buttons: dict[str, ctk.CTkButton] = {}
 
         self._build_ui()
         # The target preview excludes the architect from folder discovery, so
@@ -433,7 +439,7 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_events)
         # Silent once-a-day update check, shortly after the window paints.
-        self.after(1500, self._maybe_auto_check_for_updates)
+        self.after(AUTO_UPDATE_CHECK_DELAY_MS, self._maybe_auto_check_for_updates)
 
     def _build_ui(self) -> None:
         shell = ctk.CTkFrame(self, fg_color="transparent")
@@ -455,7 +461,7 @@ class App(ctk.CTk):
             ("Why Trust It?", self._show_why_trust_it_dialog),
             ("About", self._show_about_dialog),
         ):
-            ctk.CTkButton(
+            button = ctk.CTkButton(
                 help_buttons,
                 text=label,
                 command=handler,
@@ -467,7 +473,9 @@ class App(ctk.CTk):
                 border_color=COLORS["border"],
                 text_color=COLORS["secondary"],
                 font=_font(12),
-            ).pack(side="left", padx=(8, 0))
+            )
+            button.pack(side="left", padx=(8, 0))
+            self.help_buttons[label] = button
 
         ctk.CTkLabel(
             header,
@@ -1358,11 +1366,13 @@ class App(ctk.CTk):
             [
                 (
                     "Before you start",
-                    "You need the architect's Word template — the specification "
-                    "whose formatting you want applied — and one or more target "
-                    "specifications to reformat. An Anthropic API key is only "
-                    "required when a template or target contains content that "
-                    "cannot be classified without AI.",
+                    "You need one or more target specifications and, for Format "
+                    "only and Convert CSI to Canadian, the architect's Word "
+                    "template — the specification whose formatting you want "
+                    "applied. The two \"no template\" modes need no template. "
+                    "An Anthropic API key is only required when a new template "
+                    "must be analyzed or a target contains paragraphs the "
+                    "app's rules cannot classify.",
                 ),
                 (
                     "Run a formatting pass",
@@ -1376,7 +1386,10 @@ class App(ctk.CTk):
                         "Choose Format only to keep each target's own text and "
                         "numbering, or Convert CSI hierarchy to Canadian CSC "
                         "PageFormat to retarget recognized CSI numbering to the "
-                        "architect's automatic numbering.",
+                        "architect's automatic numbering. The two \"no template\" "
+                        "modes convert numbering to or from Canadian CSC "
+                        "PageFormat without a template and leave the target's "
+                        "own formatting alone.",
                         "Choose the output folder. Each run publishes into its "
                         "own timestamped subfolder, so nothing is ever "
                         "overwritten.",
@@ -1406,10 +1419,12 @@ class App(ctk.CTk):
             [
                 (
                     "Two passes, one workflow",
-                    "The app first analyzes the architect template once, then "
-                    "applies that analysis to every target specification. You "
-                    "never see or manage these as separate tools — Format Specs "
-                    "runs both.",
+                    "In the two template modes the app first analyzes the "
+                    "architect template once, then applies that analysis to "
+                    "every target specification. You never see or manage these "
+                    "as separate tools — Format Specs runs both. The two \"no "
+                    "template\" modes skip the template step and apply no "
+                    "styles, page layout, headers or footers.",
                 ),
                 (
                     "Architect analysis",
@@ -1454,56 +1469,19 @@ class App(ctk.CTk):
         )
 
     def _show_why_trust_it_dialog(self) -> None:
-        self._show_help_dialog(
-            "Why Trust It?",
-            [
-                (
-                    "Your files are read-only",
-                    "The architect template and every target file are copied to "
-                    "a private snapshot before anything is read; the app "
-                    "processes that snapshot, never the original. Outputs are "
-                    "always separate files.",
-                ),
-                (
-                    "Untrusted input is treated as untrusted",
-                    [
-                        "DOCX packages are validated as untrusted ZIP "
-                        "containers: no absolute paths, traversal, duplicate "
-                        "members, or symbolic links.",
-                        "Package size is bounded — 10,000 entries, 512 MiB "
-                        "uncompressed, 128 MiB per part, and a 1,000:1 "
-                        "compression-ratio cap.",
-                        "External relationship targets are recorded but never "
-                        "fetched.",
-                    ],
-                ),
-                (
-                    "Nothing is silently dropped",
-                    [
-                        "Every visible paragraph in a target is explicitly "
-                        "classified as styled content or an ignored item with a "
-                        "reason — never silently skipped.",
-                        "Format-only mode verifies the target's body text and "
-                        "effective numbering are unchanged before publishing.",
-                        "Canadian conversion is fail-closed: if the architect "
-                        "template can't prove true automatic Canadian numbering "
-                        "for a role, that target is rejected instead of "
-                        "producing a misleading result.",
-                        "Imported architect styles are namespaced privately and "
-                        "never overwrite an existing target style ID, including "
-                        "Normal.",
-                    ],
-                ),
-                (
-                    "Publication is atomic and auditable",
-                    "Every output DOCX is fully validated before it is "
-                    "published, and publication itself is atomic — a run either "
-                    "completes into its timestamped folder or leaves nothing "
-                    "partial behind. The run manifest and per-target audits "
-                    "record exactly what happened, and API keys and document "
-                    "text are never written to that metadata.",
-                ),
-            ],
+        """Open Level 1 of the trust surfaces; its button opens the dossier.
+
+        The words live in ``spec_formatter/trust.py`` and the drawing in
+        ``trust_ui.py``. Both are a contract with the code: a change to a
+        behaviour they describe updates them in the same change.
+        """
+
+        self._trust_dialog = trust_ui.open_why_trust_it(
+            self,
+            colors=COLORS,
+            font=_font,
+            opener=self.help_buttons.get("Why Trust It?"),
+            existing=self._trust_dialog,
         )
 
     def _show_about_dialog(self) -> None:

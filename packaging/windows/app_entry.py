@@ -88,6 +88,8 @@ def _selfcheck() -> int:
         from spec_formatter import updates  # noqa: F401 - proves the updater froze
         from spec_formatter import secrets  # noqa: F401 - proves the keyring wrapper froze
         import gui  # noqa: F401 - pulls customtkinter
+        import trust_ui  # noqa: F401 - the trust dialogs
+        from spec_formatter import trust  # noqa: F401 - the trust copy
         import keyring.backends.Windows  # noqa: F401 - Windows Credential Manager backend
 
         _check_prompt_resources()
