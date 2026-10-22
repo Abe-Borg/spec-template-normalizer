@@ -721,9 +721,9 @@ behind every claim. In brief:
   template, or target paragraphs no rule could settle. They carry paragraph
   excerpts (up to 200 characters each, plus up to 80 characters of each
   neighbour), style and numbering hints and the app's prompts, never whole
-  files, images, headers, footers or file names. Each template request and
-  each Haiku request is measured first with Anthropic's free token-counting
-  service. The `ANTHROPIC_BASE_URL` environment variable, which Anthropic's
+  files, images, headers, footers or file names. A template's first request
+  and each Haiku request are measured first with Anthropic's free
+  token-counting service. The `ANTHROPIC_BASE_URL` environment variable, which Anthropic's
   library honours, would send all of this elsewhere; the app never sets it.
 - **What stays on disk.** Outputs and run records in the folder you choose.
   The template cache in `%LOCALAPPDATA%\SpecificationFormatter\TemplateCache`,

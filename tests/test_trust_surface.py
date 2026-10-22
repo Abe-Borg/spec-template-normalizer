@@ -205,6 +205,14 @@ PINS = {
     "architect_patch_attempts": lambda: inspect.signature(
         architect_classifier.classify_document
     ).parameters["max_patch_attempts"].default,
+    "architect_requests": lambda: 1 + inspect.signature(
+        architect_classifier.classify_document
+    ).parameters["max_patch_attempts"].default,
+    # _request_json_response calls _call_api afresh for every response
+    # attempt, and each call has its own transport attempts.
+    "architect_sends_per_request": lambda: int(
+        _one(r"while attempt < (\d+)", _architect_call_source())
+    ) * architect_classifier.DEFAULT_RESPONSE_ATTEMPTS,
     "chunk_tokens": lambda: target_classifier._MAX_BUNDLE_TOKENS,
     "chunk_paragraphs": lambda: _chunk_paragraphs(),
     "chunk_overlap": lambda: target_classifier._CHUNK_OVERLAP,

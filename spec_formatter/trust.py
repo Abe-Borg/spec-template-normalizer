@@ -78,6 +78,8 @@ FACTS: dict[str, object] = {
     "architect_transport_attempts": 3,
     "architect_response_attempts": 2,
     "architect_patch_attempts": 3,
+    "architect_requests": 4,
+    "architect_sends_per_request": 6,
     "chunk_tokens": 80_000,
     "chunk_paragraphs": 300,
     "chunk_overlap": 20,
@@ -296,8 +298,8 @@ LEVEL1_POINTS: tuple[TrustPoint, ...] = (
         "A paragraph whose role is proven by Word's own numbering or by "
         "unmistakable text such as PART 1 - GENERAL is decided by fixed rules "
         "on your computer, and the AI cannot overrule them. Only the "
-        "remaining paragraphs are sent. When rules settle everything, no "
-        "request is made at all.",
+        "remaining paragraphs are sent. When rules settle every paragraph of "
+        "a target, no request is made for it.",
     ),
     TrustPoint(
         "The AI picks labels, never your words",
@@ -521,8 +523,8 @@ _ENGINE = Section(
                     "documents where you want the larger model.",
                 ),
                 (
-                    "Measure template requests and Haiku requests before "
-                    "sending them",
+                    "Measure a template's first request, and each Haiku "
+                    "request, before sending it",
                     "Anthropic's token-counting service, on Anthropic's servers.",
                     "Enforces the cost limits described under Money. It "
                     "produces no answer and is not billed as model use.",
@@ -617,8 +619,10 @@ _BOUNDARY = Section(
                 f"paragraph (up to {_n('architect_text_chars')} characters "
                 "each) with its style and numbering catalogs. Your key "
                 "travels in the request header.",
-                "Before each such request, the same content to Anthropic's "
-                "token-counting service on the same host.",
+                "Before a template's first request and before each Haiku "
+                "request, the same content to Anthropic's token-counting "
+                "service on the same host. Template follow-ups and Sonnet "
+                "requests are not counted first.",
                 "With every Anthropic request, the standard headers of "
                 "Anthropic's software library: its version, your operating "
                 "system, processor type and Python version.",
@@ -876,11 +880,16 @@ _CARDS: tuple[RuntimeCard, ...] = (
         ai_involved=f"{_ARCH}: {_SETTINGS}.",
         bounded_by=(
             f"Refused before any request above {_n('architect_input_cap')} "
-            f"input tokens. {_n('architect_transport_attempts')} attempts in "
-            f"all for network or server errors, with "
-            f"{_n('backoff_first_s')}- and {_n('backoff_second_s')}-second "
-            f"waits; {_n('architect_response_attempts')} attempts for an "
-            "unusable answer; a refusal is final. Connection timeout "
+            "input tokens. These limits apply to each request, and there are "
+            f"at most {_n('architect_requests')} (the first plus up to "
+            f"{_n('architect_patch_attempts')} follow-ups): up to "
+            f"{_n('architect_transport_attempts')} tries for network or "
+            f"server errors, with {_n('backoff_first_s')}- and "
+            f"{_n('backoff_second_s')}-second waits, and the whole request "
+            f"repeated for an unusable answer, {_n('architect_response_attempts')} "
+            f"times in all, so up to {_n('architect_sends_per_request')} sends "
+            "per request, plus one more without the answer format if Anthropic "
+            "cannot compile it. A refusal is final. Connection timeout "
             f"{_n('connect_timeout_s')} seconds, answer timeout "
             f"{_n('read_timeout_min')} minutes. A failure stops the whole run "
             "before any target, with records written; tokens already used are "
@@ -961,8 +970,8 @@ _CARDS: tuple[RuntimeCard, ...] = (
             "Each Haiku request must measure under "
             f"{_n('haiku_prompt_budget')} tokens, or the target fails "
             f"before it is sent. At most {_n('max_concurrent_requests')} "
-            "requests are open at once across the whole run. Network, rate "
-            f"limit and server errors get {_n('target_transport_retries')} "
+            "requests are open at once across the whole run. For each chunk, "
+            f"network, rate limit and server errors get {_n('target_transport_retries')} "
             f"retries (rate-limit waits capped at {_n('retry_after_cap_s')} "
             f"seconds); an unusable answer gets {_n('target_regenerations')} "
             "more tries; a refusal is final. No key means the target fails "
@@ -1387,9 +1396,13 @@ _MONEY = Section(
                 ),
                 (
                     "When nothing is spent.",
-                    "When rules label every paragraph, when a template is "
-                    "already cached, and in any run that fails its input "
-                    "checks.",
+                    "A run spends nothing only when both hold: no template "
+                    "needs a fresh analysis (it is already cached, or the "
+                    "mode uses none), and rules label every paragraph of "
+                    "every target. A new template is paid for even if rules "
+                    "then settle every target; a cached one does not stop "
+                    "targets from needing the AI. A run that fails its input "
+                    "checks also spends nothing.",
                 ),
                 (
                     "What is estimated.",
