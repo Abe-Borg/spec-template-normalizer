@@ -423,7 +423,8 @@ number.
 Every revision the conversion writes is numbered above the highest id the file
 already uses — its bookmarks, comments, and your own pending revisions,
 wherever in the file they are — so none can collide with an id Word already
-knows.
+knows. Pictures are not read for this, so an SVG logo exported from
+Illustrator or a similar tool does not stop the conversion.
 
 Typed markers are the deliberate output. A spec whose numbering is literal text
 renders identically everywhere, survives being pasted into another editor, and

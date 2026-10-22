@@ -147,7 +147,12 @@ def highest_annotation_id_in_package(extract_dir: Path) -> Optional[int]:
     is written. A part is XML when its extension is ``.xml`` in any case (OPC
     part names are case-insensitive) or when ``[Content_Types].xml`` declares
     an XML content type for it, by an ``Override`` or by its extension's
-    ``Default``. Relationship parts carry no annotations and are skipped.
+    ``Default``. Relationship parts carry no annotations and are skipped, and
+    so are pictures: a part whose declared content type is ``image/...``,
+    whatever its extension. An SVG is XML (``image/svg+xml``) and one
+    exported from Illustrator and similar tools begins with a DOCTYPE, which
+    the untrusted-XML parser refuses, so reading it would fail a tracked
+    conversion over a part that holds no annotation id.
     """
 
     root = Path(extract_dir)
@@ -163,6 +168,8 @@ def highest_annotation_id_in_package(extract_dir: Path) -> Optional[int]:
         name = relative.as_posix()
         extension = path.suffix[1:].casefold()
         content_type = overrides.get(name.casefold(), defaults.get(extension, ""))
+        if _is_picture_content_type(content_type):
+            continue
         if extension != "xml" and not _is_xml_content_type(content_type):
             continue
         value = max_annotation_id(path.read_bytes(), name)
@@ -196,6 +203,10 @@ def _declared_content_types(root: Path) -> Tuple[dict, dict]:
 def _is_xml_content_type(content_type: str) -> bool:
     value = content_type.strip().casefold()
     return value.endswith("+xml") or value in ("application/xml", "text/xml")
+
+
+def _is_picture_content_type(content_type: str) -> bool:
+    return content_type.strip().casefold().startswith("image/")
 
 
 def revision_kinds_by_author(xml_fragment: str, author: str) -> Counter:

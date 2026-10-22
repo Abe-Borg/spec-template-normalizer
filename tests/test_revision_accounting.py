@@ -51,9 +51,11 @@ from spec_formatter.style_application.core.expected_changes import (
 from spec_formatter.style_application.core.revisions import (
     REVISION_KINDS,
     count_revisions,
+    highest_annotation_id_in_package,
     max_annotation_id,
     revision_census,
 )
+from spec_formatter.style_application.core.untrusted_xml import UntrustedXmlError
 from spec_formatter.style_application.core.xml_helpers import (
     paragraph_run_content_signature,
     paragraph_text_from_block,
@@ -801,3 +803,108 @@ def test_marker_ids_are_allocated_above_ids_in_parts_named_any_way(
     allocated = _own_revision_ids(document)
     assert len(allocated) == 2 * len(_HIGH_ID_ROWS)
     assert min(allocated) > 900003
+
+
+# --- Pictures are not read for ids ---------------------------------------------
+#
+# An SVG is XML by its content type (image/svg+xml), and one exported from
+# Illustrator and similar tools begins with a DOCTYPE, which the untrusted-XML
+# parser refuses. A picture carries no annotation id, so the scan used to
+# fail a tracked conversion over a part that could not have changed its
+# answer.
+
+_SVG_WITH_DOCTYPE = (
+    b'<?xml version="1.0" encoding="utf-8"?>\n'
+    b'<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" '
+    b'"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n'
+    b'<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="16" height="16">'
+    b'<rect width="16" height="16"/></svg>'
+)
+_SVG_DEFAULT = '<Default Extension="svg" ContentType="image/svg+xml"/>'
+
+
+@pytest.mark.parametrize(
+    "part_name, declaration",
+    [
+        ("word/media/image1.svg", _SVG_DEFAULT),
+        # Declared by an Override instead, in other cases: extensions and
+        # media types both compare case-insensitively.
+        (
+            "word/media/logo.SVG",
+            '<Override PartName="/word/media/logo.SVG" ContentType="Image/SVG+XML"/>',
+        ),
+    ],
+)
+def test_a_picture_with_a_doctype_is_not_read_for_ids(
+    tmp_path: Path, part_name: str, declaration: str
+) -> None:
+    target = _extracted_high_id_target(tmp_path / "target", note_id=900003)
+    picture = target / part_name
+    picture.parent.mkdir(parents=True)
+    picture.write_bytes(_SVG_WITH_DOCTYPE)
+    (target / "[Content_Types].xml").write_text(
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        f"{declaration}</Types>",
+        encoding="utf-8",
+    )
+
+    # The footnote's id is still found: skipping the picture skips nothing else.
+    assert highest_annotation_id_in_package(target) == 900003
+
+    apply_canadian_to_csi(
+        target,
+        reverse._classifications([role for role, _text in _HIGH_ID_ROWS]),
+        [],
+    )
+
+    document = (target / "word" / "document.xml").read_text(encoding="utf-8")
+    allocated = _own_revision_ids(document)
+    assert len(allocated) == 2 * len(_HIGH_ID_ROWS)
+    assert min(allocated) > 900003
+    assert picture.read_bytes() == _SVG_WITH_DOCTYPE
+
+
+def test_a_wordprocessingml_part_with_a_doctype_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Only pictures are left out; every other part is still untrusted XML."""
+
+    target = _extracted_high_id_target(tmp_path / "target", note_id=900003)
+    (target / "[Content_Types].xml").write_text(
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        f"{_SVG_DEFAULT}</Types>",
+        encoding="utf-8",
+    )
+    notes = target / "word" / "footnotes.xml"
+    notes.write_bytes(b'<!DOCTYPE w:footnotes [<!ENTITY n "note">]>' + notes.read_bytes())
+
+    with pytest.raises(UntrustedXmlError, match="word/footnotes.xml"):
+        highest_annotation_id_in_package(target)
+
+
+def test_a_tracked_reverse_run_publishes_a_target_holding_an_svg_with_a_doctype(
+    tmp_path: Path,
+) -> None:
+    source = _with_parts(
+        _tracked_reverse_source(tmp_path),
+        {"word/media/image1.svg": (_SVG_WITH_DOCTYPE, None, f"{OFFICE_REL}/image")},
+    )
+    _rewrite(
+        source,
+        {"[Content_Types].xml": _replace("</Types>", f"{_SVG_DEFAULT}</Types>")},
+    )
+
+    run = _reverse_run(tmp_path, source)
+
+    assert run.success, "\n".join(run.targets[0].log)
+    report = run.targets[0].conversion_report
+    assert report is not None and report.markers_tracked is True
+    output = run.targets[0].output_path
+    assert output is not None
+    validate_docx_package(output)
+    with zipfile.ZipFile(output) as package:
+        assert package.read("word/media/image1.svg") == _SVG_WITH_DOCTYPE
+    fields = _fields(run, "build_output")
+    assert fields["revisions_added_by_application"] == 2 * report.paragraphs_converted
