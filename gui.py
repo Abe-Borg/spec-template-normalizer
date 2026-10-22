@@ -15,7 +15,7 @@ from typing import Iterable, Optional, Tuple
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
-from spec_formatter import __version__, secrets, updates
+from spec_formatter import __version__, about, secrets, updates
 from spec_formatter.app_paths import default_config_dir
 from spec_formatter.model_config import DEFAULT_TARGET_MODEL, TARGET_MODEL_CHOICES
 from spec_formatter.pipeline import (
@@ -1519,19 +1519,36 @@ class App(ctk.CTk):
                     "complete run provenance. The original architect template "
                     "and target files are never modified.",
                 ),
+                ("Author", about.AUTHOR_NAME),
+                (
+                    "Email",
+                    ("link", about.AUTHOR_EMAIL, about.author_mailto_url()),
+                ),
+                (
+                    "LinkedIn",
+                    (
+                        "link",
+                        about.linkedin_display_text(),
+                        about.AUTHOR_LINKEDIN_URL,
+                    ),
+                ),
                 (
                     "Releases",
                     ("link", "View releases on GitHub", updates.releases_page_url()),
                 ),
                 (
                     "License",
-                    "Copyright 2025 Abraham Borg. Released under the PolyForm "
+                    f"{about.COPYRIGHT_NOTICE}. Released under the PolyForm "
                     "Noncommercial License 1.0.0. Noncommercial use, "
                     "modification, and redistribution are permitted; "
                     "commercial use requires a separate license from the "
-                    "copyright holder. Bundled third-party components are "
-                    "licensed by their own copyright holders — see "
-                    "THIRD_PARTY_NOTICES.md, installed alongside this app.",
+                    f"copyright holder — email {about.AUTHOR_EMAIL} to "
+                    "arrange one. The full license text is the LICENSE file "
+                    "installed alongside this app, and the installer shows it "
+                    "for acceptance on every install and update. Bundled "
+                    "third-party components are licensed by their own "
+                    "copyright holders — see THIRD_PARTY_NOTICES.md, also "
+                    "installed alongside this app.",
                 ),
             ],
         )
@@ -1730,7 +1747,9 @@ class App(ctk.CTk):
             body,
             text=(
                 f"You have v{__version__}. Download and install the update? "
-                "The app will close so the installer can replace it."
+                "The app will close so the installer can replace it. The "
+                "installer shows the license agreement again; accept it to "
+                "finish updating."
             ),
             text_color=COLORS["secondary"],
             font=_font(13),

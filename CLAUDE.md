@@ -60,6 +60,9 @@ spec_formatter/llm_usage.py
     the one observed-usage contract for both classifiers, including failures
 spec_formatter/resources.py
     one root for shipped prompts and notices (sys._MEIPASS when frozen)
+spec_formatter/about.py
+    the author's name, email and LinkedIn profile for the About dialog,
+    repeated in the installer and held equal by tests/test_installer_license.py
 spec_formatter/builtin_scheme.py
     the committed CSC PageFormat numbering, styles, and role contracts used
     when a run has no architect template
@@ -1940,10 +1943,21 @@ override describes the license in plain words above it (noncommercial use
 permitted, commercial use needs a separate license, no warranty). The updater's
 `spawn_installer` launches the installer with no switches, so every update
 shows the page too; only a command-line `/SILENT` or `/VERYSILENT` install
-skips it. `tests/test_installer_license.py` holds all of that: do not drop the
+skips it; the update dialog tells the user the installer will ask again.
+`tests/test_installer_license.py` holds all of that: do not drop the
 page, skip `wpLicense` or preselect the accept radio in `[Code]`, override the
 radio captions, or add a silent switch to the updater. Inno reads a BOM-less
 text file in the ANSI code page, so `LICENSE` stays ASCII.
+
+The author's name, email and LinkedIn profile live in `spec_formatter/about.py`.
+The About dialog in `gui.py` reads them (email as a `mailto:` link, LinkedIn as
+a link, the email again in the license paragraph for commercial terms). The
+installer cannot import Python, so it repeats them as `MyAppContactEmail`,
+`MyAppLinkedInURL` and `MyAppCopyright` defines and uses them in `AppContact`,
+`AppPublisherURL`, `AppComments`, `AppCopyright`/`VersionInfoCopyright`, the
+license label and the Finished page (`FinishedLabel` and
+`FinishedLabelNoIcons`); `tests/test_installer_license.py` fails if either copy
+drifts. Change them in both places together.
 
 Third-party dependency licenses are inventoried in `THIRD_PARTY_NOTICES.md`.
 All runtime dependencies are permissive except `certifi` (MPL-2.0, file-level

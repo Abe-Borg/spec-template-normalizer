@@ -72,7 +72,11 @@ Before anything is installed, the installer shows a **License Agreement** page:
 a short plain-language description of the license above its full text (see
 [License](#license)). **I do not accept** is preselected and **Next** stays
 disabled until you choose **I accept the agreement**. Updates launched from the
-app run the same installer, so the page appears on every update too.
+app run the same installer, so the page appears on every update too, and you
+must accept it again to finish updating. The installer's description names
+the copyright holder's email for commercial licensing, its **Finished** page
+shows the author's email and LinkedIn profile, and **Add/Remove Programs**
+lists the email as the contact and the LinkedIn profile as the publisher link.
 
 The app is **not code-signed**, so the first time you run the installer Windows
 SmartScreen shows *"Windows protected your PC."* Choose **More info → Run
@@ -83,7 +87,8 @@ every update's SHA-256 before running it.)
 
 The app checks for updates once a day on launch and via the **Check for Updates**
 button in the footer. When a newer version exists it shows what's new and lets
-you **Download & Install** (the app closes so the installer can replace it),
+you **Download & Install** (the app closes so the installer can replace it,
+and the installer shows the License Agreement page again),
 **Skip this Version**, or decide **Later**. Update checks can be turned off with
 the `SPEC_FORMATTER_DISABLE_UPDATE_CHECK` environment variable.
 
@@ -919,6 +924,20 @@ course of a business — including formatting specifications on a paid project �
 is not covered by the PolyForm grant. Open an issue or contact the copyright
 holder to arrange commercial terms.
 
+## Contact
+
+Specification Formatter is made by **Abraham Borg**.
+
+- Email: [abrahamborg@gmail.com](mailto:abrahamborg@gmail.com)
+- LinkedIn: [linkedin.com/in/abrahamborg](https://www.linkedin.com/in/abrahamborg)
+
+The app's **About** dialog shows the same email and LinkedIn link (both
+clickable), and the Windows installer shows them too (see
+[Download for Windows](#download-for-windows)). They live in one place,
+`spec_formatter/about.py`; `packaging/windows/installer.iss` repeats them as
+preprocessor defines, and `tests/test_installer_license.py` fails if the two
+copies drift apart.
+
 Third-party components bundled with the application are licensed by their own
 copyright holders under their own terms; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
@@ -927,4 +946,5 @@ The Windows installer displays this license and requires the user to accept it
 before installing (see [Download for Windows](#download-for-windows)), and the
 installed app folder carries `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 `tests/test_installer_license.py` fails if the installer's license page is
-removed, stops describing the license, or can be skipped or pre-accepted.
+removed, stops describing the license, or can be skipped or pre-accepted, or
+if the installer's contact details stop matching the About dialog's.

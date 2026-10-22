@@ -19,6 +19,11 @@
 #define MyAppPublisher "Abraham Borg"
 #define MyAppExeName "SpecificationFormatter.exe"
 #define MyAppURL "https://github.com/abe-borg/spec-template-normalizer"
+; The author's contact details, repeated from spec_formatter/about.py (Inno
+; cannot import Python); tests/test_installer_license.py holds them equal.
+#define MyAppContactEmail "abrahamborg@gmail.com"
+#define MyAppLinkedInURL "https://www.linkedin.com/in/abrahamborg"
+#define MyAppCopyright "Copyright 2025 Abraham Borg"
 
 [Setup]
 ; A stable AppId ties every version together so an install upgrades in place
@@ -30,9 +35,17 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-AppPublisherURL={#MyAppURL}
+; Add/Remove Programs shows these: the publisher link opens the author's
+; LinkedIn profile, Contact is the author's email, and support and updates
+; point at the GitHub repository.
+AppPublisherURL={#MyAppLinkedInURL}
+AppContact={#MyAppContactEmail}
+AppComments=Contact {#MyAppPublisher} at {#MyAppContactEmail} or {#MyAppLinkedInURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}/releases/latest
+AppCopyright={#MyAppCopyright}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoCopyright={#MyAppCopyright}
 DefaultDirName={autopf}\Specification Formatter
 DefaultGroupName=Specification Formatter
 DisableProgramGroupPage=yes
@@ -45,7 +58,10 @@ DisableProgramGroupPage=yes
 ; above the text. Do not remove this line or skip wpLicense in [Code]:
 ; tests/test_installer_license.py fails if the page can be bypassed. (Only a
 ; command-line /SILENT or /VERYSILENT install skips it, as with every wizard
-; page; the in-app updater launches the installer interactively.) Inno reads a
+; page; the in-app updater launches the installer interactively.) An update
+; reruns this same wizard over the existing install, and Inno never skips the
+; License Agreement page on an upgrade the way it can skip the directory page,
+; so every update shows the license and requires "I accept" again. Inno reads a
 ; BOM-less text file in the ANSI code page, so LICENSE is kept ASCII.
 LicenseFile=..\..\LICENSE
 ; Per-user install: no admin/UAC prompt, which keeps the unsigned experience as
@@ -73,7 +89,13 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; Replaces the stock "Please read the following License Agreement" line on the
 ; License Agreement page, so the user learns what the license means before the
 ; full text. Keep it ASCII and free of "%" (Inno message placeholders).
-LicenseLabel3={#MyAppName} is source-available software under the PolyForm Noncommercial License 1.0.0 (full text below). You may use, modify, and share it for any noncommercial purpose. Commercial use, including formatting specifications on a paid project, requires a separate license from the copyright holder. It comes as is, without any warranty. You must accept the agreement to install.
+LicenseLabel3={#MyAppName} is source-available software under the PolyForm Noncommercial License 1.0.0 (full text below). You may use, modify, and share it for any noncommercial purpose. Commercial use, including formatting specifications on a paid project, requires a separate license from the copyright holder ({#MyAppContactEmail}). It comes as is, without any warranty. You must accept the agreement to install.
+
+; The Finished page names the author and how to reach them. Both variants
+; are overridden so the contact lines show whichever one Inno picks. "[name]"
+; is Inno's own placeholder for AppName and "%n" is a line break.
+FinishedLabel=Setup has finished installing [name] on your computer. The application may be launched by selecting the installed shortcuts.%n%n[name] is made by {#MyAppPublisher}.%nEmail: {#MyAppContactEmail}%nLinkedIn: {#MyAppLinkedInURL}
+FinishedLabelNoIcons=Setup has finished installing [name] on your computer.%n%n[name] is made by {#MyAppPublisher}.%nEmail: {#MyAppContactEmail}%nLinkedIn: {#MyAppLinkedInURL}
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
