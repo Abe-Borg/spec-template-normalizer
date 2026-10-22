@@ -595,7 +595,11 @@ numbering parts, which can carry property revisions too). A part is XML when
 its extension is `.xml` in any case -- OPC part names are case-insensitive, so
 a case-sensitive `*.xml` glob misses `word/comments.XML` on Linux -- or when
 `[Content_Types].xml` declares an XML content type for it, by `Override` or
-by its extension's `Default`. Then
+by its extension's `Default`. Pictures are not read: a part declared
+`image/...` is skipped whatever its extension, because an SVG is XML
+(`image/svg+xml`) that commonly begins with a DOCTYPE, which
+`parse_untrusted_xml` refuses, and holds no annotation id. The parser is not
+relaxed for any part; a DOCTYPE in a WordprocessingML part still fails. Then
 `plan_canadian_to_csi(highest_annotation_id=...)` allocates from one above the
 highest of those and of the body's own, monotonically, in document order (a
 paragraph's `w:pPrChange` before its `w:ins`). An id past 2**31 - 1, which Word
@@ -1869,6 +1873,9 @@ Before considering a formatter change complete:
   compares by author and kind.
 - Numbering revisions from a fixed base. Allocate above the highest annotation
   id in every part of the package; a reviewer's ids can be anywhere.
+- Reading a picture as WordprocessingML because its content type ends in
+  `+xml`. An SVG is `image/svg+xml`, often carries a DOCTYPE, and holds no
+  annotation id; leave `image/...` parts out of any scan of the package's XML.
 - Asserting that every `w:id` in a package is unique. Paired annotations share
   one; uniqueness holds among revision elements only.
 - Deleting a target part, or writing an architect one, without counting the

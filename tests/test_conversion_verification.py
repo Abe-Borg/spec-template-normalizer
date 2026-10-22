@@ -605,17 +605,25 @@ def _high_id_parts(document_xml: str) -> dict[str, str]:
 def converted_high_ids(tmp_path: Path) -> tuple[Path, Path]:
     """Convert through the directory entry point, which sees every part."""
 
-    parts = _high_id_parts(_high_id_document_xml())
+    return _convert_through_the_directory(tmp_path, _high_id_parts(_high_id_document_xml()))
+
+
+def _convert_through_the_directory(
+    tmp_path: Path, parts: dict[str, str | bytes]
+) -> tuple[Path, Path]:
+    def payload_bytes(payload: str | bytes) -> bytes:
+        return payload if isinstance(payload, bytes) else payload.encode("utf-8")
+
     before = tmp_path / "before.docx"
     with zipfile.ZipFile(before, "w", zipfile.ZIP_DEFLATED) as z:
         for name, payload in parts.items():
-            z.writestr(name, payload)
+            z.writestr(name, payload_bytes(payload))
 
     extracted = tmp_path / "extracted"
     for name, payload in parts.items():
         path = extracted / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload.encode("utf-8"))
+        path.write_bytes(payload_bytes(payload))
     apply_canadian_to_csi(
         extracted,
         {
@@ -726,3 +734,83 @@ def test_revision_ids_are_unique_among_revisions_in_the_output(converted_high_id
 
     assert paired(after) == paired(before)
     assert [local for _p, local, rid in paired(after) if rid == 900001].count("comment") == 1
+
+
+# --- A picture with a DOCTYPE in a tracked source -------------------------
+#
+# An SVG is XML by its content type, and one exported from Illustrator and
+# similar tools begins with a DOCTYPE. It carries no annotation id, so it must
+# neither stop the conversion nor be touched by it, and the ids must still
+# clear every annotation in the parts that do carry them.
+
+_SVG_NAME = "word/media/image1.svg"
+_SVG_WITH_DOCTYPE = (
+    b'<?xml version="1.0" encoding="utf-8"?>\n'
+    b'<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" '
+    b'"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n'
+    b'<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="16" height="16">'
+    b'<rect width="16" height="16"/></svg>'
+)
+_SVG_DOCUMENT_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.svg"/>'
+    "</Relationships>"
+)
+_CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+
+@pytest.fixture
+def converted_with_svg(tmp_path: Path) -> tuple[Path, Path]:
+    parts: dict[str, str | bytes] = dict(_high_id_parts(_high_id_document_xml()))
+    parts["[Content_Types].xml"] = _CONTENT_TYPES.replace(
+        "</Types>", '<Default Extension="svg" ContentType="image/svg+xml"/></Types>'
+    )
+    parts["word/_rels/document.xml.rels"] = _SVG_DOCUMENT_RELS
+    parts[_SVG_NAME] = _SVG_WITH_DOCTYPE
+    return _convert_through_the_directory(tmp_path, parts)
+
+
+def _declared_content_type(path: Path, name: str) -> str | None:
+    """The content type ``[Content_Types].xml`` declares for one member."""
+
+    with zipfile.ZipFile(path) as z:
+        types = ET.fromstring(z.read("[Content_Types].xml"))
+    for override in types.findall(f"{{{_CT}}}Override"):
+        if override.get("PartName", "").lstrip("/").lower() == name.lower():
+            return override.get("ContentType")
+    extension = name.rsplit(".", 1)[-1].lower()
+    for default in types.findall(f"{{{_CT}}}Default"):
+        if default.get("Extension", "").lower() == extension:
+            return default.get("ContentType")
+    return None
+
+
+def test_the_svg_fixture_is_a_picture_with_a_doctype(converted_with_svg) -> None:
+    """Guard on the fixture: the picture is one the parser would refuse."""
+
+    before, _after = converted_with_svg
+    assert _declared_content_type(before, _SVG_NAME) == "image/svg+xml"
+    with zipfile.ZipFile(before) as z:
+        assert b"<!DOCTYPE svg" in z.read(_SVG_NAME)
+
+
+def test_the_svg_is_carried_through_byte_for_byte(converted_with_svg) -> None:
+    before, after = converted_with_svg
+    before_members, after_members = _members(before), _members(after)
+    assert set(before_members) == set(after_members)
+    changed = {n for n in before_members if before_members[n] != after_members[n]}
+    assert changed == {"word/document.xml"}
+    with zipfile.ZipFile(after) as z:
+        assert z.read(_SVG_NAME) == _SVG_WITH_DOCTYPE
+
+
+def test_ids_beside_an_svg_collide_with_no_id_in_the_source(converted_with_svg) -> None:
+    before, after = converted_with_svg
+    source_ids = {revision_id for _p, _l, revision_id, _a in _annotations(before)}
+    assert {900000, 900001, 900002, 900005} <= source_ids, "fixture must reach the old base"
+
+    allocated = _allocated_ids(after)
+    assert len(allocated) == 2 * len(_BODY)
+    assert len(set(allocated)) == len(allocated)
+    assert not set(allocated) & source_ids
